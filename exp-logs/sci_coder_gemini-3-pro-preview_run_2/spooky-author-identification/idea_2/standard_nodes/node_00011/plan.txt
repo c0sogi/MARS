@@ -1,0 +1,623 @@
+Here is the implementation strategy to optimize the solution:
+
+1.  **Integrate DeBERTa-v3-large**: I will create a new `TransformerModel` class that wraps the Hugging Face `transformers` library to fine-tune `microsoft/deberta-v3-large`. This leverages the lesson on "Prioritizing Neural Backbone Capacity" (Lesson 00009) to significantly improve the ensemble's predictive power.
+2.  **Aggressive Early Stopping**: The `TransformerModel` will implement an aggressive early stopping mechanism (`patience=1`) during the Out-Of-Fold (OOF) training phase. As noted in Lesson 00010, this prevents the powerful neural model from overfitting to specific validation folds, ensuring better generalization for the meta-learner.
+3.  **Update Stacking Architecture**: I will modify the `StackingManager` to accept raw text data and incorporate the Transformer's predictions into the meta-learner's feature set (Lesson 00008: Hybrid Stacking). The ensemble will now consist of Logistic Regression (Sparse), Naive Bayes (Sparse), XGBoost (Dense SVD), and DeBERTa (Raw Text).
+4.  **Configuration Update**: I will update `Config` to include the transformer hyperparameters and ensure that the configuration hash reflects these changes to invalidate old cache files.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # 3. XGBoost (Base Estimator - operates on SVD features)
+    XGB_PARAMS = {
+        "n_estimators": 200,
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "n_jobs": -1,
+        "random_state": SEED,
+        "verbosity": 0,
+    }
+
+    # 4. Meta-Learner (Logistic Regression)
+=======
+    # 3. XGBoost (Base Estimator - operates on SVD features)
+    XGB_PARAMS = {
+        "n_estimators": 200,
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "n_jobs": -1,
+        "random_state": SEED,
+        "verbosity": 0,
+    }
+
+    # 4. Transformer (Base Estimator - operates on Raw Text)
+    # Cite Lesson 00009: Prioritize Neural Backbone Capacity (DeBERTa-v3-large)
+    # Cite Lesson 00010: Aggressive Early Stopping (patience=1)
+    TRANSFORMER_PARAMS = {
+        "model_name": "microsoft/deberta-v3-large",
+        "max_length": 128,
+        "batch_size": 16,
+        "lr": 1e-5,
+        "epochs": 3,
+        "patience": 1,
+        "random_state": SEED,
+    }
+
+    # 5. Meta-Learner (Logistic Regression)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            "lr_params": cls.LR_PARAMS,
+            "mnb_params": cls.MNB_PARAMS,
+            "xgb_params": cls.XGB_PARAMS,
+            "meta_lr_params": cls.META_LR_PARAMS,
+        }
+=======
+            "lr_params": cls.LR_PARAMS,
+            "mnb_params": cls.MNB_PARAMS,
+            "xgb_params": cls.XGB_PARAMS,
+            "transformer_params": cls.TRANSFORMER_PARAMS,
+            "meta_lr_params": cls.META_LR_PARAMS,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/transformer_model.py
+<<<<<<< SEARCH
+=======
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+
+class TextDataset(Dataset):
+    def __init__(self, texts, labels=None, tokenizer=None, max_length=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        item = {key: val.squeeze(0) for key, val in encoding.items()}
+        if self.labels is not None:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+        return item
+
+class TransformerModel:
+    """
+    Wrapper for HuggingFace Transformers to be used as a base learner.
+    Cite Lesson 00008: Hybrid Stacking with Transformers.
+    """
+    def __init__(self, model_name, num_classes=3, max_length=128, batch_size=16, lr=2e-5, epochs=3, patience=1, device=None, random_state=42):
+        self.model_name = model_name
+        self.num_classes = num_classes
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.lr = lr
+        self.epochs = epochs
+        self.patience = patience
+        self.random_state = random_state
+        
+        if device:
+            self.device = device
+        else:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+        self.model = None
+        self.tokenizer = None
+    
+    def fit(self, X, y, X_val=None, y_val=None):
+        # Set seed
+        torch.manual_seed(self.random_state)
+        if self.device == "cuda":
+            torch.cuda.manual_seed(self.random_state)
+            
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, num_labels=self.num_classes)
+        self.model.to(self.device)
+        
+        train_dataset = TextDataset(X, y, self.tokenizer, self.max_length)
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        
+        optimizer = AdamW(self.model.parameters(), lr=self.lr)
+        total_steps = len(train_loader) * self.epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+        
+        best_loss = float('inf')
+        patience_counter = 0
+        has_val = X_val is not None
+        
+        # Training Loop
+        for epoch in range(self.epochs):
+            self.model.train()
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+            
+            # Validation & Early Stopping
+            if has_val:
+                val_loss = self._evaluate(X_val, y_val)
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    # Save best model state in memory
+                    best_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.patience:
+                        break
+        
+        # Restore best weights if validation was used
+        if has_val and 'best_state' in locals():
+            self.model.load_state_dict(best_state)
+            self.model.to(self.device)
+            
+        return self
+
+    def _evaluate(self, X, y):
+        self.model.eval()
+        val_dataset = TextDataset(X, y, self.tokenizer, self.max_length)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+        
+        total_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                total_loss += outputs.loss.item() * len(labels)
+        
+        return total_loss / len(X)
+
+    def predict_proba(self, X):
+        self.model.eval()
+        dataset = TextDataset(X, None, self.tokenizer, self.max_length)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        
+        probs = []
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                probs.append(torch.softmax(logits, dim=1).cpu().numpy())
+        
+        return np.concatenate(probs, axis=0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_factory.py
+<<<<<<< SEARCH
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from xgboost import XGBClassifier
+from library.config import Config
+
+
+class ModelFactory:
+=======
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from xgboost import XGBClassifier
+from library.config import Config
+from library.transformer_model import TransformerModel
+
+
+class ModelFactory:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        models["xgb"] = XGBClassifier(**xgb_params)
+
+        return models
+=======
+        models["xgb"] = XGBClassifier(**xgb_params)
+
+        # 4. Transformer (Raw Text)
+        trans_params = Config.TRANSFORMER_PARAMS.copy()
+        for k, v in kwargs.items():
+            if k in trans_params:
+                trans_params[k] = v
+        
+        models["transformer"] = TransformerModel(**trans_params)
+
+        return models
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking_manager.py
+<<<<<<< SEARCH
+    def get_oof_predictions(
+        self, X_sparse, X_dense, y, load_cached_data=True, debug=False
+    ):
+        """
+        Generates Out-Of-Fold (OOF) predictions for the base models.
+        Uses Stratified K-Fold CV.
+        Implements caching to avoid re-computation.
+
+        Args:
+            X_sparse: Sparse feature matrix (for LR, MNB).
+            X_dense: Dense feature matrix (for XGB).
+            y: Target labels.
+            load_cached_data (bool): Whether to load from cache.
+            debug (bool): Debug mode flag for cache naming.
+
+        Returns:
+            dict: Dictionary containing OOF probability arrays for each base model.
+        """
+=======
+    def get_oof_predictions(
+        self, X_sparse, X_dense, text_data, y, load_cached_data=True, debug=False
+    ):
+        """
+        Generates Out-Of-Fold (OOF) predictions for the base models.
+        Uses Stratified K-Fold CV.
+        Implements caching to avoid re-computation.
+
+        Args:
+            X_sparse: Sparse feature matrix (for LR, MNB).
+            X_dense: Dense feature matrix (for XGB).
+            text_data: Raw text data (for Transformer).
+            y: Target labels.
+            load_cached_data (bool): Whether to load from cache.
+            debug (bool): Debug mode flag for cache naming.
+
+        Returns:
+            dict: Dictionary containing OOF probability arrays for each base model.
+        """
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        oof_preds = {
+            "lr": np.zeros((n_samples, n_classes)),
+            "mnb": np.zeros((n_samples, n_classes)),
+            "xgb": np.zeros((n_samples, n_classes)),
+        }
+=======
+        oof_preds = {
+            "lr": np.zeros((n_samples, n_classes)),
+            "mnb": np.zeros((n_samples, n_classes)),
+            "xgb": np.zeros((n_samples, n_classes)),
+            "transformer": np.zeros((n_samples, n_classes)),
+        }
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            X_dense_train = X_dense[train_idx]
+            X_dense_val = X_dense[val_idx]
+
+            y_train = y[train_idx]
+
+            # Instantiate Base Models (Fresh instance per fold)
+            models = ModelFactory.get_base_models()
+
+            # 1. Logistic Regression (Sparse)
+            models["lr"].fit(X_sparse_train, y_train)
+            oof_preds["lr"][val_idx] = models["lr"].predict_proba(X_sparse_val)
+
+            # 2. Multinomial Naive Bayes (Sparse)
+            models["mnb"].fit(X_sparse_train, y_train)
+            oof_preds["mnb"][val_idx] = models["mnb"].predict_proba(X_sparse_val)
+
+            # 3. XGBoost (Dense)
+            # Operates on SVD-reduced dense features
+            models["xgb"].fit(X_dense_train, y_train)
+            oof_preds["xgb"][val_idx] = models["xgb"].predict_proba(X_dense_val)
+=======
+            X_dense_train = X_dense[train_idx]
+            X_dense_val = X_dense[val_idx]
+
+            # Text Data for Transformer
+            text_train = text_data.iloc[train_idx].tolist()
+            text_val = text_data.iloc[val_idx].tolist()
+
+            y_train = y[train_idx]
+            y_val = y[val_idx]
+
+            # Instantiate Base Models (Fresh instance per fold)
+            models = ModelFactory.get_base_models()
+
+            # 1. Logistic Regression (Sparse)
+            models["lr"].fit(X_sparse_train, y_train)
+            oof_preds["lr"][val_idx] = models["lr"].predict_proba(X_sparse_val)
+
+            # 2. Multinomial Naive Bayes (Sparse)
+            models["mnb"].fit(X_sparse_train, y_train)
+            oof_preds["mnb"][val_idx] = models["mnb"].predict_proba(X_sparse_val)
+
+            # 3. XGBoost (Dense)
+            models["xgb"].fit(X_dense_train, y_train)
+            oof_preds["xgb"][val_idx] = models["xgb"].predict_proba(X_dense_val)
+
+            # 4. Transformer (Raw Text)
+            # Cite Lesson 00010: Aggressive Early Stopping using validation set
+            models["transformer"].fit(text_train, y_train, X_val=text_val, y_val=y_val)
+            oof_preds["transformer"][val_idx] = models["transformer"].predict_proba(text_val)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def train_meta_learner(self, oof_preds, y_true):
+        """
+        Trains the Layer 2 Meta-Learner on the OOF predictions.
+
+        Args:
+            oof_preds (dict): Dictionary of OOF probability arrays.
+            y_true: True target labels.
+
+        Returns:
+            The trained meta-learner model.
+        """
+        print("Training Meta-Learner...")
+
+        # Construct Meta-Features: Horizontal concatenation of probas
+        # Order: LR, MNB, XGB
+        meta_features = np.hstack([oof_preds["lr"], oof_preds["mnb"], oof_preds["xgb"]])
+
+        # Get and Train Meta-Learner
+=======
+    def train_meta_learner(self, oof_preds, y_true):
+        """
+        Trains the Layer 2 Meta-Learner on the OOF predictions.
+
+        Args:
+            oof_preds (dict): Dictionary of OOF probability arrays.
+            y_true: True target labels.
+
+        Returns:
+            The trained meta-learner model.
+        """
+        print("Training Meta-Learner...")
+
+        # Construct Meta-Features: Horizontal concatenation of probas
+        # Order: LR, MNB, XGB, Transformer
+        meta_features = np.hstack([
+            oof_preds["lr"], 
+            oof_preds["mnb"], 
+            oof_preds["xgb"],
+            oof_preds["transformer"]
+        ])
+
+        # Get and Train Meta-Learner
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def refit_base_models(self, X_sparse, X_dense, y):
+        """
+        Retrains all base models on the full training dataset for final inference.
+
+        Args:
+            X_sparse: Full sparse training features.
+            X_dense: Full dense training features.
+            y: Full training labels.
+
+        Returns:
+            dict: Dictionary of trained base models.
+        """
+        print("Refitting Base Models on full dataset...")
+        models = ModelFactory.get_base_models()
+
+        # 1. Logistic Regression
+        models["lr"].fit(X_sparse, y)
+
+        # 2. Multinomial Naive Bayes
+        models["mnb"].fit(X_sparse, y)
+
+        # 3. XGBoost
+        models["xgb"].fit(X_dense, y)
+
+        return models
+
+    def predict_ensemble(self, base_models, meta_learner, X_sparse_test, X_dense_test):
+        """
+        Generates final predictions using the trained ensemble.
+
+        Args:
+            base_models (dict): Dictionary of trained base models.
+            meta_learner: Trained meta-learner.
+            X_sparse_test: Sparse test features.
+            X_dense_test: Dense test features.
+
+        Returns:
+            np.ndarray: Final predicted probabilities.
+        """
+        print("Generating Ensemble Predictions...")
+
+        # 1. Base Model Predictions
+        p_lr = base_models["lr"].predict_proba(X_sparse_test)
+        p_mnb = base_models["mnb"].predict_proba(X_sparse_test)
+        p_xgb = base_models["xgb"].predict_proba(X_dense_test)
+
+        # 2. Construct Meta-Features (Must match training order)
+        meta_features = np.hstack([p_lr, p_mnb, p_xgb])
+
+        # 3. Meta-Learner Prediction
+        final_probs = meta_learner.predict_proba(meta_features)
+
+        return final_probs
+=======
+    def refit_base_models(self, X_sparse, X_dense, text_data, y):
+        """
+        Retrains all base models on the full training dataset for final inference.
+
+        Args:
+            X_sparse: Full sparse training features.
+            X_dense: Full dense training features.
+            text_data: Full raw text data.
+            y: Full training labels.
+
+        Returns:
+            dict: Dictionary of trained base models.
+        """
+        print("Refitting Base Models on full dataset...")
+        models = ModelFactory.get_base_models()
+
+        # 1. Logistic Regression
+        models["lr"].fit(X_sparse, y)
+
+        # 2. Multinomial Naive Bayes
+        models["mnb"].fit(X_sparse, y)
+
+        # 3. XGBoost
+        models["xgb"].fit(X_dense, y)
+
+        # 4. Transformer
+        # No validation set for refit, trains for fixed epochs
+        models["transformer"].fit(text_data.tolist(), y)
+
+        return models
+
+    def predict_ensemble(self, base_models, meta_learner, X_sparse_test, X_dense_test, text_test):
+        """
+        Generates final predictions using the trained ensemble.
+
+        Args:
+            base_models (dict): Dictionary of trained base models.
+            meta_learner: Trained meta-learner.
+            X_sparse_test: Sparse test features.
+            X_dense_test: Dense test features.
+            text_test: Raw text data for transformer.
+
+        Returns:
+            np.ndarray: Final predicted probabilities.
+        """
+        print("Generating Ensemble Predictions...")
+
+        # 1. Base Model Predictions
+        p_lr = base_models["lr"].predict_proba(X_sparse_test)
+        p_mnb = base_models["mnb"].predict_proba(X_sparse_test)
+        p_xgb = base_models["xgb"].predict_proba(X_dense_test)
+        p_trans = base_models["transformer"].predict_proba(text_test.tolist())
+
+        # 2. Construct Meta-Features (Must match training order)
+        meta_features = np.hstack([p_lr, p_mnb, p_xgb, p_trans])
+
+        # 3. Meta-Learner Prediction
+        final_probs = meta_learner.predict_proba(meta_features)
+
+        return final_probs
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Step A: Generate Out-Of-Fold (OOF) Predictions for Meta-Training
+    # This performs K-Fold CV on the training set
+    oof_preds = manager.get_oof_predictions(
+        X_train_sparse, X_train_dense, y_train, load_cached_data=True
+    )
+
+    # Step B: Train Meta-Learner on OOF predictions
+    meta_learner = manager.train_meta_learner(oof_preds, y_train)
+
+    # Step C: Validation Inference
+    # To get a valid validation score, we train base models on the full Training set
+    # and predict on the Validation set.
+    print("Refitting base models on Train set for validation...")
+    base_models_val = manager.refit_base_models(X_train_sparse, X_train_dense, y_train)
+
+    print("Predicting on Validation set...")
+    val_probs = manager.predict_ensemble(
+        base_models_val, meta_learner, X_val_sparse, X_val_dense
+    )
+=======
+    # Step A: Generate Out-Of-Fold (OOF) Predictions for Meta-Training
+    # This performs K-Fold CV on the training set
+    oof_preds = manager.get_oof_predictions(
+        X_train_sparse, X_train_dense, train_df["text"], y_train, load_cached_data=True
+    )
+
+    # Step B: Train Meta-Learner on OOF predictions
+    meta_learner = manager.train_meta_learner(oof_preds, y_train)
+
+    # Step C: Validation Inference
+    # To get a valid validation score, we train base models on the full Training set
+    # and predict on the Validation set.
+    print("Refitting base models on Train set for validation...")
+    base_models_val = manager.refit_base_models(X_train_sparse, X_train_dense, train_df["text"], y_train)
+
+    print("Predicting on Validation set...")
+    val_probs = manager.predict_ensemble(
+        base_models_val, meta_learner, X_val_sparse, X_val_dense, val_df["text"]
+    )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 6. Submission Generation
+    # Threshold defined in task
+    THRESHOLD = 0.34671256711662346
+
+    if val_loss < THRESHOLD:
+        print(
+            f"\nValidation score ({val_loss:.6f}) meets threshold ({THRESHOLD}). Proceeding to submission."
+        )
+
+        # For the final submission, we refit base models on ALL available labeled data (Train + Val)
+        # to maximize performance. We reuse the meta-learner trained on OOF.
+        print("Refitting base models on combined Train + Validation data...")
+
+        X_all_sparse = scipy.sparse.vstack([X_train_sparse, X_val_sparse])
+        X_all_dense = np.vstack([X_train_dense, X_val_dense])
+        y_all = np.concatenate([y_train, y_val])
+
+        final_base_models = manager.refit_base_models(X_all_sparse, X_all_dense, y_all)
+
+        print("Generating predictions for Test set...")
+        test_probs = manager.predict_ensemble(
+            final_base_models, meta_learner, X_test_sparse, X_test_dense
+        )
+=======
+    # 6. Submission Generation
+    # Threshold defined in task
+    THRESHOLD = 0.23237805822413304
+
+    if val_loss < THRESHOLD:
+        print(
+            f"\nValidation score ({val_loss:.6f}) meets threshold ({THRESHOLD}). Proceeding to submission."
+        )
+
+        # For the final submission, we refit base models on ALL available labeled data (Train + Val)
+        # to maximize performance. We reuse the meta-learner trained on OOF.
+        print("Refitting base models on combined Train + Validation data...")
+
+        X_all_sparse = scipy.sparse.vstack([X_train_sparse, X_val_sparse])
+        X_all_dense = np.vstack([X_train_dense, X_val_dense])
+        y_all = np.concatenate([y_train, y_val])
+        text_all = pd.concat([train_df["text"], val_df["text"]])
+
+        final_base_models = manager.refit_base_models(X_all_sparse, X_all_dense, text_all, y_all)
+
+        print("Generating predictions for Test set...")
+        test_probs = manager.predict_ensemble(
+            final_base_models, meta_learner, X_test_sparse, X_test_dense, test_df["text"]
+        )
+>>>>>>> REPLACE
+```

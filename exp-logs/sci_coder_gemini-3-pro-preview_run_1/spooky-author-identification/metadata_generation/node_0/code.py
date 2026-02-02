@@ -1,0 +1,117 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+
+def main():
+    # Define directories
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+
+    # Define split parameters
+    RANDOM_STATE = 42
+    VAL_SIZE = 0.2
+
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Loading raw data...")
+    # Read raw data
+    # The dataset is small enough to load into memory.
+    train_path = os.path.join(INPUT_DIR, "train.csv")
+    test_path = os.path.join(INPUT_DIR, "test.csv")
+
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Train file not found at {train_path}")
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Test file not found at {test_path}")
+
+    df_full_train = pd.read_csv(train_path)
+    df_test = pd.read_csv(test_path)
+
+    print(f"Original training data shape: {df_full_train.shape}")
+    print(f"Test data shape: {df_test.shape}")
+
+    # Perform Stratified Split
+    print("Splitting data into training and validation sets...")
+    # We stratify by the 'author' column to ensure class distribution is preserved
+    df_train, df_val = train_test_split(
+        df_full_train,
+        test_size=VAL_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=df_full_train["author"],
+    )
+
+    # Save metadata files
+    # For NLP tasks with CSV inputs, the metadata usually contains the text itself
+    # if the dataset is not referencing external text files.
+    train_meta_path = os.path.join(METADATA_DIR, "train.csv")
+    val_meta_path = os.path.join(METADATA_DIR, "validation.csv")
+    test_meta_path = os.path.join(METADATA_DIR, "test.csv")
+
+    print(f"Saving metadata to {METADATA_DIR}...")
+    df_train.to_csv(train_meta_path, index=False)
+    df_val.to_csv(val_meta_path, index=False)
+    df_test.to_csv(test_meta_path, index=False)
+
+    # -------------------------------------------------------------------------
+    # Verification Steps
+    # -------------------------------------------------------------------------
+    print("\n--- Verifying Generated Metadata ---")
+
+    # Load the generated metadata
+    df_train_check = pd.read_csv(train_meta_path)
+    df_val_check = pd.read_csv(val_meta_path)
+    df_test_check = pd.read_csv(test_meta_path)
+
+    # 1. Summary Statistics
+    print("\nSummary Statistics:")
+    print(f"Train set samples: {len(df_train_check)}")
+    print(f"Validation set samples: {len(df_val_check)}")
+    print(f"Test set samples: {len(df_test_check)}")
+
+    print("\nTrain Class Distribution:")
+    train_dist = df_train_check["author"].value_counts(normalize=True).sort_index()
+    print(train_dist)
+
+    print("\nValidation Class Distribution:")
+    val_dist = df_val_check["author"].value_counts(normalize=True).sort_index()
+    print(val_dist)
+
+    # 2. Check File Paths (Not applicable here as data is inline, but logic included for completeness)
+    # The dataset provided (Spooky Author Identification) contains text directly in the CSV.
+    # There are no external file paths to resolve relative to ./input.
+    # We skip the "missing file ratio" check as there are no file path columns.
+
+    # 3. Verify Validation Set Requirements
+
+    # Check Split Ratio
+    total_samples = len(df_train_check) + len(df_val_check)
+    actual_val_ratio = len(df_val_check) / total_samples
+    print(f"\nActual Validation Ratio: {actual_val_ratio:.5f}")
+
+    # Assert ratio is approximately 0.2
+    # Note: Exact 0.2 might not be possible due to integer counts, so we use a small tolerance.
+    if abs(actual_val_ratio - VAL_SIZE) > 0.01:
+        raise AssertionError(
+            f"Validation split ratio {actual_val_ratio} deviates significantly from expected {VAL_SIZE}"
+        )
+
+    # Check Stratification
+    # We compare the normalized value counts of the target column 'author'
+    diff = (train_dist - val_dist).abs()
+    print("\nClass distribution difference (Train - Val):")
+    print(diff)
+
+    # Assert that the maximum difference in class proportions is small (e.g., < 1%)
+    if (diff > 0.01).any():
+        raise AssertionError(
+            "Stratification failed: Significant difference in class distribution between Train and Validation sets."
+        )
+
+    print("\nVerification passed successfully.")
+
+
+if __name__ == "__main__":
+    main()

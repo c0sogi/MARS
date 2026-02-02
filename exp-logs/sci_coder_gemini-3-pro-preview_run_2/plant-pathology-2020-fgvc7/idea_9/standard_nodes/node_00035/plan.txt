@@ -1,0 +1,219 @@
+The `torch.OutOfMemoryError` indicates that the `EfficientNetV2-L` model with 480x480 input resolution and a batch size of 16 exceeds the available GPU memory. To resolve this, I will implement **Gradient Accumulation** and **Automatic Mixed Precision (AMP)**. This involves reducing the physical batch size to 4 to fit in VRAM while accumulating gradients over 4 steps to maintain an effective batch size of 16, as recommended in **Cite debug_lesson_5**. I will also update the `Config` class to include the new hyperparameters `grad_accumulation_steps` and `use_amp` to ensure synchronization between configuration and code (**Cite debug_lesson_1**).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # =========================================================================
+    batch_size = 16  # Constrained by EffNetV2-L VRAM usage
+    epochs = 12  # Sufficient for fine-tuning pre-trained models
+=======
+    # Training Hyperparameters
+    # =========================================================================
+    # Reduced batch size to 4 to fit EffNetV2-L @ 480px in 16GB VRAM.
+    # Effective batch size = 4 * 4 = 16.
+    batch_size = 4
+    grad_accumulation_steps = 4
+    use_amp = True  # Enable Automatic Mixed Precision
+
+    epochs = 12  # Sufficient for fine-tuning pre-trained models
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+
+from library.config import Config
+=======
+import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.cuda.amp import GradScaler
+
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, optimizer, dataloader, device, criterion):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    for images, targets, _ in dataloader:
+        images = images.to(device)
+        targets = targets.to(device)
+        batch_size = images.size(0)
+
+        optimizer.zero_grad()
+
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    return epoch_loss
+=======
+def train_one_epoch(model, optimizer, dataloader, device, criterion, scaler):
+    """
+    Trains the model for one epoch using AMP and Gradient Accumulation.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    optimizer.zero_grad()
+
+    for batch_idx, (images, targets, _) in enumerate(dataloader):
+        images = images.to(device)
+        targets = targets.to(device)
+        batch_size = images.size(0)
+
+        # Automatic Mixed Precision
+        with torch.autocast(device_type="cuda", enabled=Config.use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            # Scale loss for gradient accumulation
+            loss = loss / Config.grad_accumulation_steps
+
+        # Backward pass with scaler
+        scaler.scale(loss).backward()
+
+        # Step optimizer every 'grad_accumulation_steps' batches
+        if (batch_idx + 1) % Config.grad_accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        # Track total loss (scale back up for logging)
+        running_loss += (loss.item() * Config.grad_accumulation_steps) * batch_size
+        dataset_size += batch_size
+
+    # Handle any remaining gradients if dataset size isn't divisible by accumulation steps
+    if len(dataloader) % Config.grad_accumulation_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    epoch_loss = running_loss / dataset_size
+    return epoch_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def valid_one_epoch(model, dataloader, device, criterion):
+    """
+    Validates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+            batch_size = images.size(0)
+
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid to logits for metric calculation
+            preds = torch.sigmoid(outputs)
+
+            all_targets.append(targets.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+=======
+def valid_one_epoch(model, dataloader, device, criterion):
+    """
+    Validates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+            batch_size = images.size(0)
+
+            # Use autocast for validation as well (faster inference)
+            with torch.autocast(device_type="cuda", enabled=Config.use_amp):
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid to logits for metric calculation
+            preds = torch.sigmoid(outputs)
+
+            all_targets.append(targets.cpu().numpy())
+            all_preds.append(preds.cpu().float().cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # 4. Optimizer & Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay
+    )
+
+    # Standard scheduler for initial phase
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+=======
+    # 4. Optimizer & Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay
+    )
+
+    # Initialize GradScaler for AMP
+    scaler = GradScaler(enabled=Config.use_amp)
+
+    # Standard scheduler for initial phase
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Train
+        train_loss = train_one_epoch(model, optimizer, train_loader, device, criterion)
+
+        # SWA Update
+=======
+        # Train
+        train_loss = train_one_epoch(
+            model, optimizer, train_loader, device, criterion, scaler
+        )
+
+        # SWA Update
+>>>>>>> REPLACE
+```

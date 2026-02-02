@@ -1,0 +1,487 @@
+Based on the empirical findings from the previous solution and the provided lessons, I will optimize the model architecture by simplifying it to a **Wide ResNet with ECA and Multi-Scale GAP**.
+
+1.  **Remove Over-Engineering (BlurPool & GeM):** As per `Cite solution_lesson_node_00098`, complex spatial filtering like `BlurPool` and `GeM` can degrade performance on low-resolution (32x32) images by washing out details or adding unnecessary complexity. I will remove these components.
+2.  **Simplify to Wide ResNet:** I will replace the `ResNeXtBottleneck` with a standard `BasicBlock`. `Cite solution_lesson_node_00098` showed that a simple ResNet often outperforms complex variants on this task. I will maintain the "Wide" channel configuration ([64, 128, 256]) to ensure sufficient capacity (`Cite solution_lesson_node_00049`) and use standard 1x1 convolutions for shortcuts (`Cite solution_lesson_node_00063`).
+3.  **Retain Multi-Scale Aggregation:** I will keep the strategy of concatenating features from Stage 2 and Stage 3, as `Cite solution_lesson_node_00016` indicates this improves efficiency and information flow for low-res inputs. I will use standard Global Average Pooling (GAP) instead of GeM (`Cite solution_lesson_node_00053`).
+4.  **Retain ECA:** I will keep the Efficient Channel Attention (ECA) module as it accelerates convergence (`Cite solution_lesson_node_00012`) with negligible overhead.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# -----------------------------------------------------------------------------
+# Model Configuration
+# Custom Wide Anti-Aliased ResNeXt-ECA with Multi-Scale GeM Aggregation
+# -----------------------------------------------------------------------------
+MODEL_NAME = "CustomWideResNeXtECA"
+
+# "Super-Wide" Channel Configuration as per solution_lesson_node_00064
+CHANNELS = [64, 128, 256]
+CARDINALITY = 32
+
+# Structural Innovations
+USE_ECA = True  # Efficient Channel Attention instead of SE
+USE_BLURPOOL = True  # Anti-aliased downsampling (Stride-1 Conv + BlurPool)
+HEAD_TYPE = "MultiScaleGeM"  # Aggregation of Stage 2 & 3 features using GeM
+=======
+# -----------------------------------------------------------------------------
+# Model Configuration
+# Wide ResNet-ECA with Multi-Scale GAP Aggregation
+# -----------------------------------------------------------------------------
+MODEL_NAME = "WideResNetECA"
+
+# "Super-Wide" Channel Configuration
+CHANNELS = [64, 128, 256]
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+class BlurPool(nn.Module):
+    """
+    BlurPool layer for anti-aliased downsampling.
+    Applies a low-pass filter (smoothing) before subsampling.
+
+    References:
+        Zhang, Richard. "Making convolutional networks shift-invariant again." ICML 2019.
+    """
+
+    def __init__(self, channels, stride=2, filt_size=3):
+        super(BlurPool, self).__init__()
+        self.channels = channels
+        self.stride = stride
+
+        # Create the smoothing kernel (binomial filter)
+        if filt_size == 3:
+            filt = torch.tensor([1.0, 2.0, 1.0])
+        elif filt_size == 5:
+            filt = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0])
+        else:
+            raise ValueError("BlurPool filter size must be 3 or 5")
+
+        filt = filt / torch.sum(filt)
+        # Create 2D kernel by outer product
+        filt_2d = filt[:, None] * filt[None, :]
+        # Expand dims to match Conv2d weight shape: (Out, In/Groups, kH, kW)
+        # Groups = channels, so In/Groups = 1
+        filt_2d = filt_2d[None, None, :, :].repeat((self.channels, 1, 1, 1))
+
+        self.register_buffer("filt", filt_2d)
+        self.pad_size = filt_size // 2
+
+    def forward(self, x):
+        # Pad input to maintain size before striding if necessary,
+        # or simply pad to handle boundary conditions for the filter.
+        # For stride=2 downsampling, we typically want to preserve information
+        # at the edges similar to 'same' padding logic before the stride.
+        # Reflection padding is often used to reduce boundary artifacts.
+        x_pad = F.pad(
+            x,
+            (self.pad_size, self.pad_size, self.pad_size, self.pad_size),
+            mode="reflect",
+        )
+
+        return F.conv2d(x_pad, self.filt, stride=self.stride, groups=self.channels)
+
+
+class GeM(nn.Module):
+    """
+    Generalized Mean Pooling (GeM).
+
+    Computes f = (mean(x^p))^(1/p).
+    p is a learnable parameter.
+
+    References:
+        Radenović et al., "Fine-tuning CNN Image Retrieval with No Human Annotation", TPAMI 2018.
+    """
+
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        # Clamp to avoid NaN gradients or undefined operations with negative values (though ReLU usually precedes)
+        x = x.clamp(min=self.eps)
+
+        # Average pooling on x^p
+        # (B, C, H, W) -> (B, C, 1, 1)
+        x_pow = x.pow(self.p)
+        avg_x_pow = F.avg_pool2d(x_pow, (x_pow.size(-2), x_pow.size(-1)))
+
+        # Raise to power 1/p
+        gem = avg_x_pow.pow(1.0 / self.p)
+
+        # Flatten to (B, C)
+        return gem.flatten(1)
+
+    def __repr__(self):
+        return (
+            self.__class__.__name__
+            + "("
+            + "p="
+            + "{:.4f}".format(self.p.data.tolist()[0])
+            + ", "
+            + "eps="
+            + str(self.eps)
+            + ")"
+        )
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.layers import ECA, BlurPool, GeM
+from library.config import CHANNELS, CARDINALITY, NUM_CLASSES
+
+
+class ResNeXtBottleneck(nn.Module):
+    """
+    Wide ResNeXt Bottleneck with ECA and Anti-Aliased Downsampling.
+
+    Structure:
+    - 1x1 Conv (Projection to hidden_dim)
+    - 3x3 Grouped Conv (Stride 1)
+    - BlurPool (Downsampling if stride > 1)
+    - 1x1 Conv (Expansion to out_channels)
+    - ECA Attention
+    - Shortcut (with BlurPool if downsampling needed)
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1, cardinality=32):
+        super(ResNeXtBottleneck, self).__init__()
+
+        # "Wide" configuration: We set hidden_dim equal to out_channels (expansion=1)
+        # effectively making the bottleneck very wide compared to standard ResNeXt (expansion=2 or 4).
+        hidden_dim = out_channels
+        self.stride = stride
+
+        # 1. Reduce / Project
+        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+
+        # 2. 3x3 Grouped Convolution
+        # Always Stride 1 to preserve features before anti-aliased downsampling
+        self.conv2 = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=cardinality,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+
+        # 3. Anti-Aliased Downsampling (BlurPool)
+        # Applied after the 3x3 convolution if stride > 1
+        self.blur_pool = (
+            BlurPool(hidden_dim, stride=stride) if stride > 1 else nn.Identity()
+        )
+
+        # 4. Expand
+        self.conv3 = nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        # 5. Attention (ECA)
+        self.eca = ECA(out_channels)
+
+        # 6. Shortcut
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            # Strictly utilize 1x1 convolutions for projection
+            # To maintain anti-aliasing: 1x1 Conv (Stride 1) -> BlurPool (Stride s)
+            shortcut_layers = []
+            shortcut_layers.append(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=1, bias=False
+                )
+            )
+            shortcut_layers.append(nn.BatchNorm2d(out_channels))
+            if stride > 1:
+                shortcut_layers.append(BlurPool(out_channels, stride=stride))
+            self.shortcut = nn.Sequential(*shortcut_layers)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        # Apply BlurPool
+        if self.stride > 1:
+            out = self.blur_pool(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        # Apply ECA
+        out = self.eca(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class CustomWideResNeXtECA(nn.Module):
+    """
+    Custom Wide Anti-Aliased ResNeXt-ECA with Multi-Scale GeM Aggregation.
+
+    Backbone: 3-Stage Wide ResNeXt
+    Attention: ECA
+    Downsampling: BlurPool
+    Head: Multi-Scale (Stage 2 + Stage 3) -> GeM -> Concat -> FC
+    """
+
+    def __init__(self):
+        super(CustomWideResNeXtECA, self).__init__()
+
+        self.cardinality = CARDINALITY
+        self.channels = CHANNELS  # [64, 128, 256]
+
+        # Stem: 3x3 Conv -> BN -> ReLU
+        # Input 32x32
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                3, self.channels[0], kernel_size=3, stride=1, padding=1, bias=False
+            ),
+            nn.BatchNorm2d(self.channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 1: 64 -> 64, Stride 1 (32x32)
+        self.stage1 = self._make_layer(self.channels[0], self.channels[0], stride=1)
+
+        # Stage 2: 64 -> 128, Stride 2 (32x32 -> 16x16)
+        self.stage2 = self._make_layer(self.channels[0], self.channels[1], stride=2)
+
+        # Stage 3: 128 -> 256, Stride 2 (16x16 -> 8x8)
+        self.stage3 = self._make_layer(self.channels[1], self.channels[2], stride=2)
+
+        # Multi-Scale GeM Aggregation Head
+        self.gem2 = GeM()
+        self.gem3 = GeM()
+
+        # Final Classifier
+        # Input features: Stage 2 channels + Stage 3 channels
+        self.fc = nn.Linear(self.channels[1] + self.channels[2], NUM_CLASSES)
+
+        self._init_weights()
+
+    def _make_layer(self, in_channels, out_channels, stride, blocks=2):
+        layers = []
+        # First block handles stride and potential channel expansion
+        layers.append(
+            ResNeXtBottleneck(in_channels, out_channels, stride, self.cardinality)
+        )
+        # Subsequent blocks are identity mappings
+        for _ in range(1, blocks):
+            layers.append(
+                ResNeXtBottleneck(out_channels, out_channels, 1, self.cardinality)
+            )
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # Stem
+        x = self.stem(x)
+
+        # Backbone Stages
+        x1 = self.stage1(x)  # (B, 64, 32, 32)
+        x2 = self.stage2(x1)  # (B, 128, 16, 16)
+        x3 = self.stage3(x2)  # (B, 256, 8, 8)
+
+        # Multi-Scale Aggregation
+        # Extract features from Stage 2 and Stage 3
+        feat2 = self.gem2(x2)  # (B, 128)
+        feat3 = self.gem3(x3)  # (B, 256)
+
+        # Concatenate
+        combined = torch.cat([feat2, feat3], dim=1)  # (B, 384)
+
+        # Classification
+        logits = self.fc(combined)
+
+        return logits
+=======
+from library.layers import ECA
+from library.config import CHANNELS, NUM_CLASSES
+
+
+class BasicBlock(nn.Module):
+    """
+    Standard ResNet BasicBlock with ECA.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.eca = ECA(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.eca(out)
+
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+class WideResNetECA(nn.Module):
+    """
+    Wide ResNet-ECA with Multi-Scale GAP Aggregation.
+    
+    Backbone: 3-Stage Wide ResNet (BasicBlock)
+    Head: Multi-Scale (Stage 2 + Stage 3) -> GAP -> Concat -> FC
+    """
+
+    def __init__(self):
+        super(WideResNetECA, self).__init__()
+        self.channels = CHANNELS  # [64, 128, 256]
+
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                3, self.channels[0], kernel_size=3, stride=1, padding=1, bias=False
+            ),
+            nn.BatchNorm2d(self.channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stages
+        self.stage1 = self._make_layer(self.channels[0], self.channels[0], stride=1)
+        self.stage2 = self._make_layer(self.channels[0], self.channels[1], stride=2)
+        self.stage3 = self._make_layer(self.channels[1], self.channels[2], stride=2)
+
+        # Final Classifier
+        self.fc = nn.Linear(self.channels[1] + self.channels[2], NUM_CLASSES)
+
+        self._init_weights()
+
+    def _make_layer(self, in_channels, out_channels, stride, blocks=2):
+        layers = []
+        layers.append(BasicBlock(in_channels, out_channels, stride))
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(out_channels, out_channels, 1))
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.stem(x)
+
+        x1 = self.stage1(x)
+        x2 = self.stage2(x1)
+        x3 = self.stage3(x2)
+
+        # Multi-Scale Aggregation with standard GAP
+        # Stage 2: (B, 128, 16, 16) -> (B, 128)
+        feat2 = F.adaptive_avg_pool2d(x2, (1, 1)).flatten(1)
+        # Stage 3: (B, 256, 8, 8) -> (B, 256)
+        feat3 = F.adaptive_avg_pool2d(x3, (1, 1)).flatten(1)
+
+        combined = torch.cat([feat2, feat3], dim=1)
+        logits = self.fc(combined)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import CustomWideResNeXtECA
+=======
+from library.model import WideResNetECA
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Initialize Model
+    model = CustomWideResNeXtECA()
+    model = model.to(DEVICE)
+=======
+    # 3. Initialize Model
+    model = WideResNetECA()
+    model = model.to(DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import CustomWideResNeXtECA
+=======
+from library.model import WideResNetECA
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        model = CustomWideResNeXtECA()
+=======
+        model = WideResNetECA()
+>>>>>>> REPLACE
+```

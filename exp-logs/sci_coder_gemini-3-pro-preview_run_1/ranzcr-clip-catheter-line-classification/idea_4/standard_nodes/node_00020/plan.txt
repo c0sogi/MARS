@@ -1,0 +1,506 @@
+I will optimize the solution by reverting the Multi-Task Learning (MTL) approach back to a pure classification pipeline, as indicated by Lesson `solution_lesson_node_00019` which states that auxiliary segmentation degraded performance and increased resource usage. I will remove the segmentation head, segmentation loss, and mask generation logic.
+
+This simplification allows me to increase the `BATCH_SIZE` from 8 back to 12 (Cite `solution_lesson_node_00019`) and extend training to 12 epochs (Cite `solution_lesson_node_00013`) to maximize convergence on the 768x768 resolution images (Cite `solution_lesson_node_00015`). I will also ensure the `GeM` pooling layer is used without manual FP32 casting (Cite `solution_lesson_node_00016`) and maintain the EMA decay at 0.9995 (Cite `solution_lesson_node_00014`).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Batch size adjusted for A100 40GB with 768x768 resolution
+    # EfficientNetV2-S is efficient, but 768^2 is large.
+    # Batch size 8-12 is likely safe.
+    BATCH_SIZE = 8
+
+    # Training duration
+    NUM_EPOCHS = 12
+
+    # Optimization
+    LEARNING_RATE = 1e-4  # Constant LR as per strategy
+    WEIGHT_DECAY = 1e-2
+    MAX_GRAD_NORM = 1000.0
+
+    # EMA
+    USE_EMA = True
+    EMA_DECAY = 0.9995
+
+    # Loss Weights
+    # Lambda for segmentation loss in total loss: L_total = L_cls + lambda * L_seg
+    SEG_LOSS_WEIGHT = 1.0
+=======
+    # Batch size adjusted for A100 40GB with 768x768 resolution
+    # Removing segmentation head allows increasing batch size back to 12.
+    BATCH_SIZE = 12
+
+    # Training duration
+    NUM_EPOCHS = 12
+
+    # Optimization
+    LEARNING_RATE = 1e-4  # Constant LR as per strategy
+    WEIGHT_DECAY = 1e-2
+    MAX_GRAD_NORM = 1000.0
+
+    # EMA
+    USE_EMA = True
+    EMA_DECAY = 0.9995
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Load annotations only for train/val modes to support auxiliary task
+        self.annot_map = {}
+        if self.mode in ["train", "val"]:
+            annot_df = load_annotations(load_cached_data=load_cached_data)
+
+            if not annot_df.empty and "data" in annot_df.columns:
+                # Filter to keep only UIDs present in current dataset to save memory
+                relevant_uids = set(self.df["StudyInstanceUID"].unique())
+                annot_df = annot_df[annot_df["StudyInstanceUID"].isin(relevant_uids)]
+
+                # Create the map: UID -> List of RLE strings
+                # GroupBy is fast enough here.
+                self.annot_map = (
+                    annot_df.groupby("StudyInstanceUID")["data"].apply(list).to_dict()
+                )
+
+        # Pre-extract columns for faster access in __getitem__
+=======
+        # Pre-extract columns for faster access in __getitem__
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        h, w = image.shape[:2]
+        uid = self.uids[idx]
+
+        # 2. Generate Mask (Auxiliary Task)
+        # Default: Empty mask, Invalid flag
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask_validity = 0.0
+
+        if self.mode in ["train", "val"]:
+            if uid in self.annot_map:
+                annots = self.annot_map[uid]
+                for annot in annots:
+                    if isinstance(annot, str):
+                        if annot.strip().startswith("["):
+                            points = np.array(ast.literal_eval(annot), dtype=np.int32)
+                            cv2.polylines(
+                                mask, [points], isClosed=False, color=1, thickness=15
+                            )
+                        else:
+                            decoded = rle_decode(annot, (h, w))
+                            # Combine multiple catheter lines into one binary mask
+                            mask = np.maximum(mask, decoded)
+                mask_validity = 1.0
+
+        # 3. Augmentation
+        if self.transform:
+            # Albumentations handles image and mask resizing and geometric transforms
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]
+
+        # 4. Prepare Output
+        # Mask needs to be (1, H, W) float for BCE loss
+        if isinstance(mask, torch.Tensor):
+            mask = mask.float().unsqueeze(0)
+        else:
+            mask = torch.from_numpy(mask).float().unsqueeze(0)
+
+        mask_validity = torch.tensor(mask_validity, dtype=torch.float32)
+
+        output = {
+            "image": image,
+            "mask": mask,
+            "mask_validity": mask_validity,
+            "StudyInstanceUID": uid,
+        }
+=======
+        uid = self.uids[idx]
+
+        # 2. Augmentation
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+
+        # 3. Prepare Output
+        output = {
+            "image": image,
+            "StudyInstanceUID": uid,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SegmentationDecoder(nn.Module):
+    """
+    Lightweight FPN-style decoder for the auxiliary segmentation task.
+    Aggregates features from multiple backbone stages to produce a binary mask.
+    """
+
+    def __init__(self, feature_channels, out_channels=1, hidden_dim=128):
+        super().__init__()
+        # We typically use features from strides 4, 8, 16, 32
+        # These correspond to indices 1, 2, 3, 4 in EfficientNet features (index 0 is stride 2)
+        self.used_indices = [1, 2, 3, 4]
+
+        # Safety check for backbones with fewer levels
+        if len(feature_channels) < 5:
+            self.used_indices = list(range(len(feature_channels)))[-4:]
+
+        self.conv_projects = nn.ModuleList()
+        for idx in self.used_indices:
+            in_ch = feature_channels[idx]
+            self.conv_projects.append(
+                nn.Sequential(
+                    nn.Conv2d(in_ch, hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                )
+            )
+
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1),
+        )
+
+    def forward(self, features):
+        """
+        Args:
+            features (list): List of feature maps from the backbone.
+        Returns:
+            torch.Tensor: Segmentation logits.
+        """
+        # Top-down pathway: Start from the deepest feature
+        x = self.conv_projects[-1](features[self.used_indices[-1]])
+
+        # Iterate backwards through the selected levels
+        for i in range(len(self.used_indices) - 2, -1, -1):
+            feat_idx = self.used_indices[i]
+            proj = self.conv_projects[i](features[feat_idx])
+
+            # Upsample x to match the spatial size of the current projection
+            if x.shape[-2:] != proj.shape[-2:]:
+                x = F.interpolate(
+                    x, size=proj.shape[-2:], mode="bilinear", align_corners=False
+                )
+
+            x = x + proj
+
+        # Final convolution
+        x = self.final_conv(x)
+
+        # Upsample to approximate original image size (stride 4 -> stride 1)
+        # Note: The main model forward pass ensures exact size matching.
+        x = F.interpolate(x, scale_factor=4, mode="bilinear", align_corners=False)
+        return x
+
+
+class MultiTaskEfficientNet(nn.Module):
+    """
+    EfficientNetV2-S backbone with Multi-Task Learning heads:
+    1. Classification Head: GeM Pooling -> Linear Layer -> 11 Class Logits
+    2. Auxiliary Segmentation Head: FPN Decoder -> Binary Mask Logits
+    """
+
+    def __init__(
+        self,
+        model_name=Config.MODEL_NAME,
+        num_classes=Config.NUM_CLASSES,
+        pretrained=True,
+    ):
+        super().__init__()
+
+        # 1. Backbone
+        # features_only=True returns a list of feature maps from different stages
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),
+        )
+
+        feature_channels = self.backbone.feature_info.channels()
+
+        # 2. Classification Head
+        # Uses the last feature map (typically stride 32)
+        last_channel = feature_channels[-1]
+        self.gem = GeM()
+        self.drop = nn.Dropout(p=0.2)
+        self.fc = nn.Linear(last_channel, num_classes)
+
+        # 3. Segmentation Head (Auxiliary)
+        self.seg_decoder = SegmentationDecoder(feature_channels)
+
+    def forward(self, x):
+        # x: (B, 3, H, W)
+
+        # Extract features from backbone
+        features = self.backbone(x)
+
+        # --- Classification Branch ---
+        global_feat = features[-1]
+        global_feat = self.gem(global_feat)
+        global_feat = global_feat.view(global_feat.size(0), -1)
+        global_feat = self.drop(global_feat)
+        cls_logits = self.fc(global_feat)
+
+        # --- Segmentation Branch ---
+        seg_logits = self.seg_decoder(features)
+
+        # Ensure seg_logits matches input size exactly (handling potential rounding in downsampling)
+        if seg_logits.shape[-2:] != x.shape[-2:]:
+            seg_logits = F.interpolate(
+                seg_logits, size=x.shape[-2:], mode="bilinear", align_corners=False
+            )
+
+        return cls_logits, seg_logits
+=======
+class MultiTaskEfficientNet(nn.Module):
+    """
+    EfficientNetV2-S backbone with GeM Pooling.
+    """
+
+    def __init__(
+        self,
+        model_name=Config.MODEL_NAME,
+        num_classes=Config.NUM_CLASSES,
+        pretrained=True,
+    ):
+        super().__init__()
+
+        # 1. Backbone
+        # features_only=True returns a list of feature maps from different stages
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),
+        )
+
+        feature_channels = self.backbone.feature_info.channels()
+
+        # 2. Classification Head
+        # Uses the last feature map (typically stride 32)
+        last_channel = feature_channels[-1]
+        self.gem = GeM()
+        self.drop = nn.Dropout(p=0.2)
+        self.fc = nn.Linear(last_channel, num_classes)
+
+    def forward(self, x):
+        # x: (B, 3, H, W)
+
+        # Extract features from backbone
+        features = self.backbone(x)
+
+        # --- Classification Branch ---
+        global_feat = features[-1]
+        global_feat = self.gem(global_feat)
+        global_feat = global_feat.view(global_feat.size(0), -1)
+        global_feat = self.drop(global_feat)
+        cls_logits = self.fc(global_feat)
+
+        return cls_logits, None
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class MultiTaskLoss(nn.Module):
+    """
+    Composite loss function for Multi-Task Learning.
+    Combines Classification Loss (Weighted BCE) and Auxiliary Segmentation Loss (BCE).
+    """
+
+    def __init__(self, load_cached_data=True):
+        super().__init__()
+
+        # Load class weights for classification imbalance
+        weights_np = get_pos_weights(load_cached_data=load_cached_data)
+        self.pos_weights = torch.tensor(weights_np, dtype=torch.float32).to(
+            Config.DEVICE
+        )
+
+        # Classification Loss: BCE with class weights
+        self.cls_criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weights)
+
+        # Segmentation Loss: BCE (pixel-wise)
+        # We use reduction='none' to manually handle the mask validity flag
+        self.seg_criterion = nn.BCEWithLogitsLoss(reduction="none")
+
+        self.seg_weight = Config.SEG_LOSS_WEIGHT
+
+    def forward(self, cls_logits, cls_targets, seg_logits, seg_targets, mask_validity):
+        """
+        Args:
+            cls_logits: (B, NumClasses)
+            cls_targets: (B, NumClasses)
+            seg_logits: (B, 1, H, W)
+            seg_targets: (B, 1, H, W)
+            mask_validity: (B,) - 1.0 if seg target is valid, 0.0 otherwise
+
+        Returns:
+            dict: Dictionary containing total loss and individual components.
+        """
+        # 1. Classification Loss
+        cls_loss = self.cls_criterion(cls_logits, cls_targets)
+
+        # 2. Segmentation Loss (Auxiliary)
+        # Calculate pixel-wise loss
+        pixel_loss = self.seg_criterion(seg_logits, seg_targets)
+
+        # Average over spatial dimensions (H, W) and channel to get per-sample loss
+        # pixel_loss: (B, 1, H, W) -> sample_loss: (B,)
+        sample_loss = pixel_loss.mean(dim=(1, 2, 3))
+
+        # Apply validity mask
+        # Only compute gradients for samples that have ground truth segmentation
+        if mask_validity.ndim > 1:
+            mask_validity = mask_validity.view(-1)
+
+        valid_loss = sample_loss * mask_validity
+
+        # Average over the batch, considering only valid samples
+        num_valid = mask_validity.sum()
+
+        if num_valid > 0:
+            seg_loss = valid_loss.sum() / num_valid
+        else:
+            # If no valid masks in batch, seg_loss is 0 but must maintain graph connectivity if needed
+            # (though usually detached is fine, we use 0 tensor with grad enabled just in case)
+            seg_loss = torch.tensor(0.0, device=cls_logits.device, requires_grad=True)
+
+        # 3. Total Loss
+        total_loss = cls_loss + (self.seg_weight * seg_loss)
+
+        return {"loss": total_loss, "cls_loss": cls_loss, "seg_loss": seg_loss}
+=======
+class MultiTaskLoss(nn.Module):
+    """
+    Loss function for Multi-Label Classification.
+    Uses Weighted BCE With Logits.
+    """
+
+    def __init__(self, load_cached_data=True):
+        super().__init__()
+
+        # Load class weights for classification imbalance
+        weights_np = get_pos_weights(load_cached_data=load_cached_data)
+        self.pos_weights = torch.tensor(weights_np, dtype=torch.float32).to(
+            Config.DEVICE
+        )
+
+        # Classification Loss: BCE with class weights
+        self.cls_criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weights)
+
+    def forward(self, cls_logits, cls_targets, seg_logits=None, seg_targets=None, mask_validity=None):
+        """
+        Args:
+            cls_logits: (B, NumClasses)
+            cls_targets: (B, NumClasses)
+            seg_logits: Ignored
+            seg_targets: Ignored
+            mask_validity: Ignored
+
+        Returns:
+            dict: Dictionary containing total loss.
+        """
+        # 1. Classification Loss
+        cls_loss = self.cls_criterion(cls_logits, cls_targets)
+
+        return {"loss": cls_loss}
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for batch in dataloader:
+        images = batch["image"].to(device)
+        targets = batch["targets"].to(device)
+        masks = batch["mask"].to(device)
+        mask_validity = batch["mask_validity"].to(device)
+
+        batch_size = images.size(0)
+
+        optimizer.zero_grad()
+
+        with torch.cuda.amp.autocast():
+            cls_logits, seg_logits = model(images)
+            loss_dict = criterion(cls_logits, targets, seg_logits, masks, mask_validity)
+            loss = loss_dict["loss"]
+
+        scaler.scale(loss).backward()
+=======
+    for batch in dataloader:
+        images = batch["image"].to(device)
+        targets = batch["targets"].to(device)
+
+        batch_size = images.size(0)
+
+        optimizer.zero_grad()
+
+        with torch.cuda.amp.autocast():
+            cls_logits, _ = model(images)
+            loss_dict = criterion(cls_logits, targets)
+            loss = loss_dict["loss"]
+
+        scaler.scale(loss).backward()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            targets = batch["targets"].to(device)
+            masks = batch["mask"].to(device)
+            mask_validity = batch["mask_validity"].to(device)
+
+            batch_size = images.size(0)
+
+            cls_logits, seg_logits = model(images)
+            loss_dict = criterion(cls_logits, targets, seg_logits, masks, mask_validity)
+            loss = loss_dict["loss"]
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+=======
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            targets = batch["targets"].to(device)
+
+            batch_size = images.size(0)
+
+            cls_logits, _ = model(images)
+            loss_dict = criterion(cls_logits, targets)
+            loss = loss_dict["loss"]
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline
+    # 5 epochs on full data fits well within the time limit on A100
+    NUM_EPOCHS = 5
+=======
+    # Override Config
+    # 12 epochs on full data
+    NUM_EPOCHS = 12
+>>>>>>> REPLACE
+```

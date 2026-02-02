@@ -1,0 +1,485 @@
+Based on the lessons learned, specifically `solution_lesson_node_00006` (which highlights the risks of channel stacking and resizing in spectrograms) and `solution_lesson_node_00001` (which recommends a 1D-CNN encoder followed by an RNN for raw signals), I will switch the modeling approach from a 2D Spectrogram-based EfficientNet to a 1D Raw Signal-based CNN-GRU architecture.
+
+Here is the plan:
+1.  **Modify `library/config.py`**: Switch from spectrogram parameters (N_FFT, etc.) to raw signal parameters. Set `DOWNSAMPLE_FACTOR = 4` to reduce the 200Hz signal to 50Hz (Lesson 00001) and define `SEQ_LENGTH`.
+2.  **Modify `library/data.py`**: Update `EEGDataset` to load raw EEG signals, downsample them, and apply simple normalization instead of generating Mel Spectrograms. This avoids the destructive resizing of stacked channels (Lesson 00006).
+3.  **Modify `library/model.py`**: Replace `EEGEfficientNet` with `EEGWaveNet`, a hybrid architecture comprising a 1D Convolutional encoder (to extract local features and reduce sequence length) followed by a Bi-directional GRU (to capture temporal dynamics), as recommended in Lesson 00001.
+4.  **Update `library/train.py`, `library/inference.py`, and `runfile.py`**: Update model instantiation references to use the new `EEGWaveNet` class.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Spectrogram Generation
+# N_FFT=1024 (approx 5s) is too large for 50s clips if we want fine temporal resolution.
+# Using N_FFT=256 (1.28s) and HOP_LENGTH=64 (0.32s) gives ~150 time steps.
+N_FFT = 256
+HOP_LENGTH = 64
+N_MELS = 128
+FMIN = 0.5  # High-pass filter equivalent
+FMAX = 100.0  # Nyquist limit
+
+# Standard 10-20 System EEG Channels
+=======
+# Signal Processing
+DOWNSAMPLE_FACTOR = 4
+SEQ_LENGTH = TOTAL_SAMPLES // DOWNSAMPLE_FACTOR  # 2500 samples
+
+# Standard 10-20 System EEG Channels
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+# ==========================================
+# Model & Input Parameters
+# ==========================================
+# The model will receive a stacked image of (N_CHANNELS * N_MELS, TIME_STEPS)
+# We resize this to a square for EfficientNet
+IMG_SIZE = (512, 512)  # (Height, Width)
+IN_CHANNELS = 3  # EfficientNet expects 3 channels (we can replicate grayscale)
+=======
+# ==========================================
+# Model & Input Parameters
+# ==========================================
+# The model will receive raw EEG signals of shape (Batch, 19, 2500)
+IN_CHANNELS = 19
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+import torchaudio
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from library import config
+from library import utils
+
+# Ensure reproducibility
+utils.seed_everything(config.SEED)
+
+
+class EEGDataset(Dataset):
+    """
+    Dataset class for loading EEG data, converting to Mel-Spectrograms,
+    and preparing for 2D CNN input.
+    """
+
+    def __init__(self, df, mode="train", augment=False):
+        self.df = df
+        self.mode = mode
+        self.augment = augment
+
+        # Audio transform definition
+        # We define it here but it runs on CPU within the worker processes
+        self.mel_spectrogram = torchaudio.transforms.MelSpectrogram(
+            sample_rate=config.SAMPLING_RATE,
+            n_fft=config.N_FFT,
+            hop_length=config.HOP_LENGTH,
+            n_mels=config.N_MELS,
+            f_min=config.FMIN,
+            f_max=config.FMAX,
+            center=True,
+        )
+
+        # Augmentations
+        self.freq_masking = torchaudio.transforms.FrequencyMasking(freq_mask_param=20)
+        self.time_masking = torchaudio.transforms.TimeMasking(time_mask_param=40)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # 1. Resolve File Path
+        # Metadata contains relative paths (e.g., 'train_eegs/123.parquet')
+        file_path = os.path.join(config.INPUT_DIR, row["eeg_path"])
+
+        # 2. Load EEG Signal
+        try:
+            # Read specific channels from parquet
+            eeg_df = pd.read_parquet(file_path, columns=config.EEG_CHANNELS)
+            raw_data = eeg_df.values  # Shape: (Total_Time, 19)
+        except Exception as e:
+            # Fallback for corrupted files
+            raw_data = np.zeros(
+                (config.TOTAL_SAMPLES, config.N_CHANNELS), dtype=np.float32
+            )
+
+        # 3. Extract 50s Window
+        # Determine start index based on offset
+        if self.mode == "test":
+            # Test files are exactly 50s
+            start_idx = 0
+        else:
+            # Train files are longer, use offset
+            offset_sec = row.get("eeg_label_offset_seconds", 0)
+            start_idx = int(offset_sec * config.SAMPLING_RATE)
+
+        end_idx = start_idx + config.TOTAL_SAMPLES
+
+        # Handle bounds (padding or cropping)
+        total_available = raw_data.shape[0]
+
+        if start_idx < 0:
+            start_idx = 0
+            end_idx = config.TOTAL_SAMPLES
+
+        if end_idx <= total_available:
+            window = raw_data[start_idx:end_idx, :]
+        else:
+            # Pad if window goes out of bounds
+            window = raw_data[start_idx:, :]
+            pad_len = config.TOTAL_SAMPLES - window.shape[0]
+            if pad_len > 0:
+                padding = np.zeros((pad_len, config.N_CHANNELS), dtype=window.dtype)
+                window = np.concatenate([window, padding], axis=0)
+            else:
+                # Fallback if start_idx is completely out of bounds
+                window = np.zeros(
+                    (config.TOTAL_SAMPLES, config.N_CHANNELS), dtype=np.float32
+                )
+
+        # 4. Handle NaNs (Channel Mean Imputation)
+        # Iterate channels to fill NaNs with that channel's mean
+        for c in range(config.N_CHANNELS):
+            col = window[:, c]
+            if np.isnan(col).any():
+                mean_val = np.nanmean(col)
+                if np.isnan(mean_val):
+                    mean_val = 0.0
+                col[np.isnan(col)] = mean_val
+                window[:, c] = col
+
+        # 5. Signal to Spectrogram
+        # Convert to tensor and transpose to (Channels, Time)
+        tensor_eeg = torch.tensor(window, dtype=torch.float32).t()  # (19, 10000)
+
+        # Compute Mel Spectrogram -> (19, 128, ~157)
+        spec = self.mel_spectrogram(tensor_eeg)
+
+        # Log Transform: log(S + eps)
+        spec = torch.log(spec + 1e-6)
+
+        # 6. Stack Channels Vertically
+        # Reshape (Channels, Mels, Time) -> (Channels * Mels, Time)
+        # This creates a tall image where y-axis is frequency across all leads
+        c, m, t = spec.shape
+        spec_image = spec.reshape(c * m, t)  # (2432, 157)
+
+        # Add batch/channel dimension for interpolation: (1, 1, H, W)
+        spec_image = spec_image.unsqueeze(0).unsqueeze(0)
+
+        # 7. Resize to Target Image Size
+        spec_image = F.interpolate(
+            spec_image, size=config.IMG_SIZE, mode="bilinear", align_corners=False
+        ).squeeze(
+            0
+        )  # Result: (1, 512, 512)
+
+        # 8. Augmentation (Training Only)
+        if self.augment:
+            spec_image = self.freq_masking(spec_image)
+            spec_image = self.time_masking(spec_image)
+
+        # 9. Normalization (Instance Z-Score)
+        # Standardize the image to mean 0, std 1
+        mean = spec_image.mean()
+        std = spec_image.std()
+        if std > 1e-6:
+            spec_image = (spec_image - mean) / std
+        else:
+            spec_image = spec_image - mean
+
+        # 10. Replicate Channels (1 -> 3)
+        # EfficientNet expects 3 input channels
+        spec_image = spec_image.repeat(3, 1, 1)
+
+        # 11. Return Data and Target
+        if self.mode != "test":
+            target = row[config.TARGET_COLS].values.astype(np.float32)
+            return spec_image, torch.tensor(target)
+        else:
+            # For test set, return dummy target
+            return spec_image, torch.tensor(0.0)
+=======
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from library import config
+from library import utils
+
+# Ensure reproducibility
+utils.seed_everything(config.SEED)
+
+
+class EEGDataset(Dataset):
+    """
+    Dataset class for loading EEG data, downsampling, and preparing for 1D CNN input.
+    Cite solution_lesson_node_00006: Avoiding channel stacking/resizing by using raw signals.
+    """
+
+    def __init__(self, df, mode="train", augment=False):
+        self.df = df
+        self.mode = mode
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # 1. Resolve File Path
+        file_path = os.path.join(config.INPUT_DIR, row["eeg_path"])
+
+        # 2. Load EEG Signal
+        try:
+            eeg_df = pd.read_parquet(file_path, columns=config.EEG_CHANNELS)
+            raw_data = eeg_df.values  # Shape: (Total_Time, 19)
+        except Exception as e:
+            raw_data = np.zeros(
+                (config.TOTAL_SAMPLES, config.N_CHANNELS), dtype=np.float32
+            )
+
+        # 3. Extract 50s Window
+        if self.mode == "test":
+            start_idx = 0
+        else:
+            offset_sec = row.get("eeg_label_offset_seconds", 0)
+            start_idx = int(offset_sec * config.SAMPLING_RATE)
+
+        end_idx = start_idx + config.TOTAL_SAMPLES
+        total_available = raw_data.shape[0]
+
+        if start_idx < 0:
+            start_idx = 0
+            end_idx = config.TOTAL_SAMPLES
+
+        if end_idx <= total_available:
+            window = raw_data[start_idx:end_idx, :]
+        else:
+            window = raw_data[start_idx:, :]
+            pad_len = config.TOTAL_SAMPLES - window.shape[0]
+            if pad_len > 0:
+                padding = np.zeros((pad_len, config.N_CHANNELS), dtype=window.dtype)
+                window = np.concatenate([window, padding], axis=0)
+            else:
+                window = np.zeros(
+                    (config.TOTAL_SAMPLES, config.N_CHANNELS), dtype=np.float32
+                )
+
+        # 4. Handle NaNs
+        for c in range(config.N_CHANNELS):
+            col = window[:, c]
+            if np.isnan(col).any():
+                mean_val = np.nanmean(col)
+                if np.isnan(mean_val):
+                    mean_val = 0.0
+                col[np.isnan(col)] = mean_val
+                window[:, c] = col
+
+        # 5. Downsample
+        # Cite solution_lesson_node_00001: Downsample to 50Hz (factor 4)
+        window = window[::config.DOWNSAMPLE_FACTOR, :]
+
+        # 6. Clip and Normalize
+        window = np.clip(window, -1024, 1024)
+        # Robust scaling approximation
+        window = window / 32.0
+        
+        # 7. Transpose to (Channels, Time) for 1D CNN
+        tensor_eeg = torch.tensor(window, dtype=torch.float32).t()
+
+        # 8. Return Data and Target
+        if self.mode != "test":
+            target = row[config.TARGET_COLS].values.astype(np.float32)
+            return tensor_eeg, torch.tensor(target)
+        else:
+            return tensor_eeg, torch.tensor(0.0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import timm
+from library import config
+
+
+class EEGEfficientNet(nn.Module):
+    """
+    EfficientNet-B0 architecture for classifying EEG Spectrograms.
+
+    This model uses a pre-trained EfficientNet-B0 backbone from the `timm` library.
+    It is configured to accept input tensors with dimensions defined in `config.IN_CHANNELS`
+    (typically 3, representing replicated grayscale spectrograms) and outputs logits
+    for the classes defined in `config.NUM_CLASSES`.
+    """
+
+    def __init__(self, pretrained=True):
+        """
+        Initialize the model.
+
+        Args:
+            pretrained (bool): If True, load weights pretrained on ImageNet.
+        """
+        super(EEGEfficientNet, self).__init__()
+
+        # Create the EfficientNet-B0 model.
+        # - 'efficientnet_b0': The specific architecture variant.
+        # - pretrained: Loads ImageNet weights which helps with convergence.
+        # - in_chans: Adapts the first conv layer to match input channels (3).
+        # - num_classes: Replaces the final fully connected layer to output 6 logits.
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=pretrained,
+            in_chans=config.IN_CHANNELS,
+            num_classes=config.NUM_CLASSES,
+        )
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, IN_CHANNELS, Height, Width).
+                              Expected shape: (Batch, 3, 512, 512).
+
+        Returns:
+            torch.Tensor: Output logits of shape (Batch, NUM_CLASSES).
+        """
+        return self.backbone(x)
+=======
+import torch
+import torch.nn as nn
+from library import config
+
+
+class EEGWaveNet(nn.Module):
+    """
+    1D-CNN + Bi-GRU architecture for raw EEG signal classification.
+    Cite solution_lesson_node_00001: Preceding RNN with 1D-CNN to extract features.
+    Cite solution_lesson_node_00006: Using raw signals to preserve spatial integrity.
+    """
+
+    def __init__(self, pretrained=False):
+        super(EEGWaveNet, self).__init__()
+        
+        # Feature Extractor (1D CNN)
+        self.features = nn.Sequential(
+            nn.Conv1d(config.IN_CHANNELS, 64, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+            nn.MaxPool1d(2),
+            
+            nn.Conv1d(64, 128, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+            nn.MaxPool1d(2),
+            
+            nn.Conv1d(128, 256, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(256),
+            nn.SiLU(),
+            nn.MaxPool1d(2),
+            
+            nn.Conv1d(256, 512, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(512),
+            nn.SiLU(),
+            nn.MaxPool1d(2)
+        )
+        
+        # Bi-Directional GRU
+        self.gru = nn.GRU(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2
+        )
+        
+        # Classifier Head
+        self.fc = nn.Linear(256 * 2, config.NUM_CLASSES)
+
+    def forward(self, x):
+        # x shape: (Batch, 19, 2500)
+        x = self.features(x)  # -> (Batch, 512, ~156)
+        
+        # Permute for GRU: (Batch, Seq, Channels)
+        x = x.permute(0, 2, 1)
+        
+        # GRU
+        out, _ = self.gru(x)  # -> (Batch, Seq, Hidden*2)
+        
+        # Global Average Pooling over time dimension
+        out = torch.mean(out, dim=1)
+        
+        return self.fc(out)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Model Initialization
+    net = model.EEGEfficientNet(pretrained=True)
+    net.to(device)
+=======
+    # Model Initialization
+    net = model.EEGWaveNet(pretrained=False)
+    net.to(device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def predict(test_loader, device, debug=False):
+    """
+    Generates predictions for the test set and saves to submission.csv.
+    """
+    print("Starting inference on test set...")
+
+    # Load Best Model
+    net = model.EEGEfficientNet(pretrained=False)
+    net.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
+=======
+def predict(test_loader, device, debug=False):
+    """
+    Generates predictions for the test set and saves to submission.csv.
+    """
+    print("Starting inference on test set...")
+
+    # Load Best Model
+    net = model.EEGWaveNet(pretrained=False)
+    net.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Initialize Model architecture
+    # pretrained=False is used because we are loading specific trained weights,
+    # not the generic ImageNet weights.
+    net = model.EEGEfficientNet(pretrained=False)
+=======
+    # Initialize Model architecture
+    # pretrained=False is used because we are loading specific trained weights,
+    # not the generic ImageNet weights.
+    net = model.EEGWaveNet(pretrained=False)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 3. Model & Optimizer Initialization
+    # ==========================================
+    net = model.EEGEfficientNet(pretrained=True)
+    net.to(device)
+=======
+    # ==========================================
+    # 3. Model & Optimizer Initialization
+    # ==========================================
+    net = model.EEGWaveNet(pretrained=False)
+    net.to(device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,475 @@
+To optimize the solution, I will implement a **Dual-Stream Deep Sets architecture with Late Fusion**, reverting from the "Early Context Injection" approach that underperformed in the previous iteration. This strategy is supported by **Lesson 19**, which highlights that injecting global features into every atomic vector dilutes local signals. Instead, I will encode atomic features (including topological fingerprints) and global features (lattice, composition) in separate streams and fuse them only after the atomic stream has been aggregated.
+
+Specifically, I will:
+1.  **Update `library/config.py`**:
+    *   Increase `NUM_EPOCHS` to 200 to ensure full convergence (Cite **Lesson 17**).
+    *   Remove `GLOBAL_CONTEXT_DIM` from `ATOMIC_INPUT_DIM` to reflect the Late Fusion architecture.
+    *   Increase `GLOBAL_HIDDEN_DIM` to 256 to better capture macroscopic properties (Cite **Lesson 9**).
+
+2.  **Update `library/model.py`**:
+    *   Replace `CADSTFModel` with `DualStreamModel`.
+    *   Implement `AtomicEncoder` as a wide MLP (512 dim) ending with a linear projection (no activation) to preserve the vector space for pooling (Cite **Lesson 18**).
+    *   Implement `DualPoolingAggregator` to concatenate Mean and Max pooling of atomic embeddings (Cite **Lesson 5**).
+    *   Implement `GlobalEncoder` to process lattice and composition features separately.
+    *   Fuse the aggregated atomic vector and the encoded global vector before the final regression head (Cite **Lesson 19**).
+
+3.  **Update `library/train.py` and `runfile.py`**:
+    *   Update model instantiation references to `DualStreamModel`.
+    *   Allow the training loop to run for the full epoch count defined in the config.
+
+This targeted ablation aligns the architecture with the successful principles identified in the lessons (Late Fusion, Dual Pooling, Linear Projections) while maintaining the beneficial feature engineering (Topological Fingerprints).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Global Context Stream
+GLOBAL_HIDDEN_DIM = 128
+GLOBAL_CONTEXT_DIM = 64  # Size of the vector injected into the atomic stream
+
+# Atomic Stream
+# Base atomic features: 4 (One-Hot) + 3 (Coords) + K_NEIGHBORS (Distances)
+BASE_ATOMIC_DIM = NUM_ATOM_TYPES + 3 + K_NEIGHBORS
+# Total input to atomic encoder includes the injected global context
+ATOMIC_INPUT_DIM = BASE_ATOMIC_DIM + GLOBAL_CONTEXT_DIM
+
+ATOMIC_HIDDEN_DIM = 512  # Wide MLP for atomic processing
+LATENT_DIM = 512  # Dimension of atomic embeddings before pooling
+
+# Prediction Head
+HEAD_HIDDEN_DIM = 256
+DROPOUT_RATE = 0.1
+
+# ==========================================
+#           Training Hyperparameters
+# ==========================================
+
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+NUM_EPOCHS = 150
+EARLY_STOPPING_PATIENCE = 15
+=======
+# Global Context Stream
+GLOBAL_HIDDEN_DIM = 256
+GLOBAL_LATENT_DIM = 256
+
+# Atomic Stream
+# Base atomic features: 4 (One-Hot) + 3 (Coords) + K_NEIGHBORS (Distances)
+BASE_ATOMIC_DIM = NUM_ATOM_TYPES + 3 + K_NEIGHBORS
+# Input to atomic encoder (No global context injection for Late Fusion)
+ATOMIC_INPUT_DIM = BASE_ATOMIC_DIM
+
+ATOMIC_HIDDEN_DIM = 512  # Wide MLP for atomic processing
+LATENT_DIM = 512  # Dimension of atomic embeddings before pooling
+
+# Prediction Head
+HEAD_HIDDEN_DIM = 512
+DROPOUT_RATE = 0.1
+
+# ==========================================
+#           Training Hyperparameters
+# ==========================================
+
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+NUM_EPOCHS = 200
+EARLY_STOPPING_PATIENCE = 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import (
+    NUM_GLOBAL_FEATURES,
+    GLOBAL_HIDDEN_DIM,
+    GLOBAL_CONTEXT_DIM,
+    ATOMIC_INPUT_DIM,
+    ATOMIC_HIDDEN_DIM,
+    LATENT_DIM,
+    HEAD_HIDDEN_DIM,
+    DROPOUT_RATE,
+)
+
+
+class GlobalContextEncoder(nn.Module):
+    """
+    Encodes macroscopic features (lattice, volume, density, composition)
+    into a global context vector.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(NUM_GLOBAL_FEATURES, GLOBAL_HIDDEN_DIM),
+            nn.BatchNorm1d(GLOBAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(GLOBAL_HIDDEN_DIM, GLOBAL_HIDDEN_DIM),
+            nn.BatchNorm1d(GLOBAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(GLOBAL_HIDDEN_DIM, GLOBAL_CONTEXT_DIM),
+            nn.Tanh(),  # Tanh to bound the context signal, often helpful for conditioning
+        )
+
+    def forward(self, global_features):
+        return self.net(global_features)
+
+
+class ContextAwareAtomicEncoder(nn.Module):
+    """
+    Processes atomic features. The input is expected to be the concatenation
+    of the base atomic features and the expanded global context vector.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Wide MLP structure
+        self.net = nn.Sequential(
+            nn.Linear(ATOMIC_INPUT_DIM, ATOMIC_HIDDEN_DIM),
+            nn.BatchNorm1d(ATOMIC_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(ATOMIC_HIDDEN_DIM, ATOMIC_HIDDEN_DIM),
+            nn.BatchNorm1d(ATOMIC_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(ATOMIC_HIDDEN_DIM, LATENT_DIM),
+            # No activation at the end to preserve full vector space for pooling
+        )
+
+    def forward(self, x):
+        # x shape: (Batch * MaxAtoms, ATOMIC_INPUT_DIM)
+        # We process flattened batch for BatchNorm efficiency
+        return self.net(x)
+
+
+class AttentionAggregator(nn.Module):
+    """
+    Performs Attention-Weighted Mean Pooling and Global Max Pooling.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Attention scorer: maps latent dim to a scalar score
+        self.attention_net = nn.Sequential(
+            nn.Linear(LATENT_DIM, 64), nn.Tanh(), nn.Linear(64, 1)
+        )
+
+    def forward(self, atomic_embeddings, mask):
+        """
+        Args:
+            atomic_embeddings: (Batch, MaxAtoms, LatentDim)
+            mask: (Batch, MaxAtoms) - True for real atoms, False for padding
+        """
+        # 1. Compute Attention Scores
+        # scores: (Batch, MaxAtoms, 1)
+        scores = self.attention_net(atomic_embeddings)
+
+        # Mask out padding (set to large negative number before softmax)
+        # mask is (Batch, MaxAtoms), unsqueeze to broadcast
+        mask_expanded = mask.unsqueeze(-1)  # (Batch, MaxAtoms, 1)
+        scores = scores.masked_fill(~mask_expanded, -1e9)
+
+        # Compute weights
+        alpha = F.softmax(scores, dim=1)  # (Batch, MaxAtoms, 1)
+
+        # Weighted Mean Pooling
+        # sum(alpha * embeddings) along atom dimension
+        weighted_mean = torch.sum(
+            alpha * atomic_embeddings, dim=1
+        )  # (Batch, LatentDim)
+
+        # 2. Global Max Pooling
+        # Mask padding for max pooling (set to large negative number)
+        masked_embeddings = atomic_embeddings.masked_fill(~mask_expanded, -1e9)
+        max_pool, _ = torch.max(masked_embeddings, dim=1)  # (Batch, LatentDim)
+
+        # Concatenate
+        return torch.cat([weighted_mean, max_pool], dim=1)
+
+
+class CADSTFModel(nn.Module):
+    """
+    Context-Aware Deep Sets with Topological Fingerprinting.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.global_encoder = GlobalContextEncoder()
+        self.atomic_encoder = ContextAwareAtomicEncoder()
+        self.aggregator = AttentionAggregator()
+
+        # Prediction Head
+        # Input is LatentDim * 2 (from concat of mean and max pooling)
+        self.head = nn.Sequential(
+            nn.Linear(LATENT_DIM * 2, HEAD_HIDDEN_DIM),
+            nn.BatchNorm1d(HEAD_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(HEAD_HIDDEN_DIM, HEAD_HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(HEAD_HIDDEN_DIM // 2, 2),  # Output: Formation E, Bandgap E
+        )
+
+    def forward(self, global_features, atomic_features, mask):
+        """
+        Args:
+            global_features: (Batch, NumGlobalFeatures)
+            atomic_features: (Batch, MaxAtoms, BaseAtomicDim)
+            mask: (Batch, MaxAtoms)
+        """
+        batch_size, max_atoms, _ = atomic_features.shape
+
+        # 1. Encode Global Context
+        context_vec = self.global_encoder(global_features)  # (Batch, ContextDim)
+
+        # 2. Early Context Injection
+        # Expand context vector to (Batch, MaxAtoms, ContextDim)
+        context_expanded = context_vec.unsqueeze(1).expand(-1, max_atoms, -1)
+
+        # Concatenate with atomic features
+        # atomic_augmented: (Batch, MaxAtoms, BaseAtomicDim + ContextDim)
+        atomic_augmented = torch.cat([atomic_features, context_expanded], dim=2)
+
+        # 3. Atomic Encoding
+        # Flatten for MLP: (Batch * MaxAtoms, InputDim)
+        flat_input = atomic_augmented.view(-1, ATOMIC_INPUT_DIM)
+        flat_embeddings = self.atomic_encoder(flat_input)
+
+        # Reshape back: (Batch, MaxAtoms, LatentDim)
+        atomic_embeddings = flat_embeddings.view(batch_size, max_atoms, LATENT_DIM)
+
+        # 4. Aggregation
+        graph_embedding = self.aggregator(atomic_embeddings, mask)
+
+        # 5. Prediction
+        output = self.head(graph_embedding)
+
+        return output
+=======
+from library.config import (
+    NUM_GLOBAL_FEATURES,
+    GLOBAL_HIDDEN_DIM,
+    GLOBAL_LATENT_DIM,
+    ATOMIC_INPUT_DIM,
+    ATOMIC_HIDDEN_DIM,
+    LATENT_DIM,
+    HEAD_HIDDEN_DIM,
+    DROPOUT_RATE,
+)
+
+
+class GlobalEncoder(nn.Module):
+    """
+    Encodes macroscopic features (lattice, volume, density, composition).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(NUM_GLOBAL_FEATURES, GLOBAL_HIDDEN_DIM),
+            nn.BatchNorm1d(GLOBAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(GLOBAL_HIDDEN_DIM, GLOBAL_HIDDEN_DIM),
+            nn.BatchNorm1d(GLOBAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(GLOBAL_HIDDEN_DIM, GLOBAL_LATENT_DIM),
+            # Linear output for fusion (Cite 18)
+        )
+
+    def forward(self, global_features):
+        return self.net(global_features)
+
+
+class AtomicEncoder(nn.Module):
+    """
+    Processes atomic features (One-Hot + Coords + Fingerprints).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(ATOMIC_INPUT_DIM, ATOMIC_HIDDEN_DIM),
+            nn.BatchNorm1d(ATOMIC_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(ATOMIC_HIDDEN_DIM, ATOMIC_HIDDEN_DIM),
+            nn.BatchNorm1d(ATOMIC_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(ATOMIC_HIDDEN_DIM, LATENT_DIM),
+            # Linear output before pooling (Cite 18)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DualPoolingAggregator(nn.Module):
+    """
+    Performs Mean and Max Pooling (Cite 5).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, atomic_embeddings, mask):
+        """
+        Args:
+            atomic_embeddings: (Batch, MaxAtoms, LatentDim)
+            mask: (Batch, MaxAtoms) - True for real atoms
+        """
+        # Mask out padding
+        mask_expanded = mask.unsqueeze(-1)  # (Batch, MaxAtoms, 1)
+        
+        # 1. Mean Pooling
+        # Zero out padding
+        masked_embeddings_zero = atomic_embeddings * mask_expanded.float()
+        sum_embeddings = torch.sum(masked_embeddings_zero, dim=1)
+        counts = mask.sum(dim=1, keepdim=True).float()
+        mean_pool = sum_embeddings / (counts + 1e-6)
+
+        # 2. Max Pooling
+        # Set padding to large negative
+        masked_embeddings_neg = atomic_embeddings.masked_fill(~mask_expanded, -1e9)
+        max_pool, _ = torch.max(masked_embeddings_neg, dim=1)
+
+        return torch.cat([mean_pool, max_pool], dim=1)
+
+
+class DualStreamModel(nn.Module):
+    """
+    Dual-Stream Deep Sets with Late Fusion (Cite 19).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.global_encoder = GlobalEncoder()
+        self.atomic_encoder = AtomicEncoder()
+        self.aggregator = DualPoolingAggregator()
+
+        # Input to head is: (LatentDim * 2 from pooling) + GlobalLatentDim
+        fusion_dim = (LATENT_DIM * 2) + GLOBAL_LATENT_DIM
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, HEAD_HIDDEN_DIM),
+            nn.BatchNorm1d(HEAD_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(HEAD_HIDDEN_DIM, HEAD_HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(HEAD_HIDDEN_DIM // 2, 2),
+        )
+
+    def forward(self, global_features, atomic_features, mask):
+        # 1. Global Stream
+        global_vec = self.global_encoder(global_features)
+
+        # 2. Atomic Stream
+        batch_size, max_atoms, _ = atomic_features.shape
+        flat_input = atomic_features.view(-1, ATOMIC_INPUT_DIM)
+        flat_embeddings = self.atomic_encoder(flat_input)
+        atomic_embeddings = flat_embeddings.view(batch_size, max_atoms, LATENT_DIM)
+
+        # 3. Aggregation
+        atomic_vec = self.aggregator(atomic_embeddings, mask)
+
+        # 4. Late Fusion (Cite 19)
+        fused_vec = torch.cat([atomic_vec, global_vec], dim=1)
+
+        # 5. Prediction
+        output = self.head(fused_vec)
+
+        return output
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import CADSTFModel
+
+
+def set_seed(seed):
+=======
+from library.model import DualStreamModel
+
+
+def set_seed(seed):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Initialize Model
+    model = CADSTFModel().to(DEVICE)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+=======
+    # 4. Initialize Model
+    model = DualStreamModel().to(DEVICE)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    model = CADSTFModel().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+=======
+    model = DualStreamModel().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import CADSTFModel
+from library.train import run_training, generate_submission
+
+
+def main():
+    # 1. Train the model
+    # We limit epochs to 50 for a fast baseline execution as per requirements.
+    # The run_training function handles data loading, scaling, and training loop.
+    print(">>> Starting Training Pipeline")
+    scaler = run_training(max_samples=None, num_epochs=50)
+=======
+from library.model import DualStreamModel
+from library.train import run_training, generate_submission
+
+
+def main():
+    # 1. Train the model
+    # We use 200 epochs as defined in config, but run_training arg overrides it.
+    # We will pass None to let it use the config default (200).
+    print(">>> Starting Training Pipeline")
+    scaler = run_training(max_samples=None)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    model = CADSTFModel().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+=======
+    model = DualStreamModel().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+>>>>>>> REPLACE
+```

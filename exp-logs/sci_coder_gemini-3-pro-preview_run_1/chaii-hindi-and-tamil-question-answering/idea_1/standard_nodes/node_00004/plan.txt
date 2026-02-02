@@ -1,0 +1,264 @@
+The issue is that the validation pipeline uses the "Gold Window" strategy (centering the context on the answer), which leaks ground truth information and creates an unrealistic evaluation environment compared to the "Sliding Window" strategy used during inference. This is a case of Context Truncation Pitfalls (Cite solution_lesson_node_00001). To fix this, I will modify `QADataset` to support passing ground truth answers even in sliding window mode, update the validation dataloader to use `mode="test"` (sliding window), and rewrite the `Trainer.evaluate` method to aggregate predictions from multiple windows per sample before calculating the Jaccard score.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+            else:
+                # Sliding Window: Generate overlapping chunks
+                # If context is short, take it all
+                if len(context) <= CHAR_WINDOW:
+                    samples.append(
+                        {
+                            "id": sample_id,
+                            "context": context,
+                            "question": question,
+                        }
+                    )
+                else:
+                    for start_idx in range(0, len(context), STRIDE):
+                        # Stop if we've gone past the end (unless it's the first chunk)
+                        if start_idx >= len(context) and start_idx != 0:
+                            break
+
+                        end_idx = min(len(context), start_idx + CHAR_WINDOW)
+                        window_context = context[start_idx:end_idx]
+
+                        # Skip tiny trailing chunks
+                        if len(window_context) < 50 and start_idx != 0:
+                            continue
+
+                        samples.append(
+                            {
+                                "id": sample_id,
+                                "context": window_context,
+                                "question": question,
+                            }
+                        )
+
+                        if end_idx == len(context):
+                            break
+=======
+            else:
+                # Sliding Window: Generate overlapping chunks
+                # If context is short, take it all
+                if len(context) <= CHAR_WINDOW:
+                    sample = {
+                        "id": sample_id,
+                        "context": context,
+                        "question": question,
+                    }
+                    if "answer_text" in row:
+                        sample["answer_text"] = str(row["answer_text"])
+                    samples.append(sample)
+                else:
+                    for start_idx in range(0, len(context), STRIDE):
+                        # Stop if we've gone past the end (unless it's the first chunk)
+                        if start_idx >= len(context) and start_idx != 0:
+                            break
+
+                        end_idx = min(len(context), start_idx + CHAR_WINDOW)
+                        window_context = context[start_idx:end_idx]
+
+                        # Skip tiny trailing chunks
+                        if len(window_context) < 50 and start_idx != 0:
+                            continue
+
+                        sample = {
+                            "id": sample_id,
+                            "context": window_context,
+                            "question": question,
+                        }
+                        if "answer_text" in row:
+                            sample["answer_text"] = str(row["answer_text"])
+                        samples.append(sample)
+
+                        if end_idx == len(context):
+                            break
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Handle targets (Training/Validation)
+        if self.mode == "train":
+            target_text = sample["answer_text"]
+
+            # Tokenize targets
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            labels = target_encoding["input_ids"].squeeze()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            item["labels"] = labels
+            item["answer_text"] = target_text
+
+        return item
+=======
+        # Pass answer_text if available (for validation scoring)
+        if "answer_text" in sample:
+            item["answer_text"] = sample["answer_text"]
+
+        # Handle targets (Training only)
+        if self.mode == "train":
+            target_text = sample["answer_text"]
+
+            # Tokenize targets
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            labels = target_encoding["input_ids"].squeeze()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            item["labels"] = labels
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # Val: Use Gold Window for efficient metric tracking
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode="train",
+    )
+=======
+    # Val: Use Sliding Window (mode="test") to prevent leakage and match inference logic
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode="test",
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def evaluate(self, dataloader):
+        """
+        Evaluates the model on the validation set using Jaccard score.
+        """
+        self.model.eval()
+        total_jaccard = 0.0
+        count = 0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                contexts = batch["context"]
+                ground_truths = batch["answer_text"]
+
+                # Generate predictions
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=Config.MAX_TARGET_LENGTH,
+                )
+
+                # Decode predictions
+                decoded_preds = self.tokenizer.batch_decode(
+                    generated_ids, skip_special_tokens=True
+                )
+
+                # Calculate Jaccard score for the batch
+                for i, pred_text in enumerate(decoded_preds):
+                    context = contexts[i]
+                    gt_text = ground_truths[i]
+
+                    # Post-processing to find best substring in context
+                    final_pred = find_best_substring(context, pred_text)
+
+                    score = jaccard(gt_text, final_pred)
+                    total_jaccard += score
+                    count += 1
+
+        return total_jaccard / count if count > 0 else 0.0
+=======
+    def evaluate(self, dataloader):
+        """
+        Evaluates the model on the validation set using Jaccard score.
+        Aggregates sliding window predictions by ID before scoring.
+        """
+        self.model.eval()
+        
+        pred_dict = {}  # id -> list of predictions
+        gt_dict = {}    # id -> ground truth answer
+
+        with torch.no_grad():
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                contexts = batch["context"]
+                ids = batch["ids"]
+                
+                # Check if ground truth is available in the batch
+                has_gt = "answer_text" in batch
+                if has_gt:
+                    gts = batch["answer_text"]
+
+                # Generate predictions
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=Config.MAX_TARGET_LENGTH,
+                )
+
+                # Decode predictions
+                decoded_preds = self.tokenizer.batch_decode(
+                    generated_ids, skip_special_tokens=True
+                )
+
+                # Post-processing and collection
+                for i, pred_text in enumerate(decoded_preds):
+                    sample_id = ids[i]
+                    context = contexts[i]
+
+                    # Post-processing to find best substring in context
+                    final_pred = find_best_substring(context, pred_text)
+                    
+                    if sample_id not in pred_dict:
+                        pred_dict[sample_id] = []
+                    pred_dict[sample_id].append(final_pred)
+                    
+                    if has_gt:
+                        # Ground truth is same for all windows of the same ID
+                        gt_dict[sample_id] = gts[i]
+
+        # Aggregate and Calculate Score
+        total_jaccard = 0.0
+        count = 0
+        
+        for sample_id, preds in pred_dict.items():
+            # Aggregation Strategy: Longest string (matches inference logic)
+            best_pred = max(preds, key=len) if preds else ""
+            
+            # Get Ground Truth
+            gt_text = gt_dict.get(sample_id, "")
+            
+            score = jaccard(gt_text, best_pred)
+            total_jaccard += score
+            count += 1
+
+        return total_jaccard / count if count > 0 else 0.0
+>>>>>>> REPLACE
+```

@@ -1,0 +1,868 @@
+I will optimize the solution by strictly encapsulating the feature preprocessing (PCA and QuantileTransformer) within the cross-validation loop to prevent statistical leakage, addressing **Lesson 47**. I will refactor the `ViewTransformer` to be a scikit-learn compliant `TransformerMixin` that handles the concatenated feature matrix (Request Embeddings + History Embeddings + Metadata). This allows the entire pipeline (Preprocessing + Bagged Ensemble) to be validated using `cross_val_score`, ensuring that feature statistics are calculated solely on the training split of each inner fold. I will retain the Asymmetric Multi-View architecture (**Lesson 46**) and the inclusion of temporal features (**Lesson 33**).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    # Feature Extraction
+    SBERT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Asymmetric Compression (View 2)
+    HISTORY_PCA_COMPONENTS = 16
+
+    # Ensemble Strategy
+    N_FOLDS = 5
+    BAGGING_N_ESTIMATORS = 20
+
+    # Logistic Regression Grid Search Space
+    # High-Regularization Regime, Capped at 10.0
+    GRID_SEARCH_PARAMS = {
+        "C": [0.0001, 0.001, 0.01, 0.1, 1.0, 5.0, 10.0],
+        "class_weight": ["balanced", None],
+    }
+=======
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    # Feature Extraction
+    SBERT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    REQ_EMB_DIM = 384
+    HIST_EMB_DIM = 384
+
+    # Asymmetric Compression (View 2)
+    HISTORY_PCA_COMPONENTS = 16
+
+    # Ensemble Strategy
+    N_FOLDS = 5
+    BAGGING_N_ESTIMATORS = 20
+
+    # Logistic Regression Grid Search Space
+    # High-Regularization Regime, Capped at 10.0
+    # Note: Keys must be prefixed with 'ensemble__base_estimator__' when using Pipeline
+    GRID_SEARCH_PARAMS = {
+        "ensemble__base_estimator__C": [0.0001, 0.001, 0.01, 0.1, 1.0, 5.0, 10.0],
+        "ensemble__base_estimator__class_weight": ["balanced", None],
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+class ViewTransformer:
+    """
+    Handles the asymmetric transformation and fusion of features.
+    Fits PCA and QuantileTransformer on training data, applies to all.
+    """
+
+    def __init__(self):
+        self.logger = setup_logger("ViewTransformer")
+        self.pca = PCA(
+            n_components=Config.HISTORY_PCA_COMPONENTS, random_state=Config.SEED
+        )
+        self.qt = QuantileTransformer(
+            output_distribution="normal", random_state=Config.SEED
+        )
+        self.is_fitted = False
+
+    def fit(self, X_hist: np.ndarray, X_meta: np.ndarray):
+        """
+        Fits the internal transformers (PCA for history, QT for metadata).
+        This should be called on the training fold data only.
+
+        Args:
+            X_hist (np.ndarray): Raw history embeddings (N, 384).
+            X_meta (np.ndarray): Raw numerical metadata (N, F).
+        """
+        self.logger.info("Fitting ViewTransformer...")
+
+        # Fit PCA on History View (Asymmetric Compression)
+        self.pca.fit(X_hist)
+
+        # Fit QuantileTransformer on Metadata (Robust Scaling)
+        self.qt.fit(X_meta)
+
+        self.is_fitted = True
+        return self
+
+    def transform(
+        self, X_req: np.ndarray, X_hist: np.ndarray, X_meta: np.ndarray
+    ) -> np.ndarray:
+        """
+        Applies transformations and fuses views.
+
+        Args:
+            X_req (np.ndarray): Raw request embeddings (N, 384).
+            X_hist (np.ndarray): Raw history embeddings (N, 384).
+            X_meta (np.ndarray): Raw numerical metadata (N, F).
+
+        Returns:
+            np.ndarray: Fused feature matrix.
+        """
+        if not self.is_fitted:
+            raise RuntimeError("ViewTransformer must be fitted before transform.")
+
+        # View 1: Request -> L2 Normalize (Project to hypersphere)
+        # SBERT embeddings are directional; L2 norm makes dot product equivalent to cosine similarity.
+        X_req_norm = normalize(X_req, norm="l2", axis=1)
+
+        # View 2: History -> PCA -> L2 Normalize
+        # Compress history to low-dim persona vector, then normalize.
+        X_hist_pca = self.pca.transform(X_hist)
+        X_hist_norm = normalize(X_hist_pca, norm="l2", axis=1)
+
+        # View 3: Metadata -> RankGauss (QuantileTransformer)
+        # Enforce Gaussian distribution for linear model compatibility.
+        X_meta_trans = self.qt.transform(X_meta)
+
+        # Fusion: Concatenate all views
+        X_fused = np.hstack([X_req_norm, X_hist_norm, X_meta_trans])
+
+        return X_fused
+=======
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class ViewTransformer(BaseEstimator, TransformerMixin):
+    """
+    Handles the asymmetric transformation and fusion of features.
+    Implemented as a scikit-learn TransformerMixin to allow usage in Pipelines.
+    Cite Lesson 47: Encapsulate Preprocessing to Prevent Statistical Leakage.
+    """
+
+    def __init__(self):
+        self.req_dim = Config.REQ_EMB_DIM
+        self.hist_dim = Config.HIST_EMB_DIM
+        self.pca_components = Config.HISTORY_PCA_COMPONENTS
+        self.seed = Config.SEED
+        
+        self.pca = PCA(
+            n_components=self.pca_components, random_state=self.seed
+        )
+        self.qt = QuantileTransformer(
+            output_distribution="normal", random_state=self.seed
+        )
+
+    def fit(self, X, y=None):
+        """
+        Fits the internal transformers (PCA for history, QT for metadata).
+        X is expected to be the concatenated matrix of [Req_Emb, Hist_Emb, Meta].
+        """
+        # Slice input matrix
+        # X_req = X[:, :self.req_dim] # Not needed for fitting
+        X_hist = X[:, self.req_dim : self.req_dim + self.hist_dim]
+        X_meta = X[:, self.req_dim + self.hist_dim :]
+
+        # Fit PCA on History View (Asymmetric Compression)
+        self.pca.fit(X_hist)
+
+        # Fit QuantileTransformer on Metadata (Robust Scaling)
+        self.qt.fit(X_meta)
+
+        return self
+
+    def transform(self, X):
+        """
+        Applies transformations and fuses views.
+        """
+        # Slice input matrix
+        X_req = X[:, :self.req_dim]
+        X_hist = X[:, self.req_dim : self.req_dim + self.hist_dim]
+        X_meta = X[:, self.req_dim + self.hist_dim :]
+
+        # View 1: Request -> L2 Normalize (Project to hypersphere)
+        X_req_norm = normalize(X_req, norm="l2", axis=1)
+
+        # View 2: History -> PCA -> L2 Normalize
+        # Cite Lesson 46: Asymmetric Dimensionality Reduction
+        X_hist_pca = self.pca.transform(X_hist)
+        X_hist_norm = normalize(X_hist_pca, norm="l2", axis=1)
+
+        # View 3: Metadata -> RankGauss (QuantileTransformer)
+        X_meta_trans = self.qt.transform(X_meta)
+
+        # Fusion: Concatenate all views
+        X_fused = np.hstack([X_req_norm, X_hist_norm, X_meta_trans])
+
+        return X_fused
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_builder.py
+<<<<<<< SEARCH
+    def get_bagged_ensemble(
+        self, C: float = 1.0, class_weight=None
+    ) -> BaggingClassifier:
+        """
+        Constructs a BaggingClassifier with a LogisticRegression base estimator.
+
+        Args:
+            C (float): Inverse of regularization strength for Logistic Regression.
+                       Smaller values specify stronger regularization.
+            class_weight (str or None): Weights associated with classes in the form {class_label: weight}.
+                                        If 'balanced', uses the values of y to automatically adjust weights.
+
+        Returns:
+            BaggingClassifier: The configured ensemble model ready for training.
+        """
+        # Base Estimator: Logistic Regression
+        # We use 'lbfgs' as it is a robust solver for multiclass and binary problems.
+        # max_iter is set to 1000 to ensure convergence on the fused feature space.
+        # n_jobs is set to 1 because parallelism is handled at the Bagging level.
+        base_estimator = LogisticRegression(
+            C=C,
+            class_weight=class_weight,
+            solver="lbfgs",
+            max_iter=1000,
+            random_state=Config.SEED,
+            n_jobs=1,
+        )
+
+        # Bagging Ensemble
+        # Wraps the high-bias linear core to reduce variance via bootstrapping.
+        # n_estimators is retrieved from Config (default 20).
+        # n_jobs utilizes the available vCPUs defined in Config.
+        ensemble = BaggingClassifier(
+            estimator=base_estimator,
+            n_estimators=Config.BAGGING_N_ESTIMATORS,
+            random_state=Config.SEED,
+            n_jobs=Config.N_JOBS,
+            bootstrap=True,
+            bootstrap_features=False,
+        )
+
+        return ensemble
+=======
+    from sklearn.pipeline import Pipeline
+    from library.feature_engineering import ViewTransformer
+
+    def get_pipeline(self) -> Pipeline:
+        """
+        Constructs a Pipeline containing the ViewTransformer and the BaggingClassifier.
+        This ensures preprocessing is part of the CV loop (Lesson 47).
+        """
+        # Base Estimator: Logistic Regression
+        # Hyperparameters (C, class_weight) will be set via GridSearchCV using the prefix
+        base_estimator = LogisticRegression(
+            solver="lbfgs",
+            max_iter=1000,
+            random_state=Config.SEED,
+            n_jobs=1,
+        )
+
+        # Bagging Ensemble
+        ensemble = BaggingClassifier(
+            estimator=base_estimator,
+            n_estimators=Config.BAGGING_N_ESTIMATORS,
+            random_state=Config.SEED,
+            n_jobs=Config.N_JOBS,
+            bootstrap=True,
+            bootstrap_features=False,
+        )
+
+        # Pipeline
+        pipeline = Pipeline([
+            ("preprocessor", ViewTransformer()),
+            ("ensemble", ensemble)
+        ])
+
+        return pipeline
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def _get_fold_paths(self, fold_idx):
+        """Returns paths for saving/loading model and transformer for a specific fold."""
+        model_path = os.path.join(self.models_dir, f"model_fold_{fold_idx}.joblib")
+        transformer_path = os.path.join(
+            self.models_dir, f"transformer_fold_{fold_idx}.joblib"
+        )
+        return model_path, transformer_path
+
+    def load_all_data(self, split="train"):
+        """
+        Loads tabular data and embeddings for a given split.
+        Returns:
+            X_req (np.ndarray): Request embeddings
+            X_hist (np.ndarray): History embeddings
+            X_meta (np.ndarray): Numerical metadata
+            y (np.ndarray or None): Labels
+            ids (pd.Series): Request IDs
+        """
+        self.logger.info(f"Loading all data for split: {split}")
+
+        # 1. Load Tabular Data
+        df = self.data_loader.load_dataset(split=split, load_cached_data=True)
+
+        # 2. Get Embeddings (View 1 & 2)
+        # Embedder handles caching internally
+        X_req = self.embedder.get_embeddings(
+            df, split=split, view_type="request", load_cached_data=True
+        )
+        X_hist = self.embedder.get_embeddings(
+            df, split=split, view_type="history", load_cached_data=True
+        )
+
+        # 3. Get Metadata (View 3)
+        # Extract numerical columns defined in DataLoader
+        meta_cols = self.data_loader.numerical_features
+        X_meta = df[meta_cols].values
+
+        # 4. Get Labels and IDs
+        y = (
+            df["requester_received_pizza"].values
+            if "requester_received_pizza" in df.columns
+            else None
+        )
+        ids = df["request_id"]
+
+        return X_req, X_hist, X_meta, y, ids
+
+    def run_training(self):
+        """
+        Executes the 5-fold stratified cross-validation training loop.
+        """
+        set_seed(Config.SEED)
+
+        # Load Training Data
+        X_req_all, X_hist_all, X_meta_all, y_all, _ = self.load_all_data("train")
+
+        # Setup CV
+        skf = StratifiedKFold(
+            n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+        )
+
+        oof_preds = np.zeros(len(y_all))
+        fold_scores = []
+
+        self.logger.info(
+            f"Starting {Config.N_FOLDS}-Fold Stratified Cross-Validation..."
+        )
+
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_req_all, y_all)):
+            self.logger.info(f"\n{'='*20} Fold {fold_idx} {'='*20}")
+
+            # Split Data
+            X_req_train, X_req_val = X_req_all[train_idx], X_req_all[val_idx]
+            X_hist_train, X_hist_val = X_hist_all[train_idx], X_hist_all[val_idx]
+            X_meta_train, X_meta_val = X_meta_all[train_idx], X_meta_all[val_idx]
+            y_train, y_val = y_all[train_idx], y_all[val_idx]
+
+            # 1. Feature Fusion (ViewTransformer)
+            # Fit ONLY on training data to prevent leakage
+            vt = ViewTransformer()
+            vt.fit(X_hist_train, X_meta_train)
+
+            # Transform Train and Val
+            X_train_fused = vt.transform(X_req_train, X_hist_train, X_meta_train)
+            X_val_fused = vt.transform(X_req_val, X_hist_val, X_meta_val)
+
+            # 2. Hyperparameter Tuning (Inner Loop)
+            # We use a manual grid search with internal CV on the fold's training data
+            grid = ParameterGrid(self.model_builder.get_hyperparameter_grid())
+            best_score = -1.0
+            best_params = None
+
+            self.logger.info(f"Tuning hyperparameters for Fold {fold_idx}...")
+
+            # Use a smaller inner CV for speed
+            inner_cv = StratifiedKFold(
+                n_splits=3, shuffle=True, random_state=Config.SEED
+            )
+
+            for params in grid:
+                # Instantiate model with current params
+                model = self.model_builder.get_bagged_ensemble(
+                    C=params["C"], class_weight=params["class_weight"]
+                )
+
+                # Evaluate using cross_val_score
+                # Note: n_jobs=1 here because BaggingClassifier already uses n_jobs=Config.N_JOBS
+                # We want to avoid over-subscription of threads.
+                # However, cross_val_score can run in parallel if model n_jobs=1.
+                # Given Config.N_JOBS is 12, we let the ensemble handle parallelism.
+                scores = cross_val_score(
+                    model,
+                    X_train_fused,
+                    y_train,
+                    cv=inner_cv,
+                    scoring="roc_auc",
+                    n_jobs=1,
+                )
+                avg_score = np.mean(scores)
+
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_params = params
+
+            self.logger.info(
+                f"Best Params Fold {fold_idx}: {best_params} (CV AUC: {best_score:.6f})"
+            )
+
+            # 3. Train Final Model for Fold
+            final_model = self.model_builder.get_bagged_ensemble(
+                C=best_params["C"], class_weight=best_params["class_weight"]
+            )
+            final_model.fit(X_train_fused, y_train)
+
+            # 4. Evaluate on Validation Set
+            val_probs = final_model.predict_proba(X_val_fused)[:, 1]
+            fold_auc = roc_auc_score(y_val, val_probs)
+            self.logger.info(f"Fold {fold_idx} Validation AUC: {fold_auc:.10f}")
+
+            oof_preds[val_idx] = val_probs
+            fold_scores.append(fold_auc)
+
+            # 5. Save Artifacts
+            model_path, transformer_path = self._get_fold_paths(fold_idx)
+            joblib.dump(final_model, model_path)
+            joblib.dump(vt, transformer_path)
+            self.logger.info(f"Saved model and transformer for Fold {fold_idx}")
+
+        # Summary
+        mean_auc = np.mean(fold_scores)
+        std_auc = np.std(fold_scores)
+        overall_auc = roc_auc_score(y_all, oof_preds)
+
+        self.logger.info(f"\n{'='*20} Summary {'='*20}")
+        self.logger.info(f"Mean Fold AUC: {mean_auc:.10f} ± {std_auc:.10f}")
+        self.logger.info(f"Overall OOF AUC: {overall_auc:.10f}")
+=======
+    def _get_fold_paths(self, fold_idx):
+        """Returns paths for saving/loading model for a specific fold."""
+        # We only save the pipeline now, which contains both transformer and model
+        model_path = os.path.join(self.models_dir, f"pipeline_fold_{fold_idx}.joblib")
+        return model_path
+
+    def load_all_data(self, split="train"):
+        """
+        Loads tabular data and embeddings for a given split.
+        Concatenates them into a single matrix X for Pipeline usage.
+        """
+        self.logger.info(f"Loading all data for split: {split}")
+
+        # 1. Load Tabular Data
+        df = self.data_loader.load_dataset(split=split, load_cached_data=True)
+
+        # 2. Get Embeddings (View 1 & 2)
+        X_req = self.embedder.get_embeddings(
+            df, split=split, view_type="request", load_cached_data=True
+        )
+        X_hist = self.embedder.get_embeddings(
+            df, split=split, view_type="history", load_cached_data=True
+        )
+
+        # 3. Get Metadata (View 3)
+        meta_cols = self.data_loader.numerical_features
+        X_meta = df[meta_cols].values
+
+        # 4. Concatenate
+        # Order must match ViewTransformer logic: [Req, Hist, Meta]
+        X_all = np.hstack([X_req, X_hist, X_meta])
+
+        # 5. Get Labels and IDs
+        y = (
+            df["requester_received_pizza"].values
+            if "requester_received_pizza" in df.columns
+            else None
+        )
+        ids = df["request_id"]
+
+        return X_all, y, ids
+
+    def run_training(self):
+        """
+        Executes the 5-fold stratified cross-validation training loop.
+        """
+        set_seed(Config.SEED)
+
+        # Load Training Data
+        X_all, y_all, _ = self.load_all_data("train")
+
+        # Setup CV
+        skf = StratifiedKFold(
+            n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+        )
+
+        oof_preds = np.zeros(len(y_all))
+        fold_scores = []
+
+        self.logger.info(
+            f"Starting {Config.N_FOLDS}-Fold Stratified Cross-Validation..."
+        )
+
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_all, y_all)):
+            self.logger.info(f"\n{'='*20} Fold {fold_idx} {'='*20}")
+
+            # Split Data
+            X_train, X_val = X_all[train_idx], X_all[val_idx]
+            y_train, y_val = y_all[train_idx], y_all[val_idx]
+
+            # Hyperparameter Tuning (Inner Loop)
+            # We use a manual grid search but with a Pipeline to ensure correct stats calculation
+            grid = ParameterGrid(self.model_builder.get_hyperparameter_grid())
+            best_score = -1.0
+            best_params = None
+
+            self.logger.info(f"Tuning hyperparameters for Fold {fold_idx}...")
+
+            # Use a smaller inner CV for speed
+            inner_cv = StratifiedKFold(
+                n_splits=3, shuffle=True, random_state=Config.SEED
+            )
+
+            for params in grid:
+                # Instantiate pipeline
+                pipeline = self.model_builder.get_pipeline()
+                pipeline.set_params(**params)
+
+                # Evaluate using cross_val_score
+                # The Pipeline ensures ViewTransformer.fit() is called on inner train sets
+                scores = cross_val_score(
+                    pipeline,
+                    X_train,
+                    y_train,
+                    cv=inner_cv,
+                    scoring="roc_auc",
+                    n_jobs=1, # Bagging inside pipeline handles parallelism
+                )
+                avg_score = np.mean(scores)
+
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_params = params
+
+            self.logger.info(
+                f"Best Params Fold {fold_idx}: {best_params} (CV AUC: {best_score:.6f})"
+            )
+
+            # Train Final Model for Fold
+            final_pipeline = self.model_builder.get_pipeline()
+            final_pipeline.set_params(**best_params)
+            final_pipeline.fit(X_train, y_train)
+
+            # Evaluate on Validation Set
+            val_probs = final_pipeline.predict_proba(X_val)[:, 1]
+            fold_auc = roc_auc_score(y_val, val_probs)
+            self.logger.info(f"Fold {fold_idx} Validation AUC: {fold_auc:.10f}")
+
+            oof_preds[val_idx] = val_probs
+            fold_scores.append(fold_auc)
+
+            # Save Artifacts
+            model_path = self._get_fold_paths(fold_idx)
+            joblib.dump(final_pipeline, model_path)
+            self.logger.info(f"Saved pipeline for Fold {fold_idx}")
+
+        # Summary
+        mean_auc = np.mean(fold_scores)
+        std_auc = np.std(fold_scores)
+        overall_auc = roc_auc_score(y_all, oof_preds)
+
+        self.logger.info(f"\n{'='*20} Summary {'='*20}")
+        self.logger.info(f"Mean Fold AUC: {mean_auc:.10f} ± {std_auc:.10f}")
+        self.logger.info(f"Overall OOF AUC: {overall_auc:.10f}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/predictor.py
+<<<<<<< SEARCH
+    def generate_submission(self, sample_size=None):
+        """
+        Generates predictions for the test set using the ensemble of trained fold models.
+        Averages the probabilities (Bagging) and saves to CSV.
+
+        Args:
+            sample_size (int, optional): If provided, limits the inference to the first N samples
+                                         for debugging or quick validation.
+        """
+        self.logger.info("Starting submission generation...")
+
+        # 1. Load Test Data (Tabular)
+        # We load the full dataset first to ensure cache consistency for embeddings
+        df_test = self.data_loader.load_dataset(split="test", load_cached_data=True)
+
+        # 2. Load Embeddings (Views 1 & 2)
+        # Embedder handles caching. It returns the full arrays corresponding to df_test.
+        X_req = self.embedder.get_embeddings(
+            df_test, split="test", view_type="request", load_cached_data=True
+        )
+        X_hist = self.embedder.get_embeddings(
+            df_test, split="test", view_type="history", load_cached_data=True
+        )
+
+        # 3. Extract Metadata (View 3)
+        meta_cols = self.data_loader.numerical_features
+        X_meta = df_test[meta_cols].values
+
+        # Get IDs
+        ids = df_test["request_id"].values
+
+        # 4. Handle Subsetting (Debugging)
+        if sample_size is not None:
+            self.logger.info(f"Subsetting test data to first {sample_size} samples.")
+            # Slice all arrays
+            df_test = df_test.iloc[:sample_size]
+            X_req = X_req[:sample_size]
+            X_hist = X_hist[:sample_size]
+            X_meta = X_meta[:sample_size]
+            ids = ids[:sample_size]
+
+        # 5. Inference Loop (Ensemble)
+        # Initialize accumulator for probabilities
+        test_preds_sum = np.zeros(len(ids))
+        models_found = 0
+
+        for fold_idx in range(Config.N_FOLDS):
+            model_path = os.path.join(self.models_dir, f"model_fold_{fold_idx}.joblib")
+            transformer_path = os.path.join(
+                self.models_dir, f"transformer_fold_{fold_idx}.joblib"
+            )
+
+            if not os.path.exists(model_path) or not os.path.exists(transformer_path):
+                self.logger.warning(
+                    f"Artifacts for Fold {fold_idx} not found at {model_path}. Skipping."
+                )
+                continue
+
+            # Load artifacts
+            # Note: ViewTransformer class must be imported for joblib to unpickle correctly
+            try:
+                model = joblib.load(model_path)
+                vt = joblib.load(transformer_path)
+            except Exception as e:
+                self.logger.error(f"Failed to load artifacts for Fold {fold_idx}: {e}")
+                continue
+
+            # Transform Test Data using the fold-specific transformer
+            # This applies the specific PCA projection and Quantile mapping learned in that fold
+            X_test_fused = vt.transform(X_req, X_hist, X_meta)
+
+            # Predict Probability (Class 1: Received Pizza)
+            probs = model.predict_proba(X_test_fused)[:, 1]
+            test_preds_sum += probs
+            models_found += 1
+
+            self.logger.info(f"Processed inference for Fold {fold_idx}.")
+
+        if models_found == 0:
+            raise RuntimeError("No trained models found. Cannot generate submission.")
+
+        # Average predictions
+        avg_preds = test_preds_sum / models_found
+
+        # 6. Create Submission DataFrame
+        submission_df = pd.DataFrame(
+            {"request_id": ids, "requester_received_pizza": avg_preds}
+        )
+
+        # 7. Save Submission
+        os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+        submission_df.to_csv(Config.SUBMISSION_PATH, index=False)
+        self.logger.info(f"Submission saved to {Config.SUBMISSION_PATH}")
+=======
+    def generate_submission(self, sample_size=None):
+        """
+        Generates predictions for the test set using the ensemble of trained fold models.
+        Averages the probabilities (Bagging) and saves to CSV.
+        """
+        self.logger.info("Starting submission generation...")
+
+        # 1. Load Test Data (Tabular)
+        df_test = self.data_loader.load_dataset(split="test", load_cached_data=True)
+
+        # 2. Load Embeddings
+        X_req = self.embedder.get_embeddings(
+            df_test, split="test", view_type="request", load_cached_data=True
+        )
+        X_hist = self.embedder.get_embeddings(
+            df_test, split="test", view_type="history", load_cached_data=True
+        )
+
+        # 3. Extract Metadata
+        meta_cols = self.data_loader.numerical_features
+        X_meta = df_test[meta_cols].values
+
+        # Concatenate
+        X_all = np.hstack([X_req, X_hist, X_meta])
+        ids = df_test["request_id"].values
+
+        # 4. Handle Subsetting
+        if sample_size is not None:
+            self.logger.info(f"Subsetting test data to first {sample_size} samples.")
+            X_all = X_all[:sample_size]
+            ids = ids[:sample_size]
+
+        # 5. Inference Loop
+        test_preds_sum = np.zeros(len(ids))
+        models_found = 0
+
+        for fold_idx in range(Config.N_FOLDS):
+            model_path = os.path.join(self.models_dir, f"pipeline_fold_{fold_idx}.joblib")
+
+            if not os.path.exists(model_path):
+                self.logger.warning(
+                    f"Pipeline for Fold {fold_idx} not found at {model_path}. Skipping."
+                )
+                continue
+
+            try:
+                pipeline = joblib.load(model_path)
+            except Exception as e:
+                self.logger.error(f"Failed to load pipeline for Fold {fold_idx}: {e}")
+                continue
+
+            # Predict Probability (Pipeline handles transformation)
+            probs = pipeline.predict_proba(X_all)[:, 1]
+            test_preds_sum += probs
+            models_found += 1
+
+            self.logger.info(f"Processed inference for Fold {fold_idx}.")
+
+        if models_found == 0:
+            raise RuntimeError("No trained models found. Cannot generate submission.")
+
+        # Average predictions
+        avg_preds = test_preds_sum / models_found
+
+        # 6. Create Submission DataFrame
+        submission_df = pd.DataFrame(
+            {"request_id": ids, "requester_received_pizza": avg_preds}
+        )
+
+        # 7. Save Submission
+        os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+        submission_df.to_csv(Config.SUBMISSION_PATH, index=False)
+        self.logger.info(f"Submission saved to {Config.SUBMISSION_PATH}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Hold-out Validation Phase
+    # We evaluate the ensemble on the separate validation split (metadata/val.csv).
+    logger.info("\n=== Starting Hold-out Validation Phase ===")
+
+    # Load validation data
+    X_req_val, X_hist_val, X_meta_val, y_val, ids_val = trainer.load_all_data("val")
+
+    # Initialize array for ensemble predictions
+    val_preds_sum = np.zeros(len(y_val))
+    models_dir = os.path.join(Config.WORKING_DIR, "models")
+
+    # Iterate through saved fold models
+    models_found = 0
+    for fold_idx in range(Config.N_FOLDS):
+        model_path = os.path.join(models_dir, f"model_fold_{fold_idx}.joblib")
+        transformer_path = os.path.join(
+            models_dir, f"transformer_fold_{fold_idx}.joblib"
+        )
+
+        if not os.path.exists(model_path):
+            logger.warning(f"Model for fold {fold_idx} not found. Skipping.")
+            continue
+
+        # Load model and transformer
+        try:
+            model = joblib.load(model_path)
+            vt = joblib.load(transformer_path)
+        except Exception as e:
+            logger.error(f"Error loading artifacts for fold {fold_idx}: {e}")
+            continue
+
+        # Transform validation data using the fold's transformer
+        # Note: The transformer was fitted on the fold's training data
+        X_val_fused = vt.transform(X_req_val, X_hist_val, X_meta_val)
+
+        # Predict probabilities
+        probs = model.predict_proba(X_val_fused)[:, 1]
+        val_preds_sum += probs
+        models_found += 1
+
+    if models_found == 0:
+        logger.error("No models found. Cannot perform validation.")
+        return
+
+    # Average predictions (Bagging)
+    avg_val_preds = val_preds_sum / models_found
+
+    # Compute Final Metric
+    final_metric = roc_auc_score(y_val, avg_val_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 4. Failure Analysis
+    logger.info("\n=== Performing Failure Analysis ===")
+    # Calculate absolute error
+    errors = np.abs(y_val - avg_val_preds)
+
+    # Create DataFrame with numerical features and error
+    # We use the numerical features defined in DataLoader
+    feature_names = trainer.data_loader.numerical_features
+    df_analysis = pd.DataFrame(X_meta_val, columns=feature_names)
+    df_analysis["Error_Magnitude"] = errors
+=======
+    # 3. Hold-out Validation Phase
+    # We evaluate the ensemble on the separate validation split (metadata/val.csv).
+    logger.info("\n=== Starting Hold-out Validation Phase ===")
+
+    # Load validation data
+    X_val_all, y_val, ids_val = trainer.load_all_data("val")
+
+    # Initialize array for ensemble predictions
+    val_preds_sum = np.zeros(len(y_val))
+    models_dir = os.path.join(Config.WORKING_DIR, "models")
+
+    # Iterate through saved fold models
+    models_found = 0
+    for fold_idx in range(Config.N_FOLDS):
+        model_path = os.path.join(models_dir, f"pipeline_fold_{fold_idx}.joblib")
+
+        if not os.path.exists(model_path):
+            logger.warning(f"Pipeline for fold {fold_idx} not found. Skipping.")
+            continue
+
+        # Load pipeline
+        try:
+            pipeline = joblib.load(model_path)
+        except Exception as e:
+            logger.error(f"Error loading pipeline for fold {fold_idx}: {e}")
+            continue
+
+        # Predict probabilities (Pipeline handles transformation)
+        probs = pipeline.predict_proba(X_val_all)[:, 1]
+        val_preds_sum += probs
+        models_found += 1
+
+    if models_found == 0:
+        logger.error("No models found. Cannot perform validation.")
+        return
+
+    # Average predictions (Bagging)
+    avg_val_preds = val_preds_sum / models_found
+
+    # Compute Final Metric
+    final_metric = roc_auc_score(y_val, avg_val_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 4. Failure Analysis
+    logger.info("\n=== Performing Failure Analysis ===")
+    # Calculate absolute error
+    errors = np.abs(y_val - avg_val_preds)
+
+    # Create DataFrame with numerical features and error
+    # We extract the metadata part from X_val_all for analysis
+    # Metadata starts after REQ_EMB_DIM + HIST_EMB_DIM
+    meta_start_idx = Config.REQ_EMB_DIM + Config.HIST_EMB_DIM
+    X_meta_val = X_val_all[:, meta_start_idx:]
+    
+    feature_names = trainer.data_loader.numerical_features
+    df_analysis = pd.DataFrame(X_meta_val, columns=feature_names)
+    df_analysis["Error_Magnitude"] = errors
+>>>>>>> REPLACE
+```

@@ -1,0 +1,391 @@
+To improve the solution's performance, I will implement the following changes based on the provided lessons and failure analysis:
+
+1.  **Maximize Data Volume (Cite solution_lesson_node_00012)**: The previous run suffered from severe data starvation (training on only ~4,500 rows instead of millions) due to a caching issue where a stale debug subset was loaded. I will modify `runfile.py` to explicitly disable cache loading (`load_cached_data=False`), forcing the pipeline to process the full 44M+ row dataset from the metadata files. I will also update `config.py` to set `DEBUG_SAMPLE_SIZE = None` to ensure no downsampling occurs.
+
+2.  **Eliminate Weak Learners (Cite solution_lesson_node_00011)**: The ResNet model failed to converge (RMSE ~21.4) and contaminated the ensemble. I will remove the Neural Network component entirely from the `runfile.py` pipeline, relying solely on the robust Gradient Boosting models.
+
+3.  **Restore Model Capacity (Cite solution_lesson_node_00004)**: I will remove the overrides in `runfile.py` that reduced `n_estimators` to 1000. This restores the configuration to 2000 (XGBoost) and 3000 (LightGBM) trees, allowing the models to fully leverage the large dataset.
+
+4.  **Leverage Heterogeneous Stacking (Cite solution_lesson_node_00027)**: I will maintain the stacking architecture of Depth-wise (XGBoost) and Leaf-wise (LightGBM) models, which has proven effective, but now trained on the full dataset.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Debugging / Sampling
+# Set to None to use full dataset, or an integer to sample
+DEBUG_SAMPLE_SIZE = None
+=======
+# Debugging / Sampling
+# Set to None to use full dataset, or an integer to sample
+DEBUG_SAMPLE_SIZE = None
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library import (
+    config,
+    utils,
+    preprocessing,
+    features,
+    gbdt_models,
+    nn_model,
+    ensemble,
+)
+
+# ==========================================
+# CONFIGURATION OVERRIDES FOR FAST BASELINE
+# ==========================================
+# Limit training data to 2 million rows to ensure execution within 2 hours
+config.DEBUG_SAMPLE_SIZE = 2000000
+# Reduce epochs for ResNet to speed up training
+config.RESNET_PARAMS["epochs"] = 8
+# Adjust Tree estimators for speed vs performance trade-off in baseline
+config.XGB_PARAMS["n_estimators"] = 1000
+config.LGBM_PARAMS["n_estimators"] = 1000
+
+
+def main():
+    # Set seeds for reproducibility
+    utils.seed_everything(config.SEED)
+
+    print("Starting Runfile execution...")
+    print(
+        f"Configuration: Sample Size={config.DEBUG_SAMPLE_SIZE}, Device={utils.get_device()}"
+    )
+
+    # ==========================================
+    # 1. DATA LOADING & PREPROCESSING
+    # ==========================================
+    # Load data from metadata, clean it, and apply sampling if configured
+    print("\n[Step 1] Loading and Cleaning Data...")
+    train_raw, val_raw, test_raw = preprocessing.load_and_clean(load_cached_data=True)
+
+    # ==========================================
+    # 2. FEATURE ENGINEERING
+    # ==========================================
+    # Generate features for both Tree (raw/integer) and NN (scaled/cyclical) pipelines
+    print("\n[Step 2] Feature Engineering...")
+    data_dict = features.process_data(
+        train_raw, val_raw, test_raw, load_cached_data=True
+    )
+
+    # ==========================================
+    # 3. SPLIT DATA (BASE vs META)
+    # ==========================================
+    print("\n[Step 3] Splitting Data for Stacking...")
+    # We split the training set into Base-Train (for base models) and Meta-Train (for meta learner)
+    # We must split both Tree and NN datasets consistently using indices
+    indices = np.arange(len(data_dict["train_tree"]))
+    train_idx, meta_idx = train_test_split(
+        indices, test_size=config.META_TRAIN_SIZE, random_state=config.SEED
+    )
+
+    # Create Tree-based subsets
+    base_train_tree = data_dict["train_tree"].iloc[train_idx].reset_index(drop=True)
+    meta_train_tree = data_dict["train_tree"].iloc[meta_idx].reset_index(drop=True)
+
+    # Create NN-based subsets
+    base_train_nn = data_dict["train_nn"].iloc[train_idx].reset_index(drop=True)
+    meta_train_nn = data_dict["train_nn"].iloc[meta_idx].reset_index(drop=True)
+
+    # Validation and Test sets (Full)
+    val_tree = data_dict["val_tree"]
+    val_nn = data_dict["val_nn"]
+    test_tree = data_dict["test_tree"]
+    test_nn = data_dict["test_nn"]
+
+    print(f"Base Train Size: {len(base_train_tree)}")
+    print(f"Meta Train Size: {len(meta_train_tree)}")
+
+    # ==========================================
+    # 4. TRAIN BASE MODELS
+    # ==========================================
+    print("\n[Step 4] Training Base Models...")
+
+    # We use the full hold-out validation set for early stopping to ensure the models
+    # generalize well to unseen data, rather than overfitting to the meta-train split.
+
+    # 4.1 XGBoost
+    xgb_model, _ = gbdt_models.train_xgboost(base_train_tree, val_tree)
+
+    # 4.2 LightGBM
+    lgbm_model, _ = gbdt_models.train_lgbm(base_train_tree, val_tree)
+
+    # 4.3 ResNet
+    resnet_model, _ = nn_model.train_resnet(base_train_nn, val_nn)
+
+    # ==========================================
+    # 5. TRAIN META LEARNER
+    # ==========================================
+    print("\n[Step 5] Training Meta-Learner...")
+
+    # Generate predictions on Meta-Train set to form the training data for the meta-learner
+    print("Generating predictions on Meta-Train set...")
+
+    # XGBoost Prediction
+    meta_pred_xgb = xgb_model.predict(meta_train_tree[config.TREE_FEATURES])
+
+    # LightGBM Prediction
+    meta_pred_lgbm = lgbm_model.predict(meta_train_tree[config.TREE_FEATURES])
+
+    # ResNet Prediction
+    meta_pred_resnet = nn_model.predict_resnet(resnet_model, meta_train_nn)
+
+    # Stack predictions
+    meta_preds_dict = {
+        "xgb": meta_pred_xgb,
+        "lgbm": meta_pred_lgbm,
+        "resnet": meta_pred_resnet,
+    }
+
+    # Get targets (same for tree/nn)
+    meta_targets = meta_train_tree["fare_amount"].values
+
+    # Train Meta-Learner (Ridge)
+    meta_learner = ensemble.train_meta_learner(meta_preds_dict, meta_targets)
+
+    # ==========================================
+    # 6. FINAL EVALUATION
+    # ==========================================
+    print("\n[Step 6] Final Evaluation on Hold-out Validation Set...")
+
+    # Generate base predictions on the full validation set
+    val_pred_xgb = xgb_model.predict(val_tree[config.TREE_FEATURES])
+    val_pred_lgbm = lgbm_model.predict(val_tree[config.TREE_FEATURES])
+    val_pred_resnet = nn_model.predict_resnet(resnet_model, val_nn)
+
+    val_preds_dict = {
+        "xgb": val_pred_xgb,
+        "lgbm": val_pred_lgbm,
+        "resnet": val_pred_resnet,
+    }
+
+    # Generate ensemble predictions
+    final_val_preds = ensemble.predict_meta(meta_learner, val_preds_dict)
+
+    # Compute Metric
+    y_val_true = val_tree["fare_amount"].values
+    final_rmse = utils.compute_rmse(y_val_true, final_val_preds)
+
+    print(f"Final Validation Metric: {final_rmse}")
+
+    # ==========================================
+    # 7. FAILURE ANALYSIS
+    # ==========================================
+    print("\n[Step 7] Failure Analysis...")
+
+    # Calculate absolute errors
+    errors = np.abs(y_val_true - final_val_preds)
+
+    # Use the tree validation dataframe for analysis (contains raw-ish features)
+    analysis_df = val_tree.copy()
+    analysis_df["error_magnitude"] = errors
+
+    # Calculate correlation of features with error magnitude
+    # Filter to numeric columns only
+    numeric_df = analysis_df.select_dtypes(include=[np.number])
+    correlations = numeric_df.corrwith(numeric_df["error_magnitude"]).sort_values(
+        ascending=False
+    )
+
+    print("Top 10 features correlated with prediction error:")
+    print(correlations.head(10))
+
+    # ==========================================
+    # 8. SUBMISSION GENERATION
+    # ==========================================
+    THRESHOLD = 3.3898257003113574
+
+    if final_rmse < THRESHOLD:
+        print(
+            f"\n[Step 8] Validation RMSE {final_rmse} < {THRESHOLD}. Generating Submission..."
+        )
+
+        # Generate base predictions on Test set
+        test_pred_xgb = xgb_model.predict(test_tree[config.TREE_FEATURES])
+        test_pred_lgbm = lgbm_model.predict(test_tree[config.TREE_FEATURES])
+        test_pred_resnet = nn_model.predict_resnet(resnet_model, test_nn)
+
+        test_preds_dict = {
+            "xgb": test_pred_xgb,
+            "lgbm": test_pred_lgbm,
+            "resnet": test_pred_resnet,
+        }
+
+        # Generate ensemble predictions
+        final_test_preds = ensemble.predict_meta(meta_learner, test_preds_dict)
+=======
+from library import (
+    config,
+    utils,
+    preprocessing,
+    features,
+    gbdt_models,
+    ensemble,
+)
+
+# ==========================================
+# CONFIGURATION OVERRIDES
+# ==========================================
+# Removed overrides to use full dataset and full model capacity.
+
+
+def main():
+    # Set seeds for reproducibility
+    utils.seed_everything(config.SEED)
+
+    print("Starting Runfile execution...")
+    print(
+        f"Configuration: Sample Size={config.DEBUG_SAMPLE_SIZE}, Device={utils.get_device()}"
+    )
+
+    # ==========================================
+    # 1. DATA LOADING & PREPROCESSING
+    # ==========================================
+    # Load data from metadata, clean it.
+    # Cite solution_lesson_node_00012: Data Volume Dominance.
+    # We force load_cached_data=False to ensure we process the full dataset and avoid stale debug caches.
+    print("\n[Step 1] Loading and Cleaning Data...")
+    train_raw, val_raw, test_raw = preprocessing.load_and_clean(load_cached_data=False)
+
+    # ==========================================
+    # 2. FEATURE ENGINEERING
+    # ==========================================
+    # Generate features. We disable cache here as well to ensure features match the full dataset.
+    print("\n[Step 2] Feature Engineering...")
+    data_dict = features.process_data(
+        train_raw, val_raw, test_raw, load_cached_data=False
+    )
+
+    # ==========================================
+    # 3. SPLIT DATA (BASE vs META)
+    # ==========================================
+    print("\n[Step 3] Splitting Data for Stacking...")
+    # We split the training set into Base-Train (for base models) and Meta-Train (for meta learner)
+    indices = np.arange(len(data_dict["train_tree"]))
+    train_idx, meta_idx = train_test_split(
+        indices, test_size=config.META_TRAIN_SIZE, random_state=config.SEED
+    )
+
+    # Create Tree-based subsets
+    base_train_tree = data_dict["train_tree"].iloc[train_idx].reset_index(drop=True)
+    meta_train_tree = data_dict["train_tree"].iloc[meta_idx].reset_index(drop=True)
+
+    # Validation and Test sets (Full)
+    val_tree = data_dict["val_tree"]
+    test_tree = data_dict["test_tree"]
+
+    print(f"Base Train Size: {len(base_train_tree)}")
+    print(f"Meta Train Size: {len(meta_train_tree)}")
+
+    # ==========================================
+    # 4. TRAIN BASE MODELS
+    # ==========================================
+    print("\n[Step 4] Training Base Models...")
+    # Cite solution_lesson_node_00011: Ensemble Contamination.
+    # We removed the ResNet model as it was underperforming and adding noise.
+
+    # 4.1 XGBoost
+    xgb_model, _ = gbdt_models.train_xgboost(base_train_tree, val_tree)
+
+    # 4.2 LightGBM
+    lgbm_model, _ = gbdt_models.train_lgbm(base_train_tree, val_tree)
+
+    # ==========================================
+    # 5. TRAIN META LEARNER
+    # ==========================================
+    print("\n[Step 5] Training Meta-Learner...")
+
+    # Generate predictions on Meta-Train set to form the training data for the meta-learner
+    print("Generating predictions on Meta-Train set...")
+
+    # XGBoost Prediction
+    meta_pred_xgb = xgb_model.predict(meta_train_tree[config.TREE_FEATURES])
+
+    # LightGBM Prediction
+    meta_pred_lgbm = lgbm_model.predict(meta_train_tree[config.TREE_FEATURES])
+
+    # Stack predictions
+    meta_preds_dict = {
+        "xgb": meta_pred_xgb,
+        "lgbm": meta_pred_lgbm,
+    }
+
+    # Get targets
+    meta_targets = meta_train_tree["fare_amount"].values
+
+    # Train Meta-Learner (Ridge)
+    meta_learner = ensemble.train_meta_learner(meta_preds_dict, meta_targets)
+
+    # ==========================================
+    # 6. FINAL EVALUATION
+    # ==========================================
+    print("\n[Step 6] Final Evaluation on Hold-out Validation Set...")
+
+    # Generate base predictions on the full validation set
+    val_pred_xgb = xgb_model.predict(val_tree[config.TREE_FEATURES])
+    val_pred_lgbm = lgbm_model.predict(val_tree[config.TREE_FEATURES])
+
+    val_preds_dict = {
+        "xgb": val_pred_xgb,
+        "lgbm": val_pred_lgbm,
+    }
+
+    # Generate ensemble predictions
+    final_val_preds = ensemble.predict_meta(meta_learner, val_preds_dict)
+
+    # Compute Metric
+    y_val_true = val_tree["fare_amount"].values
+    final_rmse = utils.compute_rmse(y_val_true, final_val_preds)
+
+    print(f"Final Validation Metric: {final_rmse}")
+
+    # ==========================================
+    # 7. FAILURE ANALYSIS
+    # ==========================================
+    print("\n[Step 7] Failure Analysis...")
+
+    # Calculate absolute errors
+    errors = np.abs(y_val_true - final_val_preds)
+
+    # Use the tree validation dataframe for analysis (contains raw-ish features)
+    analysis_df = val_tree.copy()
+    analysis_df["error_magnitude"] = errors
+
+    # Calculate correlation of features with error magnitude
+    # Filter to numeric columns only
+    numeric_df = analysis_df.select_dtypes(include=[np.number])
+    correlations = numeric_df.corrwith(numeric_df["error_magnitude"]).sort_values(
+        ascending=False
+    )
+
+    print("Top 10 features correlated with prediction error:")
+    print(correlations.head(10))
+
+    # ==========================================
+    # 8. SUBMISSION GENERATION
+    # ==========================================
+    THRESHOLD = 3.3898257003113574
+
+    if final_rmse < THRESHOLD:
+        print(
+            f"\n[Step 8] Validation RMSE {final_rmse} < {THRESHOLD}. Generating Submission..."
+        )
+
+        # Generate base predictions on Test set
+        test_pred_xgb = xgb_model.predict(test_tree[config.TREE_FEATURES])
+        test_pred_lgbm = lgbm_model.predict(test_tree[config.TREE_FEATURES])
+
+        test_preds_dict = {
+            "xgb": test_pred_xgb,
+            "lgbm": test_pred_lgbm,
+        }
+
+        # Generate ensemble predictions
+        final_test_preds = ensemble.predict_meta(meta_learner, test_preds_dict)
+>>>>>>> REPLACE
+```

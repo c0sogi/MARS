@@ -1,0 +1,292 @@
+The execution failure in `runfile.py` is caused by `rasterio` failing to recognize and decode the DICOM files, likely due to a missing or incompatible GDAL driver for the `.dicom` extension. To resolve this, I will implement a robust, multi-backend image reading strategy in `library/dicom_converter.py` that attempts to use `pydicom` and `skimage` (if available) before falling back to `rasterio` and `cv2`. Additionally, I will update `library/dataset.py` to use the same robust strategy for retrieving original image dimensions, ensuring that bounding box scaling factors are calculated correctly even if one backend fails. This addresses the issue where fallback dimensions could lead to invalid bounding boxes (Cite debug_lesson_1).
+
+```diff
+library/dicom_converter.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+import cv2
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from library.config import Config
+from library.utils import get_logger
+
+logger = get_logger("dicom_converter")
+
+
+def _process_single_dicom(args):
+    """
+    Helper function to process a single DICOM file.
+    Reads using rasterio, validates, normalizes, resizes, and saves as PNG.
+
+    Args:
+        args (tuple): (src_path, dest_path, img_size)
+
+    Returns:
+        tuple: (src_path, success, error_message)
+    """
+    src_path, dest_path, img_size = args
+
+    # Cache hit check for the image file itself
+    if os.path.exists(dest_path):
+        return src_path, True, None
+
+    try:
+        # Use rasterio to read DICOM
+        # Note: rasterio requires GDAL with DICOM driver which is standard in this env
+        with rasterio.open(src_path) as src:
+            # Read the first band
+            img = src.read(1)
+
+        # --- Validation ---
+        # Ensure pixel value sum is greater than zero
+        if np.sum(img) == 0:
+            raise ValueError("Image is empty (pixel sum is 0).")
+
+        # Ensure variance is non-trivial (prevent flat images)
+        if np.var(img) < 1.0:
+            raise ValueError("Image has trivial variance (flat image).")
+
+        # --- Normalization ---
+        # Normalize to 0-255 range
+        img = img.astype(np.float32)
+        min_val = np.min(img)
+        max_val = np.max(img)
+
+        if max_val - min_val > 0:
+            img = (img - min_val) / (max_val - min_val)
+        else:
+            # This case should be caught by variance check, but as a safeguard
+            img = np.zeros_like(img)
+
+        img = (img * 255).astype(np.uint8)
+
+        # --- Resizing ---
+        if img_size is not None:
+            img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
+        # --- Saving ---
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        cv2.imwrite(dest_path, img)
+
+        return src_path, True, None
+
+    except Exception as e:
+        return src_path, False, str(e)
+=======
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+import cv2
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from library.config import Config
+from library.utils import get_logger
+
+# --- Optional Imports with robust error handling ---
+try:
+    import pydicom
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
+
+try:
+    from skimage import io as skimage_io
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+
+logger = get_logger("dicom_converter")
+
+
+def _process_single_dicom(args):
+    """
+    Helper function to process a single DICOM file.
+    Reads using pydicom, skimage, rasterio, or cv2 (in that order).
+    Validates, normalizes, resizes, and saves as PNG.
+
+    Args:
+        args (tuple): (src_path, dest_path, img_size)
+
+    Returns:
+        tuple: (src_path, success, error_message)
+    """
+    src_path, dest_path, img_size = args
+
+    # Cache hit check for the image file itself
+    if os.path.exists(dest_path):
+        return src_path, True, None
+
+    img = None
+    error_msgs = []
+
+    # --- Strategy 1: pydicom (Standard for Medical Imaging) ---
+    if HAS_PYDICOM:
+        try:
+            ds = pydicom.dcmread(src_path)
+            img = ds.pixel_array
+            # Handle Photometric Interpretation (Monochrome1 means 0 is white)
+            if hasattr(ds, "PhotometricInterpretation") and ds.PhotometricInterpretation == "MONOCHROME1":
+                img = np.max(img) - img
+        except Exception as e:
+            error_msgs.append(f"pydicom: {e}")
+
+    # --- Strategy 2: skimage (Relies on imageio/freeimage, often works) ---
+    if img is None and HAS_SKIMAGE:
+        try:
+            img = skimage_io.imread(src_path)
+        except Exception as e:
+            error_msgs.append(f"skimage: {e}")
+
+    # --- Strategy 3: rasterio (Original method) ---
+    if img is None:
+        try:
+            with rasterio.open(src_path) as src:
+                img = src.read(1)
+        except Exception as e:
+            error_msgs.append(f"rasterio: {e}")
+
+    # --- Strategy 4: OpenCV (Last resort, sometimes works with specific flags) ---
+    if img is None:
+        try:
+            # Try loading as-is (UNCHANGED might catch 16-bit)
+            img = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                error_msgs.append("cv2: Returned None")
+        except Exception as e:
+            error_msgs.append(f"cv2: {e}")
+
+    # --- Failure Check ---
+    if img is None:
+        return src_path, False, f"All readers failed. Errors: {'; '.join(error_msgs)}"
+
+    try:
+        # --- Post-Processing ---
+        # 1. Ensure 2D (H, W)
+        if img.ndim == 3:
+            # Heuristic to detect (C, H, W) vs (H, W, C)
+            # If 1st dim is small (<=4), assume Channels-First
+            if img.shape[0] <= 4:
+                img = img[0]
+            # If last dim is small, assume Channels-Last
+            elif img.shape[-1] <= 4:
+                if img.shape[-1] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                elif img.shape[-1] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
+                else:
+                    img = img[:, :, 0]
+        
+        # 2. Validation
+        if np.sum(img) == 0:
+            raise ValueError("Image is empty (pixel sum is 0).")
+        if np.var(img) < 1.0:
+            raise ValueError("Image has trivial variance (flat image).")
+
+        # 3. Normalization (Min-Max to 0-255)
+        img = img.astype(np.float32)
+        min_val = np.min(img)
+        max_val = np.max(img)
+
+        if max_val - min_val > 0:
+            img = (img - min_val) / (max_val - min_val)
+        else:
+            img = np.zeros_like(img)
+
+        img = (img * 255).astype(np.uint8)
+
+        # 4. Resizing
+        if img_size is not None:
+            img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
+        # 5. Saving
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        cv2.imwrite(dest_path, img)
+
+        return src_path, True, None
+
+    except Exception as e:
+        return src_path, False, f"Post-processing failed: {str(e)}"
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.utils import get_logger
+
+logger = get_logger("dataset")
+=======
+from library.config import Config
+from library.utils import get_logger
+
+# Optional imports for robust header reading
+try:
+    import pydicom
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
+
+try:
+    from skimage import io as skimage_io
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+
+logger = get_logger("dataset")
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Read metadata only (fast)
+        try:
+            with rasterio.open(orig_path) as src:
+                orig_h, orig_w = src.height, src.width
+        except Exception as e:
+            logger.error(f"Error reading DICOM header for {image_id}: {e}")
+            # Fallback to current image size (assuming no resize happened)
+            orig_h, orig_w = image.shape[:2]
+=======
+        # Read metadata (fast if possible)
+        orig_h, orig_w = None, None
+        
+        # Strategy 1: pydicom (Header only - fast)
+        if HAS_PYDICOM:
+            try:
+                ds = pydicom.dcmread(orig_path, stop_before_pixels=True)
+                orig_h, orig_w = ds.Rows, ds.Columns
+            except Exception:
+                pass
+        
+        # Strategy 2: rasterio
+        if orig_h is None:
+            try:
+                with rasterio.open(orig_path) as src:
+                    orig_h, orig_w = src.height, src.width
+            except Exception:
+                pass
+        
+        # Strategy 3: skimage (Slow - reads full image)
+        if orig_h is None and HAS_SKIMAGE:
+            try:
+                # Only read if absolutely necessary
+                full_img = skimage_io.imread(orig_path)
+                orig_h, orig_w = full_img.shape[:2]
+            except Exception:
+                pass
+        
+        # Fallback: Use current image size (Cite debug_lesson_1: Ensure Fallback Data Dimensions Match Metadata)
+        # Note: If we hit this, bboxes will be scaled by 1.0. If original was larger, 
+        # boxes will be out of bounds. We rely on clipping/filtering downstream to handle this safely.
+        if orig_h is None:
+            logger.warning(f"Could not read original dims for {image_id}. Using current dims (Boxes may be wrong).")
+            orig_h, orig_w = image.shape[:2]
+>>>>>>> REPLACE
+```

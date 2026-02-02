@@ -1,0 +1,690 @@
+I will optimize the solution by reverting to a robust ResNet18 U-Net architecture trained on the full dataset, removing the ineffective soft-gating mechanism and classification head as per **Cite {solution_lesson_node_00018}** and **Cite {solution_lesson_node_00009}**. I will replace the loss function with a hybrid `BCEWithLogitsLoss` + `GlobalBatchDiceLoss` to stabilize training gradients while directly optimizing the target metric, aligning with **Cite {solution_lesson_node_00018}** and **Cite {solution_lesson_node_00014}**. Finally, I will scale up training to the full dataset for 20 epochs to ensure sufficient convergence and background diversity, as recommended in **Cite {solution_lesson_node_00002}** and **Cite {solution_lesson_node_00007}**.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Duration: Minimum 20 epochs as per Idea 4
+    EPOCHS = 25
+
+    # Optimization
+    LEARNING_RATE = 5e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Loss Weights
+    # Total Loss = DiceLoss(Mask) + lambda * BCE(Prob)
+    LAMBDA_CLS = 0.2
+=======
+    # Training Duration: Minimum 20 epochs as per Idea 4
+    EPOCHS = 20
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SoftGatedResnetUNet(nn.Module):
+    """
+    Soft-Gated Multi-Task ResNet18 U-Net.
+
+    Features:
+    - ResNet18 Encoder (pre-trained).
+    - 6-Channel Input Adaptation.
+    - Parallel Classification Head for Soft Gating.
+    - U-Net Decoder with SCSE Attention.
+    - Differentiable Soft-Gating: Mask = Seg_Mask * Class_Prob.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(SoftGatedResnetUNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        # Load pre-trained ResNet18
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first convolution to accept 6 channels
+        # Original: Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        original_conv1 = self.encoder.conv1
+        self.encoder.conv1 = nn.Conv2d(
+            in_channels,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias,
+        )
+
+        # Initialize new input channels
+        # We copy the weights from the original 3 channels to the new channels to preserve pre-training info
+        with torch.no_grad():
+            self.encoder.conv1.weight[:, :3] = original_conv1.weight
+            self.encoder.conv1.weight[:, 3:] = original_conv1.weight
+
+        # ===========================
+        # Classification Head (Gating)
+        # ===========================
+        # Attached to Layer 4 (512 channels)
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+        # ===========================
+        # Decoder
+        # ===========================
+        # ResNet18 feature channels:
+        # x0 (stem): 64
+        # x1 (layer1): 64
+        # x2 (layer2): 128
+        # x3 (layer3): 256
+        # x4 (layer4): 512
+
+        # Center block (Bottleneck processing)
+        self.center = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder blocks
+        # Dec4: In 512 (from center), Skip 256 (x3) -> Out 256
+        self.dec4 = DecoderBlock(512, 256, 256)
+
+        # Dec3: In 256, Skip 128 (x2) -> Out 128
+        self.dec3 = DecoderBlock(256, 128, 128)
+
+        # Dec2: In 128, Skip 64 (x1) -> Out 64
+        self.dec2 = DecoderBlock(128, 64, 64)
+
+        # Dec1: In 64, Skip 64 (x0) -> Out 32
+        self.dec1 = DecoderBlock(64, 64, 32)
+
+        # Final Upsampling Block (to get to original resolution)
+        # Dec1 output is 1/2 resolution (128x128 for 256 input).
+        # We need one more upsample.
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # ===========================
+        # Encoder Path
+        # ===========================
+        # Stem
+        x = self.encoder.conv1(x)
+        x = self.encoder.bn1(x)
+        x0 = self.encoder.relu(x)  # x0: 64ch, 1/2 size
+
+        x = self.encoder.maxpool(x0)
+
+        # Layers
+        x1 = self.encoder.layer1(x)  # x1: 64ch, 1/4 size
+        x2 = self.encoder.layer2(x1)  # x2: 128ch, 1/8 size
+        x3 = self.encoder.layer3(x2)  # x3: 256ch, 1/16 size
+        x4 = self.encoder.layer4(x3)  # x4: 512ch, 1/32 size
+
+        # ===========================
+        # Classification Head
+        # ===========================
+        p_cls = self.cls_head(x4)  # Scalar probability [B, 1]
+
+        # ===========================
+        # Decoder Path
+        # ===========================
+        c = self.center(x4)
+
+        d4 = self.dec4(c, x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
+
+        # Segmentation Mask (Raw)
+        m_seg = self.final_conv(d1)
+
+        # ===========================
+        # Soft Gating
+        # ===========================
+        # Multiply pixel-wise mask by global classification probability
+        # p_cls is [B, 1], m_seg is [B, 1, H, W]
+        # Broadcasting handles the dimensions
+        m_final = m_seg * p_cls.view(-1, 1, 1, 1)
+
+        # Return dictionary for SoftGatedLoss
+        return {"mask": m_final, "cls": p_cls}
+=======
+class SoftGatedResnetUNet(nn.Module):
+    """
+    ResNet18 U-Net (Standard).
+    
+    Features:
+    - ResNet18 Encoder (pre-trained).
+    - 6-Channel Input Adaptation.
+    - U-Net Decoder with SCSE Attention.
+    - Outputs Logits (No Sigmoid).
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(SoftGatedResnetUNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        # Load pre-trained ResNet18
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first convolution to accept 6 channels
+        original_conv1 = self.encoder.conv1
+        self.encoder.conv1 = nn.Conv2d(
+            in_channels,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias,
+        )
+
+        # Initialize new input channels
+        with torch.no_grad():
+            self.encoder.conv1.weight[:, :3] = original_conv1.weight
+            self.encoder.conv1.weight[:, 3:] = original_conv1.weight
+
+        # ===========================
+        # Decoder
+        # ===========================
+        # Center block
+        self.center = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder blocks
+        self.dec4 = DecoderBlock(512, 256, 256)
+        self.dec3 = DecoderBlock(256, 128, 128)
+        self.dec2 = DecoderBlock(128, 64, 64)
+        self.dec1 = DecoderBlock(64, 64, 32)
+
+        # Final Upsampling Block
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            # No Sigmoid here, output logits
+        )
+
+    def forward(self, x):
+        # ===========================
+        # Encoder Path
+        # ===========================
+        x = self.encoder.conv1(x)
+        x = self.encoder.bn1(x)
+        x0 = self.encoder.relu(x)
+
+        x = self.encoder.maxpool(x0)
+
+        x1 = self.encoder.layer1(x)
+        x2 = self.encoder.layer2(x1)
+        x3 = self.encoder.layer3(x2)
+        x4 = self.encoder.layer4(x3)
+
+        # ===========================
+        # Decoder Path
+        # ===========================
+        c = self.center(x4)
+
+        d4 = self.dec4(c, x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
+
+        # Segmentation Mask (Logits)
+        m_seg = self.final_conv(d1)
+
+        return m_seg
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class SoftGatedLoss(nn.Module):
+    """
+    Composite loss function for the Soft-Gated Multi-Task architecture.
+
+    Combines:
+    1. Global Batch Dice Loss for the segmentation mask.
+    2. Binary Cross Entropy Loss for the classification head (presence/absence).
+
+    The total loss is: L_total = L_Dice + lambda * L_BCE
+    """
+
+    def __init__(self, lambda_cls=Config.LAMBDA_CLS, smooth=1e-6):
+        super(SoftGatedLoss, self).__init__()
+        self.lambda_cls = lambda_cls
+        self.dice_loss_fn = GlobalBatchDiceLoss(smooth=smooth)
+        self.bce_loss_fn = nn.BCELoss()
+
+        # storage for logging components if needed by the training loop
+        self.last_metrics = {}
+
+    def forward(self, outputs, targets):
+        """
+        Args:
+            outputs (dict): Dictionary containing model outputs:
+                - 'mask': Tensor of shape (B, 1, H, W), soft-gated probabilities.
+                - 'cls': Tensor of shape (B, 1), classification probabilities.
+            targets (torch.Tensor): Ground truth masks of shape (B, 1, H, W).
+
+        Returns:
+            torch.Tensor: The weighted total loss.
+        """
+        pred_mask = outputs["mask"]
+        pred_cls = outputs["cls"]
+
+        # 1. Segmentation Loss
+        # Global Batch Dice Loss on the final soft-gated mask
+        loss_seg = self.dice_loss_fn(pred_mask, targets)
+
+        # 2. Classification Loss
+        # Derive classification targets from the ground truth masks
+        # If a mask has any positive pixels (1), the image is positive (1).
+        # We use no_grad because the target generation is deterministic and not part of the graph
+        with torch.no_grad():
+            # view(B, -1) flattens H,W. sum(1) sums pixels per image.
+            # If sum > 0, it's a positive sample.
+            target_cls = (
+                (targets.view(targets.size(0), -1).sum(dim=1) > 0).float().view(-1, 1)
+            )
+
+        loss_cls = self.bce_loss_fn(pred_cls, target_cls)
+
+        # Total Loss
+        total_loss = loss_seg + self.lambda_cls * loss_cls
+
+        # Store metrics for logging (detached from graph)
+        self.last_metrics = {
+            "loss_total": total_loss.item(),
+            "loss_seg": loss_seg.item(),
+            "loss_cls": loss_cls.item(),
+        }
+
+        return total_loss
+=======
+class BCEDiceLoss(nn.Module):
+    """
+    Hybrid Loss: BCEWithLogitsLoss + GlobalBatchDiceLoss.
+    
+    Combines pixel-wise stability of BCE with global metric optimization of Dice.
+    """
+
+    def __init__(self, smooth=1e-6):
+        super(BCEDiceLoss, self).__init__()
+        self.bce_fn = nn.BCEWithLogitsLoss()
+        self.dice_fn = GlobalBatchDiceLoss(smooth=smooth)
+        self.last_metrics = {}
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (torch.Tensor): Model output logits.
+            targets (torch.Tensor): Ground truth masks.
+        """
+        # BCE Loss (Pixel-wise)
+        bce = self.bce_fn(logits, targets)
+
+        # Dice Loss (Global Batch)
+        # Apply sigmoid to logits for Dice calculation
+        probs = torch.sigmoid(logits)
+        dice = self.dice_fn(probs, targets)
+
+        total_loss = bce + dice
+
+        self.last_metrics = {
+            "loss_total": total_loss.item(),
+            "loss_bce": bce.item(),
+            "loss_dice": dice.item(),
+        }
+
+        return total_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    running_loss_total = 0.0
+    running_loss_seg = 0.0
+    running_loss_cls = 0.0
+
+    for i, (images, masks, _) in enumerate(dataloader):
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        # outputs is a dict: {'mask': ..., 'cls': ...}
+        outputs = model(images)
+
+        # Compute loss
+        loss = criterion(outputs, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Track metrics
+        # criterion stores the components of the last forward pass
+        metrics = criterion.last_metrics
+        running_loss_total += metrics["loss_total"]
+        running_loss_seg += metrics["loss_seg"]
+        running_loss_cls += metrics["loss_cls"]
+
+    n_batches = len(dataloader)
+    avg_loss_total = running_loss_total / n_batches
+    avg_loss_seg = running_loss_seg / n_batches
+    avg_loss_cls = running_loss_cls / n_batches
+
+    return avg_loss_total, avg_loss_seg, avg_loss_cls
+=======
+    running_loss_total = 0.0
+    running_loss_bce = 0.0
+    running_loss_dice = 0.0
+
+    for i, (images, masks, _) in enumerate(dataloader):
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(images)
+
+        # Compute loss
+        loss = criterion(outputs, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Track metrics
+        metrics = criterion.last_metrics
+        running_loss_total += metrics["loss_total"]
+        running_loss_bce += metrics["loss_bce"]
+        running_loss_dice += metrics["loss_dice"]
+
+    n_batches = len(dataloader)
+    avg_loss_total = running_loss_total / n_batches
+    avg_loss_bce = running_loss_bce / n_batches
+    avg_loss_dice = running_loss_dice / n_batches
+
+    return avg_loss_total, avg_loss_bce, avg_loss_dice
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+            outputs = model(images)
+
+            # Compute validation loss for monitoring
+            loss = criterion(outputs, masks)
+            running_loss += loss.item()
+
+            # Get predictions
+            pred_mask = outputs["mask"]  # Soft-gated mask
+
+            # Binarize for metric calculation
+            pred_binary = (pred_mask > threshold).float()
+=======
+            outputs = model(images)
+
+            # Compute validation loss for monitoring
+            loss = criterion(outputs, masks)
+            running_loss += loss.item()
+
+            # Get predictions (Logits -> Probs)
+            pred_mask = torch.sigmoid(outputs)
+
+            # Binarize for metric calculation
+            pred_binary = (pred_mask > threshold).float()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    criterion = SoftGatedLoss(lambda_cls=Config.LAMBDA_CLS)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+=======
+    criterion = BCEDiceLoss()
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Train
+        train_loss, train_seg_loss, train_cls_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_loss, val_dice = validate(
+            model, val_loader, criterion, device, threshold=Config.THRESHOLD
+        )
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics (Full Precision)
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"  LR: {current_lr:.9f}")
+        print(
+            f"  Train Loss: {train_loss:.9f} (Seg: {train_seg_loss:.9f}, Cls: {train_cls_loss:.9f})"
+        )
+=======
+        # Train
+        train_loss, train_bce_loss, train_dice_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_loss, val_dice = validate(
+            model, val_loader, criterion, device, threshold=Config.THRESHOLD
+        )
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics (Full Precision)
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"  LR: {current_lr:.9f}")
+        print(
+            f"  Train Loss: {train_loss:.9f} (BCE: {train_bce_loss:.9f}, Dice: {train_dice_loss:.9f})"
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+            # Forward pass
+            # Model returns dict: {'mask': ..., 'cls': ...}
+            outputs = model(images)
+            pred_masks = outputs["mask"]
+
+            # Apply threshold to get binary mask
+            # pred_masks is [B, 1, H, W]
+            binary_masks = (pred_masks > threshold).float()
+=======
+            # Forward pass
+            outputs = model(images)
+            pred_masks = torch.sigmoid(outputs)
+
+            # Apply threshold to get binary mask
+            # pred_masks is [B, 1, H, W]
+            binary_masks = (pred_masks > threshold).float()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.loss import SoftGatedLoss
+from library.train import train_model, validate
+from library.predict import predict
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model performance on the validation set to identify systematic errors.
+    Calculates the correlation between error magnitude (1 - Dice) and input features.
+    """
+    print("Starting failure analysis...")
+
+    # Access the dataframe from the dataset
+    # Note: val_loader.dataset is the ContrailDataset
+    meta_df = val_loader.dataset.df.copy()
+
+    # Store per-sample dice scores
+    per_sample_dice = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, (images, masks, record_ids) in enumerate(val_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            pred_masks = outputs["mask"]
+
+            # Binarize predictions
+            preds = (pred_masks > Config.THRESHOLD).float()
+=======
+from library.loss import BCEDiceLoss
+from library.train import train_model, validate
+from library.predict import predict
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model performance on the validation set to identify systematic errors.
+    Calculates the correlation between error magnitude (1 - Dice) and input features.
+    """
+    print("Starting failure analysis...")
+
+    # Access the dataframe from the dataset
+    # Note: val_loader.dataset is the ContrailDataset
+    meta_df = val_loader.dataset.df.copy()
+
+    # Store per-sample dice scores
+    per_sample_dice = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, (images, masks, record_ids) in enumerate(val_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            pred_masks = torch.sigmoid(outputs)
+
+            # Binarize predictions
+            preds = (pred_masks > Config.THRESHOLD).float()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Training
+    # We use a subset of training data (6000 samples) and 10 epochs to ensure fast execution (< 2 hours)
+    # while still allowing convergence.
+    print("=== Starting Training Phase ===")
+    train_model(epochs=10, max_samples=6000)
+
+    # 3. Validation
+    print("\n=== Starting Validation Phase ===")
+    # Load the best model saved during training
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError("Best model not found. Training may have failed.")
+
+    model = SoftGatedResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Load FULL validation set
+    val_dataset = ContrailDataset(split="validation")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    criterion = SoftGatedLoss()
+=======
+    # 2. Training
+    # Train on full dataset for 20 epochs as per Lesson 00002 and 00007
+    print("=== Starting Training Phase ===")
+    train_model(epochs=20, max_samples=None)
+
+    # 3. Validation
+    print("\n=== Starting Validation Phase ===")
+    # Load the best model saved during training
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError("Best model not found. Training may have failed.")
+
+    model = SoftGatedResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Load FULL validation set
+    val_dataset = ContrailDataset(split="validation")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    criterion = BCEDiceLoss()
+>>>>>>> REPLACE
+```

@@ -1,0 +1,394 @@
+Based on the provided lessons and the current solution's performance, I will implement the following optimizations:
+
+1.  **Architecture Simplification (Cite Lesson 70, 20, 24):** The current `MultiStageConvNeXtMIL` is overly complex and memory-intensive, forcing a small batch size. I will replace it with a `RSNAModel` using a standard `ResNet18` backbone, a non-linear 1D Convolutional context layer (Cite Lesson 27), and Instance-Level Aggregation (Cite Lesson 24). This structure is proven to be robust and efficient.
+2.  **Batch Size Optimization (Cite Lesson 72):** I will increase the `BATCH_SIZE` from 2 to 8 and revert the `IMAGE_SIZE` to `(224, 224)`. Lesson 72 highlights that batch diversity (via larger batch sizes) is more critical than marginal resolution gains for volumetric tasks.
+3.  **Metric Alignment (Cite Lesson 72, 43):** I will modify `RSNALoss` to use "unit-sum weights" (Patient=0.5, Vertebrae=0.5/7) and adjust the reduction logic to sum weighted losses per sample before averaging. This ensures the validation metric is mathematically comparable to the target threshold of ~0.0643.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- Caching ---
+    # Directory for storing preprocessed .npy files (2.5D stacks)
+    # Logic: If load_cached_data=True, read from here. Else, compute and save here.
+    CACHE_DIR = "./working/idea_14"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # --- Output Paths ---
+=======
+    # --- Caching ---
+    # Directory for storing preprocessed .npy files (2.5D stacks)
+    # Logic: If load_cached_data=True, read from here. Else, compute and save here.
+    CACHE_DIR = "./working/idea_optimized"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # --- Output Paths ---
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Data Processing Hyperparameters ---
+    # Input Dimensions
+    NUM_SLICES = 64  # Uniform sampling depth
+    IMAGE_SIZE = (256, 256)  # H, W (Divisible by 32 for ConvNeXt stages)
+    IN_CHANNELS = 3  # 2.5D Stacking (z-1, z, z+1)
+
+    # Bone Windowing Settings (Hounsfield Units)
+    WINDOW_LEVEL = 400
+    WINDOW_WIDTH = 1800
+
+    # --- Model Architecture ---
+    BACKBONE = "convnext_tiny"  # LayerNorm-native backbone for stability
+    NUM_CLASSES = 8  # C1-C7 (7) + Patient Overall (1)
+
+    # --- Training Hyperparameters ---
+    BATCH_SIZE = 2  # Reduced from 8 to 2 to prevent OOM (Cite debug_lesson_10)
+    EPOCHS = 10  # Number of training epochs
+=======
+    # --- Data Processing Hyperparameters ---
+    # Input Dimensions
+    NUM_SLICES = 64  # Uniform sampling depth
+    IMAGE_SIZE = (224, 224)  # H, W (Standard ResNet input)
+    IN_CHANNELS = 3  # 2.5D Stacking (z-1, z, z+1)
+
+    # Bone Windowing Settings (Hounsfield Units)
+    WINDOW_LEVEL = 400
+    WINDOW_WIDTH = 1800
+
+    # --- Model Architecture ---
+    BACKBONE = "resnet18"  # Cite Lesson 70: Avoid complex backbones/fusion
+    NUM_CLASSES = 8  # C1-C7 (7) + Patient Overall (1)
+
+    # --- Training Hyperparameters ---
+    BATCH_SIZE = 8  # Cite Lesson 72: Prioritize Batch Diversity
+    EPOCHS = 10  # Number of training epochs
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiStageConvNeXtMIL(nn.Module):
+    """
+    Multi-Stage Feature-Fused ConvNeXt MIL Network.
+
+    Architecture:
+    1. Backbone: ConvNeXt-Tiny (pretrained, features_only).
+    2. Multi-Stage Fusion: GAP on last 3 stages -> Concatenate.
+    3. Context: Conv1d -> LayerNorm -> GELU.
+    4. Heads: Linear projection to 8 classes per slice.
+    5. Aggregation: Global Max Pooling over slices.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Backbone
+        # Initialize ConvNeXt-Tiny with features_only=True to access intermediate stages
+        # We use in_chans=3 for the 2.5D input (z-1, z, z+1)
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            features_only=True,
+            in_chans=Config.IN_CHANNELS,
+        )
+
+        # Determine feature dimensions dynamically
+        # We use the last 3 stages (indices -3, -2, -1 which usually correspond to strides 8, 16, 32)
+        feature_info = self.backbone.feature_info.info
+        self.selected_indices = [-3, -2, -1]
+
+        total_features = 0
+        for i in self.selected_indices:
+            total_features += feature_info[i]["num_chs"]
+
+        self.fusion_dim = total_features
+
+        # 2. Context Module
+        # Non-Linear 1D Convolution: Conv1d(k=3, p=1) -> LayerNorm -> GELU
+        # Captures Z-axis dependencies
+        self.context_conv = nn.Conv1d(
+            in_channels=self.fusion_dim,
+            out_channels=self.fusion_dim,
+            kernel_size=3,
+            padding=1,
+            bias=True,
+        )
+        self.context_norm = nn.LayerNorm(self.fusion_dim)
+        self.context_act = nn.GELU()
+
+        # 3. Multi-Task Heads
+        # Project fused features to 8 logits (C1-C7, Patient Overall)
+        self.head = nn.Linear(self.fusion_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (Batch, Slices, Channels, H, W)
+        Returns:
+            logits: Tensor of shape (Batch, Num_Classes)
+        """
+        b, s, c, h, w = x.shape
+
+        # Merge Batch and Slices dimensions for backbone processing
+        # (B, S, C, H, W) -> (B*S, C, H, W)
+        x = x.view(b * s, c, h, w)
+
+        # Backbone Forward Pass
+        # Returns a list of feature maps
+        features = self.backbone(x)
+
+        # Multi-Stage Feature Fusion
+        pooled_features = []
+        for i in self.selected_indices:
+            f = features[i]  # Shape: (B*S, C_i, H_i, W_i)
+            # Global Average Pooling: (B*S, C_i, H_i, W_i) -> (B*S, C_i)
+            f = f.mean(dim=[-2, -1])
+            pooled_features.append(f)
+
+        # Concatenate features from different stages
+        # Shape: (B*S, Total_C)
+        x = torch.cat(pooled_features, dim=1)
+
+        # Reshape to restore Sequence dimension for Context Module
+        # Shape: (B, S, Total_C)
+        x = x.view(b, s, -1)
+
+        # Context Module
+        # Conv1d expects (Batch, Channels, Length)
+        x = x.permute(0, 2, 1)  # (B, Total_C, S)
+        x = self.context_conv(x)
+        x = x.permute(0, 2, 1)  # (B, S, Total_C)
+
+        # LayerNorm and Activation
+        x = self.context_norm(x)
+        x = self.context_act(x)
+
+        # Instance-Level Classification
+        # Shape: (B, S, Num_Classes)
+        logits = self.head(x)
+
+        # Aggregation (Global Max Pooling)
+        # Max pool across the slice dimension (dim=1)
+        # Shape: (B, Num_Classes)
+        logits, _ = torch.max(logits, dim=1)
+
+        return logits
+=======
+class RSNAModel(nn.Module):
+    """
+    Simplified ResNet18 MIL Network.
+    Cite Lesson 70: Avoid naive multi-stage fusion.
+    Cite Lesson 20: Use 1D Convolution for sequence context.
+    Cite Lesson 24: Instance-Level Aggregation (Classify then Pool).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Backbone
+        # ResNet18 with num_classes=0 returns pooled features (B, 512)
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+        )
+        self.feature_dim = self.backbone.num_features
+
+        # 2. Context Module (Cite Lesson 27: Non-linear context)
+        self.context = nn.Sequential(
+            nn.Conv1d(self.feature_dim, self.feature_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(self.feature_dim),
+            nn.ReLU(),
+        )
+
+        # 3. Head
+        self.head = nn.Linear(self.feature_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        b, s, c, h, w = x.shape
+        x = x.view(b * s, c, h, w)
+
+        # Backbone -> (B*S, 512)
+        x = self.backbone(x)
+
+        # Reshape for Context: (B, 512, S)
+        x = x.view(b, s, -1).permute(0, 2, 1)
+
+        # Context Smoothing
+        x = self.context(x)
+
+        # Back to (B, S, 512)
+        x = x.permute(0, 2, 1)
+
+        # Instance Classification -> (B, S, 8)
+        logits = self.head(x)
+
+        # Global Max Pooling -> (B, 8)
+        logits, _ = torch.max(logits, dim=1)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+    def __init__(self):
+        super().__init__()
+        # Use reduction='none' to apply element-wise weights before averaging
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        # Define weights: 1 for each vertebra, 7 for patient_overall
+        self.register_buffer(
+            "weights", torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 7.0])
+        )
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (torch.Tensor): Predicted logits of shape (Batch, 8).
+            targets (torch.Tensor): Ground truth labels of shape (Batch, 8).
+
+        Returns:
+            torch.Tensor: Scalar loss value (Weighted Log Loss).
+        """
+        # Calculate BCE for each element (Batch, 8)
+        loss = self.bce(logits, targets)
+
+        # Apply weights element-wise (Broadcasting)
+        weighted_loss = loss * self.weights
+
+        # Average across all rows (Batch * 8 elements)
+        return weighted_loss.mean()
+=======
+    def __init__(self):
+        super().__init__()
+        # Use reduction='none' to apply element-wise weights before averaging
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        # Define weights: 50% for patient, 50% for vertebrae (split 7 ways)
+        # Cite Lesson 72: Unit-sum weights for metric stability
+        w_patient = 0.5
+        w_vert = 0.5 / 7
+        weights = [w_vert] * 7 + [w_patient]
+        self.register_buffer("weights", torch.tensor(weights))
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (torch.Tensor): Predicted logits of shape (Batch, 8).
+            targets (torch.Tensor): Ground truth labels of shape (Batch, 8).
+
+        Returns:
+            torch.Tensor: Scalar loss value (Weighted Log Loss).
+        """
+        # Calculate BCE for each element (Batch, 8)
+        loss = self.bce(logits, targets)
+
+        # Apply weights element-wise (Broadcasting)
+        weighted_loss = loss * self.weights
+
+        # Sum across columns (classes) to get per-sample weighted loss, then mean across batch
+        return weighted_loss.sum(dim=1).mean()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, targets in enumerate(loader):
+            # Unpack tuple if loader returns (idx, (images, targets)) or just (images, targets)
+            # Based on RSNADataset, it returns (images, targets)
+            if isinstance(images, int):
+                # Handle case where enumerate was used on loader directly in loop definition
+                continue
+
+            # Correct unpacking based on standard loop: for batch_idx, (data, target) in enumerate...
+            # Here we just iterate: for data, target in loader:
+            pass
+
+    # Re-implementing loop correctly
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda"):
+                logits = model(images)
+                loss = criterion(logits, targets)
+
+            losses.update(loss.item(), images.size(0))
+=======
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda"):
+                logits = model(images)
+                loss = criterion(logits, targets)
+
+            losses.update(loss.item(), images.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MultiStageConvNeXtMIL
+from library.loss import RSNALoss
+from library.engine import fit, validate, inference
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = get_device()
+    logger = get_logger("runfile")
+
+    # 2. Load Metadata
+    if not os.path.exists(Config.TRAIN_METADATA_PATH):
+        logger.error(f"Metadata file not found: {Config.TRAIN_METADATA_PATH}")
+        return
+
+    train_df = pd.read_csv(Config.TRAIN_METADATA_PATH)
+    val_df = pd.read_csv(Config.VAL_METADATA_PATH)
+    test_df = pd.read_csv(Config.TEST_METADATA_PATH)
+
+    # 3. Create DataLoaders
+    # We create the test_loader here but do not pass it to fit() to control submission logic
+    train_loader, val_loader, test_loader = get_dataloaders(train_df, val_df, test_df)
+
+    # 4. Initialize Model and Loss
+    model = MultiStageConvNeXtMIL().to(device)
+    criterion = RSNALoss().to(device)
+=======
+from library.model import RSNAModel
+from library.loss import RSNALoss
+from library.engine import fit, validate, inference
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = get_device()
+    logger = get_logger("runfile")
+
+    # 2. Load Metadata
+    if not os.path.exists(Config.TRAIN_METADATA_PATH):
+        logger.error(f"Metadata file not found: {Config.TRAIN_METADATA_PATH}")
+        return
+
+    train_df = pd.read_csv(Config.TRAIN_METADATA_PATH)
+    val_df = pd.read_csv(Config.VAL_METADATA_PATH)
+    test_df = pd.read_csv(Config.TEST_METADATA_PATH)
+
+    # 3. Create DataLoaders
+    # We create the test_loader here but do not pass it to fit() to control submission logic
+    train_loader, val_loader, test_loader = get_dataloaders(train_df, val_df, test_df)
+
+    # 4. Initialize Model and Loss
+    model = RSNAModel().to(device)
+    criterion = RSNALoss().to(device)
+>>>>>>> REPLACE
+```

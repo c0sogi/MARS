@@ -1,0 +1,318 @@
+I will optimize the solution by reverting to the **Dual-Stream Point-Wise Residual Network (DSPRNet)** architecture, which was identified as the high-performing "Current Best" in the provided lessons.
+
+**Implementation Strategy:**
+1.  **Architecture Change (Cite Lesson 00052)**: Replace the `UCOSRNet` (which separated clinical and visual streams into output-space residuals and failed due to overfitting) with `DSPRNet`. This model processes inputs in two parallel streams:
+    *   **Stream A (Linear)**: Processes only the dominant autoregressive features (`Baseline FVC` and `Relative Time`).
+    *   **Stream B (Deep Interaction)**: Processes the complex `Image` (EfficientNet-B2) and `Tabular` features.
+    *   **Fusion**: The streams are summed in a shared latent space before the final projection.
+2.  **Latent Projection (Cite Lesson 00060)**: Ensure the Linear Stream is over-parameterized by projecting the 2 scalar inputs into a 64-dimensional latent space to match the Deep Stream, preventing optimization bottlenecks.
+3.  **Regularization (Cite Lesson 00126)**: Explicitly remove Dropout from the Deep Stream's MLP. The lesson indicates that stochastic regularization on this branch drowns out the weak visual residual signal in favor of the strong linear baseline.
+4.  **Configuration**: Maintain the proven settings: Batch Size 32 (Cite Lesson 00094), EfficientNet-B2 backbone (Cite Lesson 00071), and Radiological Windowing (Cite Lesson 00090).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    IDEA_NAME = "idea_36"
+    WORKING_DIR = os.path.join("./working", IDEA_NAME)
+=======
+    IDEA_NAME = "idea_dsprnet"
+    WORKING_DIR = os.path.join("./working", IDEA_NAME)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Dimensions
+    # Inputs: Baseline FVC, Relative Time, Age, Sex, SmokingStatus (Ordinal)
+    TABULAR_INPUT_DIM = 5
+    CLINICAL_HIDDEN_DIM = 128
+    CLINICAL_LATENT_DIM = 64
+
+    # Visual Stream
+    # EfficientNet B2 output features usually 1408, but we use GAP
+    VISUAL_LATENT_DIM = 64  # Dimension to project visual features to before fusion
+
+    # Dropout Settings
+    # Explicitly set to 0.0 for the Visual Stream as per design (Unregularized)
+    VISUAL_DROPOUT = 0.0
+=======
+    # Dimensions
+    # Inputs: Baseline FVC, Relative Time, Age, Sex, SmokingStatus (Ordinal)
+    TABULAR_INPUT_DIM = 5
+    
+    # Fusion Dimensions
+    FUSION_LATENT_DIM = 64
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalAnchor(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor.
+    Learns the baseline disease trajectory from tabular data.
+    """
+
+    def __init__(self):
+        super(ClinicalAnchor, self).__init__()
+        # Architecture: Linear(Input -> 128) -> ReLU -> Linear(128 -> 64)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(Config.TABULAR_INPUT_DIM, Config.CLINICAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.CLINICAL_HIDDEN_DIM, Config.CLINICAL_LATENT_DIM),
+        )
+
+        # Base Predictions: Linear projection to mu and sigma_logit
+        self.predictor = nn.Linear(Config.CLINICAL_LATENT_DIM, 2)
+
+    def forward(self, x):
+        # x shape: (Batch, TABULAR_INPUT_DIM)
+        h_clin = self.feature_extractor(x)  # (Batch, CLINICAL_LATENT_DIM)
+        preds = self.predictor(h_clin)  # (Batch, 2)
+
+        mu_base = preds[:, 0]
+        sigma_logit_base = preds[:, 1]
+
+        return mu_base, sigma_logit_base, h_clin
+
+
+class VisualResidual(nn.Module):
+    """
+    Stream B: Unregularized Cascaded Visual Residual.
+    Learns a conditional residual correction based on images and clinical state.
+    """
+
+    def __init__(self):
+        super(VisualResidual, self).__init__()
+
+        # Backbone: EfficientNet-B2
+        # num_classes=0 enables Global Average Pooling (GAP) automatically in timm
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            in_chans=3,
+        )
+
+        # --- Fine-Tuning Strategy ---
+        # 1. Freeze everything initially
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # 2. Unfreeze top two convolutional stages
+        # In timm efficientnet, structure is: conv_stem -> bn1 -> blocks -> conv_head -> bn2 -> classifier
+        # We unfreeze the head components and the last few blocks.
+
+        # Unfreeze Head
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Unfreeze last 2 blocks of the 'blocks' container
+        num_blocks = len(self.backbone.blocks)
+        for i in range(num_blocks - 2, num_blocks):
+            for param in self.backbone.blocks[i].parameters():
+                param.requires_grad = True
+
+        # Feature Dimension
+        self.vis_dim = self.backbone.num_features
+
+        # Projection to latent dim to balance fusion
+        self.vis_projector = nn.Linear(self.vis_dim, Config.VISUAL_LATENT_DIM)
+
+        # --- Cascaded Fusion & Projection ---
+        # Input: Concatenation of Visual Latent and Clinical Latent
+        fusion_dim = Config.VISUAL_LATENT_DIM + Config.CLINICAL_LATENT_DIM
+
+        # Residual Head: Linear projection to delta_mu and delta_sigma
+        self.residual_head = nn.Linear(fusion_dim, 2)
+
+        # --- Structural Innovation 2: Zero Initialization ---
+        # Initialize weights and biases to zero so the visual stream starts as a null-op
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+
+        # --- Structural Innovation 1: No Dropout ---
+        # No dropout layers added.
+
+    def forward(self, img, h_clin):
+        # img shape: (Batch, 3, H, W)
+        # h_clin shape: (Batch, CLINICAL_LATENT_DIM)
+
+        # Extract Visual Features
+        vis_feats = self.backbone(img)  # (Batch, vis_dim)
+
+        # Project to latent space
+        vis_latent = self.vis_projector(vis_feats)  # (Batch, VISUAL_LATENT_DIM)
+
+        # Cascaded Fusion
+        combined = torch.cat([vis_latent, h_clin], dim=1)
+
+        # Predict Residuals
+        residuals = self.residual_head(combined)
+
+        delta_mu = residuals[:, 0]
+        delta_sigma = residuals[:, 1]
+
+        return delta_mu, delta_sigma
+
+
+class UCOSRNet(nn.Module):
+    """
+    Unregularized Cascaded Output-Space Residual Network.
+    Combines Clinical Anchor and Visual Residual streams.
+    """
+
+    def __init__(self):
+        super(UCOSRNet, self).__init__()
+        self.anchor = ClinicalAnchor()
+        self.residual = VisualResidual()
+
+    def forward(self, img, tabular):
+        # --- Stream A: Clinical Anchor ---
+        mu_base, sigma_logit_base, h_clin = self.anchor(tabular)
+
+        # --- Stream B: Visual Residual ---
+        delta_mu, delta_sigma = self.residual(img, h_clin)
+
+        # --- Output Fusion ---
+        # Mean: Additive correction
+        mu_final = mu_base + delta_mu
+
+        # Uncertainty: Additive correction in logit space, then Softplus
+        # This ensures sigma is always positive and allows the residual to scale uncertainty
+        sigma_logit_final = sigma_logit_base + delta_sigma
+        sigma_final = F.softplus(sigma_logit_final) + 1e-6
+
+        return mu_final, sigma_final
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPRNet).
+    Stream A: Linear mapping of dominant autoregressive features (Baseline + Time).
+    Stream B: Deep interaction of Image + Tabular + Time.
+    Fusion: Summed in latent space.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # --- Stream A: Linear Autoregressive ---
+        # Input: Baseline FVC (idx 0) and Relative Time (idx 1)
+        # Cite Lesson 00060: Over-parameterize linear stream to match latent dim
+        self.stream_a = nn.Linear(2, Config.FUSION_LATENT_DIM)
+
+        # --- Stream B: Deep Interaction ---
+        # Backbone: EfficientNet-B2
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            in_chans=3,
+        )
+
+        # Fine-Tuning: Unfreeze top layers
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        num_blocks = len(self.backbone.blocks)
+        for i in range(num_blocks - 2, num_blocks):
+            for param in self.backbone.blocks[i].parameters():
+                param.requires_grad = True
+
+        self.vis_dim = self.backbone.num_features
+
+        # Deep Stream MLP
+        # Input: Image Features + All Tabular Features
+        # Cite Lesson 00103: Early Fusion
+        input_dim = self.vis_dim + Config.TABULAR_INPUT_DIM
+        
+        # Cite Lesson 00126: No Dropout in Deep Stream
+        self.stream_b_mlp = nn.Sequential(
+            nn.Linear(input_dim, Config.FUSION_LATENT_DIM * 2),
+            nn.ReLU(),
+            nn.Linear(Config.FUSION_LATENT_DIM * 2, Config.FUSION_LATENT_DIM),
+        )
+
+        # --- Final Head ---
+        self.head = nn.Linear(Config.FUSION_LATENT_DIM, 2)
+
+    def forward(self, img, tabular):
+        # --- Stream A ---
+        # Select Baseline FVC (0) and Relative Time (1)
+        linear_input = tabular[:, :2]
+        a_latent = self.stream_a(linear_input)
+
+        # --- Stream B ---
+        vis_feats = self.backbone(img)
+        # Concatenate Image + All Tabular
+        b_input = torch.cat([vis_feats, tabular], dim=1)
+        b_latent = self.stream_b_mlp(b_input)
+
+        # --- Fusion ---
+        # Cite Lesson 00052: Sum in latent space
+        fused = a_latent + b_latent
+
+        # --- Prediction ---
+        preds = self.head(fused)
+        mu = preds[:, 0]
+        sigma_logit = preds[:, 1]
+        sigma = F.softplus(sigma_logit) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import UCOSRNet
+=======
+from library.model import DSPRNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Model
+    device = torch.device(Config.DEVICE)
+    model = UCOSRNet().to(device)
+=======
+    # Initialize Model
+    device = torch.device(Config.DEVICE)
+    model = DSPRNet().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import UCOSRNet
+=======
+from library.model import DSPRNet
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Best Model
+    model = UCOSRNet().to(device)
+=======
+    # Load Best Model
+    model = DSPRNet().to(device)
+>>>>>>> REPLACE
+```

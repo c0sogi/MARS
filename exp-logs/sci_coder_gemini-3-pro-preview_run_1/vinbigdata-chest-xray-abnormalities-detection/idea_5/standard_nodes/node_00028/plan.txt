@@ -1,0 +1,361 @@
+I will optimize the solution by reverting the architectural regression identified in **Lesson 00027**. I will replace the `CoordConv` + FPN architecture with a **Weighted BiFPN-style Neck** and standard Convolutional heads. Additionally, applying **Lesson 00019**, I will remove the data subsampling and extend the training duration to train on the full dataset, as the lightweight EfficientNet-B0 + BiFPN architecture is efficient enough to handle the full data within the time limits.
+
+Here are the specific changes:
+1.  **`library/config.py`**: Increase `EPOCHS` to 15 and update the working directory.
+2.  **`library/model.py`**: Remove the `CoordConv` class. Implement a `WeightedFusion` class (BiFPN node). Update `SpatiallyAwareCenterNet` to use the weighted fusion neck and standard convolution heads.
+3.  **`runfile.py`**: Remove the "Fast Baseline" configuration block that subsampled the data and overrode the epoch count.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working Directory for this specific idea/experiment
+    WORK_DIR = "./working/idea_5"
+
+    # Sub-directories for artifacts
+=======
+    # Working Directory for this specific idea/experiment
+    WORK_DIR = "./working/idea_6"
+
+    # Sub-directories for artifacts
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 20
+    BATCH_SIZE = 8  # Tuned for 16GB VRAM
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 15
+    BATCH_SIZE = 8  # Tuned for 16GB VRAM
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CoordConv(nn.Module):
+    """
+    Coordinate Convolution Layer.
+    Concatenates normalized X and Y coordinate channels to the input features.
+    This provides the model with explicit spatial awareness, which is critical
+    for accurate regression of bounding box sizes and offsets.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super(CoordConv, self).__init__()
+        # Input channels + 2 (one for X coords, one for Y coords)
+        self.conv = nn.Conv2d(
+            in_channels + 2, out_channels, kernel_size, padding=padding, bias=True
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+
+        # Create coordinate grids
+        # Normalized to range [-1, 1]
+        y_coords = (
+            2.0 * torch.arange(h, device=x.device).unsqueeze(1).expand(h, w) / (h - 1.0)
+            - 1.0
+        )
+        x_coords = (
+            2.0 * torch.arange(w, device=x.device).unsqueeze(0).expand(h, w) / (w - 1.0)
+            - 1.0
+        )
+
+        # Expand to batch size and reshape to (B, 1, H, W)
+        y_coords = y_coords.view(1, 1, h, w).repeat(b, 1, 1, 1)
+        x_coords = x_coords.view(1, 1, h, w).repeat(b, 1, 1, 1)
+
+        # Concatenate original features with coordinate channels
+        out = torch.cat([x, x_coords, y_coords], dim=1)
+
+        return self.conv(out)
+
+
+class SpatiallyAwareCenterNet(nn.Module):
+    """
+    CenterNet architecture with EfficientNet-B0 backbone, FPN Neck,
+    and Spatially-Aware Decoupled Heads.
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        num_classes=Config.NUM_CLASSES,
+        pretrained=True,
+    ):
+        super(SpatiallyAwareCenterNet, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0
+        # We extract features from strides 4, 8, 16, 32
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+
+        # Get channel counts for the extracted features
+        # For EfficientNet-B0: [24, 40, 112, 320]
+        feature_info = self.backbone.feature_info
+        channels = [feature_info[i]["num_chs"] for i in (1, 2, 3, 4)]
+        c2, c3, c4, c5 = channels
+
+        # 2. Neck: FPN-style Upsampling
+        # Project all levels to a common dimension (64) and fuse top-down
+        self.neck_channels = 64
+
+        self.lat5 = nn.Conv2d(c5, self.neck_channels, 1)
+        self.lat4 = nn.Conv2d(c4, self.neck_channels, 1)
+        self.lat3 = nn.Conv2d(c3, self.neck_channels, 1)
+        self.lat2 = nn.Conv2d(c2, self.neck_channels, 1)
+
+        # 3. Decoupled Heads
+
+        # A. Heatmap Head (Classification)
+        # Standard Conv -> ReLU -> Conv
+        self.hm_head = nn.Sequential(
+            nn.Conv2d(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, num_classes, 1),
+        )
+
+        # B. Size Head (Regression) - Spatially Aware
+        # Uses CoordConv to inject spatial priors
+        self.wh_head = nn.Sequential(
+            CoordConv(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, 2, 1),
+        )
+
+        # C. Offset Head (Regression) - Spatially Aware
+        # Uses CoordConv to inject spatial priors
+        self.reg_head = nn.Sequential(
+            CoordConv(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, 2, 1),
+        )
+
+        # D. Global Classification Head (Finding vs No Finding)
+        # Attached to the deepest feature map (C5)
+        self.global_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(c5, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize Heatmap Head bias for focal loss stability
+        # -2.19 corresponds to a prior probability of 0.1
+        self.hm_head[-1].bias.data.fill_(-2.19)
+
+        # Initialize Regression Heads
+        # Use a tiny standard deviation to prevent exploding gradients at start
+        for head in [self.wh_head, self.reg_head]:
+            last_layer = head[-1]
+            last_layer.weight.data.normal_(0, 0.001)
+            last_layer.bias.data.zero_()
+
+    def forward(self, x):
+        # Extract Backbone Features
+        # c2: stride 4, c3: stride 8, c4: stride 16, c5: stride 32
+        features = self.backbone(x)
+        c2, c3, c4, c5 = features
+
+        # Global Classification (on deepest feature C5)
+        global_pred = self.global_head(c5)
+
+        # Neck: Top-down pathway
+        p5 = self.lat5(c5)
+        p4 = self.lat4(c4) + F.interpolate(p5, scale_factor=2, mode="nearest")
+        p3 = self.lat3(c3) + F.interpolate(p4, scale_factor=2, mode="nearest")
+        p2 = self.lat2(c2) + F.interpolate(p3, scale_factor=2, mode="nearest")
+
+        # Heads (on stride 4 feature map P2)
+        hm = self.hm_head(p2)
+        wh = self.wh_head(p2)
+        reg = self.reg_head(p2)
+
+        return {"hm": hm, "wh": wh, "reg": reg, "global": global_pred}
+=======
+class WeightedFusion(nn.Module):
+    """
+    Weighted Feature Fusion Block (BiFPN-inspired).
+    Fuses current level features with upsampled features from the previous level
+    using learnable scalar weights.
+    """
+    def __init__(self, channels):
+        super(WeightedFusion, self).__init__()
+        self.w1 = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=True)
+        self.w2 = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 1e-4
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x_curr, x_prev_up):
+        w1 = nn.functional.relu(self.w1)
+        w2 = nn.functional.relu(self.w2)
+        weights = w1 + w2 + self.epsilon
+        
+        # Fast normalized fusion
+        out = (w1 * x_curr + w2 * x_prev_up) / weights
+        return self.conv(out)
+
+
+class SpatiallyAwareCenterNet(nn.Module):
+    """
+    CenterNet architecture with EfficientNet-B0 backbone and Weighted BiFPN-style Neck.
+    Replaces explicit CoordConv with robust multi-scale fusion (Cite solution_lesson_node_00027).
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        num_classes=Config.NUM_CLASSES,
+        pretrained=True,
+    ):
+        super(SpatiallyAwareCenterNet, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+
+        # Get channel counts
+        feature_info = self.backbone.feature_info
+        channels = [feature_info[i]["num_chs"] for i in (1, 2, 3, 4)]
+        c2, c3, c4, c5 = channels
+
+        # 2. Neck: Weighted Feature Fusion (BiFPN-style Top-Down)
+        self.neck_channels = 64
+
+        # Lateral projections
+        self.lat5 = nn.Conv2d(c5, self.neck_channels, 1)
+        self.lat4 = nn.Conv2d(c4, self.neck_channels, 1)
+        self.lat3 = nn.Conv2d(c3, self.neck_channels, 1)
+        self.lat2 = nn.Conv2d(c2, self.neck_channels, 1)
+
+        # Weighted Fusion Blocks
+        self.fuse4 = WeightedFusion(self.neck_channels)
+        self.fuse3 = WeightedFusion(self.neck_channels)
+        self.fuse2 = WeightedFusion(self.neck_channels)
+
+        # 3. Decoupled Heads (Standard Conv2d, no CoordConv)
+
+        # A. Heatmap Head
+        self.hm_head = nn.Sequential(
+            nn.Conv2d(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, num_classes, 1),
+        )
+
+        # B. Size Head
+        self.wh_head = nn.Sequential(
+            nn.Conv2d(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, 2, 1),
+        )
+
+        # C. Offset Head
+        self.reg_head = nn.Sequential(
+            nn.Conv2d(self.neck_channels, self.neck_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.neck_channels, 2, 1),
+        )
+
+        # D. Global Classification Head
+        self.global_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(c5, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize Heatmap Head bias
+        self.hm_head[-1].bias.data.fill_(-2.19)
+
+        # Initialize Regression Heads (Cite solution_lesson_node_00023)
+        for head in [self.wh_head, self.reg_head]:
+            last_layer = head[-1]
+            last_layer.weight.data.normal_(0, 0.001)
+            last_layer.bias.data.zero_()
+
+    def forward(self, x):
+        # Backbone
+        features = self.backbone(x)
+        c2, c3, c4, c5 = features
+
+        # Global Classification
+        global_pred = self.global_head(c5)
+
+        # Neck: Weighted Top-Down Fusion
+        p5 = self.lat5(c5)
+        
+        p4_in = self.lat4(c4)
+        p4 = self.fuse4(p4_in, F.interpolate(p5, scale_factor=2, mode="nearest"))
+        
+        p3_in = self.lat3(c3)
+        p3 = self.fuse3(p3_in, F.interpolate(p4, scale_factor=2, mode="nearest"))
+        
+        p2_in = self.lat2(c2)
+        p2 = self.fuse2(p2_in, F.interpolate(p3, scale_factor=2, mode="nearest"))
+
+        # Heads
+        hm = self.hm_head(p2)
+        wh = self.wh_head(p2)
+        reg = self.reg_head(p2)
+
+        return {"hm": hm, "wh": wh, "reg": reg, "global": global_pred}
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 1. Configuration Override for Fast Baseline
+    # -------------------------------------------------------------------------
+    logger.info("Configuring for Fast Baseline execution...")
+    Config.EPOCHS = 5
+
+    # Create a subset of training data for speed
+    df_train = pd.read_csv(Config.TRAIN_META)
+    # Filter out "No finding" for training density or just sample
+    # Sampling 5000 images is reasonable for A100 in < 2 hours
+    subset_size = 5000
+    if len(df_train) > subset_size:
+        df_train_subset = df_train.sample(n=subset_size, random_state=Config.SEED)
+        subset_path = os.path.join(Config.WORK_DIR, "train_subset.csv")
+        df_train_subset.to_csv(subset_path, index=False)
+        Config.TRAIN_META = subset_path
+        logger.info(f"Subsampled training data to {subset_size} rows.")
+=======
+    # -------------------------------------------------------------------------
+    # 1. Configuration (Full Data Training)
+    # -------------------------------------------------------------------------
+    # We use the full dataset and extended epochs as per Lesson 00019/00027
+    logger.info("Configuring for Full Data execution...")
+    # Config.EPOCHS is already set in Config (15)
+>>>>>>> REPLACE
+```

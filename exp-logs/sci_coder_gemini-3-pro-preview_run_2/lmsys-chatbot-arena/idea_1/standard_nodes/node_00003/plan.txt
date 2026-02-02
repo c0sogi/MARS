@@ -1,0 +1,702 @@
+To improve the model's performance, I will transition from a frozen embedding approach to a **fine-tuned Bi-Encoder (Siamese) architecture**.
+
+**Strategy:**
+1.  **Architecture Upgrade (Cite solution_lesson_node_00001 & 00002)**: Instead of using frozen embeddings which lack quality-ranking signal, I will fine-tune the `sentence-transformers/all-MiniLM-L6-v2` backbone. I will use a Bi-Encoder structure where the Prompt, Response A, and Response B are encoded independently (sharing weights) to avoid the truncation issues associated with Cross-Encoders on long sequences.
+2.  **Data Processing**: I will replace the static embedding generation with a `TokenizedDataset` that tokenizes inputs on-the-fly (or pre-tokenizes into memory) using `AutoTokenizer`. This ensures the fine-tuning process has access to the raw token IDs.
+3.  **Hyperparameter Optimization**: I will lower the learning rate to `2e-5` and reduce the batch size to `16` to accommodate the gradients of the transformer backbone within the GPU memory, while setting epochs to `3` to prevent overfitting given the small dataset size relative to the model capacity.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # MLP Head Configuration
+    # Input dim will be EMBEDDING_DIM * 4 (Prompt, ResA, ResB, Diff, Prod -> Wait, idea says:
+    # 1. Prompt, 2. ResA, 3. ResB.
+    # Plus interaction: Diff (A-B) and Prod (A*B).
+    # Total vectors: Prompt(1) + ResA(1) + ResB(1) + Diff(1) + Prod(1) = 5 vectors?
+    # Or Prompt, ResA, ResB, Diff, Prod.
+    # Let's assume the feature builder will concatenate these.
+    # 5 * 384 = 1920 input features.
+    HIDDEN_LAYERS = [1024, 512, 256]
+    DROPOUT_RATE = 0.3
+    NUM_CLASSES = 3  # Winner A, Winner B, Tie
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 256
+    LEARNING_RATE = 1e-3
+    EPOCHS = 50
+    EARLY_STOPPING_PATIENCE = 5
+=======
+    # MLP Head Configuration
+    HIDDEN_LAYERS = [1024, 512, 256]
+    DROPOUT_RATE = 0.3
+    NUM_CLASSES = 3  # Winner A, Winner B, Tie
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 16
+    LEARNING_RATE = 2e-5
+    EPOCHS = 3
+    EARLY_STOPPING_PATIENCE = 2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+class ChatbotMLP(nn.Module):
+    """
+    Multi-Layer Perceptron (MLP) for Chatbot Preference Prediction.
+
+    This model is designed to work with pre-computed embeddings (Frozen Siamese Transformer approach).
+    It takes a dense feature vector as input—constructed from the prompt embedding,
+    response embeddings, and their interactions (difference, product)—and predicts
+    the logits for the three target classes: Winner Model A, Winner Model B, and Tie.
+
+    Architecture:
+        - Input Layer: Matches the combined embedding dimension.
+        - Hidden Layers: A sequence of (Linear -> BatchNorm -> ReLU -> Dropout) blocks.
+        - Output Layer: Linear layer projecting to the number of classes.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layers: list = None,
+        dropout_rate: float = None,
+        num_classes: int = None,
+    ):
+        """
+        Initialize the ChatbotMLP model.
+
+        Args:
+            input_dim (int): The size of the input feature vector.
+            hidden_layers (list, optional): List of integers defining the size of each hidden layer.
+                                            Defaults to Config.HIDDEN_LAYERS.
+            dropout_rate (float, optional): The dropout probability. Defaults to Config.DROPOUT_RATE.
+            num_classes (int, optional): The number of output classes. Defaults to Config.NUM_CLASSES.
+        """
+        super(ChatbotMLP, self).__init__()
+
+        # Set defaults from Config if arguments are not provided
+        if hidden_layers is None:
+            hidden_layers = Config.HIDDEN_LAYERS
+        if dropout_rate is None:
+            dropout_rate = Config.DROPOUT_RATE
+        if num_classes is None:
+            num_classes = Config.NUM_CLASSES
+
+        layers = []
+        current_dim = input_dim
+
+        # Build hidden layers
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = h_dim
+
+        # Output layer
+        layers.append(nn.Linear(current_dim, num_classes))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input feature tensor of shape (batch_size, input_dim).
+
+        Returns:
+            torch.Tensor: Output logits of shape (batch_size, num_classes).
+        """
+        return self.network(x)
+=======
+import torch
+import torch.nn as nn
+from transformers import AutoModel
+from library.config import Config
+
+
+class ChatbotBiEncoder(nn.Module):
+    """
+    Bi-Encoder (Siamese) Architecture for Chatbot Preference Prediction.
+    
+    Encodes Prompt, Response A, and Response B independently using a shared Transformer backbone.
+    Constructs a feature vector from the pooled embeddings and their interactions,
+    then passes it through a classification head.
+    
+    Cite solution_lesson_node_00001: Fine-tuning the encoder instead of using frozen embeddings.
+    Cite solution_lesson_node_00002: Using Bi-Encoder to avoid truncation issues with long sequences.
+    """
+
+    def __init__(
+        self,
+        model_name: str = Config.TRANSFORMER_MODEL,
+        hidden_layers: list = None,
+        dropout_rate: float = None,
+        num_classes: int = None,
+    ):
+        super(ChatbotBiEncoder, self).__init__()
+
+        # Load Transformer Backbone
+        self.backbone = AutoModel.from_pretrained(model_name)
+        embedding_dim = self.backbone.config.hidden_size
+
+        # Set defaults
+        if hidden_layers is None:
+            hidden_layers = Config.HIDDEN_LAYERS
+        if dropout_rate is None:
+            dropout_rate = Config.DROPOUT_RATE
+        if num_classes is None:
+            num_classes = Config.NUM_CLASSES
+
+        # Input dim: Prompt + ResA + ResB + Diff + Prod
+        input_dim = embedding_dim * 5
+
+        # Classification Head
+        layers = []
+        current_dim = input_dim
+
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = h_dim
+
+        layers.append(nn.Linear(current_dim, num_classes))
+        self.head = nn.Sequential(*layers)
+
+    def mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output.last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    def forward(self, features: dict) -> torch.Tensor:
+        """
+        Forward pass.
+        Args:
+            features (dict): Dictionary containing input_ids and attention_mask for 'prompt', 'res_a', 'res_b'.
+        """
+        # Encode Prompt
+        p_out = self.backbone(input_ids=features['prompt_input_ids'], attention_mask=features['prompt_attention_mask'])
+        p_emb = self.mean_pooling(p_out, features['prompt_attention_mask'])
+
+        # Encode Response A
+        a_out = self.backbone(input_ids=features['res_a_input_ids'], attention_mask=features['res_a_attention_mask'])
+        a_emb = self.mean_pooling(a_out, features['res_a_attention_mask'])
+
+        # Encode Response B
+        b_out = self.backbone(input_ids=features['res_b_input_ids'], attention_mask=features['res_b_attention_mask'])
+        b_emb = self.mean_pooling(b_out, features['res_b_attention_mask'])
+
+        # Interactions
+        diff = torch.abs(a_emb - b_emb)
+        prod = a_emb * b_emb
+
+        # Concatenate
+        combined = torch.cat([p_emb, a_emb, b_emb, diff, prod], dim=1)
+
+        # Classify
+        return self.head(combined)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
+from library.config import Config
+from library.utils import get_logger
+
+# Initialize logger
+logger = get_logger("data_processing")
+
+
+class TextVectorizer:
+    """
+    Wrapper for SentenceTransformer to encode text into embeddings.
+    """
+
+    def __init__(self, model_name=Config.TRANSFORMER_MODEL, device=Config.DEVICE):
+        self.device = device
+        logger.info(f"Loading SentenceTransformer: {model_name} on {self.device}")
+        self.model = SentenceTransformer(model_name, device=self.device)
+        self.model.max_seq_length = Config.MAX_LENGTH
+
+    def encode(self, texts, batch_size=256, show_progress_bar=False):
+        """
+        Encodes a list of texts into numpy embeddings.
+        """
+        # Ensure texts is a list
+        if isinstance(texts, pd.Series):
+            texts = texts.tolist()
+
+        # Handle potential NaNs by replacing with empty string
+        texts = [str(t) if pd.notna(t) else "" for t in texts]
+
+        embeddings = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_numpy=True,
+            normalize_embeddings=True,  # Normalize for better cosine/dot product properties in interaction features
+        )
+        return embeddings
+
+
+class ChatbotDataset(Dataset):
+    """
+    PyTorch Dataset for Chatbot Preference Prediction.
+    Constructs feature vectors from pre-computed embeddings on the fly.
+    """
+
+    def __init__(self, prompt_emb, res_a_emb, res_b_emb, targets=None):
+        self.prompt_emb = prompt_emb
+        self.res_a_emb = res_a_emb
+        self.res_b_emb = res_b_emb
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.prompt_emb)
+
+    def __getitem__(self, idx):
+        # Retrieve embeddings
+        p = self.prompt_emb[idx]
+        a = self.res_a_emb[idx]
+        b = self.res_b_emb[idx]
+
+        # Compute interaction features
+        diff = a - b
+        prod = a * b
+
+        # Concatenate all features: [Prompt, ResA, ResB, Diff, Prod]
+        # Shape: (EMBEDDING_DIM * 5, )
+        features = np.concatenate([p, a, b, diff, prod], axis=0)
+
+        # Convert to tensor
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+
+        if self.targets is not None:
+            target = self.targets[idx]
+            return features_tensor, torch.tensor(target, dtype=torch.long)
+        else:
+            return features_tensor
+
+
+def get_embeddings_for_split(df, split_name, vectorizer, load_cached_data):
+    """
+    Handles caching logic: loads embeddings from disk if available/requested,
+    otherwise computes them and saves to disk.
+    """
+    cache_file = os.path.join(Config.WORKING_DIR, f"{split_name}_embeddings.npz")
+
+    # Try loading from cache
+    if load_cached_data and os.path.exists(cache_file):
+        logger.info(f"Loading cached embeddings for {split_name} from {cache_file}")
+        try:
+            data = np.load(cache_file)
+            return data["prompt"], data["res_a"], data["res_b"]
+        except Exception as e:
+            logger.warning(
+                f"Failed to load cache for {split_name}: {e}. Recomputing..."
+            )
+
+    # Compute embeddings
+    logger.info(f"Computing embeddings for {split_name}...")
+    prompt_emb = vectorizer.encode(df["prompt"], show_progress_bar=False)
+    res_a_emb = vectorizer.encode(df["response_a"], show_progress_bar=False)
+    res_b_emb = vectorizer.encode(df["response_b"], show_progress_bar=False)
+
+    # Save to cache
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+    np.savez(cache_file, prompt=prompt_emb, res_a=res_a_emb, res_b=res_b_emb)
+    logger.info(f"Saved embeddings for {split_name} to {cache_file}")
+
+    return prompt_emb, res_a_emb, res_b_emb
+
+
+def create_dataloaders(batch_size=Config.BATCH_SIZE, load_cached_data=True):
+    """
+    Main function to prepare DataLoaders for Train, Val, and Test.
+    """
+    logger.info("Starting data processing...")
+
+    # 1. Load Metadata
+    train_df = pd.read_csv(Config.TRAIN_DATA_PATH)
+    val_df = pd.read_csv(Config.VAL_DATA_PATH)
+    test_df = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Debug Mode: Subsample
+    if Config.DEBUG:
+        logger.info(
+            f"DEBUG mode enabled. Subsampling to {Config.DEBUG_SAMPLE_SIZE} rows."
+        )
+        train_df = train_df.head(Config.DEBUG_SAMPLE_SIZE)
+        val_df = val_df.head(Config.DEBUG_SAMPLE_SIZE)
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Initialize Vectorizer
+    # We only need the vectorizer if we are NOT loading everything from cache,
+    # but since we process splits sequentially, we initialize it once.
+    # To save memory, we could initialize it inside get_embeddings_for_split only if needed,
+    # but keeping it here is cleaner.
+    vectorizer = TextVectorizer()
+
+    # 3. Process Splits
+
+    # --- Train ---
+    t_p, t_a, t_b = get_embeddings_for_split(
+        train_df, "train", vectorizer, load_cached_data
+    )
+    # Convert one-hot targets to class indices
+    # 0: Model A, 1: Model B, 2: Tie
+    # Assuming columns: winner_model_a, winner_model_b, winner_tie
+    train_targets = np.argmax(
+        train_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1
+    )
+
+    train_dataset = ChatbotDataset(t_p, t_a, t_b, train_targets)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # --- Validation ---
+    v_p, v_a, v_b = get_embeddings_for_split(
+        val_df, "val", vectorizer, load_cached_data
+    )
+    val_targets = np.argmax(
+        val_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1
+    )
+
+    val_dataset = ChatbotDataset(v_p, v_a, v_b, val_targets)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # --- Test ---
+    test_p, test_a, test_b = get_embeddings_for_split(
+        test_df, "test", vectorizer, load_cached_data
+    )
+    # Test set has no targets
+    test_dataset = ChatbotDataset(test_p, test_a, test_b, targets=None)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    logger.info("DataLoaders created successfully.")
+    return train_loader, val_loader, test_loader
+=======
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from library.config import Config
+from library.utils import get_logger
+
+# Initialize logger
+logger = get_logger("data_processing")
+
+
+class TokenizedDataset(Dataset):
+    """
+    Dataset that holds pre-tokenized tensors.
+    """
+    def __init__(self, encodings, targets=None):
+        self.encodings = encodings
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.encodings['prompt_input_ids'])
+
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        if self.targets is not None:
+            return item, torch.tensor(self.targets[idx], dtype=torch.long)
+        return item
+
+
+def tokenize_data(df, tokenizer):
+    """
+    Tokenizes Prompt, ResA, and ResB columns.
+    """
+    # Helper to tokenize a list of texts
+    def tokenize_list(texts):
+        return tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=Config.MAX_LENGTH,
+            return_tensors="pt"
+        )
+
+    # Handle NaNs
+    prompts = df["prompt"].fillna("").astype(str).tolist()
+    res_a = df["response_a"].fillna("").astype(str).tolist()
+    res_b = df["response_b"].fillna("").astype(str).tolist()
+
+    logger.info("Tokenizing prompts...")
+    p_enc = tokenize_list(prompts)
+    logger.info("Tokenizing response A...")
+    a_enc = tokenize_list(res_a)
+    logger.info("Tokenizing response B...")
+    b_enc = tokenize_list(res_b)
+
+    return {
+        'prompt_input_ids': p_enc['input_ids'],
+        'prompt_attention_mask': p_enc['attention_mask'],
+        'res_a_input_ids': a_enc['input_ids'],
+        'res_a_attention_mask': a_enc['attention_mask'],
+        'res_b_input_ids': b_enc['input_ids'],
+        'res_b_attention_mask': b_enc['attention_mask']
+    }
+
+
+def create_dataloaders(batch_size=Config.BATCH_SIZE, load_cached_data=False):
+    """
+    Main function to prepare DataLoaders for Train, Val, and Test.
+    Note: load_cached_data is ignored as we now fine-tune and tokenize on the fly/in-memory.
+    """
+    logger.info("Starting data processing (Fine-tuning Bi-Encoder)...")
+
+    # 1. Load Metadata
+    train_df = pd.read_csv(Config.TRAIN_DATA_PATH)
+    val_df = pd.read_csv(Config.VAL_DATA_PATH)
+    test_df = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Debug Mode
+    if Config.DEBUG:
+        logger.info(f"DEBUG mode enabled. Subsampling to {Config.DEBUG_SAMPLE_SIZE} rows.")
+        train_df = train_df.head(Config.DEBUG_SAMPLE_SIZE)
+        val_df = val_df.head(Config.DEBUG_SAMPLE_SIZE)
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Initialize Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(Config.TRANSFORMER_MODEL)
+
+    # 3. Prepare Datasets
+    # Train
+    train_enc = tokenize_data(train_df, tokenizer)
+    train_targets = np.argmax(train_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1)
+    train_dataset = TokenizedDataset(train_enc, train_targets)
+
+    # Val
+    val_enc = tokenize_data(val_df, tokenizer)
+    val_targets = np.argmax(val_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1)
+    val_dataset = TokenizedDataset(val_enc, val_targets)
+
+    # Test
+    test_enc = tokenize_data(test_df, tokenizer)
+    test_dataset = TokenizedDataset(test_enc, targets=None)
+
+    # 4. Create Loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=Config.NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=Config.NUM_WORKERS, pin_memory=True)
+
+    logger.info("DataLoaders created successfully.")
+    return train_loader, val_loader, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        for features, targets in self.train_loader:
+            features = features.to(self.device)
+            targets = targets.to(self.device)
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+=======
+        for features, targets in self.train_loader:
+            # Handle dictionary inputs
+            if isinstance(features, dict):
+                features = {k: v.to(self.device) for k, v in features.items()}
+            else:
+                features = features.to(self.device)
+            
+            targets = targets.to(self.device)
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Accumulate loss (multiply by batch size to handle last batch correctly)
+            batch_size = features.size(0)
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+=======
+            # Accumulate loss (multiply by batch size to handle last batch correctly)
+            # If features is dict, get batch size from one value
+            if isinstance(features, dict):
+                batch_size = next(iter(features.values())).size(0)
+            else:
+                batch_size = features.size(0)
+                
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        with torch.no_grad():
+            for features, targets in self.val_loader:
+                features = features.to(self.device)
+                targets = targets.to(self.device)
+
+                logits = self.model(features)
+                loss = self.criterion(logits, targets)
+
+                batch_size = features.size(0)
+                running_loss += loss.item() * batch_size
+                dataset_size += batch_size
+=======
+        with torch.no_grad():
+            for features, targets in self.val_loader:
+                if isinstance(features, dict):
+                    features = {k: v.to(self.device) for k, v in features.items()}
+                    batch_size = next(iter(features.values())).size(0)
+                else:
+                    features = features.to(self.device)
+                    batch_size = features.size(0)
+
+                targets = targets.to(self.device)
+
+                logits = self.model(features)
+                loss = self.criterion(logits, targets)
+
+                running_loss += loss.item() * batch_size
+                dataset_size += batch_size
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Inference loop
+        with torch.no_grad():
+            for features in self.test_loader:
+                features = features.to(self.device)
+
+                # Forward pass
+                logits = self.model(features)
+=======
+        # Inference loop
+        with torch.no_grad():
+            for features in self.test_loader:
+                if isinstance(features, dict):
+                    features = {k: v.to(self.device) for k, v in features.items()}
+                else:
+                    features = features.to(self.device)
+
+                # Forward pass
+                logits = self.model(features)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.data_processing import create_dataloaders
+from library.model import ChatbotMLP
+from library.trainer import ModelTrainer
+=======
+from library.data_processing import create_dataloaders
+from library.model import ChatbotBiEncoder
+from library.trainer import ModelTrainer
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 1. Compute Loss per sample
+    with torch.no_grad():
+        for features, targets in val_loader:
+            features = features.to(device)
+            targets = targets.to(device)
+
+            logits = model(features)
+            # Calculate loss per sample (no reduction)
+            losses = criterion(logits, targets)
+            all_losses.extend(losses.cpu().numpy())
+=======
+    # 1. Compute Loss per sample
+    with torch.no_grad():
+        for features, targets in val_loader:
+            if isinstance(features, dict):
+                features = {k: v.to(device) for k, v in features.items()}
+            else:
+                features = features.to(device)
+                
+            targets = targets.to(device)
+
+            logits = model(features)
+            # Calculate loss per sample (no reduction)
+            losses = criterion(logits, targets)
+            all_losses.extend(losses.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- 3. Model Initialization ---
+    # Input dimension = 5 vectors (Prompt, ResA, ResB, Diff, Prod) * Embedding Dim
+    input_dim = Config.EMBEDDING_DIM * 5
+    logger.info(f"Initializing ChatbotMLP with input dim: {input_dim}")
+
+    model = ChatbotMLP(
+        input_dim=input_dim,
+        hidden_layers=Config.HIDDEN_LAYERS,
+        dropout_rate=Config.DROPOUT_RATE,
+        num_classes=Config.NUM_CLASSES,
+    )
+=======
+    # --- 3. Model Initialization ---
+    logger.info(f"Initializing ChatbotBiEncoder (Fine-tuning {Config.TRANSFORMER_MODEL})")
+
+    model = ChatbotBiEncoder(
+        model_name=Config.TRANSFORMER_MODEL,
+        hidden_layers=Config.HIDDEN_LAYERS,
+        dropout_rate=Config.DROPOUT_RATE,
+        num_classes=Config.NUM_CLASSES,
+    )
+>>>>>>> REPLACE
+```

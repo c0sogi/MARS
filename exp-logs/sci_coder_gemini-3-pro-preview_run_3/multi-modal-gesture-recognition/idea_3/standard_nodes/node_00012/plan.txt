@@ -1,0 +1,623 @@
+To optimize the gesture recognition model, I will simplify the architecture by reverting to a **Bi-directional GRU (BiGRU)** without the learnable TCN refinement stage, as **deterministic post-processing** (median filtering) has been shown to outperform complex learnable refinement in this low-data regime (Cite solution_lesson_node_00011). I will also adjust the **sliding window parameters** (Window=64, Stride=32) to increase sample density (Cite solution_lesson_node_00010) and implement **median filtering** in the decoding step to smooth frame-wise predictions (Cite solution_lesson_node_00002).
+
+Here are the specific changes:
+1.  **`library/config.py`**: Reduce `WINDOW_SIZE` to 64 and `STRIDE` to 32 to match the successful baseline settings.
+2.  **`library/model.py`**: Remove `TCNRefinement` and `CascadedRefinementNet` classes, keeping only the `BiGRUEncoder`.
+3.  **`library/utils.py`**: Update `decode_predictions` to apply a median filter to the frame predictions before run-length encoding.
+4.  **`library/train.py`**: Simplify the loss function to standard CrossEntropyLoss (removing the smoothing term) and update the training loop to handle the single output of the BiGRU.
+5.  **`runfile.py`**: Update the script to instantiate `BiGRUEncoder` instead of `CascadedRefinementNet`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Sliding Window Strategy
+WINDOW_SIZE = 128  # Length of sequence window in frames
+STRIDE = 64  # Step size for sliding window (50% overlap)
+=======
+# Sliding Window Strategy
+WINDOW_SIZE = 64  # Length of sequence window in frames
+STRIDE = 32  # Step size for sliding window (50% overlap)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedResidualLayer(nn.Module):
+    """
+    A single dilated convolutional layer with residual connection.
+    Used in the TCN Refinement stage.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super(DilatedResidualLayer, self).__init__()
+
+        # Calculate padding to maintain temporal dimension (centered)
+        # padding = (kernel_size - 1) * dilation / 2
+        self.padding = (kernel_size - 1) * dilation // 2
+
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            dilation=dilation,
+            padding=self.padding,
+        )
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Time)
+        out = self.conv(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        # Residual connection
+        return x + out
+
+
+class TCNRefinement(nn.Module):
+    """
+    Stage 2: Temporal Refinement Module using Dilated TCN.
+    Takes class probabilities from Stage 1 and refines them.
+    """
+
+    def __init__(self):
+        super(TCNRefinement, self).__init__()
+
+        layers = []
+        num_channels = TCN_NUM_CHANNELS
+        kernel_size = TCN_KERNEL_SIZE
+        dropout = TCN_DROPOUT
+
+        # Input projection: Map from NumClasses (probabilities) to TCN hidden dim
+        # We assume the first layer in TCN_NUM_CHANNELS defines the hidden dim
+        hidden_dim = num_channels[0]
+        self.conv_in = nn.Conv1d(NUM_CLASSES, hidden_dim, 1)
+
+        # Stack dilated layers
+        for i, out_channels in enumerate(num_channels):
+            dilation = 2**i  # 1, 2, 4, 8...
+            layers.append(
+                DilatedResidualLayer(
+                    hidden_dim, out_channels, kernel_size, dilation, dropout
+                )
+            )
+            hidden_dim = out_channels  # Update for next layer if channels vary
+
+        self.layers = nn.ModuleList(layers)
+
+        # Output projection: Map back to NumClasses
+        self.conv_out = nn.Conv1d(hidden_dim, NUM_CLASSES, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, NumClasses, Time) - These are probabilities from Stage 1
+
+        out = self.conv_in(x)
+
+        for layer in self.layers:
+            out = layer(out)
+
+        out = self.conv_out(out)
+
+        return out
+
+
+class CascadedRefinementNet(nn.Module):
+    """
+    Cascaded Recurrent-Convolutional Refinement Network.
+    Combines BiGRUEncoder (Stage 1) and TCNRefinement (Stage 2).
+    """
+
+    def __init__(self):
+        super(CascadedRefinementNet, self).__init__()
+        self.stage1 = BiGRUEncoder()
+        self.stage2 = TCNRefinement()
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, Time, InputDim)
+
+        Returns:
+            stage1_logits (torch.Tensor): Output from BiGRU, shape (Batch, Time, NumClasses)
+            stage2_logits (torch.Tensor): Output from TCN, shape (Batch, Time, NumClasses)
+        """
+        # --- Stage 1: Bi-GRU ---
+        # Get logits: (Batch, Time, NumClasses)
+        s1_logits = self.stage1(x)
+
+        # Convert logits to probabilities for Stage 2 input
+        # Detach ensures gradients don't flow back through the soft input to Stage 1
+        # (optional, but often helpful for stability, though end-to-end is also valid.
+        # Here we allow end-to-end training as per prompt description).
+        s1_probs = F.softmax(s1_logits, dim=2)
+
+        # --- Stage 2: TCN Refinement ---
+        # TCN expects (Batch, Channels, Time)
+        s1_probs_t = s1_probs.permute(0, 2, 1)
+
+        # Forward through TCN
+        s2_logits_t = self.stage2(s1_probs_t)
+
+        # Permute back to (Batch, Time, NumClasses)
+        s2_logits = s2_logits_t.permute(0, 2, 1)
+
+        return s1_logits, s2_logits
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import itertools
+from nltk import edit_distance
+from library.config import set_seed
+
+
+def decode_predictions(frame_probs):
+    """
+    Decodes frame-wise probabilities or indices into a sequence of gesture IDs.
+
+    Applies argmax (if probabilities are provided), collapses consecutive
+    duplicates (Run-Length Encoding), and removes the background class (0).
+
+    Args:
+        frame_probs (np.ndarray): Array of shape (T, NumClasses) containing probabilities/logits,
+                                  or shape (T,) containing class indices.
+
+    Returns:
+        list: Ordered list of recognized gesture IDs (integers), excluding background.
+    """
+    # Convert to numpy if it's a tensor (just in case, though numpy is expected)
+    if hasattr(frame_probs, "cpu"):
+        frame_probs = frame_probs.cpu().numpy()
+
+    # If input is probabilities (2D), take argmax to get indices
+    if frame_probs.ndim > 1:
+        frame_preds = np.argmax(frame_probs, axis=-1)
+    else:
+        frame_preds = frame_probs
+
+    # Run-Length Encoding: collapse consecutive duplicates
+    # e.g., [0, 0, 1, 1, 0, 2, 2] -> [0, 1, 0, 2]
+    collapsed = [k for k, g in itertools.groupby(frame_preds)]
+
+    # Filter out background (class 0)
+    final_sequence = [int(x) for x in collapsed if x != 0]
+
+    return final_sequence
+=======
+import os
+import numpy as np
+import itertools
+from scipy.signal import medfilt
+from nltk import edit_distance
+from library.config import set_seed
+
+
+def decode_predictions(frame_probs, filter_size=7):
+    """
+    Decodes frame-wise probabilities or indices into a sequence of gesture IDs.
+
+    Applies argmax (if probabilities are provided), Median Filtering,
+    collapses consecutive duplicates (Run-Length Encoding), and removes the background class (0).
+
+    Args:
+        frame_probs (np.ndarray): Array of shape (T, NumClasses) containing probabilities/logits,
+                                  or shape (T,) containing class indices.
+        filter_size (int): Kernel size for median filtering.
+
+    Returns:
+        list: Ordered list of recognized gesture IDs (integers), excluding background.
+    """
+    # Convert to numpy if it's a tensor (just in case, though numpy is expected)
+    if hasattr(frame_probs, "cpu"):
+        frame_probs = frame_probs.cpu().numpy()
+
+    # If input is probabilities (2D), take argmax to get indices
+    if frame_probs.ndim > 1:
+        frame_preds = np.argmax(frame_probs, axis=-1)
+    else:
+        frame_preds = frame_probs
+
+    # Median Filter to smooth predictions
+    frame_preds = medfilt(frame_preds, kernel_size=filter_size).astype(int)
+
+    # Run-Length Encoding: collapse consecutive duplicates
+    # e.g., [0, 0, 1, 1, 0, 2, 2] -> [0, 1, 0, 2]
+    collapsed = [k for k, g in itertools.groupby(frame_preds)]
+
+    # Filter out background (class 0)
+    final_sequence = [int(x) for x in collapsed if x != 0]
+
+    return final_sequence
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import CascadedRefinementNet
+
+
+def compute_loss(s1_logits, s2_logits, targets, criterion_ce):
+    """
+    Computes the combined loss for the Cascaded Refinement Network.
+
+    Args:
+        s1_logits: Output from Stage 1 (Batch, Time, NumClasses)
+        s2_logits: Output from Stage 2 (Batch, Time, NumClasses)
+        targets: Ground truth labels (Batch, Time)
+        criterion_ce: Weighted CrossEntropyLoss instance
+
+    Returns:
+        total_loss, loss_s1, loss_s2, loss_smooth
+    """
+    # Flatten for CrossEntropy: (Batch * Time, NumClasses) vs (Batch * Time)
+    batch_size, time_steps, num_classes = s1_logits.shape
+
+    s1_flat = s1_logits.reshape(-1, num_classes)
+    s2_flat = s2_logits.reshape(-1, num_classes)
+    targets_flat = targets.reshape(-1)
+
+    # 1. Classification Losses
+    loss_s1 = criterion_ce(s1_flat, targets_flat)
+    loss_s2 = criterion_ce(s2_flat, targets_flat)
+
+    # 2. Smoothing Loss (MSE on log-probs of adjacent frames for Stage 2)
+    # Get log probabilities
+    log_probs = F.log_softmax(s2_logits, dim=2)
+
+    # Calculate difference between t and t-1
+    # shape: (Batch, Time-1, NumClasses)
+    diff = log_probs[:, 1:, :] - log_probs[:, :-1, :]
+
+    # MSE of differences (encourage them to be 0)
+    loss_smooth = torch.mean(diff**2)
+
+    # Combined Loss
+    # We weight Stage 1 and Stage 2 equally for classification, plus smoothing
+    total_loss = loss_s1 + loss_s2 + (SMOOTHING_LOSS_WEIGHT * loss_smooth)
+
+    return total_loss, loss_s1, loss_s2, loss_smooth
+
+
+def train_epoch(model, loader, optimizer, criterion_ce, device):
+    """
+    Runs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (inputs, targets) in enumerate(loader):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        s1_logits, s2_logits = model(inputs)
+
+        # Compute loss
+        loss, l1, l2, l_smooth = compute_loss(
+            s1_logits, s2_logits, targets, criterion_ce
+        )
+
+        # Backward pass
+        loss.backward()
+
+        # Gradient clipping to prevent exploding gradients in RNN
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    return running_loss / len(loader)
+
+
+def validate(model, loader, device):
+    """
+    Evaluates the model on the validation set using Levenshtein distance.
+    """
+    model.eval()
+
+    all_preds = []
+    all_truths = []
+
+    with torch.no_grad():
+        for inputs, targets, sample_id in loader:
+            inputs = inputs.to(device)
+            # targets is (Batch, Time)
+
+            # Forward pass
+            _, s2_logits = model(inputs)
+
+            # Use Stage 2 output for final prediction
+            # s2_logits shape: (1, Time, NumClasses)
+
+            # Decode predictions (batch size is 1 for validation)
+            # Squeeze batch dim -> (Time, NumClasses)
+            logits_seq = s2_logits.squeeze(0)
+            pred_seq = decode_predictions(logits_seq)
+
+            # Decode ground truth
+            # targets shape: (1, Time) -> squeeze -> (Time,)
+            target_seq_raw = targets.squeeze(0).cpu().numpy()
+            # We need to collapse the ground truth similarly to how we handle preds
+            # (Run-Length Encoding + Remove Background) to get the list of gestures
+            truth_seq = decode_predictions(target_seq_raw)
+            all_truths.append(truth_seq)
+
+    # Compute metric
+    score = compute_levenshtein_ratio(all_preds, all_truths)
+    return score
+
+
+def train_model():
+    """
+    Main driver function to train the Cascaded Refinement Network.
+    """
+    # Reproducibility
+    set_seed()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Data Loaders
+    train_loader, val_loader, _ = get_data_loaders()
+
+    # Model
+    model = CascadedRefinementNet().to(device)
+=======
+from library.model import BiGRUEncoder
+
+
+def compute_loss(logits, targets, criterion_ce):
+    """
+    Computes the loss for the BiGRU Network.
+
+    Args:
+        logits: Output from Model (Batch, Time, NumClasses)
+        targets: Ground truth labels (Batch, Time)
+        criterion_ce: Weighted CrossEntropyLoss instance
+
+    Returns:
+        total_loss
+    """
+    # Flatten for CrossEntropy: (Batch * Time, NumClasses) vs (Batch * Time)
+    batch_size, time_steps, num_classes = logits.shape
+
+    logits_flat = logits.reshape(-1, num_classes)
+    targets_flat = targets.reshape(-1)
+
+    # Classification Loss
+    loss = criterion_ce(logits_flat, targets_flat)
+
+    return loss
+
+
+def train_epoch(model, loader, optimizer, criterion_ce, device):
+    """
+    Runs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (inputs, targets) in enumerate(loader):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(inputs)
+
+        # Compute loss
+        loss = compute_loss(logits, targets, criterion_ce)
+
+        # Backward pass
+        loss.backward()
+
+        # Gradient clipping to prevent exploding gradients in RNN
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    return running_loss / len(loader)
+
+
+def validate(model, loader, device):
+    """
+    Evaluates the model on the validation set using Levenshtein distance.
+    """
+    model.eval()
+
+    all_preds = []
+    all_truths = []
+
+    with torch.no_grad():
+        for inputs, targets, sample_id in loader:
+            inputs = inputs.to(device)
+            # targets is (Batch, Time)
+
+            # Forward pass
+            logits = model(inputs)
+
+            # Decode predictions (batch size is 1 for validation)
+            # Squeeze batch dim -> (Time, NumClasses)
+            logits_seq = logits.squeeze(0)
+            pred_seq = decode_predictions(logits_seq)
+
+            # Decode ground truth
+            # targets shape: (1, Time) -> squeeze -> (Time,)
+            target_seq_raw = targets.squeeze(0).cpu().numpy()
+            # We need to collapse the ground truth similarly to how we handle preds
+            # (Run-Length Encoding + Remove Background) to get the list of gestures
+            truth_seq = decode_predictions(target_seq_raw)
+            all_truths.append(truth_seq)
+
+    # Compute metric
+    score = compute_levenshtein_ratio(all_preds, all_truths)
+    return score
+
+
+def train_model():
+    """
+    Main driver function to train the BiGRU Network.
+    """
+    # Reproducibility
+    set_seed()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Data Loaders
+    train_loader, val_loader, _ = get_data_loaders()
+
+    # Model
+    model = BiGRUEncoder().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import CascadedRefinementNet
+from library.train import train_model
+from library.utils import decode_predictions, compute_levenshtein_ratio, save_submission
+
+
+def main():
+    # 1. Setup
+    set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # 2. Training
+    # train_model handles the training loop, validation monitoring, and saving the best model.
+    print("Starting training pipeline...")
+    best_model_path = train_model()
+    print(f"Best model saved at: {best_model_path}")
+
+    # 3. Validation & Failure Analysis
+    print("Starting validation and failure analysis...")
+
+    # Load the best model
+    model = CascadedRefinementNet().to(device)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.eval()
+
+    # Get data loaders (using cached data)
+    _, val_loader, test_loader = get_data_loaders()
+
+    val_preds = []
+    val_truths = []
+    val_errors = []
+    val_lengths = []
+    val_num_gestures = []
+
+    with torch.no_grad():
+        for inputs, targets, sample_id in val_loader:
+            inputs = inputs.to(device)
+            # Forward pass (Stage 2 logits are the final output)
+            _, s2_logits = model(inputs)
+
+            # Decode predictions
+            # s2_logits: (1, Time, NumClasses) -> squeeze to (Time, NumClasses)
+            logits_seq = s2_logits.squeeze(0)
+            pred_seq = decode_predictions(logits_seq)
+=======
+from library.model import BiGRUEncoder
+from library.train import train_model
+from library.utils import decode_predictions, compute_levenshtein_ratio, save_submission
+
+
+def main():
+    # 1. Setup
+    set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # 2. Training
+    # train_model handles the training loop, validation monitoring, and saving the best model.
+    print("Starting training pipeline...")
+    best_model_path = train_model()
+    print(f"Best model saved at: {best_model_path}")
+
+    # 3. Validation & Failure Analysis
+    print("Starting validation and failure analysis...")
+
+    # Load the best model
+    model = BiGRUEncoder().to(device)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.eval()
+
+    # Get data loaders (using cached data)
+    _, val_loader, test_loader = get_data_loaders()
+
+    val_preds = []
+    val_truths = []
+    val_errors = []
+    val_lengths = []
+    val_num_gestures = []
+
+    with torch.no_grad():
+        for inputs, targets, sample_id in val_loader:
+            inputs = inputs.to(device)
+            # Forward pass
+            logits = model(inputs)
+
+            # Decode predictions
+            # logits: (1, Time, NumClasses) -> squeeze to (Time, NumClasses)
+            logits_seq = logits.squeeze(0)
+            pred_seq = decode_predictions(logits_seq)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        test_preds = []
+        test_ids = []
+
+        with torch.no_grad():
+            for inputs, _, sample_id_tuple in test_loader:
+                inputs = inputs.to(device)
+
+                # Forward pass
+                _, s2_logits = model(inputs)
+
+                # Decode
+                logits_seq = s2_logits.squeeze(0)
+                pred_seq = decode_predictions(logits_seq)
+
+                test_preds.append(pred_seq)
+                # sample_id_tuple is a tuple with one element per batch (batch size is 1)
+                test_ids.append(sample_id_tuple[0])
+=======
+        test_preds = []
+        test_ids = []
+
+        with torch.no_grad():
+            for inputs, _, sample_id_tuple in test_loader:
+                inputs = inputs.to(device)
+
+                # Forward pass
+                logits = model(inputs)
+
+                # Decode
+                logits_seq = logits.squeeze(0)
+                pred_seq = decode_predictions(logits_seq)
+
+                test_preds.append(pred_seq)
+                # sample_id_tuple is a tuple with one element per batch (batch size is 1)
+                test_ids.append(sample_id_tuple[0])
+>>>>>>> REPLACE
+```

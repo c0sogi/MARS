@@ -1,0 +1,567 @@
+To improve the model's performance, I will implement a strategy based on the provided lessons that favors robust, simpler attention mechanisms and extended training schedules over complex, short-term optimizations.
+
+1.  **Switch to scSE Attention**: I will replace the `CoordinateAttention` modules with **Concurrent Spatial and Channel Squeeze & Excitation (scSE)** blocks. Lesson `solution_lesson_node_00055` explicitly states that scSE outperforms Coordinate Attention for this specific task (101x101 resolution), as the direct spatial gating is more effective than factorized attention for small images.
+2.  **Restore Full Training Schedule**: I will revert the training duration from the "Fast Baseline" (45 epochs) to the full **150 epochs** (3 cycles of 50). Lesson `solution_lesson_node_00011` and `solution_lesson_node_00050` emphasize that sufficient training time is critical for convergence and effective ensembling, especially when using cyclic schedules.
+3.  **Clean Up Configuration**: I will update the configuration to reflect the use of scSE and the extended epoch count, removing the temporary overrides in the run script.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 4. Model Architecture
+    # -------------------------------------------------------------------------
+    # Deep Residual U-Net Config
+    ENCODER_FILTERS = [64, 128, 256, 512]  # Avoid 1024 bottleneck
+    DECODER_FILTERS = [256, 128, 64, 32]
+    DEEP_SUPERVISION = True
+    USE_COORD_ATTENTION = True  # Coordinate Attention in Decoder
+
+    # -------------------------------------------------------------------------
+    # 5. Training Hyperparameters
+    # -------------------------------------------------------------------------
+    NUM_EPOCHS = 150
+    BATCH_SIZE = 64  # Safe for A100 40GB with 128x128 images
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Scheduler: Cosine Annealing Warm Restarts
+    CYCLES = 3
+    EPOCHS_PER_CYCLE = 50  # 3 cycles * 50 epochs = 150 total
+
+    # -------------------------------------------------------------------------
+    # 6. Curriculum & Strategy
+    # -------------------------------------------------------------------------
+    # Phase 1: Epochs 0-100 -> BCE + Dice
+    # Phase 2: Epochs 101-150 -> BCE + Lovasz-Hinge
+    LOVASZ_SWITCH_EPOCH = 100
+
+    # Stochastic Weight Averaging (SWA)
+    # Active during the end of the final cycle
+    USE_SWA = True
+    SWA_START_EPOCH = 130
+    SWA_LR = 1e-4
+=======
+    # -------------------------------------------------------------------------
+    # 4. Model Architecture
+    # -------------------------------------------------------------------------
+    # Deep Residual U-Net Config
+    ENCODER_FILTERS = [64, 128, 256, 512]  # Avoid 1024 bottleneck
+    DECODER_FILTERS = [256, 128, 64, 32]
+    DEEP_SUPERVISION = True
+    USE_SCSE = True  # Cite solution_lesson_node_00055: scSE outperforms Coordinate Attention
+
+    # -------------------------------------------------------------------------
+    # 5. Training Hyperparameters
+    # -------------------------------------------------------------------------
+    NUM_EPOCHS = 150  # Cite solution_lesson_node_00011: Extend training for convergence
+    BATCH_SIZE = 64  # Safe for A100 40GB with 128x128 images
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Scheduler: Cosine Annealing Warm Restarts
+    CYCLES = 3
+    EPOCHS_PER_CYCLE = 50  # 3 cycles * 50 epochs = 150 total
+
+    # -------------------------------------------------------------------------
+    # 6. Curriculum & Strategy
+    # -------------------------------------------------------------------------
+    # Phase 1: Epochs 0-100 -> BCE + Dice
+    # Phase 2: Epochs 101-150 -> BCE + Lovasz-Hinge
+    LOVASZ_SWITCH_EPOCH = 100
+
+    # Stochastic Weight Averaging (SWA)
+    # Active during the end of the final cycle
+    USE_SWA = True
+    SWA_START_EPOCH = 130
+    SWA_LR = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_parts.py
+<<<<<<< SEARCH
+class CoordinateAttention(nn.Module):
+    """
+    Coordinate Attention Module.
+    Factorizes attention into two parallel 1D feature encodings to capture
+    long-range dependencies along one spatial direction while preserving
+    precise positional information along the other.
+    """
+
+    def __init__(self, in_channels, reduction=32):
+        super(CoordinateAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        self.conv_h = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+
+        # Pool
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        # Concatenate along spatial dimension
+        y = torch.cat([x_h, x_w], dim=2)
+
+        # Shared 1x1 Conv
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # Split
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        # Output 1x1 Convs
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+        return out
+
+
+class DecoderBlock(nn.Module):
+    """
+    Decoder Block with Bilinear Upsampling and Coordinate Attention.
+    Performs upsampling, concatenation with skip connection, convolution,
+    and then applies attention.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels, use_coord_att=True):
+        super(DecoderBlock, self).__init__()
+
+        # We use bilinear upsampling in forward, so no layer definition needed here
+        # unless using nn.Upsample. Functional interpolate is preferred for flexibility.
+
+        # Convolution block to process fused features
+        # Input channels = upsampled channels (in_channels) + skip channels
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.use_coord_att = use_coord_att
+        if use_coord_att:
+            self.att = CoordinateAttention(out_channels)
+
+    def forward(self, x, skip=None):
+        # Bilinear Upsampling
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Handle Skip Connection
+        if skip is not None:
+            # If dimensions don't match exactly due to odd sizes, resize x to match skip
+            if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
+                x = F.interpolate(
+                    x,
+                    size=(skip.size(2), skip.size(3)),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        # Convolutions
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        # Attention
+        if self.use_coord_att:
+            x = self.att(x)
+
+        return x
+=======
+class SCSEModule(nn.Module):
+    """
+    Concurrent Spatial and Channel Squeeze & Excitation (scSE).
+    Cite solution_lesson_node_00055: Outperforms Coordinate Attention on small images.
+    Cite solution_lesson_node_00007: Enhances feature recalibration.
+    """
+
+    def __init__(self, in_channels, reduction=16):
+        super(SCSEModule, self).__init__()
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, max(1, in_channels // reduction), 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(1, in_channels // reduction), in_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.sSE = nn.Sequential(nn.Conv2d(in_channels, 1, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        return x * self.cSE(x) + x * self.sSE(x)
+
+
+class DecoderBlock(nn.Module):
+    """
+    Decoder Block with Bilinear Upsampling and scSE Attention.
+    Performs upsampling, concatenation with skip connection, convolution,
+    and then applies attention.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels, use_scse=True):
+        super(DecoderBlock, self).__init__()
+
+        # We use bilinear upsampling in forward, so no layer definition needed here
+        # unless using nn.Upsample. Functional interpolate is preferred for flexibility.
+
+        # Convolution block to process fused features
+        # Input channels = upsampled channels (in_channels) + skip channels
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.use_scse = use_scse
+        if use_scse:
+            self.att = SCSEModule(out_channels)
+
+    def forward(self, x, skip=None):
+        # Bilinear Upsampling
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Handle Skip Connection
+        if skip is not None:
+            # If dimensions don't match exactly due to odd sizes, resize x to match skip
+            if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
+                x = F.interpolate(
+                    x,
+                    size=(skip.size(2), skip.size(3)),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        # Convolutions
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        # Attention
+        if self.use_scse:
+            x = self.att(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.model_parts import ResidualBlock, DecoderBlock, CoordinateAttention
+
+
+class DeepResUNet(nn.Module):
+    """
+    Deep Residual U-Net with Coordinate Attention and Deep Supervision.
+
+    Architecture:
+    - Encoder: ResNet-style blocks with [64, 128, 256, 512] filters.
+    - Decoder: Upsampling blocks with Coordinate Attention [256, 128, 64, 32].
+    - Deep Supervision: Auxiliary heads at 32x32 and 64x64 resolutions.
+    """
+
+    def __init__(self):
+        super(DeepResUNet, self).__init__()
+
+        # Configuration
+        self.n_channels = Config.INPUT_CHANNELS
+        self.enc_filters = Config.ENCODER_FILTERS  # [64, 128, 256, 512]
+        self.dec_filters = Config.DECODER_FILTERS  # [256, 128, 64, 32]
+        self.deep_supervision = Config.DEEP_SUPERVISION
+        self.use_coord_att = Config.USE_COORD_ATTENTION
+
+        # ---------------------------------------------------------------------
+        # Encoder
+        # ---------------------------------------------------------------------
+=======
+from library.config import Config
+from library.model_parts import ResidualBlock, DecoderBlock, SCSEModule
+
+
+class DeepResUNet(nn.Module):
+    """
+    Deep Residual U-Net with scSE Attention and Deep Supervision.
+
+    Architecture:
+    - Encoder: ResNet-style blocks with [64, 128, 256, 512] filters.
+    - Decoder: Upsampling blocks with scSE Attention [256, 128, 64, 32].
+    - Deep Supervision: Auxiliary heads at 32x32 and 64x64 resolutions.
+    """
+
+    def __init__(self):
+        super(DeepResUNet, self).__init__()
+
+        # Configuration
+        self.n_channels = Config.INPUT_CHANNELS
+        self.enc_filters = Config.ENCODER_FILTERS  # [64, 128, 256, 512]
+        self.dec_filters = Config.DECODER_FILTERS  # [256, 128, 64, 32]
+        self.deep_supervision = Config.DEEP_SUPERVISION
+        self.use_scse = Config.USE_SCSE
+
+        # ---------------------------------------------------------------------
+        # Encoder
+        # ---------------------------------------------------------------------
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Dec 1: 16x16 -> 32x32 (Input: 512, Skip: 256 -> Out: 256)
+        self.dec1 = DecoderBlock(
+            self.enc_filters[3],
+            self.enc_filters[2],
+            self.dec_filters[0],
+            use_coord_att=self.use_coord_att,
+        )
+
+        # Dec 2: 32x32 -> 64x64 (Input: 256, Skip: 128 -> Out: 128)
+        self.dec2 = DecoderBlock(
+            self.dec_filters[0],
+            self.enc_filters[1],
+            self.dec_filters[1],
+            use_coord_att=self.use_coord_att,
+        )
+
+        # Dec 3: 64x64 -> 128x128 (Input: 128, Skip: 64 -> Out: 64)
+        self.dec3 = DecoderBlock(
+            self.dec_filters[1],
+            self.enc_filters[0],
+            self.dec_filters[2],
+            use_coord_att=self.use_coord_att,
+        )
+
+        # Dec 4: Final Refinement 128x128 (Input: 64 -> Out: 32)
+        # We build this manually because DecoderBlock enforces upsampling
+        self.dec4_conv1 = nn.Conv2d(
+            self.dec_filters[2],
+            self.dec_filters[3],
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.dec4_bn1 = nn.BatchNorm2d(self.dec_filters[3])
+        self.dec4_conv2 = nn.Conv2d(
+            self.dec_filters[3],
+            self.dec_filters[3],
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.dec4_bn2 = nn.BatchNorm2d(self.dec_filters[3])
+
+        if self.use_coord_att:
+            self.dec4_att = CoordinateAttention(self.dec_filters[3])
+=======
+        # Dec 1: 16x16 -> 32x32 (Input: 512, Skip: 256 -> Out: 256)
+        self.dec1 = DecoderBlock(
+            self.enc_filters[3],
+            self.enc_filters[2],
+            self.dec_filters[0],
+            use_scse=self.use_scse,
+        )
+
+        # Dec 2: 32x32 -> 64x64 (Input: 256, Skip: 128 -> Out: 128)
+        self.dec2 = DecoderBlock(
+            self.dec_filters[0],
+            self.enc_filters[1],
+            self.dec_filters[1],
+            use_scse=self.use_scse,
+        )
+
+        # Dec 3: 64x64 -> 128x128 (Input: 128, Skip: 64 -> Out: 64)
+        self.dec3 = DecoderBlock(
+            self.dec_filters[1],
+            self.enc_filters[0],
+            self.dec_filters[2],
+            use_scse=self.use_scse,
+        )
+
+        # Dec 4: Final Refinement 128x128 (Input: 64 -> Out: 32)
+        # We build this manually because DecoderBlock enforces upsampling
+        self.dec4_conv1 = nn.Conv2d(
+            self.dec_filters[2],
+            self.dec_filters[3],
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.dec4_bn1 = nn.BatchNorm2d(self.dec_filters[3])
+        self.dec4_conv2 = nn.Conv2d(
+            self.dec_filters[3],
+            self.dec_filters[3],
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.dec4_bn2 = nn.BatchNorm2d(self.dec_filters[3])
+
+        if self.use_scse:
+            self.dec4_att = SCSEModule(self.dec_filters[3])
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # --- Final Refinement ---
+        d4 = self.relu(self.dec4_bn1(self.dec4_conv1(d3)))
+        d4 = self.relu(self.dec4_bn2(self.dec4_conv2(d4)))
+
+        if self.use_coord_att:
+            d4 = self.dec4_att(d4)  # (B, 32, 128, 128)
+
+        # --- Heads ---
+=======
+        # --- Final Refinement ---
+        d4 = self.relu(self.dec4_bn1(self.dec4_conv1(d3)))
+        d4 = self.relu(self.dec4_bn2(self.dec4_conv2(d4)))
+
+        if self.use_scse:
+            d4 = self.dec4_att(d4)  # (B, 32, 128, 128)
+
+        # --- Heads ---
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # -------------------------------------------------------------------------
+    # 1. Configuration Overrides for Fast Baseline
+    # -------------------------------------------------------------------------
+    # We adjust the training schedule to fit within the time limit (Fast Baseline).
+    # We compress the 3-cycle schedule into 45 epochs (15 epochs per cycle).
+    # Cycle 1 (0-14): Dice Loss
+    # Cycle 2 (15-29): Dice Loss (Save best_cycle_2 here)
+    # Cycle 3 (30-44): Lovasz Loss (Switch at 30) + SWA (Start at 35)
+
+    Config.NUM_EPOCHS = 45
+    Config.EPOCHS_PER_CYCLE = 15
+    Config.LOVASZ_SWITCH_EPOCH = 30
+    Config.SWA_START_EPOCH = 35
+
+    # Ensure directories exist
+    Config.setup()
+    set_seed(Config.SEED)
+
+    print("--- Starting Fast Baseline Pipeline ---")
+    print(
+        f"Configuration: {Config.NUM_EPOCHS} Epochs, {Config.EPOCHS_PER_CYCLE} Epochs/Cycle"
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. Training (with Subclassed Logic for Adjusted Schedule)
+    # -------------------------------------------------------------------------
+    class FastTrainer(Trainer):
+        """
+        Subclass of Trainer to override the run loop for the compressed schedule.
+        The original Trainer has hardcoded epoch ranges for saving 'best_cycle_2'.
+        """
+
+        def run(self):
+            print(f"Starting training on device: {self.device}")
+            start_time = time.time()
+
+            # Define the window for Cycle 2 based on dynamic config
+            c2_start = Config.EPOCHS_PER_CYCLE
+            c2_end = 2 * Config.EPOCHS_PER_CYCLE
+
+            for epoch in range(Config.NUM_EPOCHS):
+                epoch_start = time.time()
+
+                # Train
+                train_loss = self.train_one_epoch(epoch)
+
+                # Step Scheduler
+                self.scheduler.step()
+
+                # Validate
+                val_loss, val_map = self.validate()
+
+                epoch_time = time.time() - epoch_start
+
+                # Silent progress per requirements (only essential info)
+                # print(f"Epoch {epoch+1} | Val mAP: {val_map:.4f}")
+
+                # 1. Overall Best Model
+                if val_map > self.best_map:
+                    self.best_map = val_map
+                    self.save_checkpoint("best_model.pth")
+
+                # 2. Best Model from Cycle 2 (Dynamic Range)
+                if c2_start <= epoch < c2_end:
+                    if val_map > self.best_cycle_2_map:
+                        self.best_cycle_2_map = val_map
+                        self.save_checkpoint("best_cycle_2.pth")
+
+            # Final SWA Update
+            if Config.USE_SWA:
+                print("Updating SWA BatchNorm statistics...")
+                self.swa_handler.update_bn(self.train_loader, device=self.device)
+                self.save_swa_checkpoint("swa_model.pth")
+
+            total_time = time.time() - start_time
+            print(f"Training Complete. Total Time: {total_time/60:.2f} mins.")
+
+    # Execute Training
+    trainer = FastTrainer()
+    trainer.run()
+=======
+def main():
+    # Ensure directories exist
+    Config.setup()
+    set_seed(Config.SEED)
+
+    print("--- Starting Full Training Pipeline ---")
+    print(
+        f"Configuration: {Config.NUM_EPOCHS} Epochs, {Config.EPOCHS_PER_CYCLE} Epochs/Cycle"
+    )
+
+    # Execute Training
+    trainer = Trainer()
+    trainer.run()
+>>>>>>> REPLACE
+```

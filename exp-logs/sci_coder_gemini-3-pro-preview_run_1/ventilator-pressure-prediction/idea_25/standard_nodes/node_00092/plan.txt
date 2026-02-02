@@ -1,0 +1,413 @@
+To improve the model's performance, I will implement a strategy based on the provided lessons, specifically targeting **Explicit Context Injection** and **Recurrent Capacity**.
+
+**Strategy:**
+1.  **Explicit Context Injection (Cite solution_lesson_node_00090, solution_lesson_node_00074, solution_lesson_node_00076):**
+    The previous solution used a learned linear projection of *all* input features to generate the context vector. I will replace this with the explicit injection of specific physical attributes (`R`, `C`) and derived interaction terms (`R_u_in`, `vol_C`) at every layer. This ensures the model has direct access to the governing physical constraints without needing to disentangle them from a compressed latent representation.
+
+2.  **Wide Bi-LSTM Capacity (Cite solution_lesson_node_00055):**
+    The previous solution restricted the Bi-LSTM hidden dimension to `hidden_dim // 2` per direction to force the output size to match the input size. I will modify the `CompositeBlock` to use `hidden_size=hidden_dim` per direction (resulting in a `2 * hidden_dim` output) and use a linear projection to map it back to the residual stream dimension. This prevents bottlenecking the recurrent state capacity.
+
+3.  **Selective Injection (Cite solution_lesson_node_00066):**
+    I will ensure that only the high-level physical features are injected deep into the network, avoiding the re-injection of raw noisy control signals (like `u_in` lags) which can degrade performance.
+
+4.  **Optimization:**
+    I will increase the training epochs to 25 to allow for fuller convergence, as the previous 15 epochs showed the model was still learning.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Feature Engineering Configuration
+    # =========================================================================
+    # Feature Completeness: Include u_out in the input features
+    INCLUDE_U_OUT_IN_INPUT = True
+
+    # Physics Fidelity: Generate interaction terms (R*u_in, Vol/C)
+    USE_PHYSICS_FEATURES = True
+
+    # Temporal Dynamics
+    USE_LAGS = True
+    LAG_STEPS = [1, 2, 3, 4]
+    USE_DIFFS = True  # First and second differences of u_in
+
+    # Scaling
+    ROBUST_SCALER_QUANTILE_RANGE = (5.0, 95.0)
+
+    # =========================================================================
+    # Model Architecture (Uniform-Capacity Physics-Composite)
+    # =========================================================================
+    # Uniform width backbone to maintain representational capacity
+    HIDDEN_DIM = 512
+
+    # Stem configuration
+    STEM_KERNEL_SIZES = [3, 5, 7]
+
+    # Backbone configuration
+    NUM_LAYERS = 4
+    FFN_EXPANSION_FACTOR = 2  # Expands to 1024 internally
+    DROPOUT = 0.1
+
+    # Residuals
+    USE_STRICT_IDENTITY = True  # No weights on skip connections where dims match
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 35  # Extended horizon for convergence
+=======
+    # =========================================================================
+    # Feature Engineering Configuration
+    # =========================================================================
+    # Feature Completeness: Include u_out in the input features
+    INCLUDE_U_OUT_IN_INPUT = True
+
+    # Physics Fidelity: Generate interaction terms (R*u_in, Vol/C)
+    USE_PHYSICS_FEATURES = True
+
+    # Temporal Dynamics
+    USE_LAGS = True
+    LAG_STEPS = [1, 2, 3, 4]
+    USE_DIFFS = True  # First and second differences of u_in
+
+    # Explicit Feature Ordering for Context Injection
+    # We define the exact order to ensure we can index R, C, etc. correctly in the model
+    FEATURE_ORDER = [
+        "R", "C", "time_step", "u_in", "u_out", "volume", 
+        "R_u_in", "vol_C", 
+        "u_in_lag1", "u_in_lag2", "u_in_lag3", "u_in_lag4", 
+        "u_in_diff1", "u_in_diff2"
+    ]
+    
+    # Features to inject deep into the network (Indices based on FEATURE_ORDER)
+    # R(0), C(1), R_u_in(6), vol_C(7)
+    CONTEXT_FEATURE_INDICES = [0, 1, 6, 7]
+
+    # Scaling
+    ROBUST_SCALER_QUANTILE_RANGE = (5.0, 95.0)
+
+    # =========================================================================
+    # Model Architecture (Uniform-Capacity Physics-Composite)
+    # =========================================================================
+    # Uniform width backbone to maintain representational capacity
+    HIDDEN_DIM = 512
+
+    # Stem configuration
+    STEM_KERNEL_SIZES = [3, 5, 7]
+
+    # Backbone configuration
+    NUM_LAYERS = 4
+    FFN_EXPANSION_FACTOR = 2  # Expands to 1024 internally
+    DROPOUT = 0.1
+
+    # Residuals
+    USE_STRICT_IDENTITY = True  # No weights on skip connections where dims match
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 25  # Optimized for A100 speed vs convergence
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # Define feature columns
+    # We exclude 'id', 'breath_id', 'pressure' from X
+    # We keep 'u_out' in X for Feature Completeness
+    feature_cols = [
+        col for col in train_df.columns if col not in ["id", "breath_id", "pressure"]
+    ]
+
+    # Identify columns to scale (exclude u_out as it is binary)
+    scale_cols = [col for col in feature_cols if col != "u_out"]
+
+    print(f"Features: {feature_cols}")
+    print(f"Scaling {len(scale_cols)} features using RobustScaler...")
+=======
+    # Define feature columns using explicit order from Config
+    # This ensures we know exactly which index corresponds to R, C, etc.
+    feature_cols = Config.FEATURE_ORDER
+    
+    # Verify all columns exist
+    missing_cols = [c for c in feature_cols if c not in train_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing columns in dataframe: {missing_cols}")
+
+    # Identify columns to scale (exclude u_out as it is binary)
+    scale_cols = [col for col in feature_cols if col != "u_out"]
+
+    print(f"Features (Ordered): {feature_cols}")
+    print(f"Scaling {len(scale_cols)} features using RobustScaler...")
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CompositeBlock(nn.Module):
+    """
+    Uniform Composite Block with Curated Context Injection and Strict Identity Residuals.
+    Maintains uniform capacity (Hidden Dim 512) throughout.
+    """
+
+    def __init__(self, hidden_dim, context_dim, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Aligned Bi-LSTM
+        # Input is hidden_state + context
+        # Hidden dim is hidden_dim // 2 per direction -> output is hidden_dim
+        # This prevents the information bottleneck seen in standard Bi-LSTMs
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim + context_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Pointwise FFN (Expansion 2x)
+        # We avoid 4x expansion to maintain stability without normalization
+        ffn_dim = hidden_dim * Config.FFN_EXPANSION_FACTOR
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context):
+        # x: (Batch, Seq, Hidden)
+        # context: (Batch, Seq, Context)
+
+        # 1. Curated Context Injection
+        # We re-inject the static/physics context at every block
+        lstm_input = torch.cat([x, context], dim=-1)
+
+        # 2. Aligned Bi-LSTM
+        lstm_out, _ = self.lstm(lstm_input)
+
+        # 3. Strict Identity Residual 1
+        # Dimensions match (512 -> 512), no linear projection on skip
+        # Dropout applied to residual branch only
+        x = x + self.dropout(lstm_out)
+
+        # 4. Pointwise FFN
+        ffn_out = self.ffn(x)
+
+        # 5. Strict Identity Residual 2
+        # No LayerNorm, preserving absolute pressure magnitude
+        x = x + self.dropout(ffn_out)
+
+        return x
+
+
+class VentilatorModel(nn.Module):
+    """
+    Feature-Complete Uniform-Capacity Physics-Composite Network.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.HIDDEN_DIM
+
+        # Context Projection
+        # Learns a compact representation of the input (physics & static features)
+        # to serve as the "Curated Context" injected into each block.
+        self.context_dim = 64
+        self.context_proj = nn.Linear(input_dim, self.context_dim)
+
+        # Stem
+        self.stem = MultiScaleStem(
+            input_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            kernel_sizes=Config.STEM_KERNEL_SIZES,
+        )
+
+        # Backbone
+        self.blocks = nn.ModuleList(
+            [
+                CompositeBlock(self.hidden_dim, self.context_dim, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # Heads
+        self.head = nn.Linear(self.hidden_dim, 1)
+        self.aux_head = nn.Linear(self.hidden_dim, 1)
+
+        # Weight Initialization
+        self._init_weights()
+=======
+class CompositeBlock(nn.Module):
+    """
+    Wide-Capacity Composite Block with Explicit Context Injection.
+    Uses full-width Bi-LSTM (Output 2*Hidden) projected back to Hidden.
+    Cite solution_lesson_node_00055: Preserving State Space Capacity.
+    """
+
+    def __init__(self, hidden_dim, context_dim, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Wide Bi-LSTM
+        # Input is hidden_state + context
+        # Hidden dim is hidden_dim per direction -> output is 2 * hidden_dim
+        # This maximizes state capacity.
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim + context_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        
+        # Projection for Residual Connection
+        # Maps 2*hidden_dim back to hidden_dim
+        self.proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
+        # Pointwise FFN (Expansion 2x)
+        ffn_dim = hidden_dim * Config.FFN_EXPANSION_FACTOR
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context):
+        # x: (Batch, Seq, Hidden)
+        # context: (Batch, Seq, Context)
+
+        # 1. Explicit Context Injection
+        # Cite solution_lesson_node_00090: Explicit Injection vs Learned Projections
+        lstm_input = torch.cat([x, context], dim=-1)
+
+        # 2. Wide Bi-LSTM
+        lstm_out, _ = self.lstm(lstm_input) # (Batch, Seq, 2*Hidden)
+        
+        # 3. Projection
+        lstm_out = self.proj(lstm_out) # (Batch, Seq, Hidden)
+
+        # 4. Residual 1
+        x = x + self.dropout(lstm_out)
+
+        # 5. Pointwise FFN
+        ffn_out = self.ffn(x)
+
+        # 6. Residual 2
+        x = x + self.dropout(ffn_out)
+
+        return x
+
+
+class VentilatorModel(nn.Module):
+    """
+    Feature-Complete Wide-Capacity Physics-Composite Network.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.HIDDEN_DIM
+        
+        # Define context indices for explicit extraction
+        self.context_indices = torch.tensor(Config.CONTEXT_FEATURE_INDICES, dtype=torch.long)
+        self.context_dim = len(Config.CONTEXT_FEATURE_INDICES)
+
+        # Stem
+        self.stem = MultiScaleStem(
+            input_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            kernel_sizes=Config.STEM_KERNEL_SIZES,
+        )
+
+        # Backbone
+        self.blocks = nn.ModuleList(
+            [
+                CompositeBlock(self.hidden_dim, self.context_dim, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # Heads
+        self.head = nn.Linear(self.hidden_dim, 1)
+        self.aux_head = nn.Linear(self.hidden_dim, 1)
+
+        # Weight Initialization
+        self._init_weights()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, x):
+        # x: (Batch, Seq, Feat)
+
+        # Generate Context Vector
+        context = self.context_proj(x)
+
+        # Stem
+        h = self.stem(x)
+
+        aux_out = None
+
+        # Backbone
+        for i, block in enumerate(self.blocks):
+            h = block(h, context)
+
+            # Deep Supervision after Block 2 (index 1)
+            # Provides gradient short-circuit
+            if i == 1:
+                aux_out = self.aux_head(h)
+
+        # Final Head
+        final_out = self.head(h)
+
+        return final_out, aux_out
+=======
+    def forward(self, x):
+        # x: (Batch, Seq, Feat)
+
+        # Extract Explicit Context
+        # Cite solution_lesson_node_00066: Filter deep injections
+        # We only inject specific physics features, not the whole input
+        context = x[:, :, self.context_indices]
+
+        # Stem
+        h = self.stem(x)
+
+        aux_out = None
+
+        # Backbone
+        for i, block in enumerate(self.blocks):
+            h = block(h, context)
+
+            # Deep Supervision after Block 2 (index 1)
+            if i == 1:
+                aux_out = self.aux_head(h)
+
+        # Final Head
+        final_out = self.head(h)
+
+        return final_out, aux_out
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- Configuration ---
+    # Override defaults for a fast baseline execution that fits within time limits
+    Config.EPOCHS = 15  # Reduced from 35 to ensure completion < 2 hours
+    Config.BATCH_SIZE = 512  # Keep high for stable updates and speed on A100
+    Config.DEBUG = False  # Use full data to ensure we meet the accuracy threshold
+=======
+    # --- Configuration ---
+    # Override defaults for a fast baseline execution that fits within time limits
+    Config.EPOCHS = 25  # Increased to 25 to ensure better convergence (Cite solution_lesson_node_00028)
+    Config.BATCH_SIZE = 512  # Keep high for stable updates and speed on A100
+    Config.DEBUG = False  # Use full data to ensure we meet the accuracy threshold
+>>>>>>> REPLACE
+```

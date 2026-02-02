@@ -1,0 +1,349 @@
+I will optimize the solution by addressing the critical issue of context truncation identified in the lesson "Context Truncation Pitfalls in Long-Document Question Answering" (Cite solution_lesson_node_00001). The previous implementation simply truncated the long contexts (avg 1676 words) to 1024 tokens, often removing the answer and making learning impossible.
+
+My strategy involves:
+1.  **Modifying `QADataset`**: I will implement two modes of data processing.
+    *   **Training (`mode='train'`)**: Instead of truncating from the start, I will implement a "Gold Window" approach. I will use the `answer_start` metadata to extract a context window (approx. 3000 characters) centered around the answer. This ensures the model always receives the ground truth answer in its input, enabling it to learn the extraction task.
+    *   **Inference (`mode='test'`)**: Since we don't know the answer location at test time, I will implement a "Sliding Window" approach. I will split each long document into overlapping chunks (strides) and treat each chunk as a separate input sample.
+2.  **Updating Inference Logic**: In `library/inference.py` and `library/trainer.py`, I will add aggregation logic. Since the sliding window generates multiple predictions for a single document ID, I will aggregate them by selecting the longest predicted string, assuming that the model will output empty or short strings for chunks that do not contain the answer.
+3.  **Hyperparameter Tuning**: I will increase `EPOCHS` from 5 to 10 in `library/config.py` to allow the model more time to converge on the improved data.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 15
+    BATCH_SIZE = 8
+=======
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 10
+    BATCH_SIZE = 8
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+class QADataset(Dataset):
+    """
+    Custom Dataset for Question Answering using mT5.
+    Formats input as: "question: <question> context: <context>"
+    """
+
+    def __init__(self, data, tokenizer, source_max_len, target_max_len, is_test=False):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.source_max_len = source_max_len
+        self.target_max_len = target_max_len
+        self.is_test = is_test
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data.iloc[index]
+
+        # Input formatting for T5/mT5
+        source_text = f"question: {row['question']} context: {row['context']}"
+
+        # Tokenize inputs
+        source_encoding = self.tokenizer(
+            source_text,
+            max_length=self.source_max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Base item dictionary
+        item = {
+            "ids": row["id"],
+            "input_ids": source_encoding["input_ids"].squeeze(),
+            "attention_mask": source_encoding["attention_mask"].squeeze(),
+            "context": row["context"],  # Needed for post-processing
+            "question": row["question"],  # Kept for reference
+        }
+
+        # Handle targets (Training/Validation)
+        if not self.is_test:
+            target_text = str(row["answer_text"])
+
+            # Tokenize targets
+            # Note: text_target is the standard way to tokenize labels in newer transformers
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            labels = target_encoding["input_ids"].squeeze()
+
+            # Replace padding token id with -100 so CrossEntropyLoss ignores them
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            item["labels"] = labels
+            item["answer_text"] = target_text
+
+        return item
+=======
+class QADataset(Dataset):
+    """
+    Custom Dataset for Question Answering using mT5.
+    Formats input as: "question: <question> context: <context>"
+    Implements Gold Window (Train) and Sliding Window (Test) strategies.
+    Cite solution_lesson_node_00001: Context Truncation Pitfalls.
+    """
+
+    def __init__(self, data, tokenizer, source_max_len, target_max_len, mode="train"):
+        self.tokenizer = tokenizer
+        self.source_max_len = source_max_len
+        self.target_max_len = target_max_len
+        self.mode = mode  # 'train' or 'test'
+        self.samples = self._process_data(data)
+
+    def _process_data(self, df):
+        samples = []
+        # Heuristic: 1 token ~ 3 chars. Use a safe char window.
+        # 1024 tokens * 3 chars/token = 3072 chars.
+        CHAR_WINDOW = self.source_max_len * 3
+        STRIDE = CHAR_WINDOW // 2
+
+        for idx, row in df.iterrows():
+            context = str(row["context"])
+            question = str(row["question"])
+            sample_id = row["id"]
+
+            if self.mode == "train":
+                # Gold Window: Center on the answer
+                ans_start = int(row["answer_start"])
+                ans_text = str(row["answer_text"])
+                ans_len = len(ans_text)
+                ans_center = ans_start + ans_len // 2
+
+                # Calculate window boundaries
+                start_idx = max(0, ans_center - CHAR_WINDOW // 2)
+                end_idx = min(len(context), start_idx + CHAR_WINDOW)
+
+                # Adjust if we hit the end
+                if end_idx - start_idx < CHAR_WINDOW and start_idx > 0:
+                    start_idx = max(0, end_idx - CHAR_WINDOW)
+
+                window_context = context[start_idx:end_idx]
+
+                samples.append({
+                    "id": sample_id,
+                    "context": window_context,
+                    "question": question,
+                    "answer_text": ans_text,
+                })
+
+            else:
+                # Sliding Window: Generate overlapping chunks
+                # If context is short, take it all
+                if len(context) <= CHAR_WINDOW:
+                    samples.append({
+                        "id": sample_id,
+                        "context": context,
+                        "question": question,
+                    })
+                else:
+                    for start_idx in range(0, len(context), STRIDE):
+                        # Stop if we've gone past the end (unless it's the first chunk)
+                        if start_idx >= len(context) and start_idx != 0:
+                            break
+
+                        end_idx = min(len(context), start_idx + CHAR_WINDOW)
+                        window_context = context[start_idx:end_idx]
+
+                        # Skip tiny trailing chunks
+                        if len(window_context) < 50 and start_idx != 0:
+                            continue
+
+                        samples.append({
+                            "id": sample_id,
+                            "context": window_context,
+                            "question": question,
+                        })
+
+                        if end_idx == len(context):
+                            break
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        # Input formatting
+        source_text = f"question: {sample['question']} context: {sample['context']}"
+
+        # Tokenize inputs
+        source_encoding = self.tokenizer(
+            source_text,
+            max_length=self.source_max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Base item dictionary
+        item = {
+            "ids": sample["id"],
+            "input_ids": source_encoding["input_ids"].squeeze(),
+            "attention_mask": source_encoding["attention_mask"].squeeze(),
+            "context": sample["context"],
+            "question": sample["question"],
+        }
+
+        # Handle targets (Training/Validation)
+        if self.mode == "train":
+            target_text = sample["answer_text"]
+
+            # Tokenize targets
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            labels = target_encoding["input_ids"].squeeze()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            item["labels"] = labels
+            item["answer_text"] = target_text
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # Create Datasets
+    train_dataset = QADataset(
+        train_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=False,
+    )
+
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=False,
+    )
+
+    test_dataset = QADataset(
+        test_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=True,
+    )
+=======
+    # Create Datasets
+    # Train: Use Gold Window (contains answer)
+    train_dataset = QADataset(
+        train_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode="train",
+    )
+
+    # Val: Use Gold Window for efficient metric tracking
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode="train",
+    )
+
+    # Test: Use Sliding Window for inference
+    test_dataset = QADataset(
+        test_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode="test",
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 5. Save Submission
+    # Create DataFrame conforming to the submission format
+    submission_df = pd.DataFrame(results)
+
+    # Ensure the output directory exists
+    os.makedirs(os.path.dirname(Config.SUBMISSION_FILE), exist_ok=True)
+
+    # Save to CSV
+    submission_df.to_csv(Config.SUBMISSION_FILE, index=False)
+=======
+    # 5. Save Submission
+    # Create DataFrame conforming to the submission format
+    df = pd.DataFrame(results)
+
+    # Aggregate sliding window predictions
+    # Strategy: Pick the longest non-empty prediction for each ID
+    print("Aggregating sliding window predictions...")
+    
+    # Sort by length of prediction string (descending)
+    df["pred_len"] = df["PredictionString"].astype(str).str.len()
+    df_sorted = df.sort_values(by="pred_len", ascending=False)
+    
+    # Group by ID and take the first (longest)
+    submission_df = df_sorted.groupby("id").first().reset_index()
+    
+    # Keep only required columns
+    submission_df = submission_df[["id", "PredictionString"]]
+
+    # Ensure the output directory exists
+    os.makedirs(os.path.dirname(Config.SUBMISSION_FILE), exist_ok=True)
+
+    # Save to CSV
+    submission_df.to_csv(Config.SUBMISSION_FILE, index=False)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Create DataFrame and save
+        df = pd.DataFrame(results)
+
+        # Ensure submission directory exists
+        os.makedirs(os.path.dirname(Config.SUBMISSION_FILE), exist_ok=True)
+
+        df.to_csv(Config.SUBMISSION_FILE, index=False)
+        print(f"Submission file saved to {Config.SUBMISSION_FILE}")
+=======
+        # Create DataFrame and save
+        df = pd.DataFrame(results)
+
+        # Aggregate sliding window predictions
+        df["pred_len"] = df["PredictionString"].astype(str).str.len()
+        df_sorted = df.sort_values(by="pred_len", ascending=False)
+        submission_df = df_sorted.groupby("id").first().reset_index()
+        submission_df = submission_df[["id", "PredictionString"]]
+
+        # Ensure submission directory exists
+        os.makedirs(os.path.dirname(Config.SUBMISSION_FILE), exist_ok=True)
+
+        submission_df.to_csv(Config.SUBMISSION_FILE, index=False)
+        print(f"Submission file saved to {Config.SUBMISSION_FILE}")
+>>>>>>> REPLACE
+```

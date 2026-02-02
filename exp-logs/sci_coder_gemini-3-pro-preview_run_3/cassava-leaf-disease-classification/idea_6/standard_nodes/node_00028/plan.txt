@@ -1,0 +1,306 @@
+I will optimize the solution by reverting the architecture from the Dual-Stream (ViT + EfficientNet) approach back to a single Vision Transformer (`vit_base_patch16_384`). Previous lessons indicated that jointly training heterogeneous backbones can lead to optimization conflicts and lower performance compared to a single, well-tuned ViT (Cite solution_lesson_node_00025). Additionally, I will restore the `Transpose` augmentation to ensure the model learns rotation-invariant features, which was previously identified as critical for this dataset (Cite solution_lesson_node_00027). Finally, I will leverage the A100 GPU's capacity to increase the physical batch size to 32 (removing gradient accumulation overhead) and allow the model to train for the full 10 epochs to ensure convergence.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PROJECT_NAME = "Cassava_Dual_Stream_ViT_EffNet"
+    SEED = 42
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 100  # Number of samples to use in debug mode
+    NUM_WORKERS = 4  # Optimized for 12 vCPUs
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+=======
+    PROJECT_NAME = "Cassava_Single_Stream_ViT"
+    SEED = 42
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 100  # Number of samples to use in debug mode
+    NUM_WORKERS = 4  # Optimized for 12 vCPUs
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Dual-Stream Architecture
+    MODEL_NAME_A = "vit_base_patch16_384"  # Stream A: Global Context
+    MODEL_NAME_B = "tf_efficientnet_b4"  # Stream B: Local Detail
+
+    NUM_CLASSES = 5
+    IMG_SIZE = 384  # Unified resolution for both backbones
+    DROPOUT_RATE = 0.3  # Dropout for the fusion head
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 10
+    BATCH_SIZE = 16  # Physical batch size per step
+    ACCUMULATION_STEPS = (
+        2  # Gradient accumulation to achieve effective batch size of 32
+    )
+=======
+    # Single-Stream Architecture
+    MODEL_NAME = "vit_base_patch16_384"  # Cite solution_lesson_node_00025
+
+    NUM_CLASSES = 5
+    IMG_SIZE = 384
+    DROPOUT_RATE = 0.1  # Standard dropout for ViT
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 10
+    BATCH_SIZE = 32  # Increased for A100
+    ACCUMULATION_STEPS = 1  # Effective batch size remains 32
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    @classmethod
+    def print_config(cls):
+        """
+        Prints the current configuration.
+        """
+        print(f"\n{'='*20} CONFIGURATION {'='*20}")
+        print(f"Device: {cls.DEVICE}")
+        print(f"Model A: {cls.MODEL_NAME_A}")
+        print(f"Model B: {cls.MODEL_NAME_B}")
+        print(f"Resolution: {cls.IMG_SIZE}x{cls.IMG_SIZE}")
+        print(f"Batch Size: {cls.BATCH_SIZE} (Accum: {cls.ACCUMULATION_STEPS})")
+        print(f"Epochs: {cls.EPOCHS}")
+        print(f"Learning Rate: {cls.LEARNING_RATE}")
+        print(f"Working Dir: {cls.WORKING_DIR}")
+        print(f"{'='*55}\n")
+=======
+    @classmethod
+    def print_config(cls):
+        """
+        Prints the current configuration.
+        """
+        print(f"\n{'='*20} CONFIGURATION {'='*20}")
+        print(f"Device: {cls.DEVICE}")
+        print(f"Model: {cls.MODEL_NAME}")
+        print(f"Resolution: {cls.IMG_SIZE}x{cls.IMG_SIZE}")
+        print(f"Batch Size: {cls.BATCH_SIZE} (Accum: {cls.ACCUMULATION_STEPS})")
+        print(f"Epochs: {cls.EPOCHS}")
+        print(f"Learning Rate: {cls.LEARNING_RATE}")
+        print(f"Working Dir: {cls.WORKING_DIR}")
+        print(f"{'='*55}\n")
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                A.Resize(Config.IMG_SIZE, Config.IMG_SIZE),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                # Geometric transformations as per strategy (Lesson 00004)
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5
+                ),
+=======
+                A.Resize(Config.IMG_SIZE, Config.IMG_SIZE),
+                A.Transpose(p=0.5),  # Cite solution_lesson_node_00027
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                # Geometric transformations as per strategy (Lesson 00004)
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5
+                ),
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DualStreamModel(nn.Module):
+    """
+    Dual-Stream Late-Fusion Architecture.
+    Stream A: ViT-Base (Global Context)
+    Stream B: EfficientNet-B4 (Local Detail)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # Stream A: ViT-Base
+        # num_classes=0 returns the pooled feature (CLS token for ViT)
+        self.stream_a = timm.create_model(
+            Config.MODEL_NAME_A,
+            pretrained=pretrained,
+            num_classes=0,
+            img_size=Config.IMG_SIZE,
+        )
+
+        # Stream B: EfficientNet-B4
+        # num_classes=0 returns the global average pooled feature
+        self.stream_b = timm.create_model(
+            Config.MODEL_NAME_B, pretrained=pretrained, num_classes=0
+        )
+
+        # Dynamically determine feature dimensions
+        with torch.no_grad():
+            dummy_in = torch.zeros(1, 3, Config.IMG_SIZE, Config.IMG_SIZE)
+            dim_a = self.stream_a(dummy_in).shape[1]
+            dim_b = self.stream_b(dummy_in).shape[1]
+
+        fusion_dim = dim_a + dim_b
+
+        # Fusion Head
+        self.fusion_head = nn.Sequential(
+            nn.BatchNorm1d(fusion_dim),
+            nn.Dropout(p=Config.DROPOUT_RATE),
+            nn.Linear(fusion_dim, Config.NUM_CLASSES),
+        )
+
+    def forward(self, x):
+        # Extract features from both streams
+        feat_a = self.stream_a(x)
+        feat_b = self.stream_b(x)
+
+        # Concatenate features
+        combined = torch.cat([feat_a, feat_b], dim=1)
+
+        # Classification
+        logits = self.fusion_head(combined)
+        return logits
+=======
+class CassavaModel(nn.Module):
+    """
+    Single-Stream Vision Transformer.
+    Cite solution_lesson_node_00025: Prefer ensembling independent models over jointly training multi-stream architectures.
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+        self.model = timm.create_model(
+            Config.MODEL_NAME,
+            pretrained=pretrained,
+            num_classes=Config.NUM_CLASSES,
+            img_size=Config.IMG_SIZE,
+            drop_rate=Config.DROPOUT_RATE
+        )
+
+    def forward(self, x):
+        return self.model(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import DualStreamModel
+=======
+from library.model import CassavaModel
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def train_model(
+    train_loader,
+    val_loader,
+    device,
+    epochs=Config.EPOCHS,
+    patience=Config.PATIENCE,
+    save_path=Config.MODEL_SAVE_PATH,
+):
+    """
+    Orchestrates the training process including setup, loop, and early stopping.
+    """
+    print(f"Initializing training on {device}...")
+
+    # Initialize Model
+    model = DualStreamModel(pretrained=True)
+    model = model.to(device)
+=======
+def train_model(
+    train_loader,
+    val_loader,
+    device,
+    epochs=Config.EPOCHS,
+    patience=Config.PATIENCE,
+    save_path=Config.MODEL_SAVE_PATH,
+):
+    """
+    Orchestrates the training process including setup, loop, and early stopping.
+    """
+    print(f"Initializing training on {device}...")
+
+    # Initialize Model
+    model = CassavaModel(pretrained=True)
+    model = model.to(device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def generate_submission(
+    test_loader,
+    device,
+    model_path=Config.MODEL_SAVE_PATH,
+    output_path=Config.SUBMISSION_PATH,
+):
+    """
+    Generates submission file using the best model and TTA.
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+
+    model = DualStreamModel(pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+=======
+def generate_submission(
+    test_loader,
+    device,
+    model_path=Config.MODEL_SAVE_PATH,
+    output_path=Config.SUBMISSION_PATH,
+):
+    """
+    Generates submission file using the best model and TTA.
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+
+    model = CassavaModel(pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DualStreamModel
+from library.engine import train_model, generate_submission
+
+
+def run():
+    # 1. Configuration and Setup
+    # Override defaults for a fast baseline execution as per requirements
+    Config.setup()
+    Config.EPOCHS = 5  # Reduced from 10 to ensure completion within time limits
+
+    # Set seeds for reproducibility
+=======
+from library.model import CassavaModel
+from library.engine import train_model, generate_submission
+
+
+def run():
+    # 1. Configuration and Setup
+    Config.setup()
+    # Removed Epoch override to allow full training (10 epochs)
+
+    # Set seeds for reproducibility
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Final Validation & Failure Analysis
+    print("Loading best model for final validation and failure analysis...")
+
+    # Load the best saved model
+    model = DualStreamModel(pretrained=False)
+    model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+    model = model.to(device)
+    model.eval()
+=======
+    # 4. Final Validation & Failure Analysis
+    print("Loading best model for final validation and failure analysis...")
+
+    # Load the best saved model
+    model = CassavaModel(pretrained=False)
+    model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+    model = model.to(device)
+    model.eval()
+>>>>>>> REPLACE
+```

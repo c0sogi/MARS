@@ -1,0 +1,766 @@
+Based on the provided lessons, I will replace the complex `UltraWideRepRes2NeXt` architecture with a standard, lightweight **ResNet** ([32, 64, 128] channels). Lessons `solution_lesson_node_00013` and `solution_lesson_node_00103` indicate that a standard ResNet achieves a perfect AUC of 1.0, whereas the re-parameterized model achieved slightly less (0.99998). I will also remove the structural re-parameterization logic (`switch_to_deploy`) and increase the training epochs to 20 to ensure convergence, as standard ResNets may require more iterations than RepVGG-style models (Cite `solution_lesson_node_00124`).
+
+Here are the changes:
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+# =============================================================================
+# 1. Model Components: RepNeXt, Res2Net, SEBlock
+# =============================================================================
+
+
+def get_valid_groups(channels, target_groups=32):
+    """Calculates a valid group number that divides channels, closest to target."""
+    if channels % target_groups == 0:
+        return target_groups
+    for g in range(target_groups, 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
+def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups=1):
+    result = nn.Sequential()
+    result.add_module(
+        "conv",
+        nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=False,
+        ),
+    )
+    result.add_module("bn", nn.BatchNorm2d(num_features=out_channels))
+    return result
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class RepNeXtUnit(nn.Module):
+    def __init__(
+        self, in_channels, out_channels, stride=1, target_groups=32, deploy=False
+    ):
+        super(RepNeXtUnit, self).__init__()
+        self.deploy = deploy
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.groups = get_valid_groups(in_channels, target_groups)
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=self.groups,
+                bias=True,
+            )
+        else:
+            self.rbr_identity = (
+                nn.BatchNorm2d(in_channels)
+                if out_channels == in_channels and stride == 1
+                else None
+            )
+            self.rbr_dense = conv_bn(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=self.groups,
+            )
+            self.rbr_1x1 = conv_bn(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                padding=0,
+                groups=self.groups,
+            )
+
+    def forward(self, inputs):
+        if self.deploy:
+            return self.rbr_reparam(inputs)
+
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+
+        return self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out
+
+    def get_equivalent_kernel_bias(self):
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernel1x1 = self._pad_1x1_to_3x3_tensor(kernel1x1)
+        kernelid, biasid = self._get_identity_tensor()
+        return kernel3x3 + kernel1x1 + kernelid, bias3x3 + bias1x1 + biasid
+
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        return F.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _get_identity_tensor(self):
+        if self.rbr_identity is None:
+            return 0, 0
+
+        input_dim = self.in_channels // self.groups
+        kernel_value = np.zeros((self.in_channels, input_dim, 3, 3), dtype=np.float32)
+        for i in range(self.in_channels):
+            kernel_value[i, i % input_dim, 1, 1] = 1
+
+        id_tensor = torch.from_numpy(kernel_value).to(self.rbr_identity.weight.device)
+
+        running_mean = self.rbr_identity.running_mean
+        running_var = self.rbr_identity.running_var
+        gamma = self.rbr_identity.weight
+        beta = self.rbr_identity.bias
+        eps = self.rbr_identity.eps
+
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return id_tensor * t, beta - running_mean * gamma / std
+
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return 0, 0
+        kernel = branch.conv.weight
+        running_mean = branch.bn.running_mean
+        running_var = branch.bn.running_var
+        gamma = branch.bn.weight
+        beta = branch.bn.bias
+        eps = branch.bn.eps
+
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            3,
+            self.stride,
+            1,
+            groups=self.groups,
+            bias=True,
+        )
+        self.rbr_reparam.weight.data = kernel
+        self.rbr_reparam.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__("rbr_dense")
+        self.__delattr__("rbr_1x1")
+        if hasattr(self, "rbr_identity"):
+            self.__delattr__("rbr_identity")
+        self.deploy = True
+
+
+class Res2NetBottleneck(nn.Module):
+    def __init__(
+        self, in_channels, out_channels, stride=1, scales=4, groups=32, deploy=False
+    ):
+        super(Res2NetBottleneck, self).__init__()
+        self.scales = scales
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Internal width. For Ultra-Wide capacity, we maintain high internal width.
+        self.width = out_channels // 2
+
+        self.conv1 = conv_bn(in_channels, self.width, 1, 1, 0)
+
+        self.width_per_scale = self.width // scales
+        self.convs = nn.ModuleList()
+
+        for i in range(scales - 1):
+            self.convs.append(
+                RepNeXtUnit(
+                    self.width_per_scale,
+                    self.width_per_scale,
+                    stride=stride,
+                    target_groups=groups,
+                    deploy=deploy,
+                )
+            )
+
+        self.conv3 = conv_bn(self.width, out_channels, 1, 1, 0)
+        self.se = SEBlock(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            if stride == 2:
+                self.shortcut = nn.Sequential(
+                    nn.AvgPool2d(2, 2), conv_bn(in_channels, out_channels, 1, 1, 0)
+                )
+            else:
+                self.shortcut = conv_bn(in_channels, out_channels, 1, 1, 0)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = F.relu(out)
+
+        spx = torch.split(out, self.width_per_scale, 1)
+        sp = self.convs[0](spx[1])
+
+        y = []
+        if self.stride > 1:
+            y.append(F.avg_pool2d(spx[0], 3, stride=self.stride, padding=1))
+        else:
+            y.append(spx[0])
+
+        y.append(sp)
+
+        for i in range(1, self.scales - 1):
+            if self.stride == 1:
+                sp = sp + spx[i + 1]
+            else:
+                # Simplified Res2Net logic for stride > 1 (not used in this specific architecture plan but kept for robustness)
+                pass
+            sp = self.convs[i](sp + spx[i + 1] if self.stride == 1 else sp)
+            y.append(sp)
+
+        out = torch.cat(y, 1)
+        out = self.conv3(out)
+        out = self.se(out)
+
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+class RepDownsample(nn.Module):
+    def __init__(self, in_channels, out_channels, deploy=False):
+        super(RepDownsample, self).__init__()
+        self.deploy = deploy
+        self.conv3x3 = conv_bn(in_channels, out_channels, 3, 2, 1)
+        self.conv1x1 = conv_bn(in_channels, out_channels, 1, 2, 0)
+
+        if deploy:
+            self.fused_conv = nn.Conv2d(in_channels, out_channels, 3, 2, 1, bias=True)
+
+    def forward(self, x):
+        if self.deploy:
+            return self.fused_conv(x)
+        return self.conv3x3(x) + self.conv1x1(x)
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return
+        k3, b3 = self._fuse_bn(self.conv3x3)
+        k1, b1 = self._fuse_bn(self.conv1x1)
+        k1 = F.pad(k1, [1, 1, 1, 1])
+
+        self.fused_conv = nn.Conv2d(
+            self.conv3x3.conv.in_channels,
+            self.conv3x3.conv.out_channels,
+            3,
+            2,
+            1,
+            bias=True,
+        )
+        self.fused_conv.weight.data = k3 + k1
+        self.fused_conv.bias.data = b3 + b1
+
+        self.__delattr__("conv3x3")
+        self.__delattr__("conv1x1")
+        self.deploy = True
+
+    def _fuse_bn(self, branch):
+        k = branch.conv.weight
+        rm = branch.bn.running_mean
+        rv = branch.bn.running_var
+        gamma = branch.bn.weight
+        beta = branch.bn.bias
+        eps = branch.bn.eps
+        std = (rv + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return k * t, beta - rm * gamma / std
+
+
+class UltraWideRepRes2NeXt(nn.Module):
+    def __init__(self, num_classes=1, deploy=False):
+        super(UltraWideRepRes2NeXt, self).__init__()
+        self.deploy = deploy
+
+        widths = [96, 192, 384]
+
+        # Stem: 3 -> 96
+        self.stem = RepNeXtUnit(3, widths[0], stride=1, target_groups=1, deploy=deploy)
+
+        # Stage 1: 96 -> 96 (32x32)
+        self.stage1 = Res2NetBottleneck(widths[0], widths[0], stride=1, deploy=deploy)
+
+        # Downsample: 96 -> 192 (32x32 -> 16x16)
+        self.ds1 = RepDownsample(widths[0], widths[1], deploy=deploy)
+
+        # Stage 2: 192 -> 192 (16x16)
+        self.stage2 = Res2NetBottleneck(widths[1], widths[1], stride=1, deploy=deploy)
+
+        # Downsample: 192 -> 384 (16x16 -> 8x8)
+        self.ds2 = RepDownsample(widths[1], widths[2], deploy=deploy)
+
+        # Stage 3: 384 -> 384 (8x8)
+        self.stage3 = Res2NetBottleneck(widths[2], widths[2], stride=1, deploy=deploy)
+
+        # Head
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(widths[1] + widths[2], num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+
+        x = self.ds1(x)  # 16x16
+        x2 = self.stage2(x)
+
+        x = self.ds2(x2)  # 8x8
+        x3 = self.stage3(x)
+
+        # Multi-Scale Aggregation
+        f2 = self.gap(x2).flatten(1)
+        f3 = self.gap(x3).flatten(1)
+
+        out = torch.cat([f2, f3], dim=1)
+        out = self.fc(out)
+        return out
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return
+        for m in self.modules():
+            if isinstance(m, RepNeXtUnit):
+                m.switch_to_deploy()
+            if isinstance(m, RepDownsample):
+                m.switch_to_deploy()
+        self.deploy = True
+=======
+# =============================================================================
+# 1. Model Components: Standard ResNet for Low-Resolution
+# Cite solution_lesson_node_00001, solution_lesson_node_00013
+# =============================================================================
+
+
+class BasicBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        # Cite solution_lesson_node_00063: Prefer 1x1 convolutions for projection shortcuts
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+class CactusResNet(nn.Module):
+    """
+    Standard ResNet adapted for 32x32 input.
+    Structure: [32, 64, 128] channels.
+    Cite solution_lesson_node_00013: Standard ResNet achieves AUC 1.0.
+    """
+
+    def __init__(self, num_classes=1):
+        super(CactusResNet, self).__init__()
+        self.in_channels = 32
+
+        # Initial convolution (32x32)
+        # No initial downsampling (stride 1) to preserve resolution
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Stage 1: 32 channels, 32x32
+        self.layer1 = self._make_layer(32, 2, stride=1)
+        # Stage 2: 64 channels, 16x16
+        self.layer2 = self._make_layer(64, 2, stride=2)
+        # Stage 3: 128 channels, 8x8
+        self.layer3 = self._make_layer(128, 2, stride=2)
+
+        # Global Average Pooling
+        # Cite solution_lesson_node_00005: Use GAP instead of Flatten
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(128, num_classes)
+
+    def _make_layer(self, out_channels, blocks, stride):
+        layers = []
+        layers.append(BasicBlock(self.in_channels, out_channels, stride))
+        self.in_channels = out_channels
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(out_channels, out_channels, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def run_training(seeds=[0, 1, 2, 3, 4], epochs=20, batch_size=64, debug_size=None):
+    device = get_device()
+    train_loader, val_loader, test_loader = get_dataloaders(
+        batch_size=batch_size, debug_size=debug_size
+    )
+
+    best_models = []
+
+    for seed in seeds:
+        print(f"\n--- Training Seed {seed} ---")
+        set_seed(seed)
+
+        model = UltraWideRepRes2NeXt(num_classes=1, deploy=False).to(device)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_auc = 0.0
+        best_state = None
+        patience = 5
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            train_loss, train_auc = train_one_epoch(
+                model, train_loader, criterion, optimizer, device
+            )
+            val_loss, val_auc = validate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            print(
+                f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} AUC: {train_auc:.6f} | Val Loss: {val_loss:.6f} AUC: {val_auc}"
+            )
+
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_state = model.state_dict()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+        # Load best state and switch to deploy
+        model.load_state_dict(best_state)
+        model.switch_to_deploy()
+        best_models.append(model)
+
+    return best_models, test_loader
+=======
+def run_training(seeds=[0, 1, 2, 3, 4], epochs=20, batch_size=64, debug_size=None):
+    device = get_device()
+    train_loader, val_loader, test_loader = get_dataloaders(
+        batch_size=batch_size, debug_size=debug_size
+    )
+
+    best_models = []
+
+    for seed in seeds:
+        print(f"\n--- Training Seed {seed} ---")
+        set_seed(seed)
+
+        model = CactusResNet(num_classes=1).to(device)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_auc = 0.0
+        best_state = None
+        patience = 5
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            train_loss, train_auc = train_one_epoch(
+                model, train_loader, criterion, optimizer, device
+            )
+            val_loss, val_auc = validate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            print(
+                f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} AUC: {train_auc:.6f} | Val Loss: {val_loss:.6f} AUC: {val_auc}"
+            )
+
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_state = model.state_dict()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+        # Load best state
+        model.load_state_dict(best_state)
+        best_models.append(model)
+
+    return best_models, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import UltraWideRepRes2NeXt
+=======
+from library.model import CactusResNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_single_seed(seed, train_loader, val_loader, device, epochs=20, patience=5):
+    """
+    Trains a single model instance with a specific seed.
+    Manages Optimizer, Scheduler, and Early Stopping.
+    """
+    set_seed(seed)
+    print(f"\n--- Training Seed {seed} ---")
+
+    # Initialize Model
+    model = UltraWideRepRes2NeXt(num_classes=1, deploy=False).to(device)
+
+    # Setup Optimization
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_auc = 0.0
+    best_state = None
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_auc = evaluate(model, val_loader, criterion, device)
+
+        scheduler.step()
+
+        # Print full precision metrics
+        print(
+            f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss} AUC: {train_auc} | Val Loss: {val_loss} AUC: {val_auc}"
+        )
+
+        # Early Stopping Logic
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    # Restore best weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Structural Re-parameterization: Fuse blocks for inference speed
+    model.switch_to_deploy()
+
+    return model
+=======
+def train_single_seed(seed, train_loader, val_loader, device, epochs=20, patience=5):
+    """
+    Trains a single model instance with a specific seed.
+    Manages Optimizer, Scheduler, and Early Stopping.
+    """
+    set_seed(seed)
+    print(f"\n--- Training Seed {seed} ---")
+
+    # Initialize Model
+    model = CactusResNet(num_classes=1).to(device)
+
+    # Setup Optimization
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_auc = 0.0
+    best_state = None
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_auc = evaluate(model, val_loader, criterion, device)
+
+        scheduler.step()
+
+        # Print full precision metrics
+        print(
+            f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss} AUC: {train_auc} | Val Loss: {val_loss} AUC: {val_auc}"
+        )
+
+        # Early Stopping Logic
+        if val_auc > best_auc:
+            best_auc = val_auc
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    # Restore best weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import UltraWideRepRes2NeXt
+from library.dataset import get_dataloaders
+
+
+def load_and_prepare_model(checkpoint_path, device):
+    """
+    Loads a model checkpoint, switches to deploy mode (re-parameterization),
+    and moves it to the specified device.
+
+    Args:
+        checkpoint_path (str): Path to the .pth model file.
+        device (torch.device): The device to load the model onto.
+
+    Returns:
+        model (nn.Module): The re-parameterized model in eval mode.
+    """
+    # Initialize the model structure. deploy=False is required to load training weights
+    # which contain the multi-branch blocks.
+    model = UltraWideRepRes2NeXt(num_classes=1, deploy=False)
+
+    # Load the state dictionary
+    # map_location ensures we can load GPU-trained models on CPU if necessary
+    if os.path.exists(checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
+    # Structural Re-parameterization: Fuse the multi-branch blocks into single kernels
+    # This significantly speeds up inference.
+    model.switch_to_deploy()
+
+    model.to(device)
+    model.eval()
+    return model
+=======
+from library.model import CactusResNet
+from library.dataset import get_dataloaders
+
+
+def load_and_prepare_model(checkpoint_path, device):
+    """
+    Loads a model checkpoint and moves it to the specified device.
+
+    Args:
+        checkpoint_path (str): Path to the .pth model file.
+        device (torch.device): The device to load the model onto.
+
+    Returns:
+        model (nn.Module): The model in eval mode.
+    """
+    # Initialize the model structure.
+    model = CactusResNet(num_classes=1)
+
+    # Load the state dictionary
+    # map_location ensures we can load GPU-trained models on CPU if necessary
+    if os.path.exists(checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
+    model.to(device)
+    model.eval()
+    return model
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Configuration
+    # Using 5 epochs for a fast but effective baseline
+    EPOCHS = 5
+    BATCH_SIZE = 64
+    SEEDS = [0, 1, 2, 3, 4]
+=======
+    # 2. Configuration
+    # Increased epochs to 20 to ensure convergence for standard ResNet
+    # Cite solution_lesson_node_00060
+    EPOCHS = 20
+    BATCH_SIZE = 64
+    SEEDS = [0, 1, 2, 3, 4]
+>>>>>>> REPLACE
+```

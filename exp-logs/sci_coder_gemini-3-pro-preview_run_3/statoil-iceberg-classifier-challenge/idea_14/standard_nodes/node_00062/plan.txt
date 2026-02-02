@@ -1,0 +1,368 @@
+My optimization strategy involves simplifying the model architecture from a complex ResNet-based model to a robust, shallow Convolutional Neural Network ("SimpleCNN"), as suggested by multiple lessons derived from the "Current Best" solution.
+
+1.  **Architecture Simplification (Cite solution_lesson_node_00031, solution_lesson_node_00046):** I will replace the `HybridWideSEResNet` with a 4-layer CNN. Complex architectures like ResNets with SE blocks have shown to overfit on this small dataset, while simpler plain CNNs generalize better.
+2.  **Structural Regularization (Cite solution_lesson_node_00026, solution_lesson_node_00050):** The new `SimpleCNN` will implement early channel expansion (64 to 128 at the second block) to capture texture features but will cap the channel width at 128 to prevent overfitting, avoiding the standard doubling to 256/512.
+3.  **Global Max Pooling (Cite solution_lesson_node_00005, solution_lesson_node_00007):** I will use Global Max Pooling to aggregate features, which is superior for detecting sparse, high-intensity targets like icebergs compared to Average Pooling.
+4.  **Classifier Design (Cite solution_lesson_node_00040, solution_lesson_node_00017):** The classifier head will be simplified to a single hidden dense layer (512 units) with Dropout applied *after* the activation, ensuring the compact feature vector is not corrupted before processing.
+5.  **Metadata Fusion (Cite solution_lesson_node_00039, solution_lesson_node_00057):** I will maintain the "Late Fusion" strategy using the raw-scale incidence angle, which has proven more effective than feature-wise modulation or normalized fusion for this specific data distribution.
+
+I will modify `library/config.py` to clean up parameters, `library/model.py` to implement the `SimpleCNN`, and update `library/train_eval.py` and `runfile.py` to use the new model class.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# =============================================================================
+# MODEL ARCHITECTURE CONFIGURATION
+# =============================================================================
+# Hybrid Wide-SE-ResNet parameters
+MODEL_PARAMS = {
+    "input_channels": IN_CHANNELS,
+    "stem_channels": 64,
+    "block_channels": [64, 128, 128, 128],  # 4 Stages with early expansion to 128
+    "se_reduction": 16,  # Squeeze-and-Excitation ratio
+    "dropout_rate": 0.2,  # Dropout after activation in head
+    "use_angle": True,  # Fuse incidence angle
+}
+=======
+# =============================================================================
+# MODEL ARCHITECTURE CONFIGURATION
+# =============================================================================
+# SimpleCNN parameters
+MODEL_PARAMS = {
+    "input_channels": IN_CHANNELS,
+    "dropout_rate": 0.2,  # Dropout after activation in head - Cite solution_lesson_node_00017
+}
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block for channel-wise attention.
+    """
+
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class ResidualBlock(nn.Module):
+    """
+    Standard Residual Block with SE attention and optional downsampling.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1, se_reduction=16):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.se = SEBlock(out_channels, reduction=se_reduction)
+
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.se(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class HybridWideSEResNet(nn.Module):
+    """
+    Custom 4-Stage Residual Network with SE blocks, Global Max Pooling,
+    and Raw-Scale Incidence Angle Fusion.
+    """
+
+    def __init__(self):
+        super(HybridWideSEResNet, self).__init__()
+
+        # Load configuration
+        in_channels = MODEL_PARAMS["input_channels"]
+        stem_channels = MODEL_PARAMS["stem_channels"]
+        block_channels = MODEL_PARAMS["block_channels"]  # Expected: [64, 128, 128, 128]
+        se_reduction = MODEL_PARAMS["se_reduction"]
+        dropout_rate = MODEL_PARAMS["dropout_rate"]
+        self.use_angle = MODEL_PARAMS["use_angle"]
+
+        # 1. Stem
+        # Initial processing, keeping stride 1 to preserve spatial dims before stages
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                stem_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(stem_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Backbone Stages (4 Downsampling operations total)
+        # We apply stride=2 in every stage to achieve ~5x5 output from 75x75 input
+        self.layer1 = self._make_layer(
+            stem_channels, block_channels[0], stride=2, se_reduction=se_reduction
+        )
+        self.layer2 = self._make_layer(
+            block_channels[0], block_channels[1], stride=2, se_reduction=se_reduction
+        )
+        self.layer3 = self._make_layer(
+            block_channels[1], block_channels[2], stride=2, se_reduction=se_reduction
+        )
+        self.layer4 = self._make_layer(
+            block_channels[2], block_channels[3], stride=2, se_reduction=se_reduction
+        )
+
+        # 3. Global Max Pooling (Preserve peak signals)
+        self.global_pool = nn.AdaptiveMaxPool2d((1, 1))
+
+        # 4. Classification Head with Fusion
+        # Calculate input dimension for the linear layer
+        feature_dim = block_channels[-1]
+        if self.use_angle:
+            feature_dim += 1  # Add scalar angle
+
+        hidden_dim = 256
+
+        self.head = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Weight Initialization: Relying on PyTorch defaults (Kaiming Uniform)
+        # as explicitly requested ("Strictly use PyTorch Default Initialization").
+
+    def _make_layer(self, in_channels, out_channels, stride, se_reduction):
+        # Constructs a stage. Given the small dataset and "Simple CNN" constraints,
+        # we use 1 block per stage which performs the downsampling/expansion.
+        return ResidualBlock(
+            in_channels, out_channels, stride=stride, se_reduction=se_reduction
+        )
+
+    def forward(self, x, angle):
+        """
+        Args:
+            x (torch.Tensor): Image input of shape (B, 3, 75, 75)
+            angle (torch.Tensor): Incidence angle input of shape (B,)
+        """
+        # Backbone
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # Pooling
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)  # (B, 128)
+
+        # Fusion
+        if self.use_angle:
+            # Reshape angle to (B, 1) for concatenation
+            angle = angle.view(-1, 1)
+            # Concatenate raw angle (no normalization)
+            x = torch.cat((x, angle), dim=1)
+
+        # Classification
+        x = self.head(x)
+        return x
+=======
+class SimpleCNN(nn.Module):
+    """
+    Shallow 4-layer CNN with Global Max Pooling and Late Fusion.
+    Optimized for small, noisy radar datasets.
+    Cite solution_lesson_node_00031, solution_lesson_node_00046
+    """
+
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+
+        in_channels = MODEL_PARAMS["input_channels"]
+        dropout_rate = MODEL_PARAMS["dropout_rate"]
+
+        self.conv = nn.Sequential(
+            # Block 1: 3 -> 64
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            
+            # Block 2: 64 -> 128
+            # Early channel expansion to preserve texture - Cite solution_lesson_node_00050
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            
+            # Block 3: 128 -> 128
+            # Cap width at 128 to prevent overfitting - Cite solution_lesson_node_00026
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            
+            # Block 4: 128 -> 128
+            # Aggressive spatial reduction before pooling - Cite solution_lesson_node_00046
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+
+        # Global Max Pooling - Cite solution_lesson_node_00005, solution_lesson_node_00007
+        self.pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classifier
+        # Input features: 128 (CNN) + 1 (Angle) = 129
+        # Single hidden layer is sufficient - Cite solution_lesson_node_00040
+        self.classifier = nn.Sequential(
+            nn.Linear(129, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate), # Dropout after activation - Cite solution_lesson_node_00017
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x, angle):
+        x = self.conv(x)
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)  # Flatten (B, 128)
+
+        # Late Fusion of raw incidence angle
+        # Match numerical magnitude of auxiliary inputs - Cite solution_lesson_node_00057
+        # Prefer Late Fusion over Feature-wise Modulation - Cite solution_lesson_node_00039
+        angle = angle.view(-1, 1)
+        x = torch.cat([x, angle], dim=1)
+
+        x = self.classifier(x)
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+from library.model import HybridWideSEResNet
+from library.data_loader import get_dataloaders, IcebergDataset
+=======
+from library.model import SimpleCNN
+from library.data_loader import get_dataloaders, IcebergDataset
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+        # Initialize Model, Criterion, Optimizer
+        model = HybridWideSEResNet().to(DEVICE)
+        criterion = nn.BCEWithLogitsLoss()
+=======
+        # Initialize Model, Criterion, Optimizer
+        model = SimpleCNN().to(DEVICE)
+        criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    for fold in range(N_FOLDS):
+        print(f"Loading model for Fold {fold + 1}...")
+        model = HybridWideSEResNet().to(DEVICE)
+
+        # Load best model weights
+=======
+    for fold in range(N_FOLDS):
+        print(f"Loading model for Fold {fold + 1}...")
+        model = SimpleCNN().to(DEVICE)
+
+        # Load best model weights
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import HybridWideSEResNet
+from library.data_loader import get_dataloaders, IcebergDataset
+=======
+from library.model import SimpleCNN
+from library.data_loader import get_dataloaders, IcebergDataset
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Model Initialization
+        model = HybridWideSEResNet().to(DEVICE)
+        criterion = nn.BCEWithLogitsLoss()
+=======
+        # Model Initialization
+        model = SimpleCNN().to(DEVICE)
+        criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Ensemble predictions from all folds
+        for fold in range(N_FOLDS):
+            model = HybridWideSEResNet().to(DEVICE)
+            ckpt_path = os.path.join(WORKING_DIR, f"model_best_fold_{fold}.pth")
+=======
+        # Ensemble predictions from all folds
+        for fold in range(N_FOLDS):
+            model = SimpleCNN().to(DEVICE)
+            ckpt_path = os.path.join(WORKING_DIR, f"model_best_fold_{fold}.pth")
+>>>>>>> REPLACE
+```

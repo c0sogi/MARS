@@ -1,0 +1,315 @@
+To address the `torch.OutOfMemoryError` encountered during the training of the `microsoft/deberta-v3-large` model, I will implement gradient accumulation. This technique allows us to reduce the physical batch size (to fit in GPU memory) while maintaining the original effective batch size for optimization stability.
+
+The changes involve:
+1.  **`library/config.py`**: Reducing the batch size for DeBERTa from 4 to 2 and adding a `grad_accum_steps` parameter (set to 2 for DeBERTa, 1 for others).
+2.  **`library/engine.py`**: Modifying `train_fn` to accumulate gradients over multiple steps before updating weights, and updating `train_model` to accept the new parameter.
+3.  **`runfile.py`**: Updating the training loop to retrieve `grad_accum_steps` from the config, adjusting the learning rate scheduler's `T_max` accordingly, and passing the parameter to the training function.
+
+Cite debug_lesson_1
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    MAX_GRAD_NORM = 1.0
+
+    # Backbone Configurations
+    # We define specific settings for each stream in the ensemble
+    BACKBONES = {
+        "deberta": {"name": "microsoft/deberta-v3-large", "lr": 1e-5, "batch_size": 4},
+        "mpnet": {
+            "name": "sentence-transformers/all-mpnet-base-v2",
+            "lr": 2e-5,
+            "batch_size": 8,  # Can handle slightly larger batch
+        },
+        "roberta": {"name": "roberta-base", "lr": 2e-5, "batch_size": 8},
+    }
+=======
+    MAX_GRAD_NORM = 1.0
+    GRAD_ACCUM_STEPS = 1
+
+    # Backbone Configurations
+    # We define specific settings for each stream in the ensemble
+    BACKBONES = {
+        "deberta": {
+            "name": "microsoft/deberta-v3-large",
+            "lr": 1e-5,
+            "batch_size": 2,
+            "grad_accum_steps": 2,
+        },
+        "mpnet": {
+            "name": "sentence-transformers/all-mpnet-base-v2",
+            "lr": 2e-5,
+            "batch_size": 8,
+            "grad_accum_steps": 1,
+        },
+        "roberta": {
+            "name": "roberta-base",
+            "lr": 2e-5,
+            "batch_size": 8,
+            "grad_accum_steps": 1,
+        },
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_fn(dataloader, model, optimizer, device, scheduler=None):
+    """
+    Performs one epoch of training.
+
+    Args:
+        dataloader: PyTorch DataLoader for training data.
+        model: The neural network model.
+        optimizer: The optimizer.
+        device: The device to run on.
+        scheduler: (Optional) Learning rate scheduler.
+
+    Returns:
+        float: Average training loss.
+    """
+    model.train()
+    final_loss = 0
+    count = 0
+
+    for data in dataloader:
+        input_ids = data["input_ids"].to(device, dtype=torch.long)
+        attention_mask = data["attention_mask"].to(device, dtype=torch.long)
+        q_mask = data["q_mask"].to(device, dtype=torch.long)
+        a_mask = data["a_mask"].to(device, dtype=torch.long)
+        labels = data["labels"].to(device, dtype=torch.float)
+
+        optimizer.zero_grad()
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            q_mask=q_mask,
+            a_mask=a_mask,
+            labels=labels,
+        )
+
+        loss = outputs["loss"]
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        final_loss += loss.item()
+        count += 1
+
+    return final_loss / count
+=======
+def train_fn(dataloader, model, optimizer, device, scheduler=None, grad_accum_steps=1):
+    """
+    Performs one epoch of training.
+
+    Args:
+        dataloader: PyTorch DataLoader for training data.
+        model: The neural network model.
+        optimizer: The optimizer.
+        device: The device to run on.
+        scheduler: (Optional) Learning rate scheduler.
+        grad_accum_steps: Number of steps to accumulate gradients.
+
+    Returns:
+        float: Average training loss.
+    """
+    model.train()
+    final_loss = 0
+    count = 0
+
+    optimizer.zero_grad()
+
+    for i, data in enumerate(dataloader):
+        input_ids = data["input_ids"].to(device, dtype=torch.long)
+        attention_mask = data["attention_mask"].to(device, dtype=torch.long)
+        q_mask = data["q_mask"].to(device, dtype=torch.long)
+        a_mask = data["a_mask"].to(device, dtype=torch.long)
+        labels = data["labels"].to(device, dtype=torch.float)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            q_mask=q_mask,
+            a_mask=a_mask,
+            labels=labels,
+        )
+
+        loss = outputs["loss"]
+        final_loss += loss.item()
+
+        loss = loss / grad_accum_steps
+        loss.backward()
+
+        if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+
+        count += 1
+
+    return final_loss / count
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    scheduler,
+    num_epochs,
+    save_filename,
+):
+    """
+    Orchestrates the training process for a model including early stopping.
+
+    Args:
+        model: The model to train.
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
+        optimizer: Optimizer.
+        device: Device.
+        scheduler: Scheduler.
+        num_epochs: Maximum epochs.
+        save_filename: Filename to save the best checkpoint (relative to Config.WORKING_DIR).
+
+    Returns:
+        float: Best validation score achieved.
+    """
+    best_score = -np.inf
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        train_loss = train_fn(train_loader, model, optimizer, device, scheduler)
+        val_loss, val_score = eval_fn(val_loader, model, device)
+=======
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    scheduler,
+    num_epochs,
+    save_filename,
+    grad_accum_steps=1,
+):
+    """
+    Orchestrates the training process for a model including early stopping.
+
+    Args:
+        model: The model to train.
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
+        optimizer: Optimizer.
+        device: Device.
+        scheduler: Scheduler.
+        num_epochs: Maximum epochs.
+        save_filename: Filename to save the best checkpoint (relative to Config.WORKING_DIR).
+        grad_accum_steps: Gradient accumulation steps.
+
+    Returns:
+        float: Best validation score achieved.
+    """
+    best_score = -np.inf
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        train_loss = train_fn(
+            train_loader, model, optimizer, device, scheduler, grad_accum_steps
+        )
+        val_loss, val_score = eval_fn(val_loader, model, device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        tokenizer = get_tokenizer(backbone_cfg["name"])
+
+        # Initialize Feature Arrays
+        # We don't know feature dim yet, will init on first fold
+        oof_features = None
+=======
+        tokenizer = get_tokenizer(backbone_cfg["name"])
+
+        # Get Gradient Accumulation Steps (Default to 1 if not set)
+        grad_accum_steps = backbone_cfg.get("grad_accum_steps", 1)
+        print(f"  Batch Size: {backbone_cfg['batch_size']}")
+        print(f"  Grad Accum Steps: {grad_accum_steps}")
+
+        # Initialize Feature Arrays
+        # We don't know feature dim yet, will init on first fold
+        oof_features = None
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Optimizer & Scheduler
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=backbone_cfg["lr"],
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS * len(train_loader)
+            )
+
+            # Train
+            save_filename = f"{backbone_key}_fold{fold}.pth"
+            train_model(
+                model,
+                train_loader,
+                val_loader,
+                optimizer,
+                Config.DEVICE,
+                scheduler,
+                Config.EPOCHS,
+                save_filename,
+            )
+=======
+            # Optimizer & Scheduler
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=backbone_cfg["lr"],
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+
+            # Adjust T_max for Gradient Accumulation
+            num_update_steps_per_epoch = len(train_loader) // grad_accum_steps
+            if len(train_loader) % grad_accum_steps != 0:
+                num_update_steps_per_epoch += 1
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS * num_update_steps_per_epoch
+            )
+
+            # Train
+            save_filename = f"{backbone_key}_fold{fold}.pth"
+            train_model(
+                model,
+                train_loader,
+                val_loader,
+                optimizer,
+                Config.DEVICE,
+                scheduler,
+                Config.EPOCHS,
+                save_filename,
+                grad_accum_steps=grad_accum_steps,
+            )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,774 @@
+To optimize the model's performance, I will implement the following changes based on the provided lessons:
+
+1.  **Input Representation**: I will replace the "Spectral Deltas" (derivatives) input method with **Channel Replication** (stacking the grayscale spectrogram 3 times). Lesson 00022 demonstrates that for transfer learning with ImageNet-pretrained models, preserving the natural image statistics via replication significantly outperforms engineered features. **(Cite solution_lesson_node_00022)**
+2.  **Data Integrity**: I will remove the disk-based caching system (`.npy` files) and load data directly into memory. Lesson 00018 warns that persistent caches can lead to data corruption or staleness when pipeline logic changes, and given the small dataset size, on-the-fly loading is safer and sufficiently fast. **(Cite solution_lesson_node_00018)**
+3.  **Training Strategy**: I will simplify the training pipeline from a Teacher-Student distillation loop to a robust **Single-Stage Supervised** approach. The complexity of distillation is unnecessary given that a properly configured single ResNet34 has been shown to achieve >0.92 AUC.
+4.  **Hyperparameters**: I will increase `MIXUP_ALPHA` from 0.2 to **0.4**. Lesson 00007 indicates this is the optimal sweet spot for regularization in this data regime, balancing signal fidelity with diversity. **(Cite solution_lesson_node_00007)**
+5.  **Submission Threshold**: I will update the submission generation threshold to `0.9255537489325414` as required.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Caching Paths (for deterministic loading)
+    # ==========================================
+    # We use .npy for processed tensors/arrays to avoid re-computing deltas and resizing
+    CACHE_TRAIN_IMAGES = os.path.join(WORKING_DIR, "train_images.npy")
+    CACHE_TRAIN_LABELS = os.path.join(WORKING_DIR, "train_labels.npy")
+
+    CACHE_VAL_IMAGES = os.path.join(WORKING_DIR, "val_images.npy")
+    CACHE_VAL_LABELS = os.path.join(WORKING_DIR, "val_labels.npy")
+
+    CACHE_TEST_IMAGES = os.path.join(WORKING_DIR, "test_images.npy")
+    CACHE_TEST_IDS = os.path.join(WORKING_DIR, "test_ids.npy")
+
+    # ==========================================
+    # Model Checkpoints
+    # ==========================================
+    TEACHER_MODEL_PATH = os.path.join(WORKING_DIR, "teacher_resnet34.pth")
+    STUDENT_MODEL_PATH = os.path.join(WORKING_DIR, "student_resnet34.pth")
+
+    # ==========================================
+    # Data Preprocessing Hyperparameters
+    # ==========================================
+    # Image Dimensions:
+    # Height 256 preserves frequency resolution.
+    # Width 512 captures temporal dynamics while densifying the signal.
+    IMG_HEIGHT = 256
+    IMG_WIDTH = 512
+
+    # Input Channels: 3 (1: Intensity, 2: Delta, 3: Delta-Delta)
+    IN_CHANNELS = 3
+
+    NUM_CLASSES = 19
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+
+    # Hardware settings
+    NUM_WORKERS = 2
+    BATCH_SIZE = 16  # Adjusted for 12GB+ VRAM with ResNet34
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Augmentation
+    MIXUP_ALPHA = 0.2
+
+    # Stage 1: Teacher Training (Supervised on Fold 0)
+    TEACHER_EPOCHS = 25
+    TEACHER_PATIENCE = 6  # Early stopping patience
+
+    # Stage 2: Student Training (Semi-Supervised on Fold 0 + Fold 1 Pseudo-labels)
+    STUDENT_EPOCHS = 25
+    STUDENT_PATIENCE = 6
+=======
+    # ==========================================
+    # Model Checkpoints
+    # ==========================================
+    BEST_MODEL_PATH = os.path.join(WORKING_DIR, "best_model.pth")
+
+    # ==========================================
+    # Data Preprocessing Hyperparameters
+    # ==========================================
+    # Image Dimensions:
+    # Height 256 preserves frequency resolution.
+    # Width 512 captures temporal dynamics while densifying the signal.
+    IMG_HEIGHT = 256
+    IMG_WIDTH = 512
+
+    # Input Channels: 3 (Replicated Grayscale)
+    IN_CHANNELS = 3
+
+    NUM_CLASSES = 19
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+
+    # Hardware settings
+    NUM_WORKERS = 2
+    BATCH_SIZE = 16
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Augmentation
+    # Adjusted to 0.4 based on Lesson 00007 (Signal Preservation)
+    MIXUP_ALPHA = 0.4
+
+    # Training
+    EPOCHS = 50
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    @staticmethod
+    def compute_deltas(spec):
+        """
+        Computes the first and second temporal derivatives (deltas) of the spectrogram
+        to create a 3-channel input.
+
+        Args:
+            spec (np.ndarray): Single channel spectrogram (H, W).
+
+        Returns:
+            np.ndarray: 3-channel image (H, W, 3) -> [Intensity, Delta, Delta-Delta].
+        """
+        # Ensure input is float
+        spec = spec.astype(np.float32)
+
+        # Channel 1: Intensity (Original)
+        c1 = spec
+
+        # Channel 2: Delta (First derivative along time axis / width)
+        # axis 1 is width (time)
+        c2 = np.gradient(spec, axis=1)
+
+        # Channel 3: Delta-Delta (Second derivative)
+        c3 = np.gradient(c2, axis=1)
+
+        # Stack channels
+        img_3c = np.stack([c1, c2, c3], axis=-1)
+
+        return img_3c
+
+
+def process_and_cache_data(
+    metadata_path,
+    cache_img_path,
+    cache_label_path,
+    cache_id_path=None,
+    load_cached_data=True,
+):
+    """
+    Loads raw data, processes it (Resize + Deltas), and caches it to disk.
+
+    Args:
+        metadata_path (str): Path to the CSV file (train/val/test).
+        cache_img_path (str): Path to save/load cached images .npy.
+        cache_label_path (str): Path to save/load cached labels .npy.
+        cache_id_path (str, optional): Path to save/load cached IDs .npy.
+        load_cached_data (bool): Whether to attempt loading from cache.
+
+    Returns:
+        tuple: (images, labels, ids)
+    """
+    # 1. Try Loading from Cache
+    if load_cached_data:
+        if os.path.exists(cache_img_path) and os.path.exists(cache_label_path):
+            # Check ID cache if required
+            if cache_id_path is None or os.path.exists(cache_id_path):
+                print(f"Loading cached data from {os.path.dirname(cache_img_path)}...")
+                images = np.load(cache_img_path)
+                labels = np.load(cache_label_path)
+                ids = np.load(cache_id_path) if cache_id_path else None
+                return images, labels, ids
+
+    # 2. Process from Scratch
+    print(f"Processing data from {metadata_path}...")
+    df = pd.read_csv(metadata_path)
+
+    img_list = []
+    label_list = []
+    id_list = []
+
+    # Identify label columns
+    # Explicitly select columns based on config to avoid artifacts (Cite debug_lesson_1)
+    target_cols = [f"species_{i}" for i in range(Config.NUM_CLASSES)]
+    label_cols = [c for c in target_cols if c in df.columns]
+
+    for idx, row in df.iterrows():
+        # Construct full path to spectrogram
+        # row['file_path'] is like 'essential_data/src_wavs/filename.wav'
+        # Spectrograms are in Config.SPECTROGRAM_DIR with .bmp extension
+        wav_filename = os.path.basename(row["file_path"])
+        bmp_filename = os.path.splitext(wav_filename)[0] + ".bmp"
+        bmp_path = os.path.join(Config.SPECTROGRAM_DIR, bmp_filename)
+
+        if not os.path.exists(bmp_path):
+            # Should not happen based on metadata verification, but safe to skip
+            continue
+
+        # Load Image
+        img = cv2.imread(bmp_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+
+        # Resize
+        # cv2.resize expects (Width, Height)
+        img_resized = cv2.resize(
+            img, (Config.IMG_WIDTH, Config.IMG_HEIGHT), interpolation=cv2.INTER_LINEAR
+        )
+
+        # Normalize to 0-1 range before delta computation
+        img_norm = img_resized.astype(np.float32) / 255.0
+
+        # Compute Deltas (Structural Innovation)
+        img_3c = BirdDataset.compute_deltas(img_norm)
+
+        img_list.append(img_3c)
+        id_list.append(row["rec_id"])
+
+        # Handle Labels
+        if len(label_cols) > 0:
+            lbls = row[label_cols].values.astype(np.float32)
+            label_list.append(lbls)
+        else:
+            # Dummy labels for test set if columns missing (though metadata has them as 0)
+            label_list.append(np.zeros(Config.NUM_CLASSES, dtype=np.float32))
+
+    # Convert to numpy arrays
+    images = np.array(img_list, dtype=np.float32)
+    labels = np.array(label_list, dtype=np.float32)
+    ids = np.array(id_list, dtype=np.int64)
+
+    # Save to Cache
+    os.makedirs(os.path.dirname(cache_img_path), exist_ok=True)
+    np.save(cache_img_path, images)
+    np.save(cache_label_path, labels)
+    if cache_id_path:
+        np.save(cache_id_path, ids)
+
+    return images, labels, ids
+=======
+    @staticmethod
+    def prepare_input(spec):
+        """
+        Replicates the single channel spectrogram to create a 3-channel input.
+        This preserves natural image statistics better than engineered features
+        for transfer learning (Cite solution_lesson_node_00022).
+
+        Args:
+            spec (np.ndarray): Single channel spectrogram (H, W).
+
+        Returns:
+            np.ndarray: 3-channel image (H, W, 3).
+        """
+        # Ensure input is float
+        spec = spec.astype(np.float32)
+        
+        # Replicate channels: (H, W) -> (H, W, 3)
+        img_3c = np.stack([spec, spec, spec], axis=-1)
+
+        return img_3c
+
+
+def process_data(metadata_path):
+    """
+    Loads raw data and processes it (Resize + Channel Replication).
+    Caching is removed to ensure data integrity (Cite solution_lesson_node_00018).
+
+    Args:
+        metadata_path (str): Path to the CSV file (train/val/test).
+
+    Returns:
+        tuple: (images, labels, ids)
+    """
+    print(f"Processing data from {metadata_path}...")
+    df = pd.read_csv(metadata_path)
+
+    img_list = []
+    label_list = []
+    id_list = []
+
+    # Identify label columns
+    target_cols = [f"species_{i}" for i in range(Config.NUM_CLASSES)]
+    label_cols = [c for c in target_cols if c in df.columns]
+
+    for idx, row in df.iterrows():
+        # Construct full path to spectrogram
+        wav_filename = os.path.basename(row["file_path"])
+        bmp_filename = os.path.splitext(wav_filename)[0] + ".bmp"
+        bmp_path = os.path.join(Config.SPECTROGRAM_DIR, bmp_filename)
+
+        if not os.path.exists(bmp_path):
+            continue
+
+        # Load Image
+        img = cv2.imread(bmp_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+
+        # Resize
+        img_resized = cv2.resize(
+            img, (Config.IMG_WIDTH, Config.IMG_HEIGHT), interpolation=cv2.INTER_LINEAR
+        )
+
+        # Normalize to 0-1 range
+        img_norm = img_resized.astype(np.float32) / 255.0
+
+        # Prepare 3-channel input (Replication)
+        img_3c = BirdDataset.prepare_input(img_norm)
+
+        img_list.append(img_3c)
+        id_list.append(row["rec_id"])
+
+        # Handle Labels
+        if len(label_cols) > 0:
+            lbls = row[label_cols].values.astype(np.float32)
+            label_list.append(lbls)
+        else:
+            label_list.append(np.zeros(Config.NUM_CLASSES, dtype=np.float32))
+
+    # Convert to numpy arrays
+    images = np.array(img_list, dtype=np.float32)
+    labels = np.array(label_list, dtype=np.float32)
+    ids = np.array(id_list, dtype=np.int64)
+
+    return images, labels, ids
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def get_data_loaders(config, pseudo_labels=None, load_cached_data=True):
+    """
+    Prepares and returns DataLoaders for Train, Val, and Test sets.
+
+    Args:
+        config (Config): Configuration class.
+        pseudo_labels (dict or np.ndarray, optional): Soft labels for the test set.
+                                                      If provided, merges Train + Test for Student training.
+        load_cached_data (bool): Whether to use cached .npy files.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    set_seed(config.SEED)
+
+    # --- 1. Load Data ---
+
+    # Train Data (Fold 0)
+    train_images, train_labels, _ = process_and_cache_data(
+        config.TRAIN_CSV,
+        config.CACHE_TRAIN_IMAGES,
+        config.CACHE_TRAIN_LABELS,
+        load_cached_data=load_cached_data,
+    )
+
+    # Val Data (Fold 0)
+    val_images, val_labels, _ = process_and_cache_data(
+        config.VAL_CSV,
+        config.CACHE_VAL_IMAGES,
+        config.CACHE_VAL_LABELS,
+        load_cached_data=load_cached_data,
+    )
+
+    # Test Data (Fold 1)
+    test_images, _, test_ids = process_and_cache_data(
+        config.TEST_CSV,
+        config.CACHE_TEST_IMAGES,
+        "dummy_test_labels.npy",  # Dummy path, not used for loading labels
+        config.CACHE_TEST_IDS,
+        load_cached_data=load_cached_data,
+    )
+
+    # --- 2. Handle Pseudo-Labeling (Student Mode) ---
+
+    if pseudo_labels is not None:
+        print("Activating Student Mode: Merging Train and Pseudo-Labeled Test data.")
+
+        # If pseudo_labels is a dict {id: label}, map it to array
+        if isinstance(pseudo_labels, dict):
+            p_labels_arr = np.zeros(
+                (len(test_images), config.NUM_CLASSES), dtype=np.float32
+            )
+            for i, rid in enumerate(test_ids):
+                if rid in pseudo_labels:
+                    p_labels_arr[i] = pseudo_labels[rid]
+            pseudo_labels = p_labels_arr
+
+        # Ensure pseudo_labels match test_images count
+        if len(pseudo_labels) != len(test_images):
+            raise ValueError(
+                f"Pseudo-labels length {len(pseudo_labels)} mismatch with Test set {len(test_images)}"
+            )
+
+        # Concatenate Train (Hard Labels) + Test (Soft Labels)
+        final_train_images = np.concatenate([train_images, test_images], axis=0)
+        final_train_labels = np.concatenate([train_labels, pseudo_labels], axis=0)
+
+        print(f"Combined Training Set Size: {len(final_train_images)}")
+    else:
+        final_train_images = train_images
+        final_train_labels = train_labels
+
+    # --- 3. Create Datasets ---
+
+    # Debugging Subset
+    if config.DEBUG:
+        subset_size = min(config.DEBUG_SUBSET_SIZE, len(final_train_images))
+        final_train_images = final_train_images[:subset_size]
+        final_train_labels = final_train_labels[:subset_size]
+        val_images = val_images[:subset_size]
+        val_labels = val_labels[:subset_size]
+        test_images = test_images[:subset_size]
+        test_ids = test_ids[:subset_size]
+        print(f"DEBUG MODE: Reduced training size to {subset_size}")
+
+    train_dataset = BirdDataset(
+        final_train_images, final_train_labels, transform=get_transforms("train")
+    )
+
+    val_dataset = BirdDataset(val_images, val_labels, transform=get_transforms("val"))
+
+    test_dataset = BirdDataset(
+        test_images, ids=test_ids, transform=get_transforms("test")
+    )
+=======
+def get_data_loaders(config):
+    """
+    Prepares and returns DataLoaders for Train, Val, and Test sets.
+
+    Args:
+        config (Config): Configuration class.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    set_seed(config.SEED)
+
+    # --- 1. Load Data ---
+
+    # Train Data (Fold 0)
+    train_images, train_labels, _ = process_data(config.TRAIN_CSV)
+
+    # Val Data (Fold 0)
+    val_images, val_labels, _ = process_data(config.VAL_CSV)
+
+    # Test Data (Fold 1)
+    test_images, _, test_ids = process_data(config.TEST_CSV)
+
+    # --- 2. Create Datasets ---
+
+    # Debugging Subset
+    if config.DEBUG:
+        subset_size = min(config.DEBUG_SUBSET_SIZE, len(train_images))
+        train_images = train_images[:subset_size]
+        train_labels = train_labels[:subset_size]
+        val_images = val_images[:subset_size]
+        val_labels = val_labels[:subset_size]
+        test_images = test_images[:subset_size]
+        test_ids = test_ids[:subset_size]
+        print(f"DEBUG MODE: Reduced training size to {subset_size}")
+
+    train_dataset = BirdDataset(
+        train_images, train_labels, transform=get_transforms("train")
+    )
+
+    val_dataset = BirdDataset(val_images, val_labels, transform=get_transforms("val"))
+
+    test_dataset = BirdDataset(
+        test_images, ids=test_ids, transform=get_transforms("test")
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # --- 1. Setup & Configuration ---
+    set_seed(Config.SEED)
+
+    # Initialize Logger
+    logger = Logger(os.path.join(Config.WORKING_DIR, "training_log.txt"))
+    logger.log("Starting Spectral-Dynamic ResNet-34 with Self-Distillation Pipeline")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.log(f"Device: {device}")
+
+    # --- 2. Data Loading (Stage 1) ---
+    logger.log("\n--- Loading Data for Teacher Training ---")
+    # Load initial loaders (Train only on labeled data)
+    train_loader_teacher, val_loader, test_loader = get_data_loaders(
+        Config, pseudo_labels=None, load_cached_data=True
+    )
+
+    # --- 3. Stage 1: Teacher Training ---
+    logger.log("\n--- Stage 1: Teacher Training ---")
+
+    teacher_model = BirdResNet(num_classes=Config.NUM_CLASSES, pretrained=True).to(
+        device
+    )
+
+    optimizer_teacher = optim.AdamW(
+        teacher_model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    scheduler_teacher = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_teacher, T_max=Config.TEACHER_EPOCHS
+    )
+
+    best_teacher_auc = 0.0
+
+    for epoch in range(1, Config.TEACHER_EPOCHS + 1):
+        train_loss = train_one_epoch(
+            teacher_model, train_loader_teacher, optimizer_teacher, device, Config
+        )
+        val_loss, val_auc = validate(teacher_model, val_loader, device)
+        scheduler_teacher.step()
+
+        logger.log_metrics(epoch, train_loss, val_loss, val_auc)
+
+        if val_auc > best_teacher_auc:
+            best_teacher_auc = val_auc
+            save_checkpoint(teacher_model, Config.TEACHER_MODEL_PATH)
+            logger.log(f"  -> New Best Teacher Model Saved! AUC: {val_auc:.4f}")
+
+    logger.log(f"Best Teacher AUC: {best_teacher_auc:.4f}")
+
+    # --- 4. Pseudo-Labeling ---
+    logger.log("\n--- Generating Pseudo-Labels for Student Training ---")
+
+    # Load best teacher
+    teacher_model.load_state_dict(
+        torch.load(Config.TEACHER_MODEL_PATH, map_location=device)
+    )
+
+    # Inference on Test Set
+    test_ids, test_probs = inference(teacher_model, test_loader, device)
+
+    # Map IDs to probabilities for correct ordering in dataset merging
+    # The get_data_loaders function expects an array matching the test set order or a dict.
+    # We'll pass a dict to be safe as implemented in dataset.py
+    pseudo_labels_dict = {rid: probs for rid, probs in zip(test_ids, test_probs)}
+
+    # --- 5. Stage 2: Student Training ---
+    logger.log("\n--- Stage 2: Student Training (Self-Distillation) ---")
+
+    # Reload loaders with pseudo-labels
+    # This merges Train and Test sets for the training loader
+    train_loader_student, _, _ = get_data_loaders(
+        Config, pseudo_labels=pseudo_labels_dict, load_cached_data=True
+    )
+
+    student_model = BirdResNet(num_classes=Config.NUM_CLASSES, pretrained=True).to(
+        device
+    )
+
+    optimizer_student = optim.AdamW(
+        student_model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    scheduler_student = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_student, T_max=Config.STUDENT_EPOCHS
+    )
+
+    best_student_auc = 0.0
+
+    for epoch in range(1, Config.STUDENT_EPOCHS + 1):
+        train_loss = train_one_epoch(
+            student_model, train_loader_student, optimizer_student, device, Config
+        )
+        # Validate on the original validation set (Fold 0 hold-out)
+        val_loss, val_auc = validate(student_model, val_loader, device)
+        scheduler_student.step()
+
+        logger.log_metrics(epoch, train_loss, val_loss, val_auc)
+
+        if val_auc > best_student_auc:
+            best_student_auc = val_auc
+            save_checkpoint(student_model, Config.STUDENT_MODEL_PATH)
+            logger.log(f"  -> New Best Student Model Saved! AUC: {val_auc:.4f}")
+
+    # --- 6. Final Evaluation & Failure Analysis ---
+    logger.log("\n--- Final Evaluation & Failure Analysis ---")
+
+    # Load best student
+    student_model.load_state_dict(
+        torch.load(Config.STUDENT_MODEL_PATH, map_location=device)
+    )
+
+    # Final Validation
+    _, final_val_auc = validate(student_model, val_loader, device)
+    print(f"Final Validation Metric: {final_val_auc}")
+
+    # Failure Analysis
+    student_model.eval()
+    val_errors = []
+    val_img_means = []
+    val_img_stds = []
+    val_label_counts = []
+
+    criterion_none = nn.BCEWithLogitsLoss(reduction="none")
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            logits = student_model(images)
+            probs = torch.sigmoid(logits)
+
+            # Calculate Mean Absolute Error per sample
+            # shape: (B, C) -> mean over C -> (B,)
+            mae = torch.abs(probs - labels).mean(dim=1).cpu().numpy()
+            val_errors.extend(mae)
+
+            # Image stats (Channel 0 is intensity)
+            # images shape: (B, 3, H, W)
+            img_mean = images[:, 0, :, :].mean(dim=(1, 2)).cpu().numpy()
+            img_std = images[:, 0, :, :].std(dim=(1, 2)).cpu().numpy()
+
+            val_img_means.extend(img_mean)
+            val_img_stds.extend(img_std)
+
+            # Label counts
+            l_counts = labels.sum(dim=1).cpu().numpy()
+            val_label_counts.extend(l_counts)
+
+    val_errors = np.array(val_errors)
+    val_img_means = np.array(val_img_means)
+    val_img_stds = np.array(val_img_stds)
+    val_label_counts = np.array(val_label_counts)
+
+    # Correlations
+    corr_mean, _ = pearsonr(val_errors, val_img_means)
+    corr_std, _ = pearsonr(val_errors, val_img_stds)
+    corr_count, _ = pearsonr(val_errors, val_label_counts)
+
+    print("\nFailure Analysis Correlations (Error Magnitude vs Feature):")
+    print(f"  Signal Intensity (Mean): {corr_mean:.4f}")
+    print(f"  Signal Contrast (Std):   {corr_std:.4f}")
+    print(f"  Label Complexity (Count): {corr_count:.4f}")
+
+    # --- 7. Submission ---
+    threshold = 0.0
+    if final_val_auc > threshold:
+        logger.log(
+            f"\nValidation metric {final_val_auc} > {threshold}. Generating submission..."
+        )
+
+        # Inference on Test Set with Best Student
+        test_ids, test_probs = inference(student_model, test_loader, device)
+=======
+def main():
+    # --- 1. Setup & Configuration ---
+    set_seed(Config.SEED)
+
+    # Initialize Logger
+    logger = Logger(os.path.join(Config.WORKING_DIR, "training_log.txt"))
+    logger.log("Starting ResNet-34 Supervised Pipeline (Replicated Channels)")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.log(f"Device: {device}")
+
+    # --- 2. Data Loading ---
+    logger.log("\n--- Loading Data ---")
+    train_loader, val_loader, test_loader = get_data_loaders(Config)
+
+    # --- 3. Training ---
+    logger.log("\n--- Training ---")
+
+    model = BirdResNet(num_classes=Config.NUM_CLASSES, pretrained=True).to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.EPOCHS
+    )
+
+    best_auc = 0.0
+
+    for epoch in range(1, Config.EPOCHS + 1):
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, Config
+        )
+        val_loss, val_auc = validate(model, val_loader, device)
+        scheduler.step()
+
+        logger.log_metrics(epoch, train_loss, val_loss, val_auc)
+
+        if val_auc > best_auc:
+            best_auc = val_auc
+            save_checkpoint(model, Config.BEST_MODEL_PATH)
+            logger.log(f"  -> New Best Model Saved! AUC: {val_auc:.4f}")
+
+    logger.log(f"Best Validation AUC: {best_auc:.4f}")
+
+    # --- 4. Final Evaluation & Failure Analysis ---
+    logger.log("\n--- Final Evaluation & Failure Analysis ---")
+
+    # Load best model
+    model.load_state_dict(
+        torch.load(Config.BEST_MODEL_PATH, map_location=device)
+    )
+
+    # Final Validation
+    _, final_val_auc = validate(model, val_loader, device)
+    print(f"Final Validation Metric: {final_val_auc}")
+
+    # Failure Analysis
+    model.eval()
+    val_errors = []
+    val_img_means = []
+    val_img_stds = []
+    val_label_counts = []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            # Calculate Mean Absolute Error per sample
+            mae = torch.abs(probs - labels).mean(dim=1).cpu().numpy()
+            val_errors.extend(mae)
+
+            # Image stats (Channel 0 is intensity)
+            img_mean = images[:, 0, :, :].mean(dim=(1, 2)).cpu().numpy()
+            img_std = images[:, 0, :, :].std(dim=(1, 2)).cpu().numpy()
+
+            val_img_means.extend(img_mean)
+            val_img_stds.extend(img_std)
+
+            # Label counts
+            l_counts = labels.sum(dim=1).cpu().numpy()
+            val_label_counts.extend(l_counts)
+
+    val_errors = np.array(val_errors)
+    val_img_means = np.array(val_img_means)
+    val_img_stds = np.array(val_img_stds)
+    val_label_counts = np.array(val_label_counts)
+
+    # Correlations
+    corr_mean, _ = pearsonr(val_errors, val_img_means)
+    corr_std, _ = pearsonr(val_errors, val_img_stds)
+    corr_count, _ = pearsonr(val_errors, val_label_counts)
+
+    print("\nFailure Analysis Correlations (Error Magnitude vs Feature):")
+    print(f"  Signal Intensity (Mean): {corr_mean:.4f}")
+    print(f"  Signal Contrast (Std):   {corr_std:.4f}")
+    print(f"  Label Complexity (Count): {corr_count:.4f}")
+
+    # --- 5. Submission ---
+    threshold = 0.9255537489325414
+    if final_val_auc > threshold:
+        logger.log(
+            f"\nValidation metric {final_val_auc} > {threshold}. Generating submission..."
+        )
+
+        # Inference on Test Set
+        test_ids, test_probs = inference(model, test_loader, device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,462 @@
+I will optimize the solution by reverting the architecture to the **Dilated EfficientNet-B2** with **Attentive Pooling**, effectively removing the Transformer Encoder module that caused training instability in the previous iteration (Cite solution_lesson_node_00030). The pure CNN approach has previously demonstrated superior stability and performance (98.73%). I will also increase the `batch_size` to 128 to improve training throughput and set the `epochs` to 35 to ensure full convergence within the available runtime, leveraging the faster training dynamics of the pure CNN (Cite solution_lesson_node_00029). Additionally, I will increase the number of data loader workers to 8 to prevent data starvation.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+class ModelConfig:
+    """Configuration for the Context-Aware Dilated EfficientNet-B2."""
+
+    model_name = "efficientnet_b2"
+    pretrained = True
+    in_channels = 1  # Log-Mel Spectrogram (1 channel)
+
+    # Transformer Context Module
+    # The backbone features will be projected to d_model
+    d_model = 256
+    nhead = 4
+    num_layers = 1
+    dropout = 0.3
+
+    # Classification Head
+    # 30 words + 1 silence = 31 fine-grained classes
+    num_classes = 31
+
+
+class TrainConfig:
+    """Configuration for the training loop."""
+
+    seed = 42
+    batch_size = 64  # Optimized for A100 (40GB)
+    epochs = 50
+    learning_rate = 1e-3
+    weight_decay = 1e-2
+    mixup_alpha = 1.0  # Strong Mixup regularization
+
+    # Scheduler (Cosine Annealing)
+    T_max = 50
+    eta_min = 1e-6
+
+    # Directories
+    work_dir = "./working/idea_8/"
+=======
+class ModelConfig:
+    """Configuration for the Dilated EfficientNet-B2."""
+
+    model_name = "efficientnet_b2"
+    pretrained = True
+    in_channels = 1  # Log-Mel Spectrogram (1 channel)
+    dropout = 0.3
+
+    # Classification Head
+    # 30 words + 1 silence = 31 fine-grained classes
+    num_classes = 31
+
+
+class TrainConfig:
+    """Configuration for the training loop."""
+
+    seed = 42
+    batch_size = 128  # Increased for efficiency
+    epochs = 35
+    learning_rate = 1e-3
+    weight_decay = 1e-2
+    mixup_alpha = 1.0  # Strong Mixup regularization
+
+    # Scheduler (Cosine Annealing)
+    T_max = 35
+    eta_min = 1e-6
+
+    # Directories
+    work_dir = "./working/idea_9/"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ContextAwareEfficientNet(nn.Module):
+    """
+    Hybrid architecture combining a Dilated EfficientNet backbone with a
+    Transformer-based Temporal Context Module and Attentive Pooling.
+    """
+
+    def __init__(self):
+        super(ContextAwareEfficientNet, self).__init__()
+
+        # Configuration
+        self.num_classes = ModelConfig.num_classes
+        self.d_model = ModelConfig.d_model
+        self.dropout = ModelConfig.dropout
+
+        # 1. Backbone: Dilated EfficientNet-B2
+        # - pretrained=True: Start with ImageNet weights.
+        # - in_chans=1: Automatically adapts first conv layer by averaging RGB weights.
+        # - output_stride=16: Replaces the final stride-2 downsampling with dilation=2.
+        #   This preserves temporal resolution (feature map width ~7 instead of ~3).
+        # - global_pool='': Return the full feature map (B, C, H, W).
+        self.backbone = timm.create_model(
+            ModelConfig.model_name,
+            pretrained=ModelConfig.pretrained,
+            in_chans=ModelConfig.in_channels,
+            num_classes=0,
+            global_pool="",
+            output_stride=16,
+        )
+
+        # Determine backbone output channels dynamically
+        with torch.no_grad():
+            # Dummy input: (Batch, Channels, Freq, Time)
+            # Time = 101 frames (1s @ 16k sr, 160 hop)
+            dummy_input = torch.zeros(
+                1, ModelConfig.in_channels, AudioConfig.n_mels, 101
+            )
+            features = self.backbone(dummy_input)
+            # features shape: (1, C, H, W)
+            self.backbone_channels = features.shape[1]
+
+        # 2. Projection Layer
+        # Projects high-dim backbone features (e.g., 1408) to d_model (256)
+        self.projection = nn.Linear(self.backbone_channels, self.d_model)
+
+        # 3. Temporal Context Module (Transformer Encoder)
+        # Captures sequential dependencies between frames.
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=ModelConfig.nhead,
+            dim_feedforward=self.d_model * 4,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=ModelConfig.num_layers
+        )
+
+        # 4. Attentive Pooling Head
+        self.att_pooling = AttentivePooling(self.d_model)
+
+        # 5. Classifier
+        self.classifier = nn.Linear(self.d_model, self.num_classes)
+
+        # Initialize custom layers
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize the added layers (Projection, Transformer, Head).
+        Does not re-initialize the pretrained backbone.
+        """
+        # Init Projection and Classifier
+        nn.init.xavier_uniform_(self.projection.weight)
+        if self.projection.bias is not None:
+            nn.init.zeros_(self.projection.bias)
+
+        nn.init.xavier_uniform_(self.classifier.weight)
+        if self.classifier.bias is not None:
+            nn.init.zeros_(self.classifier.bias)
+
+        # Init Transformer parameters
+        for p in self.transformer.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+        # Init Attentive Pooling
+        for m in self.att_pooling.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Log-Mel Spectrograms. Shape (Batch, 1, 128, 101).
+        Returns:
+            logits (torch.Tensor): Class probabilities. Shape (Batch, Num_Classes).
+        """
+        # 1. Backbone Feature Extraction
+        # x: (B, 1, 128, 101) -> (B, C, H', W')
+        # H' is reduced frequency dim, W' is reduced time dim (~7 frames)
+        x = self.backbone(x)
+
+        # 2. Frequency Pooling
+        # We assume the frequency dimension (H) contains spectral patterns which the CNN
+        # has already processed. We average over H to get a vector per time step.
+        # x: (B, C, H', W') -> (B, C, W')
+        x = x.mean(dim=2)
+
+        # 3. Sequence Preparation
+        # Permute to (Batch, Time, Channels) for Transformer
+        x = x.permute(0, 2, 1)
+
+        # 4. Projection
+        # x: (B, T, C) -> (B, T, d_model)
+        x = self.projection(x)
+
+        # 5. Temporal Context
+        # x: (B, T, d_model)
+        x = self.transformer(x)
+
+        # 6. Attentive Pooling
+        # Aggregates time steps into a single vector
+        # x: (B, T, d_model) -> (B, d_model)
+        x = self.att_pooling(x)
+
+        # 7. Classification
+        # x: (B, d_model) -> (B, num_classes)
+        logits = self.classifier(x)
+
+        return logits
+=======
+class DilatedEfficientNet(nn.Module):
+    """
+    Dilated EfficientNet backbone with Attentive Pooling.
+    Removes the Transformer module to improve training stability.
+    """
+
+    def __init__(self):
+        super(DilatedEfficientNet, self).__init__()
+
+        # Configuration
+        self.num_classes = ModelConfig.num_classes
+        self.dropout = ModelConfig.dropout
+
+        # 1. Backbone: Dilated EfficientNet-B2
+        # - pretrained=True: Start with ImageNet weights.
+        # - in_chans=1: Automatically adapts first conv layer by averaging RGB weights.
+        # - output_stride=16: Replaces the final stride-2 downsampling with dilation=2.
+        #   This preserves temporal resolution.
+        # - global_pool='': Return the full feature map (B, C, H, W).
+        self.backbone = timm.create_model(
+            ModelConfig.model_name,
+            pretrained=ModelConfig.pretrained,
+            in_chans=ModelConfig.in_channels,
+            num_classes=0,
+            global_pool="",
+            output_stride=16,
+        )
+
+        # Determine backbone output channels dynamically
+        with torch.no_grad():
+            # Dummy input: (Batch, Channels, Freq, Time)
+            dummy_input = torch.zeros(
+                1, ModelConfig.in_channels, AudioConfig.n_mels, 101
+            )
+            features = self.backbone(dummy_input)
+            # features shape: (1, C, H, W)
+            self.backbone_channels = features.shape[1]
+
+        # 2. Attentive Pooling Head
+        # Operates directly on backbone channels (e.g., 1408 for B2)
+        self.att_pooling = AttentivePooling(self.backbone_channels)
+
+        # 3. Classifier
+        self.classifier = nn.Sequential(
+            nn.Dropout(self.dropout),
+            nn.Linear(self.backbone_channels, self.num_classes)
+        )
+
+        # Initialize custom layers
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize the added layers (Head).
+        Does not re-initialize the pretrained backbone.
+        """
+        # Init Classifier
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Init Attentive Pooling
+        for m in self.att_pooling.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Log-Mel Spectrograms. Shape (Batch, 1, 128, 101).
+        Returns:
+            logits (torch.Tensor): Class probabilities. Shape (Batch, Num_Classes).
+        """
+        # 1. Backbone Feature Extraction
+        # x: (B, 1, 128, 101) -> (B, C, H', W')
+        x = self.backbone(x)
+
+        # 2. Frequency Pooling
+        # x: (B, C, H', W') -> (B, C, W')
+        x = x.mean(dim=2)
+
+        # 3. Sequence Preparation
+        # Permute to (Batch, Time, Channels)
+        # x: (B, C, W') -> (B, W', C)
+        x = x.permute(0, 2, 1)
+
+        # 4. Attentive Pooling
+        # Aggregates time steps into a single vector
+        # x: (B, T, C) -> (B, C)
+        x = self.att_pooling(x)
+
+        # 5. Classification
+        # x: (B, C) -> (B, num_classes)
+        logits = self.classifier(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import ContextAwareEfficientNet
+
+
+class Trainer:
+    def __init__(self):
+        # 1. Setup
+        self.config = TrainConfig
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        set_seed(self.config.seed)
+
+        # Ensure working directory exists
+        os.makedirs(self.config.work_dir, exist_ok=True)
+
+        # 2. Data
+        print("Initializing DataLoaders...")
+        self.train_loader, self.val_loader, _ = get_dataloaders(load_cached_data=True)
+
+        # 3. Model
+        print("Initializing Model...")
+        self.model = ContextAwareEfficientNet().to(self.device)
+=======
+from library.model import DilatedEfficientNet
+
+
+class Trainer:
+    def __init__(self):
+        # 1. Setup
+        self.config = TrainConfig
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        set_seed(self.config.seed)
+
+        # Ensure working directory exists
+        os.makedirs(self.config.work_dir, exist_ok=True)
+
+        # 2. Data
+        print("Initializing DataLoaders...")
+        self.train_loader, self.val_loader, _ = get_dataloaders(load_cached_data=True)
+
+        # 3. Model
+        print("Initializing Model...")
+        self.model = DilatedEfficientNet().to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # 6. Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+=======
+    # 6. Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=TrainConfig.batch_size,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # 1. Configuration Setup
+    # =========================================================================
+    # Override configuration for a fast baseline run.
+    # Reducing epochs to 10 ensures the run completes within the 2-hour limit.
+    config.TrainConfig.epochs = 10
+
+    # Set seeds for reproducibility
+    utils.set_seed(config.TrainConfig.seed)
+=======
+    # =========================================================================
+    # 1. Configuration Setup
+    # =========================================================================
+    # Override configuration for the optimized run.
+    # Increasing epochs to 35 to ensure convergence for the pure CNN model.
+    config.TrainConfig.epochs = 35
+
+    # Set seeds for reproducibility
+    utils.set_seed(config.TrainConfig.seed)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load the best model checkpoint
+    best_model = model.ContextAwareEfficientNet().to(device)
+    checkpoint_path = config.TrainConfig.checkpoint_path
+
+    if not os.path.exists(checkpoint_path):
+=======
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load the best model checkpoint
+    best_model = model.DilatedEfficientNet().to(device)
+    checkpoint_path = config.TrainConfig.checkpoint_path
+
+    if not os.path.exists(checkpoint_path):
+>>>>>>> REPLACE
+```

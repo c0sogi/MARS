@@ -1,0 +1,399 @@
+The `torch.OutOfMemoryError` is caused by the `EfficientNetV2-L` model's large memory footprint with 480x480 images and a batch size of 16 on a 16GB GPU. To fix this, I will implement Gradient Accumulation and Automatic Mixed Precision (AMP). This involves reducing the physical batch size to fit in VRAM (Cite debug_lesson_3) while maintaining the effective batch size by accumulating gradients over multiple steps (Cite debug_lesson_5). I will also add the necessary configuration flags (Cite debug_lesson_7) and update the training loops in both the library and the execution script to utilize `torch.cuda.amp.GradScaler` and `autocast`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Loss & Regularization
+    LABEL_SMOOTHING = 0.05
+
+    # =========================================================================
+=======
+    # Loss & Regularization
+    LABEL_SMOOTHING = 0.05
+
+    # New: Mixed Precision and Gradient Accumulation
+    USE_AMP = True
+    GRAD_ACCUM_STEPS = 4
+
+    # =========================================================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    MODELS = [
+        {
+            "name": "tf_efficientnetv2_l.in21k_ft_in1k",
+            "img_size": 480,
+            "batch_size": 16,  # Adjusted for A100 40GB (EffNetV2-L is memory intensive)
+            "gem_p": 3.0,  # Initial p for GeM Pooling
+            "dropout": 0.2,
+            "num_msd": 5,  # Number of Multi-Sample Dropout branches
+            "msd_dropout": 0.2,
+        },
+        {
+            "name": "convnext_base.fb_in22k_ft_in1k_384",
+            "img_size": 384,
+            "batch_size": 32,  # ConvNeXt-Base fits larger batches
+            "gem_p": 3.0,
+            "dropout": 0.2,
+            "num_msd": 5,
+            "msd_dropout": 0.2,
+        },
+    ]
+=======
+    MODELS = [
+        {
+            "name": "tf_efficientnetv2_l.in21k_ft_in1k",
+            "img_size": 480,
+            "batch_size": 4,  # Reduced to fit 16GB VRAM (Effective batch = 4 * 4 = 16)
+            "gem_p": 3.0,  # Initial p for GeM Pooling
+            "dropout": 0.2,
+            "num_msd": 5,  # Number of Multi-Sample Dropout branches
+            "msd_dropout": 0.2,
+        },
+        {
+            "name": "convnext_base.fb_in22k_ft_in1k_384",
+            "img_size": 384,
+            "batch_size": 16,  # Reduced for safety (Effective batch = 16 * 4 = 64)
+            "gem_p": 3.0,
+            "dropout": 0.2,
+            "num_msd": 5,
+            "msd_dropout": 0.2,
+        },
+    ]
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+from library.config import Config
+=======
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from torch.cuda.amp import autocast, GradScaler
+
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def train_one_epoch(loader, model, criterion, optimizer, device, epoch, logger):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    for batch_idx, (images, targets) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        batch_size = images.size(0)
+
+        # Forward pass
+        # Model handles Multi-Sample Dropout internally during training
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+        optimizer.step()
+
+        running_loss += loss.item() * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    return epoch_loss
+=======
+def train_one_epoch(
+    loader,
+    model,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+    logger,
+    scaler=None,
+    accumulation_steps=1,
+):
+    """
+    Trains the model for one epoch with AMP and Gradient Accumulation support.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    optimizer.zero_grad()
+
+    for batch_idx, (images, targets) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        batch_size = images.size(0)
+
+        # Forward pass with AMP
+        with autocast(enabled=(scaler is not None)):
+            # Model handles Multi-Sample Dropout internally during training
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+            # Normalize loss for gradient accumulation
+            loss = loss / accumulation_steps
+
+        # Backward pass
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Step Optimizer
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+                optimizer.step()
+            
+            optimizer.zero_grad()
+
+        running_loss += loss.item() * accumulation_steps * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    return epoch_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            batch_size = images.size(0)
+
+            # Forward pass
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid for metric calculation
+            preds = torch.sigmoid(outputs)
+
+            all_targets.append(targets.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+=======
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            batch_size = images.size(0)
+
+            # Forward pass with AMP for memory efficiency
+            with autocast(enabled=Config.USE_AMP):
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid for metric calculation
+            preds = torch.sigmoid(outputs).float()
+
+            all_targets.append(targets.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+            # Loss, Optimizer, Scheduler
+            criterion = WeightedBCELoss(
+                pos_weights=pos_weights, smoothing=Config.LABEL_SMOOTHING
+            )
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=Config.LEARNING_RATE,
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+
+            # Standard Scheduler
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+            )
+
+            # SWA Setup
+            if Config.USE_SWA:
+                swa_model = AveragedModel(model)
+                swa_scheduler = SWALR(optimizer, swa_lr=Config.SWA_LR)
+                swa_start = Config.SWA_START_EPOCH
+            else:
+                swa_model = None
+                swa_start = Config.EPOCHS + 1  # Never start
+
+            best_auc = 0.0
+            best_model_path = os.path.join(
+                Config.WORKING_DIR, f"best_model_{safe_model_name}_fold_{fold}.pth"
+            )
+
+            # Training Loop
+            for epoch in range(Config.EPOCHS):
+                start_time = time.time()
+
+                train_loss = train_one_epoch(
+                    train_loader,
+                    model,
+                    criterion,
+                    optimizer,
+                    Config.DEVICE,
+                    epoch,
+                    logger,
+                )
+=======
+            # Loss, Optimizer, Scheduler
+            criterion = WeightedBCELoss(
+                pos_weights=pos_weights, smoothing=Config.LABEL_SMOOTHING
+            )
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=Config.LEARNING_RATE,
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+
+            # Standard Scheduler
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+            )
+            
+            # Scaler
+            scaler = GradScaler(enabled=Config.USE_AMP)
+
+            # SWA Setup
+            if Config.USE_SWA:
+                swa_model = AveragedModel(model)
+                swa_scheduler = SWALR(optimizer, swa_lr=Config.SWA_LR)
+                swa_start = Config.SWA_START_EPOCH
+            else:
+                swa_model = None
+                swa_start = Config.EPOCHS + 1  # Never start
+
+            best_auc = 0.0
+            best_model_path = os.path.join(
+                Config.WORKING_DIR, f"best_model_{safe_model_name}_fold_{fold}.pth"
+            )
+
+            # Training Loop
+            for epoch in range(Config.EPOCHS):
+                start_time = time.time()
+
+                train_loss = train_one_epoch(
+                    train_loader,
+                    model,
+                    criterion,
+                    optimizer,
+                    Config.DEVICE,
+                    epoch,
+                    logger,
+                    scaler=scaler,
+                    accumulation_steps=Config.GRAD_ACCUM_STEPS,
+                )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from torch.utils.data import DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import cv2
+
+# Import from provided library files
+=======
+from torch.utils.data import DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import cv2
+from torch.cuda.amp import GradScaler
+
+# Import from provided library files
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+            )
+
+            best_auc = 0.0
+            best_model_path = os.path.join(
+                Config.WORKING_DIR, f"best_model_{safe_model_name}_fold_{fold}.pth"
+            )
+
+            # Training Epochs
+            for epoch in range(Config.EPOCHS):
+                train_loss = train_one_epoch(
+                    train_loader,
+                    model,
+                    criterion,
+                    optimizer,
+                    Config.DEVICE,
+                    epoch,
+                    logger,
+                )
+                scheduler.step()
+=======
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+            )
+
+            # Scaler for AMP
+            scaler = GradScaler(enabled=Config.USE_AMP)
+
+            best_auc = 0.0
+            best_model_path = os.path.join(
+                Config.WORKING_DIR, f"best_model_{safe_model_name}_fold_{fold}.pth"
+            )
+
+            # Training Epochs
+            for epoch in range(Config.EPOCHS):
+                train_loss = train_one_epoch(
+                    train_loader,
+                    model,
+                    criterion,
+                    optimizer,
+                    Config.DEVICE,
+                    epoch,
+                    logger,
+                    scaler=scaler,
+                    accumulation_steps=Config.GRAD_ACCUM_STEPS,
+                )
+                scheduler.step()
+>>>>>>> REPLACE
+```

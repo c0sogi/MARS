@@ -1,0 +1,402 @@
+Based on the analysis of the previous solution and the provided lessons, I will optimize the solution by transitioning from a Dual-Stream architecture to a unified Deep Residual Bidirectional LSTM with Input Injection.
+
+Here is the implementation strategy:
+1.  **Modify `library/config.py`**:
+    *   Update `HIDDEN_DIM` to 512 and `EPOCHS` to 150 to maximize model capacity and convergence (Cite `solution_lesson_node_00021`, `solution_lesson_node_00005`).
+    *   Increase `BATCH_SIZE` to 1024 to improve training throughput on the A100 GPU.
+    *   Set `WEIGHT_DECAY` to 0.05 and `PATIENCE` to 25 to improve regularization and allow for stable long-term convergence (Cite `solution_lesson_node_00023`).
+    *   Remove configurations related to the MLP stream.
+
+2.  **Modify `library/model.py`**:
+    *   Replace the `DSPIN`, `RecurrentStream`, and `InstantaneousStream` classes with a single `ResBiLSTM` class.
+    *   Implement Input Injection by concatenating the original input features to the input of every hidden layer (Cite `solution_lesson_node_00021`, `solution_lesson_node_00025`).
+    *   Apply Layer Normalization and Dropout after each LSTM layer (Cite `solution_lesson_node_00023`).
+
+3.  **Modify `runfile.py`**:
+    *   Update imports and model instantiation to use `ResBiLSTM`.
+    *   Remove the `Config.EPOCHS = 6` override to allow the full training schedule.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ====================================================
+    # Model Architecture: Dual-Stream Physics-Informed Network
+    # ====================================================
+    # Common
+    HIDDEN_DIM = 256
+
+    # Stream 1: Recurrent Path (Models Elastic Pressure / Volume Dynamics)
+    # Deep Bidirectional LSTM with Input Injection
+    LSTM_LAYERS = 4
+    LSTM_BIDIRECTIONAL = True
+    LSTM_DROPOUT = 0.1
+
+    # Stream 2: Instantaneous Path (Models Resistive Pressure / Flow Dynamics)
+    # Deep Residual MLP
+    MLP_LAYERS = 4
+    MLP_DIM = 256
+    MLP_DROPOUT = 0.1
+
+    # ====================================================
+    # Training Hyperparameters
+    # ====================================================
+    BATCH_SIZE = 512  # Large batch size for A100 efficiency
+    EPOCHS = 60  # Sufficient for convergence without CNN overhead
+
+    # Optimizer
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    MAX_GRAD_NORM = 1000.0
+
+    # Loss Function Weights
+    # We weight the inspiratory phase (u_out=0) higher as it is the scored metric.
+    # Expiratory phase (u_out=1) is kept with low weight for state stability.
+    LOSS_INSPIRATORY_WEIGHT = 1.0
+    LOSS_EXPIRATORY_WEIGHT = 0.1
+
+    # Scheduler (Cosine Annealing)
+    T_MAX = EPOCHS
+    ETA_MIN = 1e-6
+
+    # Early Stopping
+    PATIENCE = 15
+=======
+    # ====================================================
+    # Model Architecture: Deep Residual BiLSTM with Input Injection
+    # ====================================================
+    # Cite solution_lesson_node_00025: Unified Recurrent Architectures Outperform Physics-Based Branching
+    # Cite solution_lesson_node_00021: Input Injection in Deep Recurrent Networks
+    HIDDEN_DIM = 512
+    LSTM_LAYERS = 4
+    LSTM_BIDIRECTIONAL = True
+    LSTM_DROPOUT = 0.1
+
+    # ====================================================
+    # Training Hyperparameters
+    # ====================================================
+    BATCH_SIZE = 1024  # Increased for throughput with larger model
+    EPOCHS = 150  # Cite solution_lesson_node_00005, solution_lesson_node_00023
+
+    # Optimizer
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.05  # Cite solution_lesson_node_00023
+    MAX_GRAD_NORM = 1000.0
+
+    # Loss Function Weights
+    # We weight the inspiratory phase (u_out=0) higher as it is the scored metric.
+    # Expiratory phase (u_out=1) is kept with low weight for state stability.
+    LOSS_INSPIRATORY_WEIGHT = 1.0
+    LOSS_EXPIRATORY_WEIGHT = 0.1
+
+    # Scheduler (Cosine Annealing)
+    T_MAX = EPOCHS
+    ETA_MIN = 1e-6
+
+    # Early Stopping
+    PATIENCE = 25  # Cite solution_lesson_node_00023
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RecurrentStream(nn.Module):
+    """
+    Stream 1: The Recurrent "Elastic" Path.
+    Models time-dependent dynamics (Volume, Compliance) using a Deep Residual Bidirectional LSTM
+    with Input Injection.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.num_layers = Config.LSTM_LAYERS
+        self.dropout_p = Config.LSTM_DROPOUT
+        self.bidirectional = Config.LSTM_BIDIRECTIONAL
+
+        # Calculate output dimension of LSTM layers
+        self.lstm_out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
+
+        self.lstm_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        for i in range(self.num_layers):
+            # Input Injection:
+            # Layer 0 takes raw input.
+            # Layer k > 0 takes concat(prev_layer_output, raw_input).
+            if i == 0:
+                layer_input_dim = input_dim
+            else:
+                layer_input_dim = self.lstm_out_dim + input_dim
+
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=layer_input_dim,
+                    hidden_size=self.hidden_dim,
+                    bidirectional=self.bidirectional,
+                    batch_first=True,
+                )
+            )
+            self.layer_norms.append(nn.LayerNorm(self.lstm_out_dim))
+            self.dropouts.append(nn.Dropout(self.dropout_p))
+
+        # Final projection to scalar pressure component
+        self.head = nn.Linear(self.lstm_out_dim, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Input_Dim)
+        current_features = x
+
+        for i in range(self.num_layers):
+            # Input Injection for layers > 0
+            if i > 0:
+                # Concatenate original input x to the features from previous layer
+                lstm_input = torch.cat([current_features, x], dim=-1)
+            else:
+                lstm_input = current_features
+
+            # Pass through LSTM
+            # output shape: (Batch, Seq_Len, Direction * Hidden)
+            output, _ = self.lstm_layers[i](lstm_input)
+
+            # Apply LayerNorm and Dropout
+            output = self.layer_norms[i](output)
+            output = self.dropouts[i](output)
+
+            # Residual Connection
+            # We can only add residual if shapes match.
+            # Layer 0 output is (B, L, 2*H). Input was (B, L, F). No residual.
+            # Layer k output is (B, L, 2*H). Input from prev layer was (B, L, 2*H).
+            # So for i > 0, current_features holds the output of layer i-1.
+            if i > 0:
+                output = output + current_features
+
+            current_features = output
+
+        # Project to scalar
+        # Shape: (Batch, Seq_Len, 1)
+        elastic_pressure = self.head(current_features)
+        return elastic_pressure
+
+
+class InstantaneousStream(nn.Module):
+    """
+    Stream 2: The Instantaneous "Resistive" Path.
+    Models flow-dependent dynamics (Resistance, Flow) using a Deep Residual MLP
+    with Input Injection. Operates on each time step independently.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.MLP_DIM
+        self.num_layers = Config.MLP_LAYERS
+        self.dropout_p = Config.MLP_DROPOUT
+
+        self.linear_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        for i in range(self.num_layers):
+            # Input Injection:
+            # Layer 0 takes raw input.
+            # Layer k > 0 takes concat(prev_layer_output, raw_input).
+            if i == 0:
+                layer_input_dim = input_dim
+            else:
+                layer_input_dim = self.hidden_dim + input_dim
+
+            self.linear_layers.append(nn.Linear(layer_input_dim, self.hidden_dim))
+            self.layer_norms.append(nn.LayerNorm(self.hidden_dim))
+            self.dropouts.append(nn.Dropout(self.dropout_p))
+
+        # Final projection to scalar pressure component
+        self.head = nn.Linear(self.hidden_dim, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Input_Dim)
+        current_features = x
+
+        for i in range(self.num_layers):
+            # Input Injection
+            if i > 0:
+                mlp_input = torch.cat([current_features, x], dim=-1)
+            else:
+                mlp_input = current_features
+
+            # Linear -> GELU -> Norm -> Dropout
+            output = self.linear_layers[i](mlp_input)
+            output = F.gelu(output)
+            output = self.layer_norms[i](output)
+            output = self.dropouts[i](output)
+
+            # Residual Connection
+            if i > 0:
+                output = output + current_features
+
+            current_features = output
+
+        # Project to scalar
+        # Shape: (Batch, Seq_Len, 1)
+        resistive_pressure = self.head(current_features)
+        return resistive_pressure
+
+
+class DSPIN(nn.Module):
+    """
+    Dual-Stream Physics-Informed Network.
+    Combines Recurrent and Instantaneous streams to predict Airway Pressure.
+    P_total = P_elastic (Stream 1) + P_resistive (Stream 2)
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.recurrent_stream = RecurrentStream(input_dim)
+        self.instantaneous_stream = InstantaneousStream(input_dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq_Len, Features)
+        Returns:
+            pressure: Predicted pressure of shape (Batch, Seq_Len, 1)
+        """
+        # Stream 1: Elastic Component (Time-dependent)
+        p_elastic = self.recurrent_stream(x)
+
+        # Stream 2: Resistive Component (Instantaneous)
+        p_resistive = self.instantaneous_stream(x)
+
+        # Physics-Informed Fusion: Additive
+        p_total = p_elastic + p_resistive
+
+        return p_total
+=======
+class ResBiLSTM(nn.Module):
+    """
+    Deep Residual Bidirectional LSTM with Input Injection.
+    Unified architecture that outperforms split physics-based streams.
+    
+    Cite solution_lesson_node_00025: Unified Recurrent Architectures Outperform Physics-Based Branching
+    Cite solution_lesson_node_00021: Input Injection in Deep Recurrent Networks
+    Cite solution_lesson_node_00023: Stabilizing Deep Residual Recurrent Networks with Layer Normalization
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.num_layers = Config.LSTM_LAYERS
+        self.dropout_p = Config.LSTM_DROPOUT
+        self.bidirectional = Config.LSTM_BIDIRECTIONAL
+
+        # Calculate output dimension of LSTM layers
+        self.lstm_out_dim = self.hidden_dim * (2 if self.bidirectional else 1)
+
+        self.lstm_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        for i in range(self.num_layers):
+            # Input Injection:
+            # Layer 0 takes raw input.
+            # Layer k > 0 takes concat(prev_layer_output, raw_input).
+            if i == 0:
+                layer_input_dim = input_dim
+            else:
+                layer_input_dim = self.lstm_out_dim + input_dim
+
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=layer_input_dim,
+                    hidden_size=self.hidden_dim,
+                    bidirectional=self.bidirectional,
+                    batch_first=True,
+                )
+            )
+            self.layer_norms.append(nn.LayerNorm(self.lstm_out_dim))
+            self.dropouts.append(nn.Dropout(self.dropout_p))
+
+        # Final projection to scalar pressure
+        self.head = nn.Linear(self.lstm_out_dim, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Input_Dim)
+        current_features = x
+
+        for i in range(self.num_layers):
+            # Input Injection for layers > 0
+            if i > 0:
+                # Concatenate original input x to the features from previous layer
+                lstm_input = torch.cat([current_features, x], dim=-1)
+            else:
+                lstm_input = current_features
+
+            # Pass through LSTM
+            output, _ = self.lstm_layers[i](lstm_input)
+
+            # Apply LayerNorm and Dropout
+            output = self.layer_norms[i](output)
+            output = self.dropouts[i](output)
+
+            # Residual Connection
+            # Layer 0 output is (B, L, 2*H). Input was (B, L, F). No residual.
+            # Layer k output is (B, L, 2*H). Input from prev layer was (B, L, 2*H).
+            if i > 0:
+                output = output + current_features
+
+            current_features = output
+
+        # Project to scalar
+        return self.head(current_features)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DSPIN
+from library.engine import fit, evaluate, generate_submission, predict
+from library.feature_engineering import load_and_process_data
+=======
+from library.model import ResBiLSTM
+from library.engine import fit, evaluate, generate_submission, predict
+from library.feature_engineering import load_and_process_data
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline
+    # We reduce epochs to ensure completion within 2 hours while using full data
+    # A100 is fast enough to handle 5M rows for ~6-10 epochs quickly.
+    Config.EPOCHS = 6
+
+    # 2. Data Preparation
+=======
+    # 2. Data Preparation
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    # Determine input dimension from dataset
+    input_dim = train_dataset.X.shape[-1]
+    print(f"Input dimension: {input_dim}")
+
+    model = DSPIN(input_dim=input_dim).to(device)
+
+    # Optimizer & Scheduler
+=======
+    # 3. Model Initialization
+    # Determine input dimension from dataset
+    input_dim = train_dataset.X.shape[-1]
+    print(f"Input dimension: {input_dim}")
+
+    model = ResBiLSTM(input_dim=input_dim).to(device)
+
+    # Optimizer & Scheduler
+>>>>>>> REPLACE
+```

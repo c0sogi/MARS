@@ -1,0 +1,654 @@
+To optimize the solution, I will transition from the Discriminative DiGUT model to a Generative Denoising DeGUT model, as suggested by Lesson `solution_lesson_node_00032` (Cite `solution_lesson_node_00032`). This involves changing the auxiliary task from corruption detection to masked value reconstruction, which forces the model to learn denser representations of the data manifold.
+
+Here is the implementation strategy:
+1.  **Configuration (`library/config.py`)**: Update hyperparameters. I will increase `EPOCHS` to 35 to allow for sufficient convergence (Cite `solution_lesson_node_00013`) and rename `SWAP_PROB` to `MASK_PROB`. I will keep `BATCH_SIZE` at 1024 for stability.
+2.  **Architecture (`library/architecture.py`)**: Rename `DiGUT` to `DeGUT`. Replace the binary `discriminator_head` with two reconstruction heads: `num_recon_head` (regression for numerical features) and `seq_recon_head` (classification for sequence characters).
+3.  **Training Logic (`library/trainer.py`)**: Replace `apply_swap_noise` with `apply_masking`. The masking logic will replace 15% of inputs with a zero vector (numerical) or a mask token index (sequence). The loss function will be updated to include MSE for numerical reconstruction and Cross-Entropy for sequence reconstruction, computed only on masked tokens.
+4.  **Execution (`runfile.py`)**: Update imports and class usage to reflect the switch to `DeGUT`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR: str = "./working/idea_9"
+    SUBMISSION_DIR: str = "./submission"
+
+    # Data Paths (using metadata splits)
+    TRAIN_PATH: str = os.path.join(METADATA_DIR, "train.csv")
+    VAL_PATH: str = os.path.join(METADATA_DIR, "val.csv")
+    TEST_PATH: str = os.path.join(METADATA_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH: str = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Output Paths
+    SUBMISSION_PATH: str = os.path.join(SUBMISSION_DIR, "submission.csv")
+    MODEL_SAVE_PATH: str = os.path.join(WORKING_DIR, "digut_model.pth")
+=======
+    WORKING_DIR: str = "./working/degut_opt"
+    SUBMISSION_DIR: str = "./submission"
+
+    # Data Paths (using metadata splits)
+    TRAIN_PATH: str = os.path.join(METADATA_DIR, "train.csv")
+    VAL_PATH: str = os.path.join(METADATA_DIR, "val.csv")
+    TEST_PATH: str = os.path.join(METADATA_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH: str = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Output Paths
+    SUBMISSION_PATH: str = os.path.join(SUBMISSION_DIR, "submission.csv")
+    MODEL_SAVE_PATH: str = os.path.join(WORKING_DIR, "degut_model.pth")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Optimized for A100-40GB. Large batch size for stability and speed.
+    # Adjusted for 16GB GPU environment (Cite debug_lesson_3)
+    BATCH_SIZE: int = 1024
+    EPOCHS: int = 30
+
+    # Optimizer (AdamW)
+    LEARNING_RATE: float = 1e-3
+    WEIGHT_DECAY: float = 0.01
+
+    # Scheduler (OneCycleLR)
+    PCT_START: float = 0.1  # Warmup percentage
+
+    # -------------------------------------------------------------------------
+    # Auxiliary Task & Regularization
+    # -------------------------------------------------------------------------
+    # Discriminative Detection Task
+    AUX_WEIGHT: float = 0.5  # Lambda: Weight for the discriminator loss
+    SWAP_PROB: float = 0.15  # Probability of swapping a token (Swap Noise)
+=======
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Optimized for A100-40GB. Large batch size for stability and speed.
+    # Adjusted for 16GB GPU environment (Cite debug_lesson_3)
+    BATCH_SIZE: int = 1024
+    EPOCHS: int = 35
+
+    # Optimizer (AdamW)
+    LEARNING_RATE: float = 1e-3
+    WEIGHT_DECAY: float = 0.01
+
+    # Scheduler (OneCycleLR)
+    PCT_START: float = 0.1  # Warmup percentage
+
+    # -------------------------------------------------------------------------
+    # Auxiliary Task & Regularization
+    # -------------------------------------------------------------------------
+    # Generative Denoising Task (Cite solution_lesson_node_00032)
+    AUX_WEIGHT: float = 0.5  # Lambda: Weight for the reconstruction loss
+    MASK_PROB: float = 0.15  # Probability of masking a token
+>>>>>>> REPLACE
+```
+
+```diff
+library/architecture.py
+<<<<<<< SEARCH
+class DiGUT(nn.Module):
+    """
+    Discriminative Granular Unified Transformer (DiGUT).
+
+    Architecture:
+    1. Granular Input:
+       - Numerical features -> Linear Projection + Feature Identity Embedding
+       - Sequence features -> Entity Embedding + Positional Embedding
+       - [CLS] Token prepended
+    2. Transformer Encoder: Stack of layers with GEGLU.
+    3. Dual Heads:
+       - Target Head: MLP on [CLS] for state prediction.
+       - Discriminator Head: Linear on feature tokens for corruption detection.
+    """
+
+    def __init__(
+        self,
+        num_numerical_features: int,
+        vocab_size: int,
+        sequence_length: int,
+        config: Config,
+    ):
+        super().__init__()
+        self.config = config
+        dim = config.HIDDEN_DIM
+
+        # ---------------------------------------------------------------------
+        # 1. Granular Embeddings
+        # ---------------------------------------------------------------------
+
+        # Numerical: Project scalar to vector + Add Feature Identity
+        # We use a shared linear projection for all numerical features to map R^1 -> R^d
+        self.num_proj = nn.Linear(1, dim)
+        # Learnable embedding for each numerical feature index (to distinguish f_00 from f_01 etc.)
+        self.num_id_emb = nn.Parameter(torch.zeros(1, num_numerical_features, dim))
+        nn.init.normal_(self.num_id_emb, std=0.02)
+
+        # Sequence: Entity Embedding + Positional Embedding
+        self.seq_emb = nn.Embedding(vocab_size, dim)
+        # Learnable positional embedding for the sequence part
+        self.seq_pos_emb = nn.Parameter(torch.zeros(1, sequence_length, dim))
+        nn.init.normal_(self.seq_pos_emb, std=0.02)
+
+        # [CLS] Token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+
+        # Dropout applied after embeddings
+        self.emb_dropout = nn.Dropout(config.DROPOUT)
+
+        # ---------------------------------------------------------------------
+        # 2. Transformer Encoder
+        # ---------------------------------------------------------------------
+        # Explicit instantiation using ModuleList
+        self.layers = nn.ModuleList(
+            [
+                DiGUTLayer(
+                    hidden_dim=dim,
+                    num_heads=config.NUM_HEADS,
+                    forward_dim=config.FORWARD_DIM,
+                    dropout=config.DROPOUT,
+                    attention_dropout=config.ATTENTION_DROPOUT,
+                )
+                for _ in range(config.NUM_LAYERS)
+            ]
+        )
+
+        self.final_norm = nn.LayerNorm(dim)
+
+        # ---------------------------------------------------------------------
+        # 3. Heads
+        # ---------------------------------------------------------------------
+
+        # Target Head (High-Capacity MLP)
+        self.target_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(dim, 1),
+        )
+
+        # Discriminator Head (Token-wise Binary Classification)
+        # Predicts probability of token being corrupted (1) or original (0)
+        self.discriminator_head = nn.Linear(dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Standard Transformer initialization
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x_num, x_seq):
+        """
+        Args:
+            x_num: (Batch, Num_Feats) - Continuous numerical features
+            x_seq: (Batch, Seq_Len) - Integer indices for sequence features
+        Returns:
+            target_logits: (Batch, 1)
+            discriminator_logits: (Batch, Total_Tokens - 1, 1)
+                                  Note: Discriminator doesn't predict for [CLS]
+        """
+        B = x_num.shape[0]
+
+        # --- Embedding Numerical ---
+        # (B, N) -> (B, N, 1) -> (B, N, H)
+        num_emb = self.num_proj(x_num.unsqueeze(-1))
+        # Add feature identity
+        num_emb = num_emb + self.num_id_emb
+
+        # --- Embedding Sequence ---
+        # (B, S) -> (B, S, H)
+        seq_emb = self.seq_emb(x_seq)
+        # Add positional info
+        seq_emb = seq_emb + self.seq_pos_emb
+
+        # --- Unified Sequence Construction ---
+        # Expand CLS token to batch size: (1, 1, H) -> (B, 1, H)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+
+        # Concatenate: [CLS, Num_Feats, Seq_Feats]
+        x = torch.cat((cls_tokens, num_emb, seq_emb), dim=1)
+
+        x = self.emb_dropout(x)
+
+        # --- Transformer Encoder ---
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.final_norm(x)
+
+        # --- Output Heads ---
+
+        # 1. Target Prediction (from [CLS] token at index 0)
+        cls_out = x[:, 0, :]
+        target_logits = self.target_head(cls_out)
+
+        # 2. Discriminator Prediction (from all feature tokens at indices 1:)
+        # We want to detect corruption in the input features
+        feature_out = x[:, 1:, :]
+        discriminator_logits = self.discriminator_head(feature_out)
+
+        return target_logits, discriminator_logits
+=======
+class DeGUT(nn.Module):
+    """
+    Denoising Granular Unified Transformer (DeGUT).
+    Cite solution_lesson_node_00032: Prefer Masked Value Reconstruction over Corruption Detection.
+
+    Architecture:
+    1. Granular Input:
+       - Numerical features -> Linear Projection + Feature Identity Embedding
+       - Sequence features -> Entity Embedding + Positional Embedding
+       - [CLS] Token prepended
+    2. Transformer Encoder: Stack of layers with GEGLU.
+    3. Multi-Task Heads:
+       - Target Head: MLP on [CLS] for state prediction.
+       - Reconstruction Heads:
+         - Numerical: Linear projection to scalar.
+         - Sequence: Linear projection to vocab logits.
+    """
+
+    def __init__(
+        self,
+        num_numerical_features: int,
+        vocab_size: int,
+        sequence_length: int,
+        config: Config,
+    ):
+        super().__init__()
+        self.config = config
+        self.num_numerical_features = num_numerical_features
+        dim = config.HIDDEN_DIM
+
+        # ---------------------------------------------------------------------
+        # 1. Granular Embeddings
+        # ---------------------------------------------------------------------
+
+        # Numerical: Project scalar to vector + Add Feature Identity
+        self.num_proj = nn.Linear(1, dim)
+        self.num_id_emb = nn.Parameter(torch.zeros(1, num_numerical_features, dim))
+        nn.init.normal_(self.num_id_emb, std=0.02)
+
+        # Sequence: Entity Embedding + Positional Embedding
+        self.seq_emb = nn.Embedding(vocab_size, dim)
+        self.seq_pos_emb = nn.Parameter(torch.zeros(1, sequence_length, dim))
+        nn.init.normal_(self.seq_pos_emb, std=0.02)
+
+        # [CLS] Token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+
+        # Dropout applied after embeddings
+        self.emb_dropout = nn.Dropout(config.DROPOUT)
+
+        # ---------------------------------------------------------------------
+        # 2. Transformer Encoder
+        # ---------------------------------------------------------------------
+        self.layers = nn.ModuleList(
+            [
+                DiGUTLayer(
+                    hidden_dim=dim,
+                    num_heads=config.NUM_HEADS,
+                    forward_dim=config.FORWARD_DIM,
+                    dropout=config.DROPOUT,
+                    attention_dropout=config.ATTENTION_DROPOUT,
+                )
+                for _ in range(config.NUM_LAYERS)
+            ]
+        )
+
+        self.final_norm = nn.LayerNorm(dim)
+
+        # ---------------------------------------------------------------------
+        # 3. Heads
+        # ---------------------------------------------------------------------
+
+        # Target Head
+        self.target_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(dim, 1),
+        )
+
+        # Reconstruction Heads (Generative Denoising)
+        self.num_recon_head = nn.Linear(dim, 1)
+        self.seq_recon_head = nn.Linear(dim, vocab_size)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x_num, x_seq):
+        """
+        Args:
+            x_num: (Batch, Num_Feats) - Continuous numerical features
+            x_seq: (Batch, Seq_Len) - Integer indices for sequence features
+        Returns:
+            target_logits: (Batch, 1)
+            num_preds: (Batch, Num_Feats)
+            seq_preds: (Batch, Seq_Len, Vocab_Size)
+        """
+        B = x_num.shape[0]
+
+        # --- Embedding Numerical ---
+        num_emb = self.num_proj(x_num.unsqueeze(-1))
+        num_emb = num_emb + self.num_id_emb
+
+        # --- Embedding Sequence ---
+        seq_emb = self.seq_emb(x_seq)
+        seq_emb = seq_emb + self.seq_pos_emb
+
+        # --- Unified Sequence Construction ---
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, num_emb, seq_emb), dim=1)
+
+        x = self.emb_dropout(x)
+
+        # --- Transformer Encoder ---
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.final_norm(x)
+
+        # --- Output Heads ---
+
+        # 1. Target Prediction (from [CLS])
+        cls_out = x[:, 0, :]
+        target_logits = self.target_head(cls_out)
+
+        # 2. Reconstruction Prediction
+        # Slice out the feature tokens
+        num_out = x[:, 1 : 1 + self.num_numerical_features, :]
+        seq_out = x[:, 1 + self.num_numerical_features :, :]
+
+        num_preds = self.num_recon_head(num_out).squeeze(-1)
+        seq_preds = self.seq_recon_head(seq_out)
+
+        return target_logits, num_preds, seq_preds
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.architecture import DiGUT
+from library.data_factory import preprocess_data, ManufacturingDataset
+
+
+def apply_swap_noise(x_num, x_seq, swap_prob):
+    """
+    Applies swap noise to a batch of data on the GPU.
+    Replaces tokens with values from the same feature in a random row within the batch.
+
+    Args:
+        x_num: (Batch, Num_Features) FloatTensor
+        x_seq: (Batch, Seq_Len) LongTensor
+        swap_prob: Probability of swapping a token
+
+    Returns:
+        x_num_corr: Corrupted numerical features
+        x_seq_corr: Corrupted sequence features
+        mask_combined: (Batch, Total_Tokens) Binary mask (1=corrupted, 0=original)
+    """
+    B = x_num.size(0)
+    device = x_num.device
+
+    # Generate random permutation of the batch
+    perm = torch.randperm(B, device=device)
+
+    # --- Numerical Corruption ---
+    # Create mask: 1 if we should swap, 0 otherwise
+    mask_num = (torch.rand(x_num.shape, device=device) < swap_prob).float()
+    # Apply swap: mask * permuted + (1-mask) * original
+    x_num_corr = mask_num * x_num[perm] + (1 - mask_num) * x_num
+
+    # --- Sequence Corruption ---
+    # Create boolean mask
+    mask_seq = torch.rand(x_seq.shape, device=device) < swap_prob
+    # Apply swap using torch.where for LongTensor
+    x_seq_corr = torch.where(mask_seq, x_seq[perm], x_seq)
+
+    # --- Combine Masks ---
+    # Concatenate numerical and sequence masks to match discriminator output
+    mask_combined = torch.cat([mask_num, mask_seq.float()], dim=1)
+
+    return x_num_corr, x_seq_corr, mask_combined
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, config):
+    model.train()
+
+    total_loss = 0.0
+    total_target_loss = 0.0
+    total_disc_loss = 0.0
+
+    # Loss functions
+    # Main target loss with label smoothing
+    criterion_target = nn.BCEWithLogitsLoss()
+    # Auxiliary discriminator loss
+    criterion_disc = nn.BCEWithLogitsLoss()
+
+    for batch_idx, (x_num, x_seq, target, _) in enumerate(dataloader):
+        # Move to GPU
+        x_num = x_num.to(device)
+        x_seq = x_seq.to(device)
+        target = target.to(device).unsqueeze(1)  # (B) -> (B, 1)
+
+        # Apply GPU-based Swap Noise
+        # Note: We ignore the mask returned by the dataset and generate fresh ones on GPU
+        x_num_corr, x_seq_corr, mask_combined = apply_swap_noise(
+            x_num, x_seq, config.SWAP_PROB
+        )
+
+        optimizer.zero_grad()
+
+        # Forward pass with corrupted data
+        target_logits, disc_logits = model(x_num_corr, x_seq_corr)
+
+        # Calculate Losses
+        loss_target = criterion_target(target_logits, target)
+
+        # Discriminator loss: Predict mask (1=corrupted)
+        # disc_logits: (B, N+S, 1) -> squeeze to (B, N+S)
+        loss_disc = criterion_disc(disc_logits.squeeze(-1), mask_combined)
+
+        # Composite Loss
+        loss = loss_target + config.AUX_WEIGHT * loss_disc
+
+        # Backward
+        loss.backward()
+
+        # Gradient Clipping (optional but good practice for Transformers)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        # Logging
+        total_loss += loss.item()
+        total_target_loss += loss_target.item()
+        total_disc_loss += loss_disc.item()
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for x_num, x_seq, target, _ in dataloader:
+            x_num = x_num.to(device)
+            x_seq = x_seq.to(device)
+
+            # No corruption during evaluation
+            target_logits, _ = model(x_num, x_seq)
+
+            probs = torch.sigmoid(target_logits).cpu().numpy()
+            targets = target.numpy()
+
+            all_preds.append(probs)
+            all_targets.append(targets)
+=======
+from library.architecture import DeGUT
+from library.data_factory import preprocess_data, ManufacturingDataset
+
+
+def apply_masking(x_num, x_seq, mask_prob):
+    """
+    Applies masking noise to a batch of data on the GPU.
+    Replaces tokens with zero (numerical) or mask token index 0 (sequence).
+
+    Args:
+        x_num: (Batch, Num_Features) FloatTensor
+        x_seq: (Batch, Seq_Len) LongTensor
+        mask_prob: Probability of masking a token
+
+    Returns:
+        x_num_masked: Masked numerical features
+        x_seq_masked: Masked sequence features
+        mask_num: (Batch, Num_Features) Boolean mask
+        mask_seq: (Batch, Seq_Len) Boolean mask
+    """
+    device = x_num.device
+
+    # --- Numerical Masking ---
+    # 0 is the mean for standardized data
+    mask_num = torch.rand(x_num.shape, device=device) < mask_prob
+    x_num_masked = x_num.clone()
+    x_num_masked[mask_num] = 0.0
+
+    # --- Sequence Masking ---
+    # 0 is unused in vocab (1-based indexing), so we use it as mask token
+    mask_seq = torch.rand(x_seq.shape, device=device) < mask_prob
+    x_seq_masked = x_seq.clone()
+    x_seq_masked[mask_seq] = 0
+
+    return x_num_masked, x_seq_masked, mask_num, mask_seq
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, config):
+    model.train()
+
+    total_loss = 0.0
+    total_target_loss = 0.0
+    total_recon_loss = 0.0
+
+    # Loss functions
+    criterion_target = nn.BCEWithLogitsLoss()
+    criterion_num = nn.MSELoss()
+    criterion_seq = nn.CrossEntropyLoss()
+
+    for batch_idx, (x_num, x_seq, target, _) in enumerate(dataloader):
+        # Move to GPU
+        x_num = x_num.to(device)
+        x_seq = x_seq.to(device)
+        target = target.to(device).unsqueeze(1)
+
+        # Apply GPU-based Masking
+        x_num_masked, x_seq_masked, mask_num, mask_seq = apply_masking(
+            x_num, x_seq, config.MASK_PROB
+        )
+
+        optimizer.zero_grad()
+
+        # Forward pass with masked data
+        target_logits, num_preds, seq_preds = model(x_num_masked, x_seq_masked)
+
+        # 1. Target Loss
+        loss_target = criterion_target(target_logits, target)
+
+        # 2. Reconstruction Loss (only on masked tokens)
+        loss_num_recon = torch.tensor(0.0, device=device)
+        if mask_num.any():
+            loss_num_recon = criterion_num(num_preds[mask_num], x_num[mask_num])
+
+        loss_seq_recon = torch.tensor(0.0, device=device)
+        if mask_seq.any():
+            # seq_preds: (B, S, V) -> (N_masked, V), x_seq: (B, S) -> (N_masked)
+            loss_seq_recon = criterion_seq(seq_preds[mask_seq], x_seq[mask_seq])
+
+        loss_recon = loss_num_recon + loss_seq_recon
+
+        # Composite Loss
+        loss = loss_target + config.AUX_WEIGHT * loss_recon
+
+        # Backward
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        # Logging
+        total_loss += loss.item()
+        total_target_loss += loss_target.item()
+        total_recon_loss += loss_recon.item()
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for x_num, x_seq, target, _ in dataloader:
+            x_num = x_num.to(device)
+            x_seq = x_seq.to(device)
+
+            # No masking during evaluation
+            target_logits, _, _ = model(x_num, x_seq)
+
+            probs = torch.sigmoid(target_logits).cpu().numpy()
+            targets = target.numpy()
+
+            all_preds.append(probs)
+            all_targets.append(targets)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.architecture import DiGUT
+from library.data_factory import preprocess_data, ManufacturingDataset
+from library.trainer import train_one_epoch, evaluate
+=======
+from library.architecture import DeGUT
+from library.data_factory import preprocess_data, ManufacturingDataset
+from library.trainer import train_one_epoch, evaluate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Model Initialization
+    print("\nInitializing DiGUT model...")
+    model = DiGUT(
+        num_numerical_features=meta["num_numerical_features"],
+        vocab_size=meta["vocab_size"],
+        sequence_length=meta["sequence_length"],
+        config=config,
+    ).to(config.DEVICE)
+=======
+    # 4. Model Initialization
+    print("\nInitializing DeGUT model...")
+    model = DeGUT(
+        num_numerical_features=meta["num_numerical_features"],
+        vocab_size=meta["vocab_size"],
+        sequence_length=meta["sequence_length"],
+        config=config,
+    ).to(config.DEVICE)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,933 @@
+Based on the provided lessons, specifically Lesson 15 ("Data Volume Trumps Model Complexity") and Lesson 8 ("Siamese Architectures Outperform Cross-Encoders for RNN-based Preference Modeling"), the strategy is to replace the computationally expensive Longformer model with a lightweight **Siamese Bi-Directional LSTM**. This will allow us to remove the artificial 10,000-sample limit and train on the **full dataset** within the time constraints.
+
+Key changes include:
+1.  **Architecture**: Replacing `LongformerHybridClassifier` with `SiameseBiLSTMAttention`. This model uses shared embeddings and LSTM layers to encode the prompt and responses independently, followed by **Attention Pooling** (Cite Lesson 11) to extract context-aware representations.
+2.  **Data Processing**: Replacing the HuggingFace tokenizer with a custom **Regex-based Vocabulary** (Cite Lesson 5) to ensure strict token normalization.
+3.  **Inputs**: Implementing **Hybrid Inputs** (Cite Lesson 4) by concatenating explicit scalar features (log-lengths) with the dense embeddings and interaction features (absolute difference) before the final classifier.
+4.  **Configuration**: Updating hyperparameters to support the LSTM (e.g., larger batch size, specific embedding dimensions) and enabling full-data training.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "allenai/longformer-base-4096"
+    NUM_LABELS = 3
+
+    # Input Sequence Length
+    # Longformer supports up to 4096, but we use 2048 to optimize throughput on A100
+    MAX_LENGTH = 2048
+
+    # Dropout
+    HIDDEN_DROPOUT_PROB = 0.1
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    EPOCHS = 3
+
+    # Batch size per GPU
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 4
+
+    # Gradient Accumulation to simulate larger effective batch size
+    # Effective Batch Size = TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+    GRADIENT_ACCUMULATION_STEPS = 4
+=======
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "lstm"
+    NUM_LABELS = 3
+    
+    # LSTM Hyperparameters
+    VOCAB_SIZE = 30000
+    EMBED_DIM = 300
+    HIDDEN_DIM = 128
+    
+    # Input Sequence Length
+    MAX_LENGTH = 300
+
+    # Dropout
+    HIDDEN_DROPOUT_PROB = 0.5
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    EPOCHS = 5
+
+    # Batch size per GPU
+    TRAIN_BATCH_SIZE = 64
+    VALID_BATCH_SIZE = 128
+
+    # Gradient Accumulation
+    GRADIENT_ACCUMULATION_STEPS = 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import LongformerTokenizer
+from library.config import Config
+from library.utils import seed_everything
+
+
+class ChatbotDataset(Dataset):
+    """
+    Dataset class for the Chatbot Arena task using Longformer.
+    Handles tokenization and extraction of scalar features (length statistics).
+    """
+
+    def __init__(self, data, tokenizer, max_length=None, is_test=False):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length if max_length is not None else Config.MAX_LENGTH
+        self.is_test = is_test
+
+        # Unpack data arrays
+        self.ids = data["id"]
+        self.prompts = data["prompt"]
+        self.responses_a = data["response_a"]
+        self.responses_b = data["response_b"]
+
+        if not self.is_test:
+            self.targets = data["targets"]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # Ensure inputs are strings
+        prompt = str(self.prompts[idx])
+        resp_a = str(self.responses_a[idx])
+        resp_b = str(self.responses_b[idx])
+
+        # Tokenize components separately to calculate scalar features
+        # We use the tokenizer to get accurate token counts
+        tokens_prompt = self.tokenizer.tokenize(prompt)
+        tokens_a = self.tokenizer.tokenize(resp_a)
+        tokens_b = self.tokenizer.tokenize(resp_b)
+
+        # Calculate explicit scalar features: Log-transformed token counts
+        # These help the model distinguish length biases
+        len_p = np.log1p(len(tokens_prompt))
+        len_a = np.log1p(len(tokens_a))
+        len_b = np.log1p(len(tokens_b))
+        scalar_features = torch.tensor([len_p, len_a, len_b], dtype=torch.float32)
+
+        # Construct the input sequence for Longformer
+        # Format: <s> Prompt </s> Response A </s> Response B </s>
+        bos_token = self.tokenizer.cls_token
+        sep_token = self.tokenizer.sep_token
+
+        # Manually construct the token list to ensure correct structure
+        full_tokens = (
+            [bos_token]
+            + tokens_prompt
+            + [sep_token]
+            + tokens_a
+            + [sep_token]
+            + tokens_b
+            + [sep_token]
+        )
+
+        # Convert tokens to IDs
+        input_ids = self.tokenizer.convert_tokens_to_ids(full_tokens)
+
+        # Truncate to max_length if necessary
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[: self.max_length]
+            # Note: We simply truncate the end. The Longformer's long context (2048/4096)
+            # minimizes the risk of losing critical information compared to standard BERT.
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        item = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "scalar_features": scalar_features,
+            "id": self.ids[idx],
+        }
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.targets[idx], dtype=torch.float32)
+
+        return item
+
+
+class CollateFn:
+    """
+    Custom collate function to handle dynamic padding and Global Attention Mask generation.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def __call__(self, batch):
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        scalar_features = torch.stack([item["scalar_features"] for item in batch])
+        ids = [item["id"] for item in batch]
+
+        # Dynamic padding to the longest sequence in the batch
+        input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.pad_token_id
+        )
+        attention_mask_padded = torch.nn.utils.rnn.pad_sequence(
+            attention_mask, batch_first=True, padding_value=0
+        )
+
+        # Create global_attention_mask for Longformer
+        # 0: Local Attention, 1: Global Attention
+        # We apply global attention to the <s> (CLS) token at index 0
+        global_attention_mask = torch.zeros_like(input_ids_padded)
+        global_attention_mask[:, 0] = 1
+
+        batch_output = {
+            "input_ids": input_ids_padded,
+            "attention_mask": attention_mask_padded,
+            "global_attention_mask": global_attention_mask,
+            "scalar_features": scalar_features,
+            "id": torch.tensor(ids, dtype=torch.long),
+        }
+
+        if "labels" in batch[0]:
+            labels = torch.stack([item["labels"] for item in batch])
+            batch_output["labels"] = labels
+
+        return batch_output
+=======
+import os
+import re
+import json
+import numpy as np
+import pandas as pd
+import torch
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+from library.config import Config
+from library.utils import seed_everything
+
+
+class Vocabulary:
+    def __init__(self, max_size=Config.VOCAB_SIZE):
+        self.max_size = max_size
+        self.stoi = {"<pad>": 0, "<unk>": 1}
+        self.itos = {0: "<pad>", 1: "<unk>"}
+
+    def fit(self, texts):
+        counter = Counter()
+        for text in texts:
+            # Cite solution_lesson_node_00005: "Tokenization Hygiene... regex-based alphanumeric extraction"
+            tokens = re.findall(r"\b\w+\b", str(text).lower())
+            counter.update(tokens)
+        
+        most_common = counter.most_common(self.max_size - 2)
+        for i, (word, _) in enumerate(most_common):
+            self.stoi[word] = i + 2
+            self.itos[i + 2] = word
+            
+    def save(self, path):
+        with open(path, 'w') as f:
+            json.dump(self.stoi, f)
+            
+    def load(self, path):
+        with open(path, 'r') as f:
+            self.stoi = json.load(f)
+        self.itos = {v: k for k, v in self.stoi.items()}
+        
+    def __len__(self):
+        return len(self.stoi)
+
+    def encode(self, text, max_len):
+        tokens = re.findall(r"\b\w+\b", str(text).lower())
+        ids = [self.stoi.get(t, 1) for t in tokens]
+        if len(ids) > max_len:
+            ids = ids[:max_len]
+        else:
+            ids = ids + [0] * (max_len - len(ids))
+        return ids
+
+
+class ChatbotDataset(Dataset):
+    """
+    Dataset class for the Chatbot Arena task using LSTM.
+    """
+
+    def __init__(self, data, vocab, max_length=None, is_test=False):
+        self.data = data
+        self.vocab = vocab
+        self.max_length = max_length if max_length is not None else Config.MAX_LENGTH
+        self.is_test = is_test
+
+        self.ids = data["id"]
+        self.prompts = data["prompt"]
+        self.responses_a = data["response_a"]
+        self.responses_b = data["response_b"]
+
+        if not self.is_test:
+            self.targets = data["targets"]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        prompt = str(self.prompts[idx])
+        resp_a = str(self.responses_a[idx])
+        resp_b = str(self.responses_b[idx])
+
+        # Encode text
+        ids_prompt = self.vocab.encode(prompt, self.max_length)
+        ids_a = self.vocab.encode(resp_a, self.max_length)
+        ids_b = self.vocab.encode(resp_b, self.max_length)
+
+        # Scalar features (Cite solution_lesson_node_00004: "Hybrid Inputs")
+        # Cite solution_lesson_node_00005: "derive meta-features... from the processed token sequences"
+        # We use the length of the non-padded tokens
+        len_p = np.log1p(np.count_nonzero(ids_prompt))
+        len_a = np.log1p(np.count_nonzero(ids_a))
+        len_b = np.log1p(np.count_nonzero(ids_b))
+        scalar_features = torch.tensor([len_p, len_a, len_b], dtype=torch.float32)
+
+        item = {
+            "ids_prompt": torch.tensor(ids_prompt, dtype=torch.long),
+            "ids_a": torch.tensor(ids_a, dtype=torch.long),
+            "ids_b": torch.tensor(ids_b, dtype=torch.long),
+            "scalar_features": scalar_features,
+            "id": self.ids[idx],
+        }
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.targets[idx], dtype=torch.float32)
+
+        return item
+
+
+class CollateFn:
+    def __init__(self):
+        pass
+
+    def __call__(self, batch):
+        ids_prompt = torch.stack([item["ids_prompt"] for item in batch])
+        ids_a = torch.stack([item["ids_a"] for item in batch])
+        ids_b = torch.stack([item["ids_b"] for item in batch])
+        scalar_features = torch.stack([item["scalar_features"] for item in batch])
+        ids = [item["id"] for item in batch]
+
+        batch_output = {
+            "ids_prompt": ids_prompt,
+            "ids_a": ids_a,
+            "ids_b": ids_b,
+            "scalar_features": scalar_features,
+            "id": torch.tensor(ids, dtype=torch.long),
+        }
+
+        if "labels" in batch[0]:
+            labels = torch.stack([item["labels"] for item in batch])
+            batch_output["labels"] = labels
+
+        return batch_output
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_dataloaders(load_cached_data=True):
+    """
+    Initializes the Tokenizer, Datasets, and DataLoaders.
+
+    Args:
+        load_cached_data (bool): Whether to use cached data files.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    seed_everything(Config.SEED)
+
+    # Initialize Tokenizer
+    tokenizer = LongformerTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # Load Data
+    train_data = load_and_cache_data("train", load_cached_data)
+    val_data = load_and_cache_data("val", load_cached_data)
+    test_data = load_and_cache_data("test", load_cached_data)
+
+    # Create Datasets
+    train_dataset = ChatbotDataset(train_data, tokenizer, is_test=False)
+    val_dataset = ChatbotDataset(val_data, tokenizer, is_test=False)
+    test_dataset = ChatbotDataset(test_data, tokenizer, is_test=True)
+
+    # Initialize Collate Function
+    collate_fn = CollateFn(tokenizer)
+=======
+def get_dataloaders(load_cached_data=True):
+    """
+    Initializes the Tokenizer, Datasets, and DataLoaders.
+
+    Args:
+        load_cached_data (bool): Whether to use cached data files.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    seed_everything(Config.SEED)
+
+    # Load Data
+    train_data = load_and_cache_data("train", load_cached_data)
+    val_data = load_and_cache_data("val", load_cached_data)
+    test_data = load_and_cache_data("test", load_cached_data)
+
+    # Initialize and Build Vocabulary
+    vocab_path = os.path.join(Config.WORKING_DIR, "vocab.json")
+    vocab = Vocabulary(Config.VOCAB_SIZE)
+    
+    # We always rebuild vocab from train data to ensure consistency or load if exists
+    if os.path.exists(vocab_path):
+        print(f"Loading vocabulary from {vocab_path}")
+        vocab.load(vocab_path)
+    else:
+        print("Building vocabulary from training data...")
+        # Combine all text fields for vocab building
+        all_text = np.concatenate([
+            train_data["prompt"], 
+            train_data["response_a"], 
+            train_data["response_b"]
+        ])
+        vocab.fit(all_text)
+        vocab.save(vocab_path)
+        print(f"Vocabulary built: {len(vocab)} tokens.")
+
+    # Create Datasets
+    train_dataset = ChatbotDataset(train_data, vocab, is_test=False)
+    val_dataset = ChatbotDataset(val_data, vocab, is_test=False)
+    test_dataset = ChatbotDataset(test_data, vocab, is_test=True)
+
+    # Initialize Collate Function
+    collate_fn = CollateFn()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from transformers import LongformerModel
+from library.config import Config
+
+
+class LongformerHybridClassifier(nn.Module):
+    """
+    A hybrid classifier that combines a pre-trained Longformer backbone with
+    explicit scalar features (log-transformed lengths) for text classification.
+    """
+
+    def __init__(self):
+        super(LongformerHybridClassifier, self).__init__()
+
+        # 1. Load Pre-trained Longformer Backbone
+        # We use the model name from Config (allenai/longformer-base-4096)
+        self.backbone = LongformerModel.from_pretrained(Config.MODEL_NAME)
+
+        # 2. Define Feature Dimensions
+        # Longformer base hidden size is usually 768
+        self.hidden_size = self.backbone.config.hidden_size
+
+        # We have 3 scalar features: log(len_prompt), log(len_resp_a), log(len_resp_b)
+        self.num_scalar_features = 3
+
+        # Combined dimension for the classifier input
+        self.combined_dim = self.hidden_size + self.num_scalar_features
+
+        # 3. Define Classification Head
+        self.dropout = nn.Dropout(Config.HIDDEN_DROPOUT_PROB)
+        self.classifier = nn.Linear(self.combined_dim, Config.NUM_LABELS)
+
+    def forward(
+        self, input_ids, attention_mask, global_attention_mask, scalar_features
+    ):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Token IDs (batch_size, seq_len).
+            attention_mask (torch.Tensor): Local attention mask (batch_size, seq_len).
+            global_attention_mask (torch.Tensor): Global attention mask (batch_size, seq_len).
+            scalar_features (torch.Tensor): Explicit features (batch_size, 3).
+
+        Returns:
+            torch.Tensor: Logits for the 3 classes (batch_size, 3).
+        """
+        # Pass inputs through the Longformer backbone
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            global_attention_mask=global_attention_mask,
+        )
+
+        # Extract the pooler output
+        # This corresponds to the hidden state of the first token (<s>)
+        # processed by a linear layer and a tanh activation.
+        # Shape: (batch_size, hidden_size)
+        pooler_output = outputs.pooler_output
+
+        # Apply dropout
+        pooler_output = self.dropout(pooler_output)
+
+        # Concatenate the backbone output with scalar features
+        # scalar_features shape: (batch_size, 3)
+        # combined_features shape: (batch_size, hidden_size + 3)
+        combined_features = torch.cat((pooler_output, scalar_features), dim=1)
+
+        # Pass through the linear classifier to get logits
+        logits = self.classifier(combined_features)
+
+        return logits
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+
+
+class AttentionPooling(nn.Module):
+    """
+    Cite solution_lesson_node_00011: "Superiority of Learned Attention Pooling"
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+
+    def forward(self, x, mask=None):
+        # x: (batch, seq_len, hidden_size)
+        # mask: (batch, seq_len) - 0 for pad, 1 for real
+        
+        # Calculate weights
+        weights = self.attention(x) # (batch, seq_len, 1)
+        
+        if mask is not None:
+            # Mask padding
+            weights = weights.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+            
+        weights = F.softmax(weights, dim=1)
+        
+        # Weighted sum
+        # (batch, seq_len, 1) * (batch, seq_len, hidden_size) -> sum over seq_len
+        pooled = torch.sum(weights * x, dim=1)
+        return pooled
+
+
+class SiameseBiLSTMAttention(nn.Module):
+    """
+    Siamese Bi-LSTM with Attention Pooling and Hybrid Inputs.
+    Cite solution_lesson_node_00008: "Siamese Architectures Outperform Cross-Encoders"
+    """
+    def __init__(self):
+        super().__init__()
+        
+        self.embedding = nn.Embedding(Config.VOCAB_SIZE, Config.EMBED_DIM, padding_idx=0)
+        
+        self.lstm = nn.LSTM(
+            input_size=Config.EMBED_DIM,
+            hidden_size=Config.HIDDEN_DIM,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # Bidirectional -> 2 * hidden_dim
+        self.pooler = AttentionPooling(Config.HIDDEN_DIM * 2)
+        
+        # Input features:
+        # Prompt Embedding (2*H)
+        # Resp A Embedding (2*H)
+        # Resp B Embedding (2*H)
+        # Diff (2*H)
+        # Scalars (3)
+        # Total = 8*H + 3
+        self.combined_dim = (Config.HIDDEN_DIM * 2 * 4) + 3
+        
+        self.dropout = nn.Dropout(Config.HIDDEN_DROPOUT_PROB)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.combined_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(Config.HIDDEN_DROPOUT_PROB),
+            nn.Linear(128, Config.NUM_LABELS)
+        )
+
+    def forward_one(self, ids):
+        # Create mask (non-zero tokens)
+        mask = (ids != 0).long()
+        
+        embeds = self.embedding(ids)
+        out, _ = self.lstm(embeds)
+        pooled = self.pooler(out, mask)
+        return pooled
+
+    def forward(self, ids_prompt, ids_a, ids_b, scalar_features):
+        # Encode each sequence
+        # Cite solution_lesson_node_00010: "Late Interaction"
+        u = self.forward_one(ids_prompt)
+        v = self.forward_one(ids_a)
+        w = self.forward_one(ids_b)
+        
+        # Interaction features
+        diff = torch.abs(v - w)
+        
+        # Concatenate
+        combined = torch.cat([u, v, w, diff, scalar_features], dim=1)
+        combined = self.dropout(combined)
+        
+        logits = self.classifier(combined)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import LongformerHybridClassifier
+
+
+class Trainer:
+    """
+    Trainer class to manage the training, validation, and inference lifecycle
+    of the LongformerHybridClassifier.
+    """
+
+    def __init__(self):
+        # 1. Setup
+        seed_everything(Config.SEED)
+        self.device = Config.DEVICE
+
+        print(f"Initializing Trainer on device: {self.device}")
+
+        # 2. Data
+        print("Loading dataloaders...")
+        self.train_loader, self.val_loader, self.test_loader = get_dataloaders(
+            load_cached_data=True
+        )
+
+        # 3. Model
+        print("Initializing model...")
+        self.model = LongformerHybridClassifier()
+        self.model.to(self.device)
+
+        # 4. Optimization
+        # Calculate total training steps for scheduler
+        num_update_steps_per_epoch = (
+            len(self.train_loader) // Config.GRADIENT_ACCUMULATION_STEPS
+        )
+        max_train_steps = Config.EPOCHS * num_update_steps_per_epoch
+
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(max_train_steps * Config.WARMUP_RATIO),
+            num_training_steps=max_train_steps,
+        )
+
+        self.criterion = nn.CrossEntropyLoss()
+=======
+from library.model import SiameseBiLSTMAttention
+
+
+class Trainer:
+    """
+    Trainer class to manage the training, validation, and inference lifecycle
+    of the SiameseBiLSTMAttention.
+    """
+
+    def __init__(self):
+        # 1. Setup
+        seed_everything(Config.SEED)
+        self.device = Config.DEVICE
+
+        print(f"Initializing Trainer on device: {self.device}")
+
+        # 2. Data
+        print("Loading dataloaders...")
+        self.train_loader, self.val_loader, self.test_loader = get_dataloaders(
+            load_cached_data=True
+        )
+
+        # 3. Model
+        print("Initializing model...")
+        self.model = SiameseBiLSTMAttention()
+        self.model.to(self.device)
+
+        # 4. Optimization
+        # Calculate total training steps for scheduler
+        num_update_steps_per_epoch = (
+            len(self.train_loader) // Config.GRADIENT_ACCUMULATION_STEPS
+        )
+        max_train_steps = Config.EPOCHS * num_update_steps_per_epoch
+
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=1e-3, # Higher LR for LSTM
+            weight_decay=1e-5,
+        )
+
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(max_train_steps * 0.0), # No warmup needed for LSTM usually
+            num_training_steps=max_train_steps,
+        )
+
+        self.criterion = nn.CrossEntropyLoss()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        for step, batch in enumerate(self.train_loader):
+            # Move batch to device
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            global_attention_mask = batch["global_attention_mask"].to(self.device)
+            scalar_features = batch["scalar_features"].to(self.device)
+            labels = batch["labels"].to(self.device)
+
+            # Mixed Precision Forward Pass
+            with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                logits = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    global_attention_mask=global_attention_mask,
+                    scalar_features=scalar_features,
+                )
+
+                # Check if labels are one-hot/probabilities or indices
+=======
+        for step, batch in enumerate(self.train_loader):
+            # Move batch to device
+            ids_prompt = batch["ids_prompt"].to(self.device)
+            ids_a = batch["ids_a"].to(self.device)
+            ids_b = batch["ids_b"].to(self.device)
+            scalar_features = batch["scalar_features"].to(self.device)
+            labels = batch["labels"].to(self.device)
+
+            # Mixed Precision Forward Pass
+            with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                logits = self.model(
+                    ids_prompt=ids_prompt,
+                    ids_a=ids_a,
+                    ids_b=ids_b,
+                    scalar_features=scalar_features,
+                )
+
+                # Check if labels are one-hot/probabilities or indices
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    def validate(self):
+        """
+        Runs validation on the validation set.
+        """
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                global_attention_mask = batch["global_attention_mask"].to(self.device)
+                scalar_features = batch["scalar_features"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                # Forward pass (no autocast needed for eval usually, but good for consistency/speed)
+                with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                    logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        global_attention_mask=global_attention_mask,
+                        scalar_features=scalar_features,
+                    )
+
+                # Apply Softmax to get probabilities
+=======
+    def validate(self):
+        """
+        Runs validation on the validation set.
+        """
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                ids_prompt = batch["ids_prompt"].to(self.device)
+                ids_a = batch["ids_a"].to(self.device)
+                ids_b = batch["ids_b"].to(self.device)
+                scalar_features = batch["scalar_features"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                # Forward pass (no autocast needed for eval usually, but good for consistency/speed)
+                with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                    logits = self.model(
+                        ids_prompt=ids_prompt,
+                        ids_a=ids_a,
+                        ids_b=ids_b,
+                        scalar_features=scalar_features,
+                    )
+
+                # Apply Softmax to get probabilities
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        with torch.no_grad():
+            for batch in self.test_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                global_attention_mask = batch["global_attention_mask"].to(self.device)
+                scalar_features = batch["scalar_features"].to(self.device)
+                ids = batch["id"]
+
+                with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                    logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        global_attention_mask=global_attention_mask,
+                        scalar_features=scalar_features,
+                    )
+
+                # Cast to float32 for numerical stability before softmax
+=======
+        with torch.no_grad():
+            for batch in self.test_loader:
+                ids_prompt = batch["ids_prompt"].to(self.device)
+                ids_a = batch["ids_a"].to(self.device)
+                ids_b = batch["ids_b"].to(self.device)
+                scalar_features = batch["scalar_features"].to(self.device)
+                ids = batch["id"]
+
+                with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                    logits = self.model(
+                        ids_prompt=ids_prompt,
+                        ids_a=ids_a,
+                        ids_b=ids_b,
+                        scalar_features=scalar_features,
+                    )
+
+                # Cast to float32 for numerical stability before softmax
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            global_attention_mask = batch["global_attention_mask"].to(device)
+            scalar_features = batch["scalar_features"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Forward pass with Mixed Precision
+            with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                logits = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    global_attention_mask=global_attention_mask,
+                    scalar_features=scalar_features,
+                )
+
+                # Calculate loss per sample
+=======
+    with torch.no_grad():
+        for batch in val_loader:
+            ids_prompt = batch["ids_prompt"].to(device)
+            ids_a = batch["ids_a"].to(device)
+            ids_b = batch["ids_b"].to(device)
+            scalar_features = batch["scalar_features"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Forward pass with Mixed Precision
+            with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+                logits = model(
+                    ids_prompt=ids_prompt,
+                    ids_a=ids_a,
+                    ids_b=ids_b,
+                    scalar_features=scalar_features,
+                )
+
+                # Calculate loss per sample
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration Overrides for Fast Baseline
+    # Limit to 1 epoch to ensure completion within strict time limits
+    Config.EPOCHS = 1
+    Config.USE_FP16 = True
+
+    # 2. Initialize Trainer
+    # This loads data and model
+    trainer = Trainer()
+
+    # 3. Limit Training Samples
+    # Manually slice the dataset in the loader to enforce the sample limit
+    # regardless of cached data size.
+    MAX_TRAIN_SAMPLES = 10000
+    train_dataset = trainer.train_loader.dataset
+
+    if len(train_dataset) > MAX_TRAIN_SAMPLES:
+        print(
+            f"Limiting training data from {len(train_dataset)} to {MAX_TRAIN_SAMPLES} samples for fast baseline."
+        )
+        train_dataset.ids = train_dataset.ids[:MAX_TRAIN_SAMPLES]
+        train_dataset.prompts = train_dataset.prompts[:MAX_TRAIN_SAMPLES]
+        train_dataset.responses_a = train_dataset.responses_a[:MAX_TRAIN_SAMPLES]
+        train_dataset.responses_b = train_dataset.responses_b[:MAX_TRAIN_SAMPLES]
+        train_dataset.targets = train_dataset.targets[:MAX_TRAIN_SAMPLES]
+
+    # 4. Train
+    trainer.fit()
+=======
+def main():
+    # 1. Configuration Overrides
+    # Cite solution_lesson_node_00015: "Prioritize data coverage over architectural complexity"
+    # We remove the sample limit to train on the full dataset.
+    Config.USE_FP16 = True
+    # We use the epochs defined in Config (5)
+
+    # 2. Initialize Trainer
+    # This loads data and model
+    trainer = Trainer()
+
+    # 3. Train
+    trainer.fit()
+>>>>>>> REPLACE
+```

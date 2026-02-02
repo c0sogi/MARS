@@ -1,0 +1,462 @@
+To optimize the solution, I will revert the model architecture from the Edge-Updated Graph Attention Network (EUGAT) to a Crystal Graph Convolutional Neural Network (CGCNN) with static edge features, as the dynamic updates in EUGAT were found to degrade performance on this dataset (Cite solution_lesson_node_00008). I will configure the model with 4 interaction layers, a hidden dimension of 128, and 50 Radial Basis Function (RBF) bins, which was identified as a high-performing configuration (Cite solution_lesson_node_00006). Additionally, I will reduce the batch size to 48 to aid generalization (Cite solution_lesson_node_00005) and maintain the neighbor cutoff radius at 5.0Å to prevent noise from distant atoms (Cite solution_lesson_node_00007). The working directory will be updated to `./working/idea_3`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for artifacts (cache, checkpoints, etc.)
+    # We use a specific subdirectory for this idea iteration
+    WORKING_DIR = "./working/idea_2"
+
+    # Subdirectories for organization
+=======
+    # Working directory for artifacts (cache, checkpoints, etc.)
+    # We use a specific subdirectory for this idea iteration
+    WORKING_DIR = "./working/idea_3"
+
+    # Subdirectories for organization
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Model Architecture (EU-GAT)
+    # -------------------------------------------------------------------------
+    # Dimension of node and edge embeddings
+    HIDDEN_DIM = 96
+
+    # Number of message passing interaction layers
+    NUM_LAYERS = 4
+
+    # Number of attention heads for the GAT mechanism
+    # 96 / 4 = 24 dimensions per head
+    NUM_HEADS = 4
+
+    # Number of Gaussian basis functions for edge distance expansion
+    NUM_RBF = 60
+
+    # Dropout rate for regularization within message passing blocks
+    DROPOUT = 0.2
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Initial learning rate
+    LEARNING_RATE = 1e-3
+
+    # Weight decay for regularization (AdamW)
+    WEIGHT_DECAY = 1e-4
+
+    # Batch size
+    BATCH_SIZE = 64
+=======
+    # -------------------------------------------------------------------------
+    # Model Architecture (CGCNN)
+    # -------------------------------------------------------------------------
+    # Dimension of node and edge embeddings
+    HIDDEN_DIM = 128
+
+    # Number of message passing interaction layers
+    NUM_LAYERS = 4
+
+    # Number of attention heads (Not used in CGCNN, kept for compatibility if needed)
+    NUM_HEADS = 4
+
+    # Number of Gaussian basis functions for edge distance expansion
+    NUM_RBF = 50
+
+    # Dropout rate for regularization within message passing blocks
+    DROPOUT = 0.1
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Initial learning rate
+    LEARNING_RATE = 1e-3
+
+    # Weight decay for regularization (AdamW)
+    WEIGHT_DECAY = 1e-4
+
+    # Batch size
+    BATCH_SIZE = 48
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class EdgeUpdateGATLayer(MessagePassing):
+    """
+    A Graph Attention Layer that performs dynamic edge feature updates.
+
+    The layer operates in two steps:
+    1. Edge Update: e'_ij = MLP(e_ij || x_i || x_j)
+    2. Message Passing: x'_i = sum(alpha_ij * W * x_j), where alpha_ij is derived from e'_ij
+    """
+
+    def __init__(self, hidden_dim, num_heads, dropout):
+        # Set aggr='add' because we perform the weighted sum manually in message()
+        # via attention, but standard GAT implementation often uses 'add' aggregation
+        # of weighted messages.
+        super().__init__(aggr="add", node_dim=0)
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.dropout = dropout
+
+        # MLP for updating edge features based on incident nodes and current edge features
+        # Input: Node_i (H) + Node_j (H) + Edge_ij (H) = 3*H
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(3 * hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Attention mechanism: Projects updated edge features to attention logits
+        # We produce one score per head
+        self.att_linear = nn.Linear(hidden_dim, num_heads)
+
+        # Linear transformation for the node features (Value in attention)
+        self.msg_linear = nn.Linear(hidden_dim, hidden_dim)
+
+        # Normalization for edge update residual
+        self.norm_edge = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x, edge_index, edge_attr):
+        """
+        Args:
+            x: Node features [N, hidden_dim]
+            edge_index: Graph connectivity [2, E]
+            edge_attr: Edge features [E, hidden_dim]
+
+        Returns:
+            x_new: Updated node features [N, hidden_dim]
+            edge_attr_new: Updated edge features [E, hidden_dim]
+        """
+        row, col = edge_index
+
+        # 1. Dynamic Edge Update
+        # Concatenate source node, target node, and existing edge features
+        edge_input = torch.cat([x[row], x[col], edge_attr], dim=-1)
+
+        # Compute new edge features
+        edge_update = self.edge_mlp(edge_input)
+
+        # Residual connection and Normalization for edges
+        edge_attr_new = self.norm_edge(edge_attr + edge_update)
+
+        # 2. Message Propagation
+        # Propagate uses the *updated* edge attributes to compute attention
+        x_new = self.propagate(edge_index, x=x, edge_attr=edge_attr_new)
+
+        return x_new, edge_attr_new
+
+    def message(self, x_j, edge_attr, index):
+        """
+        Computes the message for each edge.
+
+        Args:
+            x_j: Features of neighbor nodes [E, hidden_dim]
+            edge_attr: Updated edge features [E, hidden_dim]
+            index: Target node indices [E] (used for softmax normalization)
+        """
+        # Compute attention logits from edge features: [E, num_heads]
+        alpha_logits = self.att_linear(edge_attr)
+
+        # Apply LeakyReLU (standard GAT practice, though optional here since input is MLP)
+        alpha_logits = F.leaky_relu(alpha_logits, negative_slope=0.2)
+
+        # Normalize attention scores using softmax over neighbors
+        # index corresponds to the target node 'i'
+        alpha = softmax(alpha_logits, index)
+
+        # Apply dropout to attention weights
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        # Transform neighbor node features: [E, hidden_dim]
+        msg = self.msg_linear(x_j)
+
+        # Reshape for multi-head attention: [E, num_heads, head_dim]
+        msg = msg.view(-1, self.num_heads, self.head_dim)
+
+        # Reshape alpha for broadcasting: [E, num_heads, 1]
+        alpha = alpha.unsqueeze(-1)
+
+        # Weighted message: [E, num_heads, head_dim]
+        weighted_msg = msg * alpha
+
+        # Flatten heads back to hidden_dim: [E, hidden_dim]
+        return weighted_msg.view(-1, self.hidden_dim)
+
+
+class EUGAT(nn.Module):
+    """
+    Edge-Updated Graph Attention Network.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.num_layers = Config.NUM_LAYERS
+        self.num_heads = Config.NUM_HEADS
+        self.dropout = Config.DROPOUT
+
+        # 1. Node Embedding
+        # Maps atomic numbers to continuous vectors
+        # Assuming max atomic number < 100 (In is 49)
+        self.node_emb = nn.Embedding(100, self.hidden_dim)
+
+        # 2. Edge Embedding
+        # Expands scalar distances using RBF
+        self.rbf = GaussianRBF(
+            start=0.0, stop=Config.CUTOFF_RADIUS, n_centers=Config.NUM_RBF
+        )
+        # Projects RBF features to hidden dimension
+        self.edge_emb = nn.Linear(Config.NUM_RBF, self.hidden_dim)
+
+        # 3. Interaction Layers
+        self.layers = nn.ModuleList(
+            [
+                EdgeUpdateGATLayer(self.hidden_dim, self.num_heads, self.dropout)
+                for _ in range(self.num_layers)
+            ]
+        )
+
+        # Layer Norms for node residual connections
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(self.hidden_dim) for _ in range(self.num_layers)]
+        )
+
+        # 4. Output Head
+        self.out_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, len(Config.TARGET_COLS)),
+        )
+
+    def forward(self, data):
+        """
+        Forward pass of the model.
+
+        Args:
+            data: PyG Data object containing x, edge_index, edge_attr, batch
+        """
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        # Initial Node Embeddings
+        x = self.node_emb(x)  # [N, hidden_dim]
+
+        # Initial Edge Embeddings
+        # edge_attr is [E, 1] (distances), squeeze to [E]
+        edge_attr = self.rbf(edge_attr.squeeze(-1))  # [E, num_rbf]
+        edge_attr = self.edge_emb(edge_attr)  # [E, hidden_dim]
+
+        # Message Passing Layers
+        for layer, norm in zip(self.layers, self.norms):
+            x_res = x
+
+            # Apply layer: updates both nodes and edges
+            x_updated, edge_attr_updated = layer(x, edge_index, edge_attr)
+
+            # Update edge features for the next layer
+            edge_attr = edge_attr_updated
+
+            # Residual connection for nodes
+            x = x_res + F.dropout(x_updated, p=self.dropout, training=self.training)
+            x = norm(x)
+
+        # Global Pooling
+        # Aggregate node features to graph representation
+        x_graph = global_mean_pool(x, batch)  # [batch_size, hidden_dim]
+
+        # Prediction Head
+        out = self.out_mlp(x_graph)  # [batch_size, num_targets]
+
+        return out
+=======
+class CGCNNConv(MessagePassing):
+    """
+    Crystal Graph Convolutional Neural Network Layer.
+    Uses static edge features to modulate message passing.
+    """
+
+    def __init__(self, hidden_dim):
+        super().__init__(aggr="add")
+        # Input to linears: node_i + node_j + edge_attr = 3 * hidden_dim
+        self.lin_f = nn.Linear(3 * hidden_dim, hidden_dim)
+        self.lin_s = nn.Linear(3 * hidden_dim, hidden_dim)
+        self.bn = nn.BatchNorm1d(hidden_dim)
+
+    def forward(self, x, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_i, x_j, edge_attr):
+        # Concatenate features: [E, 3 * hidden_dim]
+        z = torch.cat([x_i, x_j, edge_attr], dim=1)
+        # Gated linear unit: sigmoid(W_f * z) * softplus(W_s * z)
+        return torch.sigmoid(self.lin_f(z)) * F.softplus(self.lin_s(z))
+
+    def update(self, aggr_out, x):
+        # Residual connection + BatchNorm
+        return self.bn(x + aggr_out)
+
+
+class CrystalGraphConvNet(nn.Module):
+    """
+    Crystal Graph Convolutional Neural Network (CGCNN).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.num_layers = Config.NUM_LAYERS
+        self.dropout = Config.DROPOUT
+
+        # 1. Node Embedding
+        self.node_emb = nn.Embedding(100, self.hidden_dim)
+
+        # 2. Edge Embedding
+        self.rbf = GaussianRBF(
+            start=0.0, stop=Config.CUTOFF_RADIUS, n_centers=Config.NUM_RBF
+        )
+        self.edge_emb = nn.Linear(Config.NUM_RBF, self.hidden_dim)
+
+        # 3. Interaction Layers
+        self.layers = nn.ModuleList(
+            [CGCNNConv(self.hidden_dim) for _ in range(self.num_layers)]
+        )
+
+        # 4. Output Head
+        self.out_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, len(Config.TARGET_COLS)),
+        )
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        # Initial Embeddings
+        x = self.node_emb(x)
+        edge_attr = self.rbf(edge_attr.squeeze(-1))
+        edge_attr = self.edge_emb(edge_attr)
+
+        # Message Passing
+        for layer in self.layers:
+            # CGCNNConv handles residual and norm internally in update()
+            # But standard implementation often does it explicitly.
+            # Here update() does x + aggr, so we just pass x.
+            # However, PyG MessagePassing update() receives x as the target node features
+            # if we pass it to propagate.
+            # Our CGCNNConv.update takes (aggr_out, x).
+            x = layer(x, edge_index, edge_attr)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Global Pooling
+        x_graph = global_mean_pool(x, batch)
+
+        # Prediction
+        out = self.out_mlp(x_graph)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import EUGAT
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+=======
+from library.model import CrystalGraphConvNet
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Model Initialization
+    print("Initializing Model...")
+    model = EUGAT().to(device)
+
+    # 5. Optimizer and Scheduler
+=======
+    # 4. Model Initialization
+    print("Initializing Model...")
+    model = CrystalGraphConvNet().to(device)
+
+    # 5. Optimizer and Scheduler
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import EUGAT
+from library.train import train_one_epoch, evaluate
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.RANDOM_SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    # Use load_cached_data=True to speed up if available
+    print("Loading data...")
+    train_loader, val_loader, test_loader, scaler = get_dataloaders(
+        batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = EUGAT().to(device)
+
+    # 4. Optimizer & Scheduler
+=======
+from library.model import CrystalGraphConvNet
+from library.train import train_one_epoch, evaluate
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.RANDOM_SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    # Use load_cached_data=True to speed up if available
+    print("Loading data...")
+    train_loader, val_loader, test_loader, scaler = get_dataloaders(
+        batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = CrystalGraphConvNet().to(device)
+
+    # 4. Optimizer & Scheduler
+>>>>>>> REPLACE
+```

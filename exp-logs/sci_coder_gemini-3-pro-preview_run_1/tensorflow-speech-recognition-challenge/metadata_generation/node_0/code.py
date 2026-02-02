@@ -1,0 +1,232 @@
+import os
+import glob
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+
+def generate_metadata():
+    # Constants
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    TRAIN_AUDIO_DIR = os.path.join(INPUT_DIR, "train", "audio")
+    TEST_AUDIO_DIR = os.path.join(INPUT_DIR, "test", "audio")
+
+    # Labels that should be predicted. All others are 'unknown' or 'silence'.
+    TARGET_LABELS = {
+        "yes",
+        "no",
+        "up",
+        "down",
+        "left",
+        "right",
+        "on",
+        "off",
+        "stop",
+        "go",
+    }
+    RANDOM_STATE = 42
+
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Scanning training data...")
+    train_records = []
+
+    # 1. Collect Training Data
+    if os.path.exists(TRAIN_AUDIO_DIR):
+        # List all subdirectories (labels)
+        subdirs = [d.name for d in os.scandir(TRAIN_AUDIO_DIR) if d.is_dir()]
+
+        for subdir in subdirs:
+            dir_path = os.path.join(TRAIN_AUDIO_DIR, subdir)
+
+            # Determine Label
+            if subdir == "_background_noise_":
+                label = "silence"
+                is_noise = True
+            elif subdir in TARGET_LABELS:
+                label = subdir
+                is_noise = False
+            else:
+                label = "unknown"
+                is_noise = False
+
+            # Get all .wav files in the subdirectory
+            wav_files = glob.glob(os.path.join(dir_path, "*.wav"))
+
+            for file_path in wav_files:
+                # Path relative to ./input
+                rel_path = os.path.relpath(file_path, INPUT_DIR)
+                filename = os.path.basename(file_path)
+
+                # Extract Subject ID
+                if is_noise:
+                    # Background noise files don't have subject IDs
+                    subject_id = "noise_placeholder"
+                else:
+                    # Format: subjectID_nohash_repeat.wav
+                    parts = filename.split("_")
+                    if len(parts) > 1:
+                        subject_id = parts[0]
+                    else:
+                        subject_id = "unknown_subject"
+
+                train_records.append(
+                    {
+                        "filepath": rel_path,
+                        "label": label,
+                        "subject_id": subject_id,
+                        "is_noise": is_noise,
+                    }
+                )
+
+    df_all = pd.DataFrame(train_records)
+    if df_all.empty:
+        raise ValueError(f"No training data found in {TRAIN_AUDIO_DIR}")
+
+    print(f"Total training files found: {len(df_all)}")
+
+    # 2. Split Training Data (Train vs Validation)
+    # We must use Group Sampling based on subject_id to avoid data leakage.
+    # Background noise files are treated separately as they don't have subject IDs.
+
+    df_noise = df_all[df_all["is_noise"]].copy()
+    df_regular = df_all[~df_all["is_noise"]].copy()
+
+    # Split Regular Data (Group Split)
+    # n_splits=1, test_size=0.2, random_state=42
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
+    train_idx, val_idx = next(
+        gss.split(df_regular, df_regular["label"], groups=df_regular["subject_id"])
+    )
+
+    train_regular = df_regular.iloc[train_idx]
+    val_regular = df_regular.iloc[val_idx]
+
+    # Split Noise Data (Simple Split)
+    # If there are enough files, split 80/20. If very few, we try to respect the ratio.
+    if len(df_noise) >= 2:
+        train_noise, val_noise = train_test_split(
+            df_noise, test_size=0.2, random_state=RANDOM_STATE
+        )
+    else:
+        # Fallback for extremely low count (e.g. 1 file)
+        train_noise = df_noise
+        val_noise = pd.DataFrame(columns=df_noise.columns)
+
+    # Combine
+    df_train_final = pd.concat([train_regular, train_noise], ignore_index=True)
+    df_val_final = pd.concat([val_regular, val_noise], ignore_index=True)
+
+    # Shuffle final datasets
+    df_train_final = df_train_final.sample(
+        frac=1, random_state=RANDOM_STATE
+    ).reset_index(drop=True)
+    df_val_final = df_val_final.sample(frac=1, random_state=RANDOM_STATE).reset_index(
+        drop=True
+    )
+
+    # 3. Collect Test Data
+    print("Scanning test data...")
+    test_records = []
+    if os.path.exists(TEST_AUDIO_DIR):
+        test_files = glob.glob(os.path.join(TEST_AUDIO_DIR, "*.wav"))
+        for file_path in test_files:
+            rel_path = os.path.relpath(file_path, INPUT_DIR)
+            test_records.append(
+                {"filepath": rel_path, "label": "unknown"}  # Placeholder
+            )
+
+    df_test = pd.DataFrame(test_records)
+
+    # 4. Save Metadata
+    # We save specific columns. Subject ID is useful for debugging but strictly 'filepath' and 'label' are needed for loading.
+    # We'll keep subject_id in train/val for reference.
+    cols_to_save = ["filepath", "label", "subject_id"]
+
+    train_csv_path = os.path.join(METADATA_DIR, "train.csv")
+    val_csv_path = os.path.join(METADATA_DIR, "val.csv")
+    test_csv_path = os.path.join(METADATA_DIR, "test.csv")
+
+    df_train_final[cols_to_save].to_csv(train_csv_path, index=False)
+    df_val_final[cols_to_save].to_csv(val_csv_path, index=False)
+
+    # Test usually doesn't need subject_id
+    if not df_test.empty:
+        df_test[["filepath", "label"]].to_csv(test_csv_path, index=False)
+    else:
+        # Create empty if needed
+        pd.DataFrame(columns=["filepath", "label"]).to_csv(test_csv_path, index=False)
+
+    print("Metadata files saved.")
+
+    # 5. Validation and Statistics
+    print("\n" + "=" * 30)
+    print("DATASET STATISTICS")
+    print("=" * 30)
+    print(f"Train Set Size: {len(df_train_final)}")
+    print(f"Val Set Size:   {len(df_val_final)}")
+    print(f"Test Set Size:  {len(df_test)}")
+
+    print("\nTrain Label Distribution:")
+    print(df_train_final["label"].value_counts())
+    print("\nVal Label Distribution:")
+    print(df_val_final["label"].value_counts())
+
+    # --- Check 1: File Existence ---
+    def check_file_existence(df, name):
+        if df.empty:
+            return
+        # Check up to 1000 files
+        sample = df.sample(n=min(1000, len(df)), random_state=RANDOM_STATE)
+        missing_count = 0
+        missing_examples = []
+
+        for idx, row in sample.iterrows():
+            full_path = os.path.join(INPUT_DIR, row["filepath"])
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(row["filepath"])
+
+        ratio = missing_count / len(sample)
+        print(f"\n[{name}] Missing file ratio: {ratio:.4f}")
+
+        if ratio > 0.5:
+            print(f"Examples of missing files: {missing_examples}")
+            raise FileNotFoundError(
+                f"More than 50% of files missing in {name} metadata."
+            )
+
+    check_file_existence(df_train_final, "Train")
+    check_file_existence(df_val_final, "Val")
+    check_file_existence(df_test, "Test")
+
+    # --- Check 2: Group Split Verification (Leakage Check) ---
+    # Ensure no subject ID appears in both Train and Val (excluding noise placeholder)
+    train_subjects = set(
+        df_train_final[df_train_final["subject_id"] != "noise_placeholder"][
+            "subject_id"
+        ]
+    )
+    val_subjects = set(
+        df_val_final[df_val_final["subject_id"] != "noise_placeholder"]["subject_id"]
+    )
+
+    intersection = train_subjects.intersection(val_subjects)
+
+    print(f"\nUnique subjects in Train: {len(train_subjects)}")
+    print(f"Unique subjects in Val:   {len(val_subjects)}")
+    print(f"Intersection (Leakage):   {len(intersection)}")
+
+    if len(intersection) > 0:
+        raise AssertionError(
+            f"Data Leakage Detected! {len(intersection)} subjects are present in both Train and Validation sets."
+        )
+
+    print("\nValidation Successful: No subject leakage detected.")
+
+
+if __name__ == "__main__":
+    generate_metadata()

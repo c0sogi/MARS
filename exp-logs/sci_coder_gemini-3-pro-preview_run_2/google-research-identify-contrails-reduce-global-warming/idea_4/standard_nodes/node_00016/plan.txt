@@ -1,0 +1,1298 @@
+I will implement the optimization strategy based on the provided lessons, focusing on reverting to a robust baseline trained on the full dataset.
+
+**Strategy:**
+1.  **Revert to Robust Baseline (Cite Lesson 00009, 00014):** I will replace the complex `SoftGatedResnetUNet` with a standard `ResnetUNet` (ResNet18 encoder, bilinear decoder). The lessons indicate that the multi-task architecture with soft gating and SCSE attention underperformed the simpler baseline (0.46 vs 0.545). The added complexity likely introduced noise or optimization difficulties.
+2.  **Full Dataset Training (Cite Lesson 00002):** I will remove the `max_samples` constraint in `runfile.py` to train on the full 18,673 samples. The lessons emphasize that scale is a prerequisite for sparse segmentation and that subsets fail to capture sufficient background diversity.
+3.  **Optimize Hyperparameters (Cite Lesson 00007):** I will set the training duration to 20 epochs, aligning the learning rate schedule with the training horizon to ensuring proper convergence.
+4.  **Simplify Loss Function:** I will use `GlobalBatchDiceLoss` directly, removing the composite `SoftGatedLoss` since the auxiliary classification head is being removed.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Duration: Minimum 20 epochs as per Idea 4
+    EPOCHS = 25
+
+    # Optimization
+    LEARNING_RATE = 5e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Loss Weights
+    # Total Loss = DiceLoss(Mask) + lambda * BCE(Prob)
+    LAMBDA_CLS = 0.2
+=======
+    # Training Duration: Minimum 20 epochs as per Idea 4
+    EPOCHS = 20
+
+    # Optimization
+    LEARNING_RATE = 5e-4
+    WEIGHT_DECAY = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SCSEModule(nn.Module):
+    """
+    Spatial and Channel Squeeze & Excitation (SCSE) Module.
+    Combines Channel Squeeze & Excitation (cSE) and Spatial Squeeze & Excitation (sSE).
+    """
+
+    def __init__(self, in_channels, reduction=16):
+        super(SCSEModule, self).__init__()
+
+        # Channel Squeeze and Excitation (cSE)
+        # Global Average Pooling -> FC -> ReLU -> FC -> Sigmoid
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+        # Spatial Squeeze and Excitation (sSE)
+        # Conv 1x1 -> Sigmoid
+        self.sSE = nn.Sequential(
+            nn.Conv2d(in_channels, 1, kernel_size=1, bias=False), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # cSE path: re-weight channels
+        # x shape: [B, C, H, W]
+        # cse shape: [B, C] -> [B, C, 1, 1]
+        cse = self.cSE(x).view(x.size(0), x.size(1), 1, 1)
+        x_cse = x * cse
+
+        # sSE path: re-weight spatial locations
+        # sse shape: [B, 1, H, W]
+        sse = self.sSE(x)
+        x_sse = x * sse
+
+        # Combine (Concurrent SCSE)
+        return x_cse + x_sse
+
+
+class DecoderBlock(nn.Module):
+    """
+    U-Net Decoder Block with Bilinear Upsampling and SCSE Attention.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+
+        # We use Bilinear upsampling in the forward pass, so no layer here for that.
+        # The input to conv block will be in_channels (from upsample) + skip_channels
+
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.scse = SCSEModule(out_channels)
+
+    def forward(self, x, skip=None):
+        # Bilinear Upsampling
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Concatenate skip connection
+        if skip is not None:
+            # Handle potential slight shape mismatch due to rounding in pooling
+            if x.size() != skip.size():
+                x = F.interpolate(
+                    x, size=skip.shape[2:], mode="bilinear", align_corners=True
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        # Apply Attention
+        x = self.scse(x)
+        return x
+
+
+class SoftGatedResnetUNet(nn.Module):
+    """
+    Soft-Gated Multi-Task ResNet18 U-Net.
+
+    Features:
+    - ResNet18 Encoder (pre-trained).
+    - 6-Channel Input Adaptation.
+    - Parallel Classification Head for Soft Gating.
+    - U-Net Decoder with SCSE Attention.
+    - Differentiable Soft-Gating: Mask = Seg_Mask * Class_Prob.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(SoftGatedResnetUNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        # Load pre-trained ResNet18
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first convolution to accept 6 channels
+        # Original: Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        original_conv1 = self.encoder.conv1
+        self.encoder.conv1 = nn.Conv2d(
+            in_channels,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias,
+        )
+
+        # Initialize new input channels
+        # We copy the weights from the original 3 channels to the new channels to preserve pre-training info
+        with torch.no_grad():
+            self.encoder.conv1.weight[:, :3] = original_conv1.weight
+            self.encoder.conv1.weight[:, 3:] = original_conv1.weight
+
+        # ===========================
+        # Classification Head (Gating)
+        # ===========================
+        # Attached to Layer 4 (512 channels)
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+        # ===========================
+        # Decoder
+        # ===========================
+        # ResNet18 feature channels:
+        # x0 (stem): 64
+        # x1 (layer1): 64
+        # x2 (layer2): 128
+        # x3 (layer3): 256
+        # x4 (layer4): 512
+
+        # Center block (Bottleneck processing)
+        self.center = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder blocks
+        # Dec4: In 512 (from center), Skip 256 (x3) -> Out 256
+        self.dec4 = DecoderBlock(512, 256, 256)
+
+        # Dec3: In 256, Skip 128 (x2) -> Out 128
+        self.dec3 = DecoderBlock(256, 128, 128)
+
+        # Dec2: In 128, Skip 64 (x1) -> Out 64
+        self.dec2 = DecoderBlock(128, 64, 64)
+
+        # Dec1: In 64, Skip 64 (x0) -> Out 32
+        self.dec1 = DecoderBlock(64, 64, 32)
+
+        # Final Upsampling Block (to get to original resolution)
+        # Dec1 output is 1/2 resolution (128x128 for 256 input).
+        # We need one more upsample.
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # ===========================
+        # Encoder Path
+        # ===========================
+        # Stem
+        x = self.encoder.conv1(x)
+        x = self.encoder.bn1(x)
+        x0 = self.encoder.relu(x)  # x0: 64ch, 1/2 size
+
+        x = self.encoder.maxpool(x0)
+
+        # Layers
+        x1 = self.encoder.layer1(x)  # x1: 64ch, 1/4 size
+        x2 = self.encoder.layer2(x1)  # x2: 128ch, 1/8 size
+        x3 = self.encoder.layer3(x2)  # x3: 256ch, 1/16 size
+        x4 = self.encoder.layer4(x3)  # x4: 512ch, 1/32 size
+
+        # ===========================
+        # Classification Head
+        # ===========================
+        p_cls = self.cls_head(x4)  # Scalar probability [B, 1]
+
+        # ===========================
+        # Decoder Path
+        # ===========================
+        c = self.center(x4)
+
+        d4 = self.dec4(c, x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
+
+        # Segmentation Mask (Raw)
+        m_seg = self.final_conv(d1)
+
+        # ===========================
+        # Soft Gating
+        # ===========================
+        # Multiply pixel-wise mask by global classification probability
+        # p_cls is [B, 1], m_seg is [B, 1, H, W]
+        # Broadcasting handles the dimensions
+        m_final = m_seg * p_cls.view(-1, 1, 1, 1)
+
+        # Return dictionary for SoftGatedLoss
+        return {"mask": m_final, "cls": p_cls}
+=======
+class DecoderBlock(nn.Module):
+    """
+    U-Net Decoder Block with Bilinear Upsampling.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+
+        # We use Bilinear upsampling in the forward pass, so no layer here for that.
+        # The input to conv block will be in_channels (from upsample) + skip_channels
+
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x, skip=None):
+        # Bilinear Upsampling
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Concatenate skip connection
+        if skip is not None:
+            # Handle potential slight shape mismatch due to rounding in pooling
+            if x.size() != skip.size():
+                x = F.interpolate(
+                    x, size=skip.shape[2:], mode="bilinear", align_corners=True
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        return x
+
+
+class ResnetUNet(nn.Module):
+    """
+    Standard ResNet18 U-Net.
+    Cite solution_lesson_node_00009: Removed Soft Gating and Multi-Task head.
+    Cite solution_lesson_node_00014: Removed SCSE attention.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(ResnetUNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        # Load pre-trained ResNet18
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first convolution to accept 6 channels
+        original_conv1 = self.encoder.conv1
+        self.encoder.conv1 = nn.Conv2d(
+            in_channels,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias,
+        )
+
+        # Initialize new input channels
+        with torch.no_grad():
+            self.encoder.conv1.weight[:, :3] = original_conv1.weight
+            self.encoder.conv1.weight[:, 3:] = original_conv1.weight
+
+        # ===========================
+        # Decoder
+        # ===========================
+        # Center block (Bottleneck processing)
+        self.center = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder blocks
+        self.dec4 = DecoderBlock(512, 256, 256)
+        self.dec3 = DecoderBlock(256, 128, 128)
+        self.dec2 = DecoderBlock(128, 64, 64)
+        self.dec1 = DecoderBlock(64, 64, 32)
+
+        # Final Upsampling Block
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # ===========================
+        # Encoder Path
+        # ===========================
+        # Stem
+        x = self.encoder.conv1(x)
+        x = self.encoder.bn1(x)
+        x0 = self.encoder.relu(x)  # x0: 64ch, 1/2 size
+
+        x = self.encoder.maxpool(x0)
+
+        # Layers
+        x1 = self.encoder.layer1(x)  # x1: 64ch, 1/4 size
+        x2 = self.encoder.layer2(x1)  # x2: 128ch, 1/8 size
+        x3 = self.encoder.layer3(x2)  # x3: 256ch, 1/16 size
+        x4 = self.encoder.layer4(x3)  # x4: 512ch, 1/32 size
+
+        # ===========================
+        # Decoder Path
+        # ===========================
+        c = self.center(x4)
+
+        d4 = self.dec4(c, x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
+
+        # Segmentation Mask
+        m_seg = self.final_conv(d1)
+
+        return m_seg
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class SoftGatedLoss(nn.Module):
+    """
+    Composite loss function for the Soft-Gated Multi-Task architecture.
+
+    Combines:
+    1. Global Batch Dice Loss for the segmentation mask.
+    2. Binary Cross Entropy Loss for the classification head (presence/absence).
+
+    The total loss is: L_total = L_Dice + lambda * L_BCE
+    """
+
+    def __init__(self, lambda_cls=Config.LAMBDA_CLS, smooth=1e-6):
+        super(SoftGatedLoss, self).__init__()
+        self.lambda_cls = lambda_cls
+        self.dice_loss_fn = GlobalBatchDiceLoss(smooth=smooth)
+        self.bce_loss_fn = nn.BCELoss()
+
+        # storage for logging components if needed by the training loop
+        self.last_metrics = {}
+
+    def forward(self, outputs, targets):
+        """
+        Args:
+            outputs (dict): Dictionary containing model outputs:
+                - 'mask': Tensor of shape (B, 1, H, W), soft-gated probabilities.
+                - 'cls': Tensor of shape (B, 1), classification probabilities.
+            targets (torch.Tensor): Ground truth masks of shape (B, 1, H, W).
+
+        Returns:
+            torch.Tensor: The weighted total loss.
+        """
+        pred_mask = outputs["mask"]
+        pred_cls = outputs["cls"]
+
+        # 1. Segmentation Loss
+        # Global Batch Dice Loss on the final soft-gated mask
+        loss_seg = self.dice_loss_fn(pred_mask, targets)
+
+        # 2. Classification Loss
+        # Derive classification targets from the ground truth masks
+        # If a mask has any positive pixels (1), the image is positive (1).
+        # We use no_grad because the target generation is deterministic and not part of the graph
+        with torch.no_grad():
+            # view(B, -1) flattens H,W. sum(1) sums pixels per image.
+            # If sum > 0, it's a positive sample.
+            target_cls = (
+                (targets.view(targets.size(0), -1).sum(dim=1) > 0).float().view(-1, 1)
+            )
+
+        loss_cls = self.bce_loss_fn(pred_cls, target_cls)
+
+        # Total Loss
+        total_loss = loss_seg + self.lambda_cls * loss_cls
+
+        # Store metrics for logging (detached from graph)
+        self.last_metrics = {
+            "loss_total": total_loss.item(),
+            "loss_seg": loss_seg.item(),
+            "loss_cls": loss_cls.item(),
+        }
+
+        return total_loss
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import SoftGatedResnetUNet
+from library.loss import SoftGatedLoss
+from library.utils import dice_score_batch
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Executes one epoch of training.
+    """
+    model.train()
+
+    running_loss_total = 0.0
+    running_loss_seg = 0.0
+    running_loss_cls = 0.0
+
+    for i, (images, masks, _) in enumerate(dataloader):
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        # outputs is a dict: {'mask': ..., 'cls': ...}
+        outputs = model(images)
+
+        # Compute loss
+        loss = criterion(outputs, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Track metrics
+        # criterion stores the components of the last forward pass
+        metrics = criterion.last_metrics
+        running_loss_total += metrics["loss_total"]
+        running_loss_seg += metrics["loss_seg"]
+        running_loss_cls += metrics["loss_cls"]
+
+    n_batches = len(dataloader)
+    avg_loss_total = running_loss_total / n_batches
+    avg_loss_seg = running_loss_seg / n_batches
+    avg_loss_cls = running_loss_cls / n_batches
+
+    return avg_loss_total, avg_loss_seg, avg_loss_cls
+
+
+def validate(model, dataloader, criterion, device, threshold=0.5):
+    """
+    Evaluates the model on the validation set.
+    Computes the Global Dice Coefficient over the entire dataset.
+    """
+    model.eval()
+
+    running_loss = 0.0
+
+    # Accumulators for Global Dice Calculation
+    # Dice = 2 * (Intersection) / (Cardinality)
+    # Summed over the entire dataset
+    total_intersection = 0.0
+    total_cardinality = 0.0
+
+    with torch.no_grad():
+        for images, masks, _ in dataloader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+
+            # Compute validation loss for monitoring
+            loss = criterion(outputs, masks)
+            running_loss += loss.item()
+
+            # Get predictions
+            pred_mask = outputs["mask"]  # Soft-gated mask
+
+            # Binarize for metric calculation
+            pred_binary = (pred_mask > threshold).float()
+
+            # Flatten for global accumulation
+            pred_flat = pred_binary.view(-1)
+            target_flat = masks.view(-1)
+
+            intersection = (pred_flat * target_flat).sum().item()
+            cardinality = (pred_flat.sum() + target_flat.sum()).item()
+
+            total_intersection += intersection
+            total_cardinality += cardinality
+
+    avg_loss = running_loss / len(dataloader)
+
+    # Compute Global Dice
+    epsilon = 1e-6
+    global_dice = (2.0 * total_intersection) / (total_cardinality + epsilon)
+
+    return avg_loss, global_dice
+
+
+def train_model(
+    epochs=Config.EPOCHS,
+    batch_size=Config.BATCH_SIZE,
+    learning_rate=Config.LEARNING_RATE,
+    weight_decay=Config.WEIGHT_DECAY,
+    max_samples=None,
+    num_workers=Config.NUM_WORKERS,
+    patience=5,
+):
+    """
+    Main training pipeline.
+
+    Args:
+        epochs (int): Number of training epochs.
+        batch_size (int): Batch size.
+        learning_rate (float): Learning rate for AdamW.
+        weight_decay (float): Weight decay for AdamW.
+        max_samples (int, optional): Limit dataset size for debugging.
+        num_workers (int): Number of dataloader workers.
+        patience (int): Early stopping patience.
+    """
+    # Set seeds for reproducibility
+    Config.set_seed(Config.SEED)
+
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # 1. Prepare Data
+    print("Initializing Datasets...")
+    train_dataset = ContrailDataset(split="train", max_samples=max_samples)
+    val_dataset = ContrailDataset(split="validation", max_samples=max_samples)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,  # Drop last incomplete batch to stabilize batch norm
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+
+    # 2. Prepare Model, Loss, Optimizer
+    print("Initializing Model...")
+    model = SoftGatedResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=True)
+    model = model.to(device)
+
+    criterion = SoftGatedLoss(lambda_cls=Config.LAMBDA_CLS)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=Config.ETA_MIN
+    )
+
+    # 3. Training Loop
+    best_dice = -1.0
+    patience_counter = 0
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+
+    print("Starting training...")
+    for epoch in range(epochs):
+        # Train
+        train_loss, train_seg_loss, train_cls_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_loss, val_dice = validate(
+            model, val_loader, criterion, device, threshold=Config.THRESHOLD
+        )
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics (Full Precision)
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"  LR: {current_lr:.9f}")
+        print(
+            f"  Train Loss: {train_loss:.9f} (Seg: {train_seg_loss:.9f}, Cls: {train_cls_loss:.9f})"
+        )
+        print(f"  Val Loss:   {val_loss:.9f}")
+        print(f"  Val Global Dice: {val_dice:.9f}")
+
+        # Checkpointing & Early Stopping
+        if val_dice > best_dice:
+            print(
+                f"  New Best Dice! ({best_dice:.9f} -> {val_dice:.9f}). Saving model..."
+            )
+            best_dice = val_dice
+            torch.save(model.state_dict(), best_model_path)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"  No improvement. Patience: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    print(f"Training complete. Best Validation Global Dice: {best_dice:.9f}")
+    print(f"Best model saved to: {best_model_path}")
+=======
+from library.model import ResnetUNet
+from library.loss import GlobalBatchDiceLoss
+from library.utils import dice_score_batch
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Executes one epoch of training.
+    """
+    model.train()
+
+    running_loss = 0.0
+
+    for i, (images, masks, _) in enumerate(dataloader):
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(images)
+
+        # Compute loss
+        loss = criterion(outputs, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    avg_loss = running_loss / len(dataloader)
+
+    return avg_loss
+
+
+def validate(model, dataloader, criterion, device, threshold=0.5):
+    """
+    Evaluates the model on the validation set.
+    Computes the Global Dice Coefficient over the entire dataset.
+    """
+    model.eval()
+
+    running_loss = 0.0
+
+    # Accumulators for Global Dice Calculation
+    # Dice = 2 * (Intersection) / (Cardinality)
+    # Summed over the entire dataset
+    total_intersection = 0.0
+    total_cardinality = 0.0
+
+    with torch.no_grad():
+        for images, masks, _ in dataloader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+
+            # Compute validation loss for monitoring
+            loss = criterion(outputs, masks)
+            running_loss += loss.item()
+
+            # Get predictions
+            pred_mask = outputs  # Shape [B, 1, H, W]
+
+            # Binarize for metric calculation
+            pred_binary = (pred_mask > threshold).float()
+
+            # Flatten for global accumulation
+            pred_flat = pred_binary.view(-1)
+            target_flat = masks.view(-1)
+
+            intersection = (pred_flat * target_flat).sum().item()
+            cardinality = (pred_flat.sum() + target_flat.sum()).item()
+
+            total_intersection += intersection
+            total_cardinality += cardinality
+
+    avg_loss = running_loss / len(dataloader)
+
+    # Compute Global Dice
+    epsilon = 1e-6
+    global_dice = (2.0 * total_intersection) / (total_cardinality + epsilon)
+
+    return avg_loss, global_dice
+
+
+def train_model(
+    epochs=Config.EPOCHS,
+    batch_size=Config.BATCH_SIZE,
+    learning_rate=Config.LEARNING_RATE,
+    weight_decay=Config.WEIGHT_DECAY,
+    max_samples=None,
+    num_workers=Config.NUM_WORKERS,
+    patience=5,
+):
+    """
+    Main training pipeline.
+    """
+    # Set seeds for reproducibility
+    Config.set_seed(Config.SEED)
+
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # 1. Prepare Data
+    print("Initializing Datasets...")
+    train_dataset = ContrailDataset(split="train", max_samples=max_samples)
+    val_dataset = ContrailDataset(split="validation", max_samples=max_samples)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+
+    # 2. Prepare Model, Loss, Optimizer
+    print("Initializing Model...")
+    model = ResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=True)
+    model = model.to(device)
+
+    criterion = GlobalBatchDiceLoss()
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=Config.ETA_MIN
+    )
+
+    # 3. Training Loop
+    best_dice = -1.0
+    patience_counter = 0
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+
+    print("Starting training...")
+    for epoch in range(epochs):
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_loss, val_dice = validate(
+            model, val_loader, criterion, device, threshold=Config.THRESHOLD
+        )
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"  LR: {current_lr:.9f}")
+        print(f"  Train Loss: {train_loss:.9f}")
+        print(f"  Val Loss:   {val_loss:.9f}")
+        print(f"  Val Global Dice: {val_dice:.9f}")
+
+        # Checkpointing & Early Stopping
+        if val_dice > best_dice:
+            print(
+                f"  New Best Dice! ({best_dice:.9f} -> {val_dice:.9f}). Saving model..."
+            )
+            best_dice = val_dice
+            torch.save(model.state_dict(), best_model_path)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"  No improvement. Patience: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    print(f"Training complete. Best Validation Global Dice: {best_dice:.9f}")
+    print(f"Best model saved to: {best_model_path}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+from library.model import SoftGatedResnetUNet
+from library.utils import rle_encode
+
+
+def predict(
+    batch_size=Config.BATCH_SIZE,
+    num_workers=Config.NUM_WORKERS,
+    device=Config.DEVICE,
+    threshold=Config.THRESHOLD,
+):
+    """
+    Runs inference on the test dataset and generates the submission file.
+
+    Args:
+        batch_size (int): Batch size for inference.
+        num_workers (int): Number of workers for data loading.
+        device (torch.device): Device to run inference on.
+        threshold (float): Threshold for binarizing probability masks.
+    """
+    # Set seeds for reproducibility
+    Config.set_seed(Config.SEED)
+
+    print(f"Starting inference on device: {device}")
+
+    # 1. Load Model
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Model file not found at {model_path}. Please train the model first."
+        )
+
+    print(f"Loading model from {model_path}...")
+    model = SoftGatedResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+
+    # Load state dict
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+
+    model.to(device)
+    model.eval()
+
+    # 2. Prepare Data
+    print("Initializing Test Dataset...")
+    test_dataset = ContrailDataset(split="test")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Total test samples: {len(test_dataset)}")
+
+    # 3. Inference Loop
+    submission_data = []
+
+    with torch.no_grad():
+        for i, (images, _, record_ids) in enumerate(test_loader):
+            images = images.to(device)
+
+            # Forward pass
+            # Model returns dict: {'mask': ..., 'cls': ...}
+            outputs = model(images)
+            pred_masks = outputs["mask"]
+
+            # Apply threshold to get binary mask
+            # pred_masks is [B, 1, H, W]
+            binary_masks = (pred_masks > threshold).float()
+
+            # Move to CPU for RLE encoding
+            binary_masks_np = binary_masks.cpu().numpy()
+=======
+from library.model import ResnetUNet
+from library.utils import rle_encode
+
+
+def predict(
+    batch_size=Config.BATCH_SIZE,
+    num_workers=Config.NUM_WORKERS,
+    device=Config.DEVICE,
+    threshold=Config.THRESHOLD,
+):
+    """
+    Runs inference on the test dataset and generates the submission file.
+
+    Args:
+        batch_size (int): Batch size for inference.
+        num_workers (int): Number of workers for data loading.
+        device (torch.device): Device to run inference on.
+        threshold (float): Threshold for binarizing probability masks.
+    """
+    # Set seeds for reproducibility
+    Config.set_seed(Config.SEED)
+
+    print(f"Starting inference on device: {device}")
+
+    # 1. Load Model
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Model file not found at {model_path}. Please train the model first."
+        )
+
+    print(f"Loading model from {model_path}...")
+    model = ResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+
+    # Load state dict
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+
+    model.to(device)
+    model.eval()
+
+    # 2. Prepare Data
+    print("Initializing Test Dataset...")
+    test_dataset = ContrailDataset(split="test")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Total test samples: {len(test_dataset)}")
+
+    # 3. Inference Loop
+    submission_data = []
+
+    with torch.no_grad():
+        for i, (images, _, record_ids) in enumerate(test_loader):
+            images = images.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            pred_masks = outputs
+
+            # Apply threshold to get binary mask
+            # pred_masks is [B, 1, H, W]
+            binary_masks = (pred_masks > threshold).float()
+
+            # Move to CPU for RLE encoding
+            binary_masks_np = binary_masks.cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SoftGatedResnetUNet
+from library.loss import SoftGatedLoss
+from library.train import train_model, validate
+from library.predict import predict
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model performance on the validation set to identify systematic errors.
+    Calculates the correlation between error magnitude (1 - Dice) and input features.
+    """
+    print("Starting failure analysis...")
+
+    # Access the dataframe from the dataset
+    # Note: val_loader.dataset is the ContrailDataset
+    meta_df = val_loader.dataset.df.copy()
+
+    # Store per-sample dice scores
+    per_sample_dice = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, (images, masks, record_ids) in enumerate(val_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            pred_masks = outputs["mask"]
+
+            # Binarize predictions
+            preds = (pred_masks > Config.THRESHOLD).float()
+
+            # Compute Dice per sample for analysis
+            # Intersection and Cardinality per image in the batch
+            intersection = (preds * masks).sum(dim=(1, 2, 3))
+            cardinality = preds.sum(dim=(1, 2, 3)) + masks.sum(dim=(1, 2, 3))
+
+            # Add epsilon to avoid division by zero for empty mask + empty pred
+            # If both are empty, dice is 1.0. If one is empty, dice is 0.0.
+            # Using a small epsilon handles the 0/0 case correctly if logic matches metric
+            # Here we use standard formula
+            dice_scores = (2.0 * intersection) / (cardinality + 1e-6)
+
+            # Handle the case where cardinality is 0 (both empty) -> Dice should be 1
+            # The formula gives 0 if intersection is 0.
+            # We fix this: if cardinality is effectively 0, score is 1.
+            is_empty = cardinality < 1e-5
+            dice_scores[is_empty] = 1.0
+
+            per_sample_dice.extend(dice_scores.cpu().numpy())
+
+    # Add error metric to dataframe
+    # Ensure length matches
+    if len(per_sample_dice) != len(meta_df):
+        print(
+            f"Warning: Mismatch in failure analysis samples. Preds: {len(per_sample_dice)}, DF: {len(meta_df)}"
+        )
+        # Truncate to match the smaller one (though they should match)
+        min_len = min(len(per_sample_dice), len(meta_df))
+        per_sample_dice = per_sample_dice[:min_len]
+        meta_df = meta_df.iloc[:min_len]
+
+    meta_df["dice"] = per_sample_dice
+    meta_df["error"] = 1.0 - meta_df["dice"]
+
+    # Feature Engineering for Correlation
+    if "timestamp" in meta_df.columns:
+        meta_df["datetime"] = pd.to_datetime(meta_df["timestamp"], unit="s")
+        meta_df["hour"] = meta_df["datetime"].dt.hour
+        meta_df["month"] = meta_df["datetime"].dt.month
+
+    # Features to check
+    features = ["timestamp", "row_min", "col_min", "hour", "month"]
+    correlations = {}
+
+    print("Correlation between Error (1-Dice) and Features:")
+    for feat in features:
+        if feat in meta_df.columns:
+            # Drop NaNs just in case
+            valid_df = meta_df[[feat, "error"]].dropna()
+            if not valid_df.empty:
+                corr = valid_df["error"].corr(valid_df[feat])
+                correlations[feat] = corr
+                print(f"  {feat}: {corr}")
+            else:
+                print(f"  {feat}: Insufficient data")
+        else:
+            print(f"  {feat}: Not found in metadata")
+
+
+def main():
+    # 1. Setup
+    Config.set_seed(Config.SEED)
+    device = Config.DEVICE
+
+    # 2. Training
+    # We use a subset of training data (6000 samples) and 10 epochs to ensure fast execution (< 2 hours)
+    # while still allowing convergence.
+    print("=== Starting Training Phase ===")
+    train_model(epochs=10, max_samples=6000)
+
+    # 3. Validation
+    print("\n=== Starting Validation Phase ===")
+    # Load the best model saved during training
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError("Best model not found. Training may have failed.")
+
+    model = SoftGatedResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Load FULL validation set
+    val_dataset = ContrailDataset(split="validation")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    criterion = SoftGatedLoss()
+=======
+from library.model import ResnetUNet
+from library.loss import GlobalBatchDiceLoss
+from library.train import train_model, validate
+from library.predict import predict
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model performance on the validation set to identify systematic errors.
+    Calculates the correlation between error magnitude (1 - Dice) and input features.
+    """
+    print("Starting failure analysis...")
+
+    # Access the dataframe from the dataset
+    # Note: val_loader.dataset is the ContrailDataset
+    meta_df = val_loader.dataset.df.copy()
+
+    # Store per-sample dice scores
+    per_sample_dice = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, (images, masks, record_ids) in enumerate(val_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Forward pass
+            outputs = model(images)
+            pred_masks = outputs
+
+            # Binarize predictions
+            preds = (pred_masks > Config.THRESHOLD).float()
+
+            # Compute Dice per sample for analysis
+            # Intersection and Cardinality per image in the batch
+            intersection = (preds * masks).sum(dim=(1, 2, 3))
+            cardinality = preds.sum(dim=(1, 2, 3)) + masks.sum(dim=(1, 2, 3))
+
+            # Add epsilon to avoid division by zero for empty mask + empty pred
+            # If both are empty, dice is 1.0. If one is empty, dice is 0.0.
+            # Using a small epsilon handles the 0/0 case correctly if logic matches metric
+            # Here we use standard formula
+            dice_scores = (2.0 * intersection) / (cardinality + 1e-6)
+
+            # Handle the case where cardinality is 0 (both empty) -> Dice should be 1
+            # The formula gives 0 if intersection is 0.
+            # We fix this: if cardinality is effectively 0, score is 1.
+            is_empty = cardinality < 1e-5
+            dice_scores[is_empty] = 1.0
+
+            per_sample_dice.extend(dice_scores.cpu().numpy())
+
+    # Add error metric to dataframe
+    # Ensure length matches
+    if len(per_sample_dice) != len(meta_df):
+        print(
+            f"Warning: Mismatch in failure analysis samples. Preds: {len(per_sample_dice)}, DF: {len(meta_df)}"
+        )
+        # Truncate to match the smaller one (though they should match)
+        min_len = min(len(per_sample_dice), len(meta_df))
+        per_sample_dice = per_sample_dice[:min_len]
+        meta_df = meta_df.iloc[:min_len]
+
+    meta_df["dice"] = per_sample_dice
+    meta_df["error"] = 1.0 - meta_df["dice"]
+
+    # Feature Engineering for Correlation
+    if "timestamp" in meta_df.columns:
+        meta_df["datetime"] = pd.to_datetime(meta_df["timestamp"], unit="s")
+        meta_df["hour"] = meta_df["datetime"].dt.hour
+        meta_df["month"] = meta_df["datetime"].dt.month
+
+    # Features to check
+    features = ["timestamp", "row_min", "col_min", "hour", "month"]
+    correlations = {}
+
+    print("Correlation between Error (1-Dice) and Features:")
+    for feat in features:
+        if feat in meta_df.columns:
+            # Drop NaNs just in case
+            valid_df = meta_df[[feat, "error"]].dropna()
+            if not valid_df.empty:
+                corr = valid_df["error"].corr(valid_df[feat])
+                correlations[feat] = corr
+                print(f"  {feat}: {corr}")
+            else:
+                print(f"  {feat}: Insufficient data")
+        else:
+            print(f"  {feat}: Not found in metadata")
+
+
+def main():
+    # 1. Setup
+    Config.set_seed(Config.SEED)
+    device = Config.DEVICE
+
+    # 2. Training
+    # Cite solution_lesson_node_00002: Training on full dataset (removed max_samples)
+    print("=== Starting Training Phase ===")
+    train_model(epochs=Config.EPOCHS)
+
+    # 3. Validation
+    print("\n=== Starting Validation Phase ===")
+    # Load the best model saved during training
+    model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError("Best model not found. Training may have failed.")
+
+    model = ResnetUNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Load FULL validation set
+    val_dataset = ContrailDataset(split="validation")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    criterion = GlobalBatchDiceLoss()
+>>>>>>> REPLACE
+```

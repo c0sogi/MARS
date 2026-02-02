@@ -1,0 +1,204 @@
+To optimize the model's performance and specifically target the bias mitigation metrics (Subgroup AUC, BPSN, BNSP), I will implement a **Targeted Loss Reweighting** strategy (Cite solution_lesson_node_00010). This involves assigning higher loss weights to training examples that are critical for learning unbiased decision boundaries—specifically, non-toxic comments that mention identity terms ("hard negatives").
+
+Here is the implementation strategy:
+
+1.  **Modify `ToxicityDataset` in `library/data.py`**:
+    -   Precompute sample weights during initialization.
+    -   Assign a base weight of 1.0.
+    -   Add +0.5 weight to all examples mentioning an identity (to ensure the model pays attention to these subgroups).
+    -   Add an additional +1.5 weight (total 3.0) to **non-toxic** examples mentioning an identity. This heavily penalizes the model for False Positives on identity terms, directly addressing the BPSN metric.
+    -   Return the `weight` in the `__getitem__` method.
+
+2.  **Modify `DynamicPaddingCollator` in `library/data.py`**:
+    -   Update the collator to batch the `weight` values into a tensor.
+
+3.  **Modify `Trainer` in `library/trainer.py`**:
+    -   Change the loss function `BCEWithLogitsLoss` to use `reduction='none'` so we can apply per-sample weights manually.
+    -   In the training loop, multiply the computed losses by the sample weights before taking the mean. This applies the reweighting strategy to both the main toxicity task and the auxiliary tasks.
+
+4.  **Update `runfile.py`**:
+    -   Update the submission threshold to the new required value (`0.9378314975158606`).
+
+This approach leverages the existing DistilBERT architecture but alters the optimization landscape to prioritize the "difficult" regions of the data distribution where bias typically manifests.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        if Config.AUX_COLUMNS[0] in df.columns:
+            self.aux_targets = df[Config.AUX_COLUMNS].values.astype(np.float32)
+        else:
+            self.aux_targets = np.zeros(
+                (len(df), len(Config.AUX_COLUMNS)), dtype=np.float32
+            )
+
+        self.tokenizer = tokenizer
+        self.is_train = is_train
+=======
+        if Config.AUX_COLUMNS[0] in df.columns:
+            self.aux_targets = df[Config.AUX_COLUMNS].values.astype(np.float32)
+        else:
+            self.aux_targets = np.zeros(
+                (len(df), len(Config.AUX_COLUMNS)), dtype=np.float32
+            )
+
+        # Precompute sample weights for bias mitigation (Cite solution_lesson_node_00010)
+        self.weights = np.ones(len(df), dtype=np.float32)
+        if is_train and all(col in df.columns for col in Config.IDENTITY_COLUMNS):
+            identities = df[Config.IDENTITY_COLUMNS].fillna(0.0).values
+            # Vectorized weight calculation
+            has_identity = np.any(identities >= 0.5, axis=1)
+            is_nontoxic = self.targets < 0.5
+
+            # Apply moderate boost to all identity mentions (+0.5)
+            self.weights[has_identity] += 0.5
+            # Apply significant boost to non-toxic identity mentions (+1.5)
+            # Total weight for non-toxic identity: 1.0 + 0.5 + 1.5 = 3.0
+            self.weights[has_identity & is_nontoxic] += 1.5
+
+        self.tokenizer = tokenizer
+        self.is_train = is_train
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        return {
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+            "target": self.targets[idx],
+            "aux_target": self.aux_targets[idx],
+        }
+=======
+        return {
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+            "target": self.targets[idx],
+            "aux_target": self.aux_targets[idx],
+            "weight": self.weights[idx],
+        }
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        targets_batch = []
+        aux_targets_batch = []
+
+        for x in batch:
+            input_ids = x["input_ids"]
+            attention_mask = x["attention_mask"]
+
+            # Calculate padding length
+            pad_len = max_len - len(input_ids)
+
+            # Pad input_ids
+            padded_input_ids = input_ids + [self.pad_token_id] * pad_len
+            # Pad attention_mask (0 for padded positions)
+            padded_attention_mask = attention_mask + [0] * pad_len
+
+            input_ids_batch.append(padded_input_ids)
+            attention_mask_batch.append(padded_attention_mask)
+            targets_batch.append(x["target"])
+            aux_targets_batch.append(x["aux_target"])
+
+        return {
+            "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.long),
+            "target": torch.tensor(targets_batch, dtype=torch.float),
+            "aux_target": torch.tensor(np.array(aux_targets_batch), dtype=torch.float),
+        }
+=======
+        targets_batch = []
+        aux_targets_batch = []
+        weights_batch = []
+
+        for x in batch:
+            input_ids = x["input_ids"]
+            attention_mask = x["attention_mask"]
+
+            # Calculate padding length
+            pad_len = max_len - len(input_ids)
+
+            # Pad input_ids
+            padded_input_ids = input_ids + [self.pad_token_id] * pad_len
+            # Pad attention_mask (0 for padded positions)
+            padded_attention_mask = attention_mask + [0] * pad_len
+
+            input_ids_batch.append(padded_input_ids)
+            attention_mask_batch.append(padded_attention_mask)
+            targets_batch.append(x["target"])
+            aux_targets_batch.append(x["aux_target"])
+            weights_batch.append(x["weight"])
+
+        return {
+            "input_ids": torch.tensor(input_ids_batch, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask_batch, dtype=torch.long),
+            "target": torch.tensor(targets_batch, dtype=torch.float),
+            "aux_target": torch.tensor(np.array(aux_targets_batch), dtype=torch.float),
+            "weight": torch.tensor(weights_batch, dtype=torch.float),
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Loss Function
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        # Metadata for evaluation (identities needed for bias metrics)
+=======
+        # Loss Function
+        # Cite solution_lesson_node_00010: Use reduction='none' to support sample weighting
+        self.criterion = nn.BCEWithLogitsLoss(reduction='none')
+
+        # Metadata for evaluation (identities needed for bias metrics)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            targets = batch["target"].to(self.device).unsqueeze(1)  # Shape: (batch, 1)
+            aux_targets = batch["aux_target"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Multi-Task Learning Forward Pass
+            logits, aux_logits = self.model(input_ids, attention_mask)
+
+            # Cite solution_lesson_node_00008: L_total = L_main + 0.5 * L_aux
+            loss_main = self.criterion(logits, targets)
+            loss_aux = self.criterion(aux_logits, aux_targets)
+            loss = loss_main + 0.5 * loss_aux
+
+            loss.backward()
+=======
+            targets = batch["target"].to(self.device).unsqueeze(1)  # Shape: (batch, 1)
+            aux_targets = batch["aux_target"].to(self.device)
+            weights = batch["weight"].to(self.device).unsqueeze(1)  # Shape: (batch, 1)
+
+            self.optimizer.zero_grad()
+
+            # Multi-Task Learning Forward Pass
+            logits, aux_logits = self.model(input_ids, attention_mask)
+
+            # Cite solution_lesson_node_00010: Targeted Loss Reweighting
+            loss_main = self.criterion(logits, targets)
+            loss_aux = self.criterion(aux_logits, aux_targets)
+
+            # Apply sample weights
+            weighted_loss_main = (loss_main * weights).mean()
+            # Weight aux loss (averaged over aux classes per sample)
+            weighted_loss_aux = (loss_aux.mean(dim=1, keepdim=True) * weights).mean()
+
+            loss = weighted_loss_main + 0.5 * weighted_loss_aux
+
+            loss.backward()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 6. Submission
+    THRESHOLD = 0.9368921743738194
+
+    if final_score > THRESHOLD:
+=======
+    # 6. Submission
+    THRESHOLD = 0.9378314975158606
+
+    if final_score > THRESHOLD:
+>>>>>>> REPLACE
+```

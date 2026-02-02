@@ -1,0 +1,231 @@
+To address the `torch.OutOfMemoryError`, I will implement a multi-faceted memory optimization strategy. First, I will reduce the input image resolution and batch size in `library/config.py` to lower the memory footprint of the 3D volume processing, citing the lesson on calculating effective batch size for volumetric data. Second, I will modify `library/engine.py` to implement Mixed Precision Training (AMP) using `torch.amp.autocast` and `GradScaler`. This reduces memory usage by storing activations in FP16 while maintaining stability via gradient scaling. Finally, I will increase the gradient accumulation steps to maintain the effective batch size despite the reduced physical batch size.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Image Resolution: EfficientNet-B4 native is ~380. Using 384 for standard alignment.
+    IMAGE_SIZE = (384, 384)
+
+    # Sequence Length: High density sampling (96 slices) to capture fine fractures
+=======
+    # Image Resolution: Reduced to 256 to prevent OOM. Cite debug_lesson_1.
+    IMAGE_SIZE = (256, 256)
+
+    # Sequence Length: High density sampling (96 slices) to capture fine fractures
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Batch Size: Constrained by memory (B4 backbone + 96 slices per sample).
+    # A100 40GB allows roughly 2 samples per forward/backward pass.
+    BATCH_SIZE = 2
+
+    # Gradient Accumulation: Simulates a larger batch size (Target effective batch ~16)
+    ACCUMULATION_STEPS = 8
+=======
+    # Batch Size: Reduced to 1 to prevent OOM (Effective batch = 1 * 96 = 96 images). Cite debug_lesson_1.
+    BATCH_SIZE = 1
+
+    # Gradient Accumulation: Increased to 16 to compensate for small batch size
+    ACCUMULATION_STEPS = 16
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import pandas as pd
+import gc
+from library.config import Config
+from library.utils import get_logger, calculate_weighted_loss
+=======
+import pandas as pd
+import gc
+from torch.amp import autocast, GradScaler
+from library.config import Config
+from library.utils import get_logger, calculate_weighted_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+    """
+    Trains the model for one epoch using Gradient Accumulation and BCELoss.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    # Zero gradients at the start
+    optimizer.zero_grad()
+
+    # Standard BCELoss without weights for calibration
+    criterion = nn.BCELoss()
+
+    for step, (images, targets, _) in enumerate(dataloader):
+        batch_size = images.size(0)
+
+        images = images.to(device, dtype=torch.float32)
+        targets = targets.to(device, dtype=torch.float32)
+
+        # Forward Pass
+        # Model returns probabilities via Sigmoid
+        outputs = model(images)
+
+        # Clamp for numerical stability in Log Loss
+        outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+
+        # Calculate Loss
+        loss = criterion(outputs, targets)
+
+        # Scale loss for gradient accumulation
+        loss = loss / Config.ACCUMULATION_STEPS
+
+        # Backward Pass
+        loss.backward()
+
+        # Optimization Step
+        if (step + 1) % Config.ACCUMULATION_STEPS == 0:
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+            optimizer.step()
+            optimizer.zero_grad()
+=======
+def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch):
+    """
+    Trains the model for one epoch using Gradient Accumulation, BCELoss, and AMP.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    # Zero gradients at the start
+    optimizer.zero_grad()
+
+    # Standard BCELoss without weights for calibration
+    criterion = nn.BCELoss()
+
+    for step, (images, targets, _) in enumerate(dataloader):
+        batch_size = images.size(0)
+
+        images = images.to(device, dtype=torch.float32)
+        targets = targets.to(device, dtype=torch.float32)
+
+        # Forward Pass with AMP
+        with autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(images)
+            # Cast to float32 for numerical stability
+            outputs = outputs.to(torch.float32)
+            outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+            loss = criterion(outputs, targets)
+            loss = loss / Config.ACCUMULATION_STEPS
+
+        # Backward Pass with Scaler
+        scaler.scale(loss).backward()
+
+        # Optimization Step
+        if (step + 1) % Config.ACCUMULATION_STEPS == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            batch_size = images.size(0)
+
+            images = images.to(device, dtype=torch.float32)
+            targets = targets.to(device, dtype=torch.float32)
+
+            outputs = model(images)
+            outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+
+            loss = criterion(outputs, targets)
+=======
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            batch_size = images.size(0)
+
+            images = images.to(device, dtype=torch.float32)
+            targets = targets.to(device, dtype=torch.float32)
+
+            with autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(images)
+                outputs = outputs.to(torch.float32)
+                outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+                loss = criterion(outputs, targets)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
+=======
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Initialize GradScaler for AMP
+    scaler = GradScaler("cuda")
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        val_loss, val_metric = validate(model, val_loader, device)
+=======
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, epoch)
+        val_loss, val_metric = validate(model, val_loader, device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, _, uids in test_loader:
+            images = images.to(device, dtype=torch.float32)
+
+            outputs = model(images)
+            outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+
+            probs = outputs.cpu().numpy()
+=======
+    with torch.no_grad():
+        for images, _, uids in test_loader:
+            images = images.to(device, dtype=torch.float32)
+
+            with autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(images)
+                outputs = outputs.to(torch.float32)
+                outputs = torch.clamp(outputs, 1e-7, 1.0 - 1e-7)
+
+            probs = outputs.cpu().numpy()
+>>>>>>> REPLACE
+```

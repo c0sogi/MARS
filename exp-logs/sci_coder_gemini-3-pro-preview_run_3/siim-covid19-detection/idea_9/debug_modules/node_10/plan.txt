@@ -1,0 +1,428 @@
+To resolve the `TimeoutError` caused by excessive runtime, I will implement a strategy to accelerate training and validation while reducing the total workload.
+
+1.  **Reduce Workload**: I will update `library/config.py` to reduce the number of epochs from 15 to 10 and increase the batch size from 8 to 32. This utilizes the A100 GPU more efficiently and cuts down the total steps.
+2.  **Accelerate Training**: I will modify `library/engine.py` to implement Automatic Mixed Precision (AMP) using `torch.cuda.amp.GradScaler` and `autocast`. This leverages the GPU's Tensor Cores for faster computation.
+3.  **Optimize Validation**: I will rewrite the `MAPCalculator` in `library/utils.py` to use `torchvision.ops.box_iou` for vectorized IoU calculation, replacing the slow Python loop that was causing validation bottlenecks.
+4.  **Ensure Stability**: I will update `library/loss.py` to force the loss calculation to run in FP32 (using `autocast(enabled=False)`), preventing numerical instability (overflow/underflow) during the calculation of IoU and Focal Loss.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BATCH_SIZE = 8  # Tuned for A100 40GB
+    EPOCHS = 15
+=======
+    BATCH_SIZE = 32  # Tuned for A100 40GB
+    EPOCHS = 10
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+import numpy as np
+import torch
+from library.config import Config
+=======
+import numpy as np
+import torch
+import torchvision
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    def update(self, pred_boxes, pred_scores, gt_boxes, iou_threshold=0.5):
+        """
+        Updates the calculator with predictions and ground truth for a single image.
+
+        Args:
+            pred_boxes (array): Predicted boxes [N, 4]
+            pred_scores (array): Predicted scores [N]
+            gt_boxes (array): Ground truth boxes [M, 4]
+            iou_threshold (float): IoU threshold for a match to be considered a True Positive.
+        """
+        self.n_positives += len(gt_boxes)
+
+        if len(pred_boxes) == 0:
+            return
+
+        # Sort predictions by score descending
+        indices = np.argsort(pred_scores)[::-1]
+        pred_boxes = pred_boxes[indices]
+        pred_scores = pred_scores[indices]
+
+        gt_matched = np.zeros(len(gt_boxes))
+
+        for box, score in zip(pred_boxes, pred_scores):
+            best_iou = 0
+            best_gt_idx = -1
+
+            # Find best matching ground truth
+            for j, g_box in enumerate(gt_boxes):
+                if gt_matched[j]:
+                    continue
+                iou = calculate_iou(box, g_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = j
+
+            if best_iou >= iou_threshold:
+                self.predictions.append((score, 1))  # True Positive
+                gt_matched[best_gt_idx] = 1
+            else:
+                self.predictions.append((score, 0))  # False Positive
+=======
+    def update(self, pred_boxes, pred_scores, gt_boxes, iou_threshold=0.5):
+        """
+        Updates the calculator with predictions and ground truth for a single image.
+
+        Args:
+            pred_boxes (array): Predicted boxes [N, 4]
+            pred_scores (array): Predicted scores [N]
+            gt_boxes (array): Ground truth boxes [M, 4]
+            iou_threshold (float): IoU threshold for a match to be considered a True Positive.
+        """
+        self.n_positives += len(gt_boxes)
+
+        if len(pred_boxes) == 0:
+            return
+
+        # Handle case with no GT (all FPs)
+        if len(gt_boxes) == 0:
+            for s in pred_scores:
+                self.predictions.append((s, 0))
+            return
+
+        # Vectorized IoU calculation using Torchvision
+        # Convert numpy arrays to tensors
+        p_boxes = torch.from_numpy(pred_boxes).float()
+        g_boxes = torch.from_numpy(gt_boxes).float()
+
+        # Compute IoU matrix [N, M]
+        iou_matrix = torchvision.ops.box_iou(p_boxes, g_boxes).numpy()
+
+        # Sort predictions by score descending
+        indices = np.argsort(pred_scores)[::-1]
+        pred_scores = pred_scores[indices]
+        iou_matrix = iou_matrix[indices]
+
+        gt_matched = np.zeros(len(gt_boxes), dtype=bool)
+
+        for i, score in enumerate(pred_scores):
+            # Find best matching ground truth for this prediction
+            best_gt_idx = np.argmax(iou_matrix[i])
+            best_iou = iou_matrix[i][best_gt_idx]
+
+            if best_iou >= iou_threshold and not gt_matched[best_gt_idx]:
+                self.predictions.append((score, 1))  # True Positive
+                gt_matched[best_gt_idx] = True
+            else:
+                self.predictions.append((score, 0))  # False Positive
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        self.criterion = Criterion().to(device)
+
+        # Early Stopping parameters
+=======
+        self.criterion = Criterion().to(device)
+        # Initialize GradScaler for Mixed Precision Training
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        # Early Stopping parameters
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Forward pass
+            preds = self.model(images)
+
+            # Calculate loss
+            loss_dict = self.criterion(preds, targets)
+            loss = loss_dict["loss"]
+
+            # Backprop
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+=======
+            # Mixed Precision Forward Pass
+            with torch.cuda.amp.autocast():
+                preds = self.model(images)
+                loss_dict = self.criterion(preds, targets)
+                loss = loss_dict["loss"]
+
+            # Scaled Backward Pass
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+                # Forward pass
+                preds = self.model(images)
+
+                # --- Study Classification Evaluation ---
+=======
+                # Forward pass (can use autocast for inference too)
+                with torch.cuda.amp.autocast():
+                    preds = self.model(images)
+
+                # --- Study Classification Evaluation ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+                    # Move to CPU for numpy processing in MAPCalculator
+                    pred_boxes_np = decoded_boxes.cpu().numpy()
+                    pred_scores_np = valid_scores.cpu().numpy()
+                    gt_boxes_np = gt_boxes.cpu().numpy()
+
+                    map_calculator.update(
+                        pred_boxes_np, pred_scores_np, gt_boxes_np, iou_threshold=0.5
+                    )
+=======
+                    # Move to CPU for MAPCalculator (which now uses vectorized ops)
+                    pred_boxes_np = decoded_boxes.float().cpu().numpy()
+                    pred_scores_np = valid_scores.float().cpu().numpy()
+                    gt_boxes_np = gt_boxes.float().cpu().numpy()
+
+                    map_calculator.update(
+                        pred_boxes_np, pred_scores_np, gt_boxes_np, iou_threshold=0.5
+                    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+    def decode_boxes(self, anchors, box_preds):
+        """
+        Decode predicted offsets to x1y1x2y2.
+        anchors: [N, 4] (cx, cy, stride, stride)
+        box_preds: [N, 4] (l, t, r, b)
+        """
+        cx, cy, stride = anchors[:, 0], anchors[:, 1], anchors[:, 2]
+        l, t, r, b = box_preds[:, 0], box_preds[:, 1], box_preds[:, 2], box_preds[:, 3]
+
+        x1 = cx - l * stride
+        y1 = cy - t * stride
+        x2 = cx + r * stride
+        y2 = cy + b * stride
+
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    def forward(self, preds, targets):
+        """
+        preds: dict containing:
+            - 'cls_logits': Tensor [B, N_anchors, 1]
+            - 'bbox_preds': Tensor [B, N_anchors, 4] (l,t,r,b)
+            - 'anchors': Tensor [N_anchors, 4] (cx, cy, stride_w, stride_h)
+            - 'num_anchors_per_level': list of ints
+            - 'study_logits': Tensor [B, 4]
+        targets: list of dicts (len B) containing:
+            - 'boxes': Tensor [M, 4]
+            - 'labels': Tensor [M]
+            - 'study_label': Tensor scalar
+        """
+
+        # 1. Study Loss
+        study_logits = preds["study_logits"]
+        study_targets = torch.stack([t["study_label"] for t in targets]).to(
+            study_logits.device
+        )
+        loss_study = self.study_loss(study_logits, study_targets)
+
+        # 2. Detection Loss
+        cls_logits = preds["cls_logits"]  # [B, N, 1]
+        bbox_preds = preds["bbox_preds"]  # [B, N, 4]
+        anchors = preds["anchors"]  # [N, 4]
+        num_anchors_list = preds["num_anchors_per_level"]
+
+        batch_size = cls_logits.size(0)
+
+        loss_cls = 0.0
+        loss_box = 0.0
+        num_positives = 0
+
+        for i in range(batch_size):
+            gt_boxes = targets[i]["boxes"].to(anchors.device)
+            gt_labels = targets[i]["labels"].to(
+                anchors.device
+            )  # Usually all 1s for opacity
+
+            # Label Assignment
+            matched_gt_inds, ious = self.matcher(anchors, gt_boxes, num_anchors_list)
+
+            # Identify Positives and Negatives
+            pos_mask = matched_gt_inds >= 0
+
+            # Prepare Classification Targets (Quality Focal Loss)
+            # Target is 0 for neg, IoU for pos
+            cls_target = torch.zeros_like(cls_logits[i], dtype=torch.float32)
+
+            if pos_mask.sum() > 0:
+                # Assign IoU score as target for positive class
+                pos_anchor_inds = torch.where(pos_mask)[0]
+                matched_gt_inds_pos = matched_gt_inds[pos_mask]
+                pos_ious = ious[pos_anchor_inds, matched_gt_inds_pos]
+
+                # Assuming single class detection (opacity)
+                # If multi-class, we would scatter IoUs to specific class indices
+                cls_target[pos_mask, 0] = pos_ious
+
+                # Regression Loss (only for positives)
+                pred_boxes_pos = bbox_preds[i][pos_mask]
+                anchors_pos = anchors[pos_mask]
+                gt_boxes_pos = gt_boxes[matched_gt_inds[pos_mask]]
+
+                decoded_pred_boxes = self.decode_boxes(anchors_pos, pred_boxes_pos)
+
+                loss_box += self.reg_loss(decoded_pred_boxes, gt_boxes_pos)
+                num_positives += pos_mask.sum().item()
+
+            # Classification Loss (Positives + Negatives)
+            loss_cls += self.cls_loss(cls_logits[i], cls_target)
+
+        # Normalize losses
+        if num_positives > 0:
+            loss_cls /= num_positives
+            loss_box /= num_positives
+        else:
+            # If no positives in entire batch (rare but possible), normalize by batch size or 1
+            loss_cls /= batch_size
+            # loss_box is 0
+            loss_box = torch.tensor(0.0, device=cls_logits.device)
+
+        total_loss = (
+            (self.weight_cls * loss_cls)
+            + (self.weight_box * loss_box)
+            + (self.weight_study * loss_study)
+        )
+
+        return {
+            "loss": total_loss,
+            "loss_cls": loss_cls,
+            "loss_box": loss_box,
+            "loss_study": loss_study,
+        }
+=======
+    def decode_boxes(self, anchors, box_preds):
+        """
+        Decode predicted offsets to x1y1x2y2.
+        anchors: [N, 4] (cx, cy, stride, stride)
+        box_preds: [N, 4] (l, t, r, b)
+        """
+        cx, cy, stride = anchors[:, 0], anchors[:, 1], anchors[:, 2]
+        l, t, r, b = box_preds[:, 0], box_preds[:, 1], box_preds[:, 2], box_preds[:, 3]
+
+        x1 = cx - l * stride
+        y1 = cy - t * stride
+        x2 = cx + r * stride
+        y2 = cy + b * stride
+
+        return torch.stack([x1, y1, x2, y2], dim=1)
+
+    @torch.cuda.amp.autocast(enabled=False)
+    def forward(self, preds, targets):
+        """
+        Calculates loss. Forces FP32 to prevent overflow in IoU calculations.
+        """
+        # Ensure all inputs are float32
+        preds = {
+            k: v.float() if isinstance(v, torch.Tensor) else v for k, v in preds.items()
+        }
+
+        study_logits = preds["study_logits"]
+        study_targets = torch.stack([t["study_label"] for t in targets]).to(
+            study_logits.device
+        )
+        loss_study = self.study_loss(study_logits, study_targets)
+
+        cls_logits = preds["cls_logits"]
+        bbox_preds = preds["bbox_preds"]
+        anchors = preds["anchors"]
+        num_anchors_list = preds["num_anchors_per_level"]
+
+        batch_size = cls_logits.size(0)
+
+        loss_cls = 0.0
+        loss_box = 0.0
+        num_positives = 0
+
+        for i in range(batch_size):
+            gt_boxes = targets[i]["boxes"].to(anchors.device).float()
+            gt_labels = targets[i]["labels"].to(
+                anchors.device
+            )  # Usually all 1s for opacity
+
+            # Label Assignment
+            matched_gt_inds, ious = self.matcher(anchors, gt_boxes, num_anchors_list)
+
+            # Identify Positives and Negatives
+            pos_mask = matched_gt_inds >= 0
+
+            # Prepare Classification Targets (Quality Focal Loss)
+            # Target is 0 for neg, IoU for pos
+            cls_target = torch.zeros_like(cls_logits[i], dtype=torch.float32)
+
+            if pos_mask.sum() > 0:
+                # Assign IoU score as target for positive class
+                pos_anchor_inds = torch.where(pos_mask)[0]
+                matched_gt_inds_pos = matched_gt_inds[pos_mask]
+                pos_ious = ious[pos_anchor_inds, matched_gt_inds_pos]
+
+                # Assuming single class detection (opacity)
+                # If multi-class, we would scatter IoUs to specific class indices
+                cls_target[pos_mask, 0] = pos_ious
+
+                # Regression Loss (only for positives)
+                pred_boxes_pos = bbox_preds[i][pos_mask]
+                anchors_pos = anchors[pos_mask]
+                gt_boxes_pos = gt_boxes[matched_gt_inds[pos_mask]]
+
+                decoded_pred_boxes = self.decode_boxes(anchors_pos, pred_boxes_pos)
+
+                loss_box += self.reg_loss(decoded_pred_boxes, gt_boxes_pos)
+                num_positives += pos_mask.sum().item()
+
+            # Classification Loss (Positives + Negatives)
+            loss_cls += self.cls_loss(cls_logits[i], cls_target)
+
+        # Normalize losses
+        if num_positives > 0:
+            loss_cls /= num_positives
+            loss_box /= num_positives
+        else:
+            # If no positives in entire batch (rare but possible), normalize by batch size or 1
+            loss_cls /= batch_size
+            # loss_box is 0
+            loss_box = torch.tensor(0.0, device=cls_logits.device)
+
+        total_loss = (
+            (self.weight_cls * loss_cls)
+            + (self.weight_box * loss_box)
+            + (self.weight_study * loss_study)
+        )
+
+        return {
+            "loss": total_loss,
+            "loss_cls": loss_cls,
+            "loss_box": loss_box,
+            "loss_study": loss_study,
+        }
+>>>>>>> REPLACE
+```

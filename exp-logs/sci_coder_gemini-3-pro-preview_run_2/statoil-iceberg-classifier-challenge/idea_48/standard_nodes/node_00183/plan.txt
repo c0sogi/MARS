@@ -1,0 +1,347 @@
+My implementation strategy focuses on correcting the architectural flaw identified in the previous solution (the use of dilated convolutions on small 4x4 feature maps) and applying lessons learned regarding robust feature fusion.
+
+1.  **Architecture Update (Cite solution_lesson_node_00182 & 00123)**: I will replace the `DilatedReadout` with a `RobustDualPathReadout`. The previous dilated readout was detrimental on the small spatial grid (4x4) at the end of the network. The new readout will split the features into two paths:
+    *   **Spatial Path**: Uses a standard 3x3 convolution to capture local structure, followed by flattening.
+    *   **Intensity Path**: Uses Global Average Pooling (GAP) to capture robust signal statistics (invariance).
+2.  **Normalization Refinement (Cite solution_lesson_node_00161)**: I will apply `BatchNorm1d` to the output of *each* branch (Spatial, Intensity, and Metadata) *before* concatenation. This ensures that the high-variance spatial features do not dominate the gradients of the scalar metadata or global intensity features during the initial fusion steps. Specifically, I will remove the final ReLU in the metadata branch to allow the Batch Normalization to center the distribution, matching the behavior of the visual branches.
+3.  **Renaming**: The model class `DCWBN` (Dilated-Context Wide-Body Network) will be renamed to `RDPWBN` (Robust Dual-Path Wide-Body Network) to reflect these changes.
+
+I will maintain the "Low and Slow" training configuration (Batch Size 64, LR 2e-4) which has proven stable for this architecture.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+WORKING_DIR = "./working/idea_48"
+=======
+WORKING_DIR = "./working/idea_49"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedReadout(nn.Module):
+    """
+    Dilated Dual-Path Spatial Readout.
+
+    Path A (Spatial): Parallel dilated convolutions (d=1, d=2) to capture local
+    boundaries and broader context on the 4x4 grid.
+    Path B (Intensity): Global Average Pooling for robust statistics.
+    """
+
+    def __init__(self, in_channels):
+        super(DilatedReadout, self).__init__()
+
+        # Path A: Spatial Features
+        # Stream A1: Local (d=1)
+        self.conv_local = nn.Conv2d(
+            in_channels, 32, kernel_size=3, padding=1, dilation=1
+        )
+        # Stream A2: Context (d=2)
+        self.conv_context = nn.Conv2d(
+            in_channels, 32, kernel_size=3, padding=2, dilation=2
+        )
+
+        # Output of each stream is 4x4x32. Concat -> 4x4x64. Flatten -> 1024.
+        self.bn_spatial = nn.BatchNorm1d(1024)
+
+        # Path B: Robust Intensity
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.bn_intensity = nn.BatchNorm1d(in_channels)
+
+    def forward(self, x):
+        # x: (B, 256, 4, 4)
+
+        # Path A
+        a1 = self.conv_local(x)  # (B, 32, 4, 4)
+        a2 = self.conv_context(x)  # (B, 32, 4, 4)
+        spatial = torch.cat([a1, a2], dim=1)  # (B, 64, 4, 4)
+        spatial = spatial.view(spatial.size(0), -1)  # (B, 1024)
+        spatial = self.bn_spatial(spatial)
+
+        # Path B
+        intensity = self.global_pool(x).view(x.size(0), -1)  # (B, 256)
+        intensity = self.bn_intensity(intensity)
+
+        # Fuse
+        return torch.cat([spatial, intensity], dim=1)  # (B, 1280)
+
+
+class DCWBN(nn.Module):
+    """
+    Dilated-Context Wide-Body Network.
+
+    Features:
+    - Wide-Body Backbone (128 filters)
+    - Delayed Integration blocks
+    - CBAM Attention
+    - Dual-Pooling (Max+Min)
+    - Dilated Readout
+    - Metadata Embedding
+    """
+
+    def __init__(self):
+        super(DCWBN, self).__init__()
+
+        # --- Visual Branch ---
+        # Stage 1
+        self.stage1_conv = WideConvBlock(3, 128)
+        self.stage1_cbam = CBAM(128)
+        self.stage1_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 2
+        self.stage2_conv = WideConvBlock(256, 128)
+        self.stage2_cbam = CBAM(128)
+        self.stage2_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 3
+        self.stage3_conv = WideConvBlock(256, 128)
+        self.stage3_cbam = CBAM(128)
+        self.stage3_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 4
+        self.stage4_conv = WideConvBlock(256, 128)
+        self.stage4_cbam = CBAM(128)
+        self.stage4_pool = DualPooling(2, 2)  # Out: 256 channels, 4x4 spatial
+
+        # Readout
+        self.readout = DilatedReadout(256)  # Returns 1280 dim vector
+
+        # --- Metadata Branch ---
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Fusion Head ---
+        # Input: 1280 (Visual) + 32 (Meta) = 1312
+        self.head = nn.Sequential(
+            nn.Linear(1312, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(512, 2),  # Logits
+        )
+
+    def forward(self, img, inc_angle):
+        # Visual Path
+        x = self.stage1_conv(img)
+        x = self.stage1_cbam(x)
+        x = self.stage1_pool(x)
+
+        x = self.stage2_conv(x)
+        x = self.stage2_cbam(x)
+        x = self.stage2_pool(x)
+
+        x = self.stage3_conv(x)
+        x = self.stage3_cbam(x)
+        x = self.stage3_pool(x)
+
+        x = self.stage4_conv(x)
+        x = self.stage4_cbam(x)
+        x = self.stage4_pool(x)
+
+        visual_feat = self.readout(x)
+
+        # Metadata Path
+        meta_feat = self.meta_mlp(inc_angle)
+
+        # Fusion
+        combined = torch.cat([visual_feat, meta_feat], dim=1)
+        logits = self.head(combined)
+
+        return logits
+=======
+class RobustDualPathReadout(nn.Module):
+    """
+    Robust Dual-Path Readout (Cite solution_lesson_node_00123).
+    
+    Decouples spatial structure from global statistics:
+    Path A (Spatial): 3x3 Convolution -> Flatten -> BN (Cite solution_lesson_node_00182: Avoid dilation on small maps).
+    Path B (Intensity): Global Average Pooling -> BN.
+    
+    Applies Late-Stage Branch Normalization (Cite solution_lesson_node_00161).
+    """
+
+    def __init__(self, in_channels, spatial_out_channels=48):
+        super(RobustDualPathReadout, self).__init__()
+
+        # Path A: Spatial Features (Structure)
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(in_channels, spatial_out_channels, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        # Flattened size: spatial_out_channels * 4 * 4
+        self.flat_dim = spatial_out_channels * 4 * 4
+        self.bn_spatial = nn.BatchNorm1d(self.flat_dim)
+
+        # Path B: Robust Intensity (Invariance)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.bn_intensity = nn.BatchNorm1d(in_channels)
+
+    def forward(self, x):
+        # x: (B, 256, 4, 4)
+
+        # Path A
+        s = self.spatial_conv(x)
+        s = s.view(s.size(0), -1)
+        s = self.bn_spatial(s)
+
+        # Path B
+        i = self.global_pool(x).view(x.size(0), -1)
+        i = self.bn_intensity(i)
+
+        # Fuse
+        return torch.cat([s, i], dim=1)
+
+
+class RDPWBN(nn.Module):
+    """
+    Robust Dual-Path Wide-Body Network.
+    
+    Replaces Dilated Readout with Robust Dual-Path Readout.
+    """
+
+    def __init__(self):
+        super(RDPWBN, self).__init__()
+
+        # --- Visual Branch ---
+        # Stage 1
+        self.stage1_conv = WideConvBlock(3, 128)
+        self.stage1_cbam = CBAM(128)
+        self.stage1_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 2
+        self.stage2_conv = WideConvBlock(256, 128)
+        self.stage2_cbam = CBAM(128)
+        self.stage2_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 3
+        self.stage3_conv = WideConvBlock(256, 128)
+        self.stage3_cbam = CBAM(128)
+        self.stage3_pool = DualPooling(2, 2)  # Out: 256 channels
+
+        # Stage 4
+        self.stage4_conv = WideConvBlock(256, 128)
+        self.stage4_cbam = CBAM(128)
+        self.stage4_pool = DualPooling(2, 2)  # Out: 256 channels, 4x4 spatial
+
+        # Readout
+        # Spatial: 48 * 16 = 768. Intensity: 256. Total: 1024.
+        self.readout = RobustDualPathReadout(256, spatial_out_channels=48)
+
+        # --- Metadata Branch ---
+        # Cite solution_lesson_node_00161: Normalize branch before fusion
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 32),
+            nn.BatchNorm1d(32)
+            # No final ReLU to allow centered distribution matching BN outputs of visual branches
+        )
+
+        # --- Fusion Head ---
+        # Input: 1024 (Visual) + 32 (Meta) = 1056
+        self.head = nn.Sequential(
+            nn.Linear(1056, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(512, 2),  # Logits
+        )
+
+    def forward(self, img, inc_angle):
+        # Visual Path
+        x = self.stage1_conv(img)
+        x = self.stage1_cbam(x)
+        x = self.stage1_pool(x)
+
+        x = self.stage2_conv(x)
+        x = self.stage2_cbam(x)
+        x = self.stage2_pool(x)
+
+        x = self.stage3_conv(x)
+        x = self.stage3_cbam(x)
+        x = self.stage3_pool(x)
+
+        x = self.stage4_conv(x)
+        x = self.stage4_cbam(x)
+        x = self.stage4_pool(x)
+
+        visual_feat = self.readout(x)
+
+        # Metadata Path
+        meta_feat = self.meta_mlp(inc_angle)
+
+        # Fusion
+        combined = torch.cat([visual_feat, meta_feat], dim=1)
+        logits = self.head(combined)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DCWBN
+=======
+from library.model import RDPWBN
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = DCWBN().to(device)
+=======
+    # Initialize Model
+    model = RDPWBN().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Forward pass: DCWBN takes both images and incidence angles
+=======
+        # Forward pass: RDPWBN takes both images and incidence angles
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DCWBN
+=======
+from library.model import RDPWBN
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Generate OOF Predictions for this fold
+        model = DCWBN().to(DEVICE)
+=======
+        # Generate OOF Predictions for this fold
+        model = RDPWBN().to(DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        for i, path in enumerate(model_paths):
+            print(f"Inference with model fold {i+1}...")
+            model = DCWBN().to(DEVICE)
+=======
+        for i, path in enumerate(model_paths):
+            print(f"Inference with model fold {i+1}...")
+            model = RDPWBN().to(DEVICE)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,248 @@
+import os
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
+from library.config import Config
+from library.utils import set_seed
+
+
+class QADataset(Dataset):
+    """
+    PyTorch Dataset for Question Answering.
+    Wraps the processed DataFrame and converts rows to tensors.
+    """
+
+    def __init__(self, data_df, mode="train"):
+        """
+        Args:
+            data_df (pd.DataFrame): DataFrame containing processed features.
+            mode (str): 'train' or 'val'/'test'. Determines which columns to return.
+        """
+        self.data = data_df
+        self.mode = mode
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+
+        # Basic inputs
+        item = {
+            "input_ids": torch.tensor(row["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(row["attention_mask"], dtype=torch.long),
+        }
+
+        # Add labels for training
+        if self.mode == "train":
+            item["start_positions"] = torch.tensor(
+                row["start_positions"], dtype=torch.long
+            )
+            item["end_positions"] = torch.tensor(row["end_positions"], dtype=torch.long)
+
+        # For validation/test, we don't return metadata here as it's handled
+        # via the dataframe in the post-processing step.
+
+        return item
+
+
+def get_tokenizer():
+    """
+    Initializes and returns the tokenizer defined in Config.
+    """
+    return AutoTokenizer.from_pretrained(Config.MODEL_CHECKPOINT)
+
+
+def prepare_train_features(examples_df, tokenizer):
+    """
+    Preprocesses training data: tokenization, sliding window, and label mapping.
+    """
+    # Convert DataFrame to dict of lists for tokenizer compatibility
+    examples = examples_df.to_dict(orient="list")
+
+    # Tokenize with sliding window
+    tokenized_examples = tokenizer(
+        examples["question"],
+        examples["context"],
+        truncation="only_second",
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    # Extract mappings
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized_examples.pop("offset_mapping")
+
+    # Initialize lists for labels
+    tokenized_examples["start_positions"] = []
+    tokenized_examples["end_positions"] = []
+
+    for i, offsets in enumerate(offset_mapping):
+        input_ids = tokenized_examples["input_ids"][i]
+        cls_index = input_ids.index(tokenizer.cls_token_id)
+
+        # Get sequence IDs to distinguish question (0) from context (1)
+        sequence_ids = tokenized_examples.sequence_ids(i)
+
+        # Retrieve original answer
+        sample_index = sample_mapping[i]
+        answer_text = examples["answer_text"][sample_index]
+        start_char = examples["answer_start"][sample_index]
+        end_char = start_char + len(answer_text)
+
+        # Find the start and end of the context in the current window
+        # sequence_ids contains None for special tokens, 0 for question, 1 for context
+        seq_ids_safe = [x if x is not None else -1 for x in sequence_ids]
+
+        try:
+            token_start_index = seq_ids_safe.index(1)
+            # Find last index of 1
+            token_end_index = len(seq_ids_safe) - 1 - seq_ids_safe[::-1].index(1)
+        except ValueError:
+            # Context not found in this window (rare case)
+            tokenized_examples["start_positions"].append(cls_index)
+            tokenized_examples["end_positions"].append(cls_index)
+            continue
+
+        # Check if the answer is fully contained in this window
+        # offsets[token_start_index][0] is the start char of the context in this window
+        # offsets[token_end_index][1] is the end char of the context in this window
+        if not (
+            offsets[token_start_index][0] <= start_char
+            and offsets[token_end_index][1] >= end_char
+        ):
+            tokenized_examples["start_positions"].append(cls_index)
+            tokenized_examples["end_positions"].append(cls_index)
+        else:
+            # Map character positions to token indices
+            # Move idx_start forward until it points to the token containing start_char
+            idx_start = token_start_index
+            while idx_start <= token_end_index and offsets[idx_start][1] <= start_char:
+                idx_start += 1
+
+            # Move idx_end backward until it points to the token containing end_char
+            idx_end = token_end_index
+            while idx_end >= token_start_index and offsets[idx_end][0] >= end_char:
+                idx_end -= 1
+
+            tokenized_examples["start_positions"].append(idx_start)
+            tokenized_examples["end_positions"].append(idx_end)
+
+    return pd.DataFrame(dict(tokenized_examples))
+
+
+def prepare_validation_features(examples_df, tokenizer):
+    """
+    Preprocesses validation/test data: tokenization and sliding window.
+    Preserves mappings for post-processing.
+    """
+    examples = examples_df.to_dict(orient="list")
+
+    tokenized_examples = tokenizer(
+        examples["question"],
+        examples["context"],
+        truncation="only_second",
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+
+    # We need to construct a dict to convert to DataFrame, handling complex types
+    data = dict(tokenized_examples)
+    data["example_id"] = []
+    data["sequence_ids"] = []
+
+    # Sanitize offset_mapping (convert tuples to lists for Parquet compatibility)
+    # offset_mapping is a list of lists of tuples.
+    if "offset_mapping" in data:
+        data["offset_mapping"] = [
+            [list(span) for span in seq] for seq in data["offset_mapping"]
+        ]
+
+    for i in range(len(data["input_ids"])):
+        sample_index = sample_mapping[i]
+        data["example_id"].append(examples["id"][sample_index])
+
+        # Handle sequence_ids (replace None with -1 for storage)
+        seq_ids = tokenized_examples.sequence_ids(i)
+        data["sequence_ids"].append([s if s is not None else -1 for s in seq_ids])
+
+    return pd.DataFrame(data)
+
+
+def load_data(split, tokenizer, load_cached_data=True, debug=False):
+    """
+    Loads, processes, and caches data for the given split.
+
+    Args:
+        split (str): 'train', 'val', or 'test'.
+        tokenizer: The tokenizer instance.
+        load_cached_data (bool): Whether to try loading from cache.
+        debug (bool): If True, limits data size for debugging.
+
+    Returns:
+        pd.DataFrame: Processed features.
+    """
+    set_seed(Config.SEED)
+
+    cache_filename = f"cached_{split}_features.parquet"
+    if debug:
+        cache_filename = f"cached_{split}_debug_features.parquet"
+
+    cache_path = os.path.join(Config.OUTPUT_DIR, cache_filename)
+
+    # 1. Try loading from cache
+    if load_cached_data and os.path.exists(cache_path):
+        print(f"Loading cached {split} features from {cache_path}...")
+        try:
+            df = pd.read_parquet(cache_path)
+            return df
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Re-processing...")
+
+    print(f"Processing {split} data...")
+
+    # 2. Determine input path
+    if split == "train":
+        input_path = Config.TRAIN_DATA_PATH
+    elif split == "val":
+        input_path = Config.VAL_DATA_PATH
+    elif split == "test":
+        input_path = Config.TEST_DATA_PATH
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    # 3. Load raw data
+    raw_df = pd.read_csv(input_path)
+
+    # Ensure text columns are strings
+    raw_df["question"] = raw_df["question"].fillna("").astype(str)
+    raw_df["context"] = raw_df["context"].fillna("").astype(str)
+
+    if debug:
+        raw_df = raw_df.head(Config.DEBUG_SIZE)
+
+    # 4. Process data
+    if split == "train":
+        processed_df = prepare_train_features(raw_df, tokenizer)
+    else:
+        processed_df = prepare_validation_features(raw_df, tokenizer)
+
+    # 5. Save to cache
+    print(f"Saving {split} features to {cache_path}...")
+    # Use pyarrow engine for better handling of nested list columns
+    processed_df.to_parquet(cache_path, engine="pyarrow")
+
+    return processed_df

@@ -1,0 +1,211 @@
+Based on the provided lessons, the previous attempt using a "Learnable Multi-Slice Projection" (LMSP) with 3 slices per modality failed because learnable projection layers often fail to converge on small datasets compared to deterministic heuristics (Cite solution_lesson_node_00025). Furthermore, stacking multiple slices into the channel dimension can dilute the signal with noise (Cite solution_lesson_node_00009).
+
+To optimize performance, I will:
+1.  **Revert to the "Middle Slice" Heuristic**: Change `SLICE_DEPTH` from 3 to 1 in `config.py`. This selects the single most informative slice (geometric center) for each of the 3 modalities (FLAIR, T1wCE, T2w), resulting in a standard 3-channel input that aligns with ImageNet-pretrained weights.
+2.  **Simplify the Model Architecture**: Replace the `LMSPEfficientNet` in `model.py` with a standard `BraTSClassifier` that wraps `efficientnet_b0`. This removes the learnable 1x1 convolution adapter, relying instead on the robust features of the pretrained backbone.
+3.  **Maintain Aggressive Regularization**: Keep `WEIGHT_DECAY` at `1e-2` and use non-rigid augmentations (ElasticTransform), as these have been proven effective for this small dataset (Cite solution_lesson_node_00010).
+4.  **Ensure Correct Dropout**: Explicitly pass the dropout rate to the `timm` model creator to ensure regularization is applied.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Slice Selection Strategy
+    # We select 3 consecutive slices: Middle-1, Middle, Middle+1
+    SLICE_DEPTH = 3
+
+    # Total Input Channels = Number of Modalities * Slices per Modality
+    # 3 modalities * 3 slices = 9 channels
+    IN_CHANNELS = len(MODALITY_COLS) * SLICE_DEPTH
+=======
+    # Slice Selection Strategy
+    # We select 1 middle slice per modality to avoid noise from adjacent slices
+    # Cite solution_lesson_node_00025
+    SLICE_DEPTH = 1
+
+    # Total Input Channels = Number of Modalities * Slices per Modality
+    # 3 modalities * 1 slice = 3 channels (RGB-like)
+    IN_CHANNELS = len(MODALITY_COLS) * SLICE_DEPTH
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class LMSPEfficientNet(nn.Module):
+    """
+    2.5D EfficientNet with Learnable Multi-Slice Projection (LMSP).
+
+    This model takes a 'thick slab' of MRI slices (multiple slices per modality) as input.
+    It uses a learnable 1x1 convolution (Adapter) to project these slices into a 3-channel
+    tensor (RGB-like) which is then processed by a standard ImageNet-pretrained EfficientNet.
+
+    The adapter is initialized to pass through the middle slice of each modality, ensuring
+    the model starts with a strong 2D baseline and learns to utilize the volumetric context
+    (neighboring slices) during training.
+    """
+
+    def __init__(self):
+        super(LMSPEfficientNet, self).__init__()
+
+        # ==========================================
+        # 1. Learnable Input Adapter
+        # ==========================================
+        # Projects IN_CHANNELS (e.g., 9) down to 3 (RGB-like) for the backbone.
+        # Kernel size 1x1 acts as a learnable linear combination of slices/modalities per pixel.
+        self.adapter = nn.Conv2d(
+            in_channels=Config.IN_CHANNELS, out_channels=3, kernel_size=1, bias=True
+        )
+
+        # ==========================================
+        # 2. Backbone (EfficientNet-B0)
+        # ==========================================
+        # Load pretrained EfficientNet-B0.
+        # num_classes=1 for binary classification (MGMT promoter methylation).
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            num_classes=Config.NUM_CLASSES,
+        )
+
+        # ==========================================
+        # 3. Initialization
+        # ==========================================
+        self.init_adapter_weights()
+
+    def init_adapter_weights(self):
+        """
+        Initializes the adapter layer to act as an Identity Pass-Through for the middle slices.
+
+        Logic:
+            - Weights are initialized to 0.
+            - For each modality (FLAIR, T1wCE, T2w), the weight corresponding to the
+              middle slice is set to 1.0 in the corresponding output channel (R, G, or B).
+            - This effectively copies the middle slices to the RGB input of the backbone
+              at initialization, preserving ImageNet priors.
+        """
+        # Zero out all weights and biases first
+        nn.init.constant_(self.adapter.weight, 0.0)
+        if self.adapter.bias is not None:
+            nn.init.constant_(self.adapter.bias, 0.0)
+
+        # Calculate indices
+        middle_offset = Config.SLICE_DEPTH // 2
+        num_modalities = len(Config.MODALITY_COLS)
+
+        # We map up to 3 modalities to the 3 output channels (RGB)
+        # Config.MODALITY_COLS = ["flair_path", "t1wce_path", "t2w_path"]
+        # Output Channel 0 (R) <- FLAIR Middle
+        # Output Channel 1 (G) <- T1wCE Middle
+        # Output Channel 2 (B) <- T2w Middle
+
+        with torch.no_grad():
+            for m in range(min(num_modalities, 3)):
+                # Calculate the input channel index for the middle slice of modality 'm'
+                # Input structure: [Mod0_S0, Mod0_S1, Mod0_S2, Mod1_S0, ...]
+                input_idx = m * Config.SLICE_DEPTH + middle_offset
+
+                # Output channel index (0, 1, or 2)
+                output_idx = m
+
+                # Set weight to 1.0 (Identity)
+                self.adapter.weight[output_idx, input_idx, 0, 0] = 1.0
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, 9, H, W)
+               Contains stacked slices: [FLAIR_slices, T1wCE_slices, T2w_slices]
+        Returns:
+            logits: Output tensor of shape (Batch, 1)
+        """
+        # 1. Project 9 channels -> 3 channels (Synthesize 'Super-RGB' image)
+        x = self.adapter(x)
+
+        # 2. Pass through backbone
+        # timm efficientnet returns (Batch, num_classes)
+        x = self.backbone(x)
+
+        return x
+=======
+class BraTSClassifier(nn.Module):
+    """
+    Standard 2.5D EfficientNet Classifier.
+    
+    Uses a deterministic 'Middle Slice' heuristic (via Config.SLICE_DEPTH=1) to select
+    the most informative slice from each modality, avoiding the noise introduced by 
+    learnable projections on small datasets (Cite solution_lesson_node_00025).
+    """
+
+    def __init__(self):
+        super(BraTSClassifier, self).__init__()
+
+        # Load pretrained EfficientNet-B0
+        # We explicitly pass in_chans and drop_rate
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            num_classes=Config.NUM_CLASSES,
+            in_chans=Config.IN_CHANNELS,
+            drop_rate=Config.DROPOUT_RATE
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import LMSPEfficientNet
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+=======
+from library.model import BraTSClassifier
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Model Init
+    print("Initializing model...")
+    model = LMSPEfficientNet()
+    model.to(device)
+=======
+    # 3. Model Init
+    print("Initializing model...")
+    model = BraTSClassifier()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import LMSPEfficientNet
+from library.trainer import train_one_epoch
+=======
+from library.model import BraTSClassifier
+from library.trainer import train_one_epoch
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Initialize Model
+        model = LMSPEfficientNet()
+        model.to(device)
+=======
+        # Initialize Model
+        model = BraTSClassifier()
+        model.to(device)
+>>>>>>> REPLACE
+```

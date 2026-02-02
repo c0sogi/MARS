@@ -1,0 +1,666 @@
+To improve the model's performance, I will revert the complex semi-supervised (Noisy Student) pipeline to a robust supervised baseline, as the previous teacher model was under-trained (20 epochs) and failed to surpass the known supervised benchmark. I will increase the training duration to 50 epochs to ensure full convergence (Cite `solution_lesson_node_00045`).
+
+I will also implement adaptive thresholding during the validation loop to checkpoint the model based on its optimal binarization threshold rather than a fixed 0.5 cutoff (Cite `solution_lesson_node_00033`). Furthermore, I will reduce the probability of geometric augmentations (ShiftScaleRotate) from 0.5 to 0.2 to preserve high-frequency edge details required for high IoU scores (Cite `solution_lesson_node_00054`). Finally, I will ensure explicit depth injection is maintained without masking (Cite `solution_lesson_node_00051`).
+
+Here are the code changes:
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                A.HorizontalFlip(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=10, p=0.5
+                ),
+                A.Normalize(mean=(IMG_MEAN,), std=(IMG_STD,), max_pixel_value=255.0),
+=======
+                A.HorizontalFlip(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=10, p=0.2
+                ),
+                A.Normalize(mean=(IMG_MEAN,), std=(IMG_STD,), max_pixel_value=255.0),
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    def train_teacher_epoch(self, loader, loss_fn):
+        """
+        Trains the teacher model for one epoch.
+        Bernoulli Depth Masking is handled by the dataset/loader configuration.
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        for images, masks, depths, ids in loader:
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            depths = depths.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            logits = self.model(images, depths)
+            loss = loss_fn(logits, masks)
+
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        if self.scheduler:
+            self.scheduler.step()
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        return avg_loss
+
+    def train_student_epoch(self, labeled_loader, unlabeled_loader, supervised_loss_fn):
+        """
+        Trains the student model for one epoch using Noisy Student logic.
+
+        Args:
+            labeled_loader: Loader for ground truth data.
+            unlabeled_loader: Loader for test data with soft pseudo-labels.
+            supervised_loss_fn: Loss function for labeled data.
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        # Handle different loader lengths by cycling the shorter one (usually labeled)
+        # or cycling unlabeled if labeled is longer (unlikely here).
+        if len(labeled_loader) < len(unlabeled_loader):
+            loader_zip = zip(itertools.cycle(labeled_loader), unlabeled_loader)
+            steps = len(unlabeled_loader)
+        else:
+            loader_zip = zip(labeled_loader, itertools.cycle(unlabeled_loader))
+            steps = len(labeled_loader)
+
+        for (l_images, l_masks, l_depths, _), (
+            u_images,
+            u_targets,
+            u_depths,
+            _,
+        ) in loader_zip:
+            # Move data to device
+            l_images = l_images.to(self.device)
+            l_masks = l_masks.to(self.device)
+            l_depths = l_depths.to(self.device)
+
+            u_images = u_images.to(self.device)
+            u_targets = u_targets.to(self.device)  # Soft targets (probs)
+            u_depths = u_depths.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # --- Supervised Step ---
+            l_logits = self.model(l_images, l_depths)
+            l_loss = supervised_loss_fn(l_logits, l_masks)
+
+            # --- Unsupervised (Consistency) Step ---
+            # Student predicts on strongly augmented unlabeled images
+            u_logits = self.model(u_images, u_depths)
+            # Loss against Teacher's soft targets
+            u_loss = self.consistency_loss_fn(u_logits, u_targets)
+
+            # Combine losses
+            loss = l_loss + u_loss
+
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        if self.scheduler:
+            self.scheduler.step()
+
+        avg_loss = total_loss / steps if steps > 0 else 0.0
+        return avg_loss
+
+    def validate(self, loader, loss_fn):
+        """
+        Evaluates the model on the validation set.
+        Computes Loss and mAP.
+        """
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        all_preds = []
+        all_gts = []
+
+        with torch.no_grad():
+            for images, masks, depths, ids in loader:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                depths = depths.to(self.device)
+
+                # Forward
+                logits = self.model(images, depths)
+                loss = loss_fn(logits, masks)
+                total_loss += loss.item()
+                num_batches += 1
+
+                # Prepare for mAP calculation
+                # Sigmoid to get probabilities
+                probs = torch.sigmoid(logits).cpu().numpy()
+                gts = masks.cpu().numpy()
+
+                # Unpad and accumulate
+                for i in range(len(probs)):
+                    # Extract single image (C, H, W) -> (128, 128)
+                    p = probs[i][0]
+                    g = gts[i][0]
+
+                    # Unpad back to 101x101
+                    p_unpad = do_unpad(p, original_shape=(101, 101))
+                    g_unpad = do_unpad(g, original_shape=(101, 101))
+
+                    all_preds.append(p_unpad)
+                    all_gts.append(g_unpad)
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
+        # Calculate mAP
+        # Note: calculate_map internally binarizes predictions at 0.5 for IoU calculation
+        map_score = calculate_map(all_preds, all_gts)
+
+        print(f"Validation Loss: {avg_loss}")
+        print(f"Validation mAP: {map_score}")
+
+        return avg_loss, map_score
+=======
+    def train_epoch(self, loader, loss_fn):
+        """
+        Trains the model for one epoch.
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        for images, masks, depths, ids in loader:
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+            depths = depths.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            logits = self.model(images, depths)
+            loss = loss_fn(logits, masks)
+
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        if self.scheduler:
+            self.scheduler.step()
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        return avg_loss
+
+    def validate(self, loader, loss_fn):
+        """
+        Evaluates the model on the validation set.
+        Computes Loss and mAP with threshold optimization.
+        """
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+
+        all_preds = []
+        all_gts = []
+
+        with torch.no_grad():
+            for images, masks, depths, ids in loader:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                depths = depths.to(self.device)
+
+                # Forward
+                logits = self.model(images, depths)
+                loss = loss_fn(logits, masks)
+                total_loss += loss.item()
+                num_batches += 1
+
+                # Prepare for mAP calculation
+                # Sigmoid to get probabilities
+                probs = torch.sigmoid(logits).cpu().numpy()
+                gts = masks.cpu().numpy()
+
+                # Unpad and accumulate
+                for i in range(len(probs)):
+                    # Extract single image (C, H, W) -> (128, 128)
+                    p = probs[i][0]
+                    g = gts[i][0]
+
+                    # Unpad back to 101x101
+                    p_unpad = do_unpad(p, original_shape=(101, 101))
+                    g_unpad = do_unpad(g, original_shape=(101, 101))
+
+                    all_preds.append(p_unpad)
+                    all_gts.append(g_unpad)
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
+        # Threshold search for best mAP
+        best_map = 0.0
+        best_thresh = 0.5
+        thresholds = np.arange(0.3, 0.75, 0.05)
+
+        for t in thresholds:
+            binary_preds = [(p > t).astype(np.uint8) for p in all_preds]
+            score = calculate_map(binary_preds, all_gts)
+            if score > best_map:
+                best_map = score
+                best_thresh = t
+
+        print(f"Validation Loss: {avg_loss:.4f}")
+        print(f"Validation mAP: {best_map:.4f} (at threshold {best_thresh:.2f})")
+
+        return avg_loss, best_map, best_thresh
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# --- Configuration ---
+SEED = 42
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 32
+NUM_WORKERS = 4
+TEACHER_EPOCHS = 20
+STUDENT_EPOCHS = 20
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+SUBMISSION_THRESHOLD_REQ = 0.7985
+OUTPUT_DIR = "./working"
+SUBMISSION_DIR = "./submission"
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+
+def main():
+    # 1. Setup
+    set_seed(SEED)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    print(f"Running on device: {DEVICE}")
+
+    # 2. Data Loading (Stage 1)
+    print("\n--- Initializing Data Loaders (Stage 1) ---")
+
+    # Teacher Train Set: Weak Augmentation, 50% Depth Masking
+    train_ds_teacher = SaltDataset(
+        mode="train", transform=get_transforms("train"), depth_mask_prob=0.5
+    )
+    train_loader_teacher = DataLoader(
+        train_ds_teacher,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Validation Set
+    val_ds = SaltDataset(mode="val", transform=get_transforms("val"))
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 3. Model Initialization (Teacher)
+    print("\n--- Initializing Teacher Model ---")
+    teacher_model = ResNet34WideLinkNet().to(DEVICE)
+    optimizer = optim.AdamW(
+        teacher_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=TEACHER_EPOCHS, eta_min=1e-6
+    )
+    loss_fn = CombinedLoss(bce_weight=0.5, lovasz_weight=0.5)
+
+    engine = SaltEngine(teacher_model, DEVICE, optimizer, scheduler)
+
+    # 4. Train Teacher
+    print(f"\n--- Training Teacher for {TEACHER_EPOCHS} epochs ---")
+    best_teacher_map = 0.0
+    best_teacher_path = os.path.join(OUTPUT_DIR, "teacher_best.pth")
+
+    for epoch in range(TEACHER_EPOCHS):
+        train_loss = engine.train_teacher_epoch(train_loader_teacher, loss_fn)
+        val_loss, val_map = engine.validate(val_loader, loss_fn)
+
+        print(
+            f"Epoch {epoch+1}/{TEACHER_EPOCHS} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val mAP: {val_map:.4f}"
+        )
+
+        if val_map > best_teacher_map:
+            best_teacher_map = val_map
+            torch.save(teacher_model.state_dict(), best_teacher_path)
+            print(f"  -> New Best Teacher Saved! ({best_teacher_map:.4f})")
+
+    # 5. Pseudo-Labeling
+    print("\n--- Generating Pseudo-Labels for Noisy Student ---")
+    # Load best teacher
+    teacher_model.load_state_dict(torch.load(best_teacher_path, map_location=DEVICE))
+
+    # Test Dataset for Pseudo-labeling: Force zero depth (Generalist mode)
+    test_ds_pseudo = SaltDataset(
+        mode="test", transform=get_transforms("val"), force_zero_depth=True
+    )
+    test_loader_pseudo = DataLoader(
+        test_ds_pseudo, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+    )
+
+    # Generate soft predictions
+    pseudo_labels = engine.predict_proba(test_loader_pseudo)
+    print(f"Generated pseudo-labels for {len(pseudo_labels)} test images.")
+
+    # 6. Data Loading (Stage 2 - Student)
+    print("\n--- Initializing Data Loaders (Stage 2) ---")
+
+    # Labeled Data for Student: Strong Augmentation, True Depth (Specialist)
+    # Note: We use 'student' transform which includes strong augs
+    train_ds_student_labeled = SaltDataset(
+        mode="train",
+        transform=get_transforms("student"),
+        depth_mask_prob=0.0,  # Student learns to use depth when available
+    )
+    loader_student_labeled = DataLoader(
+        train_ds_student_labeled,
+        batch_size=BATCH_SIZE // 2,  # Split batch between labeled and unlabeled
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    # Unlabeled Data for Student: Strong Augmentation, Zero Depth, Soft Targets
+    train_ds_student_unlabeled = SaltDataset(
+        mode="test",
+        transform=get_transforms("student"),
+        force_zero_depth=True,
+        pseudo_labels=pseudo_labels,
+    )
+    loader_student_unlabeled = DataLoader(
+        train_ds_student_unlabeled,
+        batch_size=BATCH_SIZE // 2,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    # 7. Model Initialization (Student)
+    print("\n--- Initializing Student Model ---")
+    student_model = ResNet34WideLinkNet().to(DEVICE)
+    optimizer_student = optim.AdamW(
+        student_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scheduler_student = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_student, T_max=STUDENT_EPOCHS, eta_min=1e-6
+    )
+
+    engine_student = SaltEngine(
+        student_model, DEVICE, optimizer_student, scheduler_student
+    )
+
+    # 8. Train Student
+    print(f"\n--- Training Student for {STUDENT_EPOCHS} epochs ---")
+    best_student_map = 0.0
+    best_student_path = os.path.join(OUTPUT_DIR, "student_best.pth")
+
+    for epoch in range(STUDENT_EPOCHS):
+        # Supervised loss for labeled part
+        train_loss = engine_student.train_student_epoch(
+            loader_student_labeled, loader_student_unlabeled, loss_fn
+        )
+
+        # Validate (Student uses standard validation settings)
+        val_loss, val_map = engine_student.validate(val_loader, loss_fn)
+
+        print(
+            f"Epoch {epoch+1}/{STUDENT_EPOCHS} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val mAP: {val_map:.4f}"
+        )
+
+        if val_map > best_student_map:
+            best_student_map = val_map
+            torch.save(student_model.state_dict(), best_student_path)
+            print(f"  -> New Best Student Saved! ({best_student_map:.4f})")
+
+    # 9. Final Evaluation & Threshold Optimization
+    print("\n--- Final Evaluation & Threshold Optimization ---")
+    # Load best student
+    student_model.load_state_dict(torch.load(best_student_path, map_location=DEVICE))
+
+    # Get raw probabilities for validation set
+    val_probs_dict = engine_student.predict_proba(val_loader)
+
+    # Load GT masks for validation
+    val_meta = pd.read_csv("./metadata/val.csv")
+    val_gts = []
+    val_ids = []
+    val_preds = []
+
+    for _, row in val_meta.iterrows():
+        img_id = row["id"]
+        rle = row["rle_mask"]
+        if pd.isna(rle) or rle == "":
+            mask = np.zeros((101, 101), dtype=np.uint8)
+        else:
+            mask = rle_decode(rle)
+        val_gts.append(mask)
+        val_ids.append(img_id)
+        val_preds.append(val_probs_dict[img_id])
+
+    # Threshold Sweep
+    thresholds = np.arange(0.3, 0.75, 0.05)
+    best_thresh = 0.5
+    best_sweep_map = 0.0
+
+    for t in thresholds:
+        # Binarize
+        binary_preds = [(p > t).astype(np.uint8) for p in val_preds]
+        score = calculate_map(binary_preds, val_gts)
+        if score > best_sweep_map:
+            best_sweep_map = score
+            best_thresh = t
+
+    print(f"Optimized Threshold: {best_thresh:.2f}")
+    print(f"Final Validation Metric: {best_sweep_map:.10f}")
+
+    # 10. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate per-image IoU at best threshold
+    ious = []
+    for p, g in zip(val_preds, val_gts):
+        p_bin = (p > best_thresh).astype(np.uint8)
+        ious.append(calculate_iou(p_bin, g))
+
+    val_meta["iou"] = ious
+    val_meta["error"] = 1.0 - val_meta["iou"]
+
+    # Correlation with Depth
+    corr_depth = val_meta["error"].corr(val_meta["z"])
+    # Correlation with Salt Coverage
+    corr_coverage = val_meta["error"].corr(val_meta["salt_coverage"])
+
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_coverage:.4f}")
+
+    # 11. Submission
+    if best_sweep_map > SUBMISSION_THRESHOLD_REQ:
+        print(
+            f"\nMetric {best_sweep_map:.4f} > {SUBMISSION_THRESHOLD_REQ}. Generating submission..."
+        )
+
+        test_ds_final = SaltDataset(
+            mode="test",
+            transform=get_transforms("val"),
+            force_zero_depth=True,  # Inference assumption
+        )
+        test_loader_final = DataLoader(
+            test_ds_final, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+        )
+
+        engine_student.generate_submission(
+            test_loader_final, SUBMISSION_PATH, threshold=best_thresh
+        )
+    else:
+        print(
+            f"\nMetric {best_sweep_map:.4f} <= {SUBMISSION_THRESHOLD_REQ}. Skipping submission."
+        )
+=======
+# --- Configuration ---
+SEED = 42
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 32
+NUM_WORKERS = 4
+EPOCHS = 50
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+SUBMISSION_THRESHOLD_REQ = 0.7985
+OUTPUT_DIR = "./working"
+SUBMISSION_DIR = "./submission"
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+
+def main():
+    # 1. Setup
+    set_seed(SEED)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    print(f"Running on device: {DEVICE}")
+
+    # 2. Data Loading
+    print("\n--- Initializing Data Loaders ---")
+
+    # Train Set: Weak Augmentation, No Masking of Depth
+    train_ds = SaltDataset(
+        mode="train", transform=get_transforms("train"), depth_mask_prob=0.0
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Validation Set
+    val_ds = SaltDataset(mode="val", transform=get_transforms("val"))
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 3. Model Initialization
+    print("\n--- Initializing Model ---")
+    model = ResNet34WideLinkNet().to(DEVICE)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6
+    )
+    loss_fn = CombinedLoss(bce_weight=0.5, lovasz_weight=0.5)
+
+    engine = SaltEngine(model, DEVICE, optimizer, scheduler)
+
+    # 4. Train
+    print(f"\n--- Training for {EPOCHS} epochs ---")
+    best_map = 0.0
+    best_thresh = 0.5
+    best_model_path = os.path.join(OUTPUT_DIR, "best_model.pth")
+
+    for epoch in range(EPOCHS):
+        train_loss = engine.train_epoch(train_loader, loss_fn)
+        val_loss, val_map, val_thresh = engine.validate(val_loader, loss_fn)
+
+        print(
+            f"Epoch {epoch+1}/{EPOCHS} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val mAP: {val_map:.4f}"
+        )
+
+        if val_map > best_map:
+            best_map = val_map
+            best_thresh = val_thresh
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  -> New Best Model Saved! ({best_map:.4f} at {best_thresh:.2f})")
+
+    # 5. Final Evaluation
+    print("\n--- Final Evaluation ---")
+    print(f"Best Validation Metric: {best_map:.10f} (Threshold: {best_thresh:.2f})")
+
+    # Load best model
+    model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+
+    # 6. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Get predictions on val set
+    val_probs_dict = engine.predict_proba(val_loader)
+    val_meta = pd.read_csv("./metadata/val.csv")
+    
+    ious = []
+    for _, row in val_meta.iterrows():
+        img_id = row["id"]
+        rle = row["rle_mask"]
+        if pd.isna(rle) or rle == "":
+            gt_mask = np.zeros((101, 101), dtype=np.uint8)
+        else:
+            gt_mask = rle_decode(rle)
+        
+        prob = val_probs_dict[img_id]
+        pred_bin = (prob > best_thresh).astype(np.uint8)
+        ious.append(calculate_iou(pred_bin, gt_mask))
+
+    val_meta["iou"] = ious
+    val_meta["error"] = 1.0 - val_meta["iou"]
+
+    # Correlation with Depth
+    corr_depth = val_meta["error"].corr(val_meta["z"])
+    # Correlation with Salt Coverage
+    corr_coverage = val_meta["error"].corr(val_meta["salt_coverage"])
+
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_coverage:.4f}")
+
+    # 7. Submission
+    if best_map > SUBMISSION_THRESHOLD_REQ:
+        print(
+            f"\nMetric {best_map:.4f} > {SUBMISSION_THRESHOLD_REQ}. Generating submission..."
+        )
+
+        test_ds_final = SaltDataset(
+            mode="test",
+            transform=get_transforms("val"),
+            force_zero_depth=True,  # Inference assumption
+        )
+        test_loader_final = DataLoader(
+            test_ds_final, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+        )
+
+        engine.generate_submission(
+            test_loader_final, SUBMISSION_PATH, threshold=best_thresh
+        )
+    else:
+        print(
+            f"\nMetric {best_map:.4f} <= {SUBMISSION_THRESHOLD_REQ}. Skipping submission."
+        )
+>>>>>>> REPLACE
+```

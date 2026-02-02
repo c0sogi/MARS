@@ -1,0 +1,322 @@
+To optimize the solution, I will implement a strategy based on the provided lessons, focusing on architectural simplification and extended training convergence.
+
+**Strategy Outline:**
+
+1.  **Architecture Simplification (Cite `solution_lesson_node_00048`)**: I will replace the computationally expensive "Gated-Cascade" backbone with a standard, high-throughput BiLSTM backbone. This removes the complex inter-layer gating that was slowing down training without providing proportional accuracy gains.
+2.  **Deep Input Injection (Cite `solution_lesson_node_00039`, `solution_lesson_node_00045`)**: I will implement a "Deep Injection" mechanism where the input to *every* LSTM layer consists of the previous layer's output concatenated with both the **Raw Features** and a **Bottlenecked Latent Context**. This ensures that deep layers maintain direct access to the physical control signals (u_in, R, C) and prevents signal dilution.
+3.  **Context Projection (Cite `solution_lesson_node_00035`)**: I will use a Gated Linear Unit (GLU) to project the raw features into the latent context before injection, allowing the model to learn non-linear feature selection.
+4.  **Extended Convergence (Cite `solution_lesson_node_00029`, `solution_lesson_node_00043`)**: I will increase the training duration to **180 epochs** and use a stretched Cosine Annealing schedule. The simplified architecture will allow this extended run to complete within the time limit (estimated ~45 mins vs 3 hours limit), enabling the model to benefit from the "long-tail" convergence properties of physical regression tasks.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    # Stretched-Horizon Convergence Protocol
+    EPOCHS = 200
+    BATCH_SIZE = 256  # Optimized for A100 GPU
+    LEARNING_RATE = 1e-3
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    # Stretched-Horizon Convergence Protocol
+    # Cite solution_lesson_node_00043: Extended Cosine Annealing Horizons
+    EPOCHS = 180
+    BATCH_SIZE = 512  # Optimized for A100 GPU
+    LEARNING_RATE = 1e-3
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Scheduler (Cosine Annealing)
+    SCHEDULER_T_MAX = 200
+    SCHEDULER_ETA_MIN = 1e-6
+=======
+    # Scheduler (Cosine Annealing)
+    SCHEDULER_T_MAX = 180
+    SCHEDULER_ETA_MIN = 1e-6
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DGC_BiLSTM(nn.Module):
+    """
+    Deep Gated-Cascade BiLSTM (DGC-BiLSTM) Model.
+
+    Features:
+    - Dual-Path Injection (Identity + GLU) for physics context retention.
+    - Gated-Cascade Inter-Layer Connectivity (LayerNorm -> GLU -> Dropout).
+    - Deep Recurrent Backbone (4-layer BiLSTM).
+    """
+
+    def __init__(self):
+        super(DGC_BiLSTM, self).__init__()
+
+        # Dimensions
+        self.input_dim = 12  # Based on feature engineering in data_loader.py
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.injection_dim = Config.INJECTION_DIM
+        self.num_layers = Config.NUM_LAYERS
+        self.dropout_p = Config.DROPOUT
+        self.bidirectional = Config.BIDIRECTIONAL
+
+        # LSTM Output Dimension (2x if bidirectional)
+        self.lstm_out_dim = (
+            self.hidden_dim * 2 if self.bidirectional else self.hidden_dim
+        )
+
+        # ==========================================
+        # 1. Bottlenecked Dual-Path Injection
+        # ==========================================
+        # Projects raw input to hidden space, applies residual GLU, then compresses
+        self.stem_proj = nn.Linear(self.input_dim, self.hidden_dim)
+        self.stem_glu = GLU(self.hidden_dim, self.hidden_dim)
+        self.injection_bottleneck = nn.Linear(self.hidden_dim, self.injection_dim)
+
+        # ==========================================
+        # 2. Recurrent Backbone & Gated Cascade
+        # ==========================================
+        self.lstm_layers = nn.ModuleList()
+        self.inter_layer_gates = nn.ModuleList()
+
+        # Layer 0
+        # Input: Raw Features + Injection Context
+        self.lstm_layers.append(
+            nn.LSTM(
+                input_size=self.input_dim + self.injection_dim,
+                hidden_size=self.hidden_dim,
+                batch_first=True,
+                bidirectional=self.bidirectional,
+            )
+        )
+
+        # Layers 1 to N-1
+        for _ in range(1, self.num_layers):
+            # Inter-Layer Gating Block: Norm -> GLU -> Dropout
+            self.inter_layer_gates.append(
+                nn.Sequential(
+                    nn.LayerNorm(self.lstm_out_dim),
+                    GLU(self.lstm_out_dim, self.lstm_out_dim),
+                    nn.Dropout(self.dropout_p),
+                )
+            )
+
+            # LSTM Layer Input: Gated Previous Output + Injection Context
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=self.lstm_out_dim + self.injection_dim,
+                    hidden_size=self.hidden_dim,
+                    batch_first=True,
+                    bidirectional=self.bidirectional,
+                )
+            )
+
+        # ==========================================
+        # 3. Prediction Head
+        # ==========================================
+        # Projects final LSTM output to scalar pressure
+        self.head = nn.Linear(self.lstm_out_dim, 1)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, Seq_Len, Input_Dim)
+        Returns:
+            torch.Tensor: Pressure predictions of shape (Batch, Seq_Len)
+        """
+        # 1. Compute Injection Context
+        # Dual-Path: Identity + GLU
+        stem = self.stem_proj(x)
+        context = stem + self.stem_glu(stem)
+        injection = self.injection_bottleneck(context)  # (Batch, Seq, Injection_Dim)
+
+        # 2. Recurrent Propagation
+        lstm_out = None
+
+        for i, lstm in enumerate(self.lstm_layers):
+            if i == 0:
+                # First Layer: Cat(Raw, Injection)
+                lstm_input = torch.cat([x, injection], dim=-1)
+            else:
+                # Subsequent Layers: Cat(Gated_Prev_Out, Injection)
+                # Apply Gated-Cascade Block to previous output
+                gated_prev = self.inter_layer_gates[i - 1](lstm_out)
+                lstm_input = torch.cat([gated_prev, injection], dim=-1)
+
+            # LSTM Forward
+            # self.lstm returns (output, (h_n, c_n))
+            lstm_out, _ = lstm(lstm_input)
+
+        # 3. Head
+        # lstm_out shape: (Batch, Seq, LSTM_Out_Dim)
+        pred = self.head(lstm_out)  # (Batch, Seq, 1)
+
+        return pred.squeeze(-1)
+=======
+class DeepInjectionBiLSTM(nn.Module):
+    """
+    Deep Injection BiLSTM.
+    
+    Features:
+    - Cite solution_lesson_node_00048: Simple backbone (Standard LSTM) to maximize throughput.
+    - Cite solution_lesson_node_00039: Input Injection of Raw Features + Latent Context.
+    - Cite solution_lesson_node_00045: Constrained (Bottlenecked) Injection Context.
+    - Cite solution_lesson_node_00035: GLU-based Context Projection.
+    """
+
+    def __init__(self):
+        super(DeepInjectionBiLSTM, self).__init__()
+
+        # Dimensions
+        self.input_dim = 12
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.injection_dim = Config.INJECTION_DIM
+        self.num_layers = Config.NUM_LAYERS
+        self.dropout_p = Config.DROPOUT
+        self.bidirectional = Config.BIDIRECTIONAL
+
+        self.lstm_out_dim = self.hidden_dim * 2 if self.bidirectional else self.hidden_dim
+
+        # 1. Context Projection (GLU + Bottleneck)
+        # Projects raw input to a constrained latent context
+        self.context_proj = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            GLU(self.hidden_dim, self.injection_dim)
+        )
+
+        # 2. Deep Recurrent Backbone
+        self.lstm_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        # Layer 0
+        # Input: Raw (12) + Context (128)
+        self.lstm_layers.append(
+            nn.LSTM(
+                input_size=self.input_dim + self.injection_dim,
+                hidden_size=self.hidden_dim,
+                batch_first=True,
+                bidirectional=self.bidirectional,
+            )
+        )
+        self.norms.append(nn.LayerNorm(self.lstm_out_dim))
+        self.dropouts.append(nn.Dropout(self.dropout_p))
+
+        # Layers 1 to N-1
+        for _ in range(1, self.num_layers):
+            # Input: Prev_Out + Context + Raw
+            # Cite solution_lesson_node_00039: Concatenate raw features to deep layers
+            input_size = self.lstm_out_dim + self.injection_dim + self.input_dim
+            
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=input_size,
+                    hidden_size=self.hidden_dim,
+                    batch_first=True,
+                    bidirectional=self.bidirectional,
+                )
+            )
+            self.norms.append(nn.LayerNorm(self.lstm_out_dim))
+            self.dropouts.append(nn.Dropout(self.dropout_p))
+
+        # 3. Prediction Head
+        self.head = nn.Linear(self.lstm_out_dim, 1)
+
+    def forward(self, x):
+        # x: (Batch, Seq, 12)
+        
+        # Compute Context
+        context = self.context_proj(x) # (Batch, Seq, 128)
+        
+        lstm_out = None
+        
+        for i, lstm in enumerate(self.lstm_layers):
+            if i == 0:
+                # Layer 0 Input: Raw + Context
+                lstm_input = torch.cat([x, context], dim=-1)
+            else:
+                # Deep Layer Input: Prev_Out + Context + Raw
+                lstm_input = torch.cat([lstm_out, context, x], dim=-1)
+            
+            lstm_out, _ = lstm(lstm_input)
+            
+            # Apply Norm and Dropout (Cite solution_lesson_node_00023)
+            lstm_out = self.norms[i](lstm_out)
+            lstm_out = self.dropouts[i](lstm_out)
+            
+        pred = self.head(lstm_out)
+        return pred.squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DGC_BiLSTM
+=======
+from library.model import DeepInjectionBiLSTM
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = DGC_BiLSTM().to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = DeepInjectionBiLSTM().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DGC_BiLSTM
+=======
+from library.model import DeepInjectionBiLSTM
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# ==========================================
+# Configuration Overrides for Fast Baseline
+# ==========================================
+# Reduce epochs to ensure completion within ~2 hours while maintaining convergence quality
+Config.EPOCHS = 30
+# Increase batch size to utilize A100 GPU memory and speed up training
+Config.BATCH_SIZE = 512
+=======
+# ==========================================
+# Configuration Overrides
+# ==========================================
+# Use full epochs defined in Config (180) to maximize convergence
+# Config.EPOCHS is already set to 180 in library/config.py
+pass
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Load Best Model
+    device = torch.device(Config.DEVICE)
+    model = DGC_BiLSTM().to(device)
+=======
+    # 2. Load Best Model
+    device = torch.device(Config.DEVICE)
+    model = DeepInjectionBiLSTM().to(device)
+>>>>>>> REPLACE
+```

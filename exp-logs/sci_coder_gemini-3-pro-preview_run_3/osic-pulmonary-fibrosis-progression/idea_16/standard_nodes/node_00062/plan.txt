@@ -1,0 +1,305 @@
+My implementation strategy focuses on optimizing the model architecture by adopting the **Dual-Stream Point-Wise Residual (DSPR)** approach, which was identified as the most effective in the provided lessons.
+
+1.  **Architecture Refinement (DSPR-Net)**:
+    *   **Stream A (Linear Residual)**: I will replace the "Clinical Residual" MLP with a direct linear projection of `Baseline FVC` and `Time`. This allows the model to trivially learn the dominant autoregressive trend (Identity + Linear Decay) without being hindered by non-linearities, addressing the high temporal error correlation observed in the previous run. I will project this to the latent dimension (128) rather than a narrow bottleneck, as advised in `solution_lesson_node_00060`.
+    *   **Stream B (Deep Interaction)**: This stream will process the concatenated Image embeddings and *all* Clinical Metadata via an MLP to learn complex, non-linear residuals (e.g., how fibrosis patterns accelerate decline).
+    *   **Fusion**: The streams will be summed, effectively modeling `Prediction = LinearTrend + DeepCorrection`.
+
+2.  **Capacity Adjustment**:
+    *   I will switch the backbone from **EfficientNet-B2** to **EfficientNet-B0** and reduce the image resolution from **260** to **224**. The previous solution showed signs of overfitting (validation metric degraded after epoch 20), and `solution_lesson_node_00054` warns against capacity mismatch in small datasets.
+
+3.  **Config Updates**:
+    *   Define `LINEAR_INPUT_DIM` and update model hyperparameters in `library/config.py`.
+
+These changes directly address the lessons regarding preserving linear baselines (`solution_lesson_node_00060`), using dual-stream residuals (`solution_lesson_node_00052`), and managing model capacity (`solution_lesson_node_00054`).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture: RALI-Net
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b2"
+
+    # Stream A: Over-Parameterized Clinical Residual
+    # Input: FVC(1) + Time(1) + Age(1) + Sex(1) + Smoking(3 OHE) = 7
+    CLINICAL_INPUT_DIM = 7
+    CLINICAL_HIDDEN_DIM = 128
+
+    # Stream B: Visual Interaction Stream
+    # Visual Projection (from CNN backbone)
+    VISUAL_PROJECTION_DIM = 128
+    # Interaction Input: Visual(128) + Clinical(7)
+    INTERACTION_INPUT_DIM = VISUAL_PROJECTION_DIM + CLINICAL_INPUT_DIM
+    INTERACTION_HIDDEN_DIM = 256
+
+    # Latent Fusion (Summation Space)
+    LATENT_DIM = 128
+=======
+    # ==========================================
+    # Model Architecture: DSPR-Net (Dual-Stream Point-Wise Residual)
+    # ==========================================
+    # Cite solution_lesson_node_00054: Limit capacity (B2 -> B0) to prevent overfitting
+    BACKBONE_NAME = "efficientnet_b0"
+
+    # Stream A: Linear Residual (BaseFVC + Time)
+    # Input: BaseFVC(1) + Time(1) = 2
+    LINEAR_INPUT_DIM = 2
+    
+    # Stream B: Deep Interaction
+    # Visual Projection (from CNN backbone)
+    VISUAL_PROJECTION_DIM = 128
+    # Clinical Input: All 7 features
+    CLINICAL_INPUT_DIM = 7
+    
+    # Interaction Input: Visual(128) + Clinical(7)
+    INTERACTION_INPUT_DIM = VISUAL_PROJECTION_DIM + CLINICAL_INPUT_DIM
+    INTERACTION_HIDDEN_DIM = 256
+
+    # Latent Fusion (Summation Space)
+    LATENT_DIM = 128
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Image Resolution
+    IMG_SIZE = 260  # Optimal resolution for EfficientNet-B2
+=======
+    # Image Resolution
+    IMG_SIZE = 224  # Standard for EfficientNet-B0
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RaliNet(nn.Module):
+    """
+    Residual-Augmented Latent Interaction Network (RALI-Net).
+
+    Architecture:
+    1. Backbone: EfficientNet-B2 (Fine-tuned top stages).
+    2. Stream A: Over-Parameterized Clinical MLP (Models trajectory).
+    3. Stream B: Visual Interaction MLP (Models visual residuals).
+    4. Fusion: Summation of Stream A and Stream B latents.
+    """
+
+    def __init__(self):
+        super(RaliNet, self).__init__()
+
+        # ==============================
+        # 1. Image Backbone (EfficientNet-B2)
+        # ==============================
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=True,
+            num_classes=0,  # Remove classifier
+            global_pool="",  # We will handle pooling manually
+        )
+
+        # Feature dimension for EfficientNet-B2 is typically 1408
+        self.num_features = self.backbone.num_features
+
+        # Freezing Strategy:
+        # Freeze all parameters first
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze top layers (conv_head, bn2, and last 2 blocks)
+        # Note: timm EfficientNet structure usually has 'blocks', 'conv_head', 'bn2'
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Unfreeze last 2 blocks in the 'blocks' container
+        # EfficientNet-B2 has 7 stages in 'blocks'
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            # Unfreeze the last 2 blocks
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        # Image Projection Layer
+        self.img_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.img_projector = nn.Linear(self.num_features, Config.VISUAL_PROJECTION_DIM)
+
+        # ==============================
+        # 2. Stream A: Clinical Residual
+        # ==============================
+        # Input: 7 Clinical Features
+        # Architecture: Linear -> ReLU -> Linear
+        self.clinical_net = nn.Sequential(
+            nn.Linear(Config.CLINICAL_INPUT_DIM, Config.CLINICAL_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.CLINICAL_HIDDEN_DIM, Config.LATENT_DIM),
+        )
+
+        # ==============================
+        # 3. Stream B: Visual Interaction
+        # ==============================
+        # Input: Visual Projection (128) + Clinical (7)
+        # Architecture: Linear -> ReLU -> Linear
+        self.interaction_net = nn.Sequential(
+            nn.Linear(Config.INTERACTION_INPUT_DIM, Config.INTERACTION_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.INTERACTION_HIDDEN_DIM, Config.LATENT_DIM),
+        )
+
+        # ==============================
+        # 4. Prediction Head
+        # ==============================
+        # Input: Fused Latent (128)
+        # Output: 2 (FVC, Raw Sigma)
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images (torch.Tensor): (Batch, 3, H, W)
+            tabular (torch.Tensor): (Batch, 7)
+        Returns:
+            torch.Tensor: (Batch, 2) -> [FVC, Raw_Sigma]
+        """
+        # --- Image Branch ---
+        # Extract features: (B, C, H, W)
+        features = self.backbone.forward_features(images)
+        # Pool: (B, C, 1, 1) -> (B, C)
+        pooled = self.img_pool(features).flatten(1)
+        # Project: (B, 128)
+        visual_latent = self.img_projector(pooled)
+
+        # --- Stream A: Clinical Residual ---
+        # Models the robust clinical trajectory
+        # (B, 7) -> (B, 128)
+        clinical_latent = self.clinical_net(tabular)
+
+        # --- Stream B: Visual Interaction ---
+        # Concatenate Visual and Clinical features
+        # (B, 128) + (B, 7) -> (B, 135)
+        combined_input = torch.cat([visual_latent, tabular], dim=1)
+        # Models the non-linear interaction / residual correction
+        # (B, 135) -> (B, 128)
+        interaction_latent = self.interaction_net(combined_input)
+
+        # --- Latent Fusion ---
+        # Summation forces Stream B to learn a residual to Stream A
+        # (B, 128)
+        fused_latent = clinical_latent + interaction_latent
+
+        # --- Prediction ---
+        # (B, 2)
+        output = self.head(fused_latent)
+
+        return output
+=======
+class RaliNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPR-Net).
+    Cite solution_lesson_node_00052: Dual-Stream Residuals for Strong Autoregressive Signals.
+
+    Architecture:
+    1. Backbone: EfficientNet-B0 (Fine-tuned top stages).
+    2. Stream A (Linear Residual): Over-Parameterized Linear Projection of BaseFVC + Time.
+       Cite solution_lesson_node_00060: Do not bottleneck strong linear baselines.
+    3. Stream B (Deep Interaction): MLP processing Image + All Clinical Metadata.
+    4. Fusion: Summation of Stream A and Stream B latents.
+    """
+
+    def __init__(self):
+        super(RaliNet, self).__init__()
+
+        # ==============================
+        # 1. Image Backbone (EfficientNet-B0)
+        # ==============================
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=True,
+            num_classes=0,
+            global_pool="",
+        )
+
+        self.num_features = self.backbone.num_features
+
+        # Freezing Strategy
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze top layers
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        # Image Projection
+        self.img_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.img_projector = nn.Linear(self.num_features, Config.VISUAL_PROJECTION_DIM)
+
+        # ==============================
+        # 2. Stream A: Linear Residual
+        # ==============================
+        # Input: BaseFVC(1) + Time(1) = 2
+        # Projects to Latent Dim (128) without non-linearity
+        # Cite solution_lesson_node_00060
+        self.linear_stream = nn.Linear(Config.LINEAR_INPUT_DIM, Config.LATENT_DIM)
+
+        # ==============================
+        # 3. Stream B: Deep Interaction
+        # ==============================
+        # Input: Visual(128) + All Clinical(7)
+        self.deep_stream = nn.Sequential(
+            nn.Linear(Config.INTERACTION_INPUT_DIM, Config.INTERACTION_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.INTERACTION_HIDDEN_DIM, Config.LATENT_DIM),
+        )
+
+        # ==============================
+        # 4. Prediction Head
+        # ==============================
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images (torch.Tensor): (Batch, 3, H, W)
+            tabular (torch.Tensor): (Batch, 7)
+        """
+        # --- Image Features ---
+        features = self.backbone.forward_features(images)
+        pooled = self.img_pool(features).flatten(1)
+        visual_latent = self.img_projector(pooled)
+
+        # --- Stream A: Linear Residual ---
+        # Select BaseFVC (idx 0) and Time (idx 1)
+        linear_input = tabular[:, :2]
+        linear_latent = self.linear_stream(linear_input)
+
+        # --- Stream B: Deep Interaction ---
+        combined_input = torch.cat([visual_latent, tabular], dim=1)
+        deep_latent = self.deep_stream(combined_input)
+
+        # --- Fusion ---
+        # Summation allows Stream B to correct Stream A
+        fused_latent = linear_latent + deep_latent
+
+        # --- Prediction ---
+        output = self.head(fused_latent)
+
+        return output
+>>>>>>> REPLACE
+```

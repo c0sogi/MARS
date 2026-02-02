@@ -1,0 +1,174 @@
+The root cause of the `torch.OutOfMemoryError` is the sequential execution of two memory-intensive training jobs (`TaggerTrainer` and `Seq2SeqTrainer`) within the same process. Even after the first model finishes, its resources (CUDA context, optimizer states, graph references) are not immediately or fully released by the Python garbage collector or the CUDA allocator. When the second model initializes, it attempts to allocate memory on top of the "zombie" footprint of the first model, exceeding the GPU capacity.
+
+To fix this, I will isolate each training stage in a separate Operating System process using `multiprocessing`. This ensures that when a training stage completes, the OS forcibly reclaims all associated GPU resources, providing a clean slate for the next stage (Cite debug_lesson_5).
+
+I will implement this by:
+1.  Adding wrapper functions (`run_tagger_safe`, `run_seq2seq_safe`) to `library/trainer.py`. These functions will be importable by the child processes (Cite debug_lesson_6), accept configuration overrides to match the main script's settings, and wrap execution in a `try...except` block to ensure exceptions are printed and streams flushed (Cite debug_lesson_7, debug_lesson_8).
+2.  Modifying `runfile.py` to use `torch.multiprocessing` to spawn these functions instead of calling the trainer classes directly.
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        return total_loss / len(self.val_loader)
+=======
+        return total_loss / len(self.val_loader)
+
+
+# =========================================================================
+# Multiprocessing Wrappers
+# =========================================================================
+
+def run_tagger_safe(config_overrides=None):
+    import sys
+    import traceback
+    from library.config import Config
+
+    try:
+        # Apply overrides
+        if config_overrides:
+            print(f"Applying Config overrides: {config_overrides}")
+            for k, v in config_overrides.items():
+                setattr(Config, k, v)
+
+        # Run Training
+        trainer = TaggerTrainer()
+        trainer.train()
+
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(1)
+
+
+def run_seq2seq_safe(config_overrides=None):
+    import sys
+    import traceback
+    from library.config import Config
+
+    try:
+        # Apply overrides
+        if config_overrides:
+            print(f"Applying Config overrides: {config_overrides}")
+            for k, v in config_overrides.items():
+                setattr(Config, k, v)
+
+        # Run Training
+        trainer = Seq2SeqTrainer()
+        trainer.train()
+
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(1)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import sys
+import os
+import pandas as pd
+import numpy as np
+import torch
+import warnings
+import json
+from scipy.stats import pearsonr
+=======
+import sys
+import os
+import pandas as pd
+import numpy as np
+import torch
+import warnings
+import json
+import torch.multiprocessing as mp
+from scipy.stats import pearsonr
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import seed_everything
+from library.dataset import build_artifacts, get_tagger_loader, Vocab
+from library.trainer import TaggerTrainer, Seq2SeqTrainer
+from library.predictor import generate_submission
+from library.models import MorphoBiLSTMTagger, CharSeq2Seq
+=======
+from library.config import seed_everything
+from library.dataset import build_artifacts, get_tagger_loader, Vocab
+from library.trainer import run_tagger_safe, run_seq2seq_safe
+from library.predictor import generate_submission
+from library.models import MorphoBiLSTMTagger, CharSeq2Seq
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # Set Seed
+    seed_everything(Config.SEED)
+
+    # 1. Build Data Artifacts
+    # This creates vocabs and the knowledge base from training data
+    print("Step 1: Building Data Artifacts...")
+    build_artifacts(load_cached_data=True)
+
+    # 2. Train Tagger
+    # The TaggerTrainer handles data loading (with density sampling) and training loop
+    print("\nStep 2: Training Morphologically-Augmented Tagger...")
+    tagger_trainer = TaggerTrainer()
+    tagger_trainer.train()
+
+    # 3. Train Seq2Seq Fallback
+    # The Seq2SeqTrainer trains only on 'changed' tokens
+    print("\nStep 3: Training Seq2Seq Fallback Model...")
+    seq2seq_trainer = Seq2SeqTrainer()
+    seq2seq_trainer.train()
+
+    # 4. Validation & Failure Analysis
+    val_metric = run_validation_pipeline()
+=======
+def main():
+    # Set Seed
+    seed_everything(Config.SEED)
+
+    # Define Overrides for Fast Baseline
+    # These must be passed to child processes since they reload Config from disk
+    overrides = {
+        "NUM_EPOCHS_TAGGER": Config.NUM_EPOCHS_TAGGER,
+        "NUM_EPOCHS_SEQ2SEQ": Config.NUM_EPOCHS_SEQ2SEQ,
+        "PLAIN_KEEP_RATE": Config.PLAIN_KEEP_RATE,
+        "SEED": Config.SEED
+    }
+
+    # 1. Build Data Artifacts
+    # This creates vocabs and the knowledge base from training data
+    print("Step 1: Building Data Artifacts...")
+    build_artifacts(load_cached_data=True)
+
+    # 2. Train Tagger
+    # The TaggerTrainer handles data loading (with density sampling) and training loop
+    print("\nStep 2: Training Morphologically-Augmented Tagger (Isolated)...")
+    ctx = mp.get_context('spawn')
+    p1 = ctx.Process(target=run_tagger_safe, args=(overrides,))
+    p1.start()
+    p1.join()
+    if p1.exitcode != 0:
+        raise RuntimeError("Tagger Training Failed")
+
+    # 3. Train Seq2Seq Fallback
+    # The Seq2SeqTrainer trains only on 'changed' tokens
+    print("\nStep 3: Training Seq2Seq Fallback Model (Isolated)...")
+    p2 = ctx.Process(target=run_seq2seq_safe, args=(overrides,))
+    p2.start()
+    p2.join()
+    if p2.exitcode != 0:
+        raise RuntimeError("Seq2Seq Training Failed")
+
+    # 4. Validation & Failure Analysis
+    val_metric = run_validation_pipeline()
+>>>>>>> REPLACE
+```

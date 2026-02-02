@@ -1,0 +1,222 @@
+The previous implementation of `read_dicom_manual` relied primarily on `cv2.imdecode` to parse DICOM pixel data, which works for encapsulated formats (like JPEG) but fails for native (raw) pixel data often found in medical datasets. This caused the data loader to fallback to dummy black images, preventing the model from learning.
+
+I will fix this by enhancing `read_dicom_manual` to include a low-level binary parser. This parser will:
+1.  Scan the DICOM header for metadata tags (`Rows`, `Columns`, `BitsAllocated`) to determine the image geometry.
+2.  If standard decoding fails, calculate the expected byte size of the pixel buffer.
+3.  Directly extract and reshape the raw bytes from the file stream into a NumPy array.
+
+This approach ensures that both encapsulated and raw DICOM formats are handled correctly, even without the `pydicom` library (Cite `debug_lesson_1`).
+
+```diff
+library/dicom_utils.py
+<<<<<<< SEARCH
+def read_dicom_manual(file_path):
+    """
+    Manually parses a DICOM file to extract pixel data without relying on pydicom.
+    Handles encapsulated JPEG data and Photometric Interpretation.
+
+    Args:
+        file_path (str): Full path to the DICOM file.
+
+    Returns:
+        np.ndarray: The image data (2D or 3D).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"DICOM file not found: {file_path}")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    img = None
+
+    # Strategy 1: Search for Pixel Data Tag (7FE0, 0010)
+    # Little Endian byte sequence: E0 7F 10 00
+    pixel_data_tag = b"\xe0\x7f\x10\x00"
+
+    # Find the tag. In some DICOMs, there might be multiple (e.g. icon),
+    # but usually the last large one or the one after the header is the image.
+    # We try the first occurrence.
+    tag_idx = data.find(pixel_data_tag)
+
+    if tag_idx != -1:
+        # Try decoding from various offsets after the tag to handle VR/Length bytes
+        # Common offsets:
+        # 8 bytes (Tag 4 + Length 4) - Implicit VR
+        # 12 bytes (Tag 4 + VR 2 + Reserved 2 + Length 4) - Explicit VR
+        offsets = [8, 12, 0, 4, 16]
+
+        for offset in offsets:
+            start_idx = tag_idx + offset
+            if start_idx >= len(data):
+                continue
+
+            # Attempt to decode the remaining buffer as an image (JPEG/JPEG2000)
+            img_buffer = np.frombuffer(data[start_idx:], dtype=np.uint8)
+            try:
+                decoded = cv2.imdecode(img_buffer, cv2.IMREAD_UNCHANGED)
+                if decoded is not None and decoded.size > 0:
+                    img = decoded
+                    break
+            except Exception:
+                continue
+
+    # Strategy 2: Fallback to direct cv2.imread (sometimes works for non-standard DICOMs)
+    if img is None:
+        try:
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            pass
+
+    if img is None:
+        raise ValueError(f"Failed to parse pixel data from {file_path}")
+
+    # Handle Photometric Interpretation
+    # If 'MONOCHROME1' is present, 0 is White and Max is Black. We need to invert.
+    # We search the binary header for this string.
+    if b"MONOCHROME1" in data[:2000]:  # Header is usually at the beginning
+        # Invert the image
+        if img.dtype == np.uint8:
+            img = 255 - img
+        elif img.dtype == np.uint16:
+            img = 65535 - img
+        else:
+            img = np.max(img) - img
+
+    return img
+=======
+def read_dicom_manual(file_path):
+    """
+    Manually parses a DICOM file to extract pixel data without relying on pydicom.
+    Handles both Encapsulated (JPEG) and Native (Raw) pixel data.
+    Cite debug_lesson_1: Implement Low-Level Binary Parsing Fallbacks.
+
+    Args:
+        file_path (str): Full path to the DICOM file.
+
+    Returns:
+        np.ndarray: The image data (2D or 3D).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"DICOM file not found: {file_path}")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    img = None
+
+    # --- Helper: Find Tag Value (Little Endian) ---
+    def find_tag_value(tag_bytes, data, search_limit=2000):
+        """
+        Scans for a tag (e.g., b'\\x28\\x00\\x10\\x00' for Rows) and extracts its value.
+        Handles Explicit VR (US) and Implicit VR (assumes 2-byte length for these tags).
+        """
+        start = 0
+        while True:
+            idx = data.find(tag_bytes, start)
+            if idx == -1 or idx > search_limit:
+                return None
+
+            # Check for Explicit VR 'US' (Unsigned Short) -> Tag(4) + VR(2) + Len(2) + Val(2)
+            # VR 'US' is 0x5553
+            if idx + 10 <= len(data):
+                vr = data[idx + 4 : idx + 6]
+                if vr == b"US":
+                    val = int.from_bytes(data[idx + 8 : idx + 10], "little")
+                    return val
+
+            # Check for Implicit VR -> Tag(4) + Len(4) + Val(Len)
+            # For Rows/Cols, Length is usually 2 or 4. We assume 2 for short.
+            if idx + 10 <= len(data):
+                length = int.from_bytes(data[idx + 4 : idx + 8], "little")
+                if length == 2:
+                    val = int.from_bytes(data[idx + 8 : idx + 10], "little")
+                    return val
+
+            start = idx + 1
+
+    # 1. extract Metadata (Rows, Cols, Bits)
+    # Tags: Rows (0028,0010), Columns (0028,0011), BitsAllocated (0028,0100)
+    rows = find_tag_value(b"\x28\x00\x10\x00", data)
+    cols = find_tag_value(b"\x28\x00\x11\x00", data)
+    bits = find_tag_value(b"\x28\x00\x00\x01", data)
+
+    if bits is None:
+        bits = 16  # Default assumption for X-ray if missing
+
+    # 2. Find Pixel Data Tag (7FE0,0010)
+    # Little Endian byte sequence: E0 7F 10 00
+    pixel_data_tag = b"\xe0\x7f\x10\x00"
+    tag_idx = data.find(pixel_data_tag)
+
+    if tag_idx != -1:
+        # Possible offsets to the actual data start
+        # Explicit VR: Tag(4) + VR(2) + Res(2) + Len(4) = 12 bytes
+        # Implicit VR: Tag(4) + Len(4) = 8 bytes
+        offsets = [12, 8, 0, 4, 16]
+
+        # Strategy A: Try decoding as Encapsulated (JPEG/JPEG2000)
+        for offset in offsets:
+            start = tag_idx + offset
+            if start >= len(data):
+                continue
+
+            # Grab a chunk to try decoding
+            b = np.frombuffer(data[start:], dtype=np.uint8)
+            try:
+                decoded = cv2.imdecode(b, cv2.IMREAD_UNCHANGED)
+                if decoded is not None and decoded.size > 0:
+                    img = decoded
+                    break
+            except Exception:
+                pass
+
+        # Strategy B: Try reading as Raw/Native
+        if img is None and rows is not None and cols is not None:
+            num_pixels = rows * cols
+            bytes_per_pixel = 2 if bits > 8 else 1
+            expected_bytes = num_pixels * bytes_per_pixel
+
+            for offset in offsets:
+                start = tag_idx + offset
+                if start + expected_bytes <= len(data):
+                    raw = np.frombuffer(
+                        data[start : start + expected_bytes], dtype=np.uint8
+                    )
+
+                    if bytes_per_pixel == 2:
+                        # View as uint16
+                        # Note: DICOM is usually Little Endian. np.frombuffer uses system endianness.
+                        # We assume Little Endian system (x86/GPU).
+                        raw = raw.view(np.uint16)
+
+                    try:
+                        img = raw.reshape((rows, cols))
+                        break
+                    except ValueError:
+                        continue
+
+    # Strategy 3: Fallback to direct cv2.imread (sometimes works for non-standard DICOMs)
+    if img is None:
+        try:
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            pass
+
+    if img is None:
+        raise ValueError(f"Failed to parse pixel data from {file_path}")
+
+    # Handle Photometric Interpretation
+    # If 'MONOCHROME1' is present, 0 is White and Max is Black. We need to invert.
+    # We search the binary header for this string.
+    if b"MONOCHROME1" in data[:2000]:  # Header is usually at the beginning
+        # Invert the image
+        if img.dtype == np.uint8:
+            img = 255 - img
+        elif img.dtype == np.uint16:
+            img = 65535 - img
+        else:
+            img = np.max(img) - img
+
+    return img
+>>>>>>> REPLACE
+```

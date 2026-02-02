@@ -1,0 +1,368 @@
+I will implement the following optimizations based on the lessons learned:
+
+1.  **Architecture Upgrade (Embedding-Space Attention):** I will modify `FractureMILModel` to use **Attention-based Aggregation** instead of Top-K Mean Pooling. The backbone will output feature vectors (embeddings) which are then weighted by a learnable attention mechanism before classification. This addresses the instability of probability pooling in low-data regimes (Cite `solution_lesson_node_00005`).
+2.  **Volumetric Augmentation:** I will update `RSNADataset` to implement a `UnifiedTransform` strategy. This ensures that random affine transformations and flips are applied identically to every slice within a study ("bag"), preserving the 3D anatomical coherence required for the model to learn robust features (Cite `solution_lesson_node_00008`).
+3.  **Hyperparameter Tuning:** I will increase `BATCH_SIZE` to 4 to stabilize gradient updates (Cite `solution_lesson_node_00007`) and introduce `WEIGHT_DECAY` and `DROPOUT` to `Config` and `Trainer` to mitigate the rapid overfitting observed in the previous run.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training settings
+    BATCH_SIZE = 2  # Batch size of studies (bags)
+    EPOCHS = 10
+    LEARNING_RATE = 1e-4
+    NUM_WORKERS = 4  # For DataLoader
+=======
+    # Training settings
+    BATCH_SIZE = 4  # Batch size of studies (bags)
+    EPOCHS = 10
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-2
+    DROPOUT = 0.5
+    NUM_WORKERS = 4  # For DataLoader
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import os
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+from library.config import Config
+from library.utils import get_study_paths, load_dicom_and_process
+=======
+import os
+import torch
+import numpy as np
+import pandas as pd
+import random
+import torchvision.transforms.functional as F
+from torch.utils.data import Dataset
+from library.config import Config
+from library.utils import get_study_paths, load_dicom_and_process
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __init__(self, df, config, transform=None, load_cached_paths=True):
+        """
+        Args:
+            df (pd.DataFrame): Metadata DataFrame containing StudyInstanceUID and labels.
+            config (Config): Configuration object with hyperparameters.
+            transform (callable, optional): Optional transform to be applied on a sample.
+            load_cached_paths (bool): Whether to use cached file paths to speed up initialization.
+        """
+        self.df = df.reset_index(drop=True)
+        self.config = config
+        self.transform = transform
+=======
+    def __init__(self, df, config, split="train", transform=None, load_cached_paths=True):
+        """
+        Args:
+            df (pd.DataFrame): Metadata DataFrame containing StudyInstanceUID and labels.
+            config (Config): Configuration object with hyperparameters.
+            split (str): 'train', 'val', or 'test'. Controls augmentation.
+            transform (callable, optional): Optional transform to be applied on a sample.
+            load_cached_paths (bool): Whether to use cached file paths to speed up initialization.
+        """
+        self.df = df.reset_index(drop=True)
+        self.config = config
+        self.split = split
+        self.transform = transform
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+            images = torch.from_numpy(volume).float()
+
+        # Apply optional transforms
+        if self.transform:
+            images = self.transform(images)
+
+        # Retrieve Labels
+=======
+            images = torch.from_numpy(volume).float()
+
+        # Apply unified transforms for training (Cite solution_lesson_node_00008)
+        if self.split == "train":
+            # Random Affine Parameters
+            angle = random.uniform(-15, 15)
+            translate = (random.uniform(-0.1, 0.1) * self.config.IMG_SIZE, 
+                         random.uniform(-0.1, 0.1) * self.config.IMG_SIZE)
+            scale = random.uniform(0.9, 1.1)
+            do_flip = random.random() > 0.5
+
+            # Apply to all slices consistently
+            # images shape: (S, 1, H, W)
+            images = F.affine(images, angle=angle, translate=translate, scale=scale, shear=0)
+            
+            if do_flip:
+                images = F.hflip(images)
+
+        # Apply optional transforms
+        if self.transform:
+            images = self.transform(images)
+
+        # Retrieve Labels
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Initialize the 2D CNN backbone using timm.
+        # - in_chans=1: Adapts the first layer for grayscale CT inputs.
+        # - num_classes=Config.N_CLASSES (8): Sets the final linear layer to output
+        #   logits for C1-C7 and patient_overall.
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            in_chans=Config.IN_CHANNELS,
+            num_classes=Config.N_CLASSES,
+        )
+
+    def forward(self, x):
+        """
+        Forward pass of the MIL model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Slices, Channels, Height, Width).
+
+        Returns:
+            torch.Tensor: Predicted probabilities of shape (Batch, N_CLASSES).
+        """
+        # Unpack dimensions
+        # b: Batch size (number of studies)
+        # s: Number of slices per study
+        # c: Channels (1)
+        # h, w: Image height and width
+        b, s, c, h, w = x.shape
+
+        # 1. Collapse Batch and Slice dimensions
+        # Reshape to (Batch * Slices, C, H, W) to process all slices as independent images
+        x = x.view(b * s, c, h, w)
+
+        # 2. Slice-level Inference
+        # Pass through the backbone to get logits for each slice
+        # Shape: (Batch * Slices, N_CLASSES)
+        logits = self.backbone(x)
+
+        # 3. Reshape back to Study structure
+        # Shape: (Batch, Slices, N_CLASSES)
+        logits = logits.view(b, s, Config.N_CLASSES)
+
+        # 4. Activation
+        # Convert slice-level logits to probabilities [0, 1]
+        slice_probs = torch.sigmoid(logits)
+
+        # 5. MIL Aggregation (Top-k Mean Pooling)
+        # Instead of Max-Pooling which is unstable in low-data regimes, we average
+        # the probabilities of the top k most confident slices.
+        # Cite solution_lesson_node_00002
+        topk_probs, _ = torch.topk(slice_probs, k=Config.TOP_K, dim=1)
+
+        # Shape: (Batch, N_CLASSES)
+        probs = torch.mean(topk_probs, dim=1)
+
+        return probs
+=======
+        # Initialize the 2D CNN backbone using timm.
+        # Cite solution_lesson_node_00005: Use Embedding-Space Aggregation.
+        # num_classes=0 returns the pooled feature vector (B, num_features).
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            in_chans=Config.IN_CHANNELS,
+            num_classes=0,
+        )
+        self.in_features = self.backbone.num_features
+
+        # Attention Mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(self.in_features, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+        # Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(self.in_features, Config.N_CLASSES)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass of the MIL model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Slices, Channels, Height, Width).
+
+        Returns:
+            torch.Tensor: Predicted probabilities of shape (Batch, N_CLASSES).
+        """
+        b, s, c, h, w = x.shape
+
+        # 1. Collapse Batch and Slice dimensions
+        x = x.view(b * s, c, h, w)
+
+        # 2. Feature Extraction
+        # Shape: (Batch * Slices, Features)
+        features = self.backbone(x)
+
+        # 3. Reshape back to Study structure
+        # Shape: (Batch, Slices, Features)
+        features = features.view(b, s, self.in_features)
+
+        # 4. Attention Aggregation (Cite solution_lesson_node_00005)
+        # Calculate attention weights: (Batch, Slices, 1)
+        attn_weights = self.attention(features)
+        attn_weights = torch.softmax(attn_weights, dim=1)
+
+        # Weighted sum of features: (Batch, Features)
+        study_embedding = torch.sum(features * attn_weights, dim=1)
+
+        # 5. Classification
+        logits = self.classifier(study_embedding)
+        
+        return torch.sigmoid(logits)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Initialize Optimizer and Scheduler
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=config.LEARNING_RATE)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=config.EPOCHS
+        )
+
+        # Prepare DataLoaders
+        self.train_loader, self.val_loader = self._get_dataloaders()
+
+    def _get_dataloaders(self):
+        """
+        Loads metadata and creates DataLoaders for training and validation.
+        """
+        train_df = pd.read_csv(self.config.TRAIN_METADATA_PATH)
+        val_df = pd.read_csv(self.config.VAL_METADATA_PATH)
+
+        # Debug mode: Use a tiny subset of data
+        if self.debug:
+            train_df = train_df.head(self.config.BATCH_SIZE * 2)
+            val_df = val_df.head(self.config.BATCH_SIZE * 2)
+
+        # Initialize Datasets
+        # load_cached_paths=True ensures we use the parquet cache for speed
+        train_dataset = RSNADataset(train_df, self.config, load_cached_paths=True)
+        val_dataset = RSNADataset(val_df, self.config, load_cached_paths=True)
+
+        # Initialize DataLoaders
+=======
+        # Initialize Optimizer and Scheduler
+        # Cite solution_lesson_node_00008: Use Weight Decay
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), 
+            lr=config.LEARNING_RATE, 
+            weight_decay=config.WEIGHT_DECAY
+        )
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=config.EPOCHS
+        )
+
+        # Prepare DataLoaders
+        self.train_loader, self.val_loader = self._get_dataloaders()
+
+    def _get_dataloaders(self):
+        """
+        Loads metadata and creates DataLoaders for training and validation.
+        """
+        train_df = pd.read_csv(self.config.TRAIN_METADATA_PATH)
+        val_df = pd.read_csv(self.config.VAL_METADATA_PATH)
+
+        # Debug mode: Use a tiny subset of data
+        if self.debug:
+            train_df = train_df.head(self.config.BATCH_SIZE * 2)
+            val_df = val_df.head(self.config.BATCH_SIZE * 2)
+
+        # Initialize Datasets
+        # load_cached_paths=True ensures we use the parquet cache for speed
+        train_dataset = RSNADataset(train_df, self.config, split="train", load_cached_paths=True)
+        val_dataset = RSNADataset(val_df, self.config, split="val", load_cached_paths=True)
+
+        # Initialize DataLoaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Load Test Data
+        test_df = pd.read_csv(self.config.TEST_METADATA_PATH)
+        test_dataset = RSNADataset(test_df, self.config, load_cached_paths=True)
+        test_loader = DataLoader(
+            test_dataset,
+=======
+        # Load Test Data
+        test_df = pd.read_csv(self.config.TEST_METADATA_PATH)
+        test_dataset = RSNADataset(test_df, self.config, split="test", load_cached_paths=True)
+        test_loader = DataLoader(
+            test_dataset,
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Initialize Dataset and DataLoader
+    # load_cached_paths=load_cached_data ensures we use the parquet cache if available
+    test_dataset = RSNADataset(test_df, config, load_cached_paths=load_cached_data)
+
+    test_loader = DataLoader(
+=======
+    # Initialize Dataset and DataLoader
+    # load_cached_paths=load_cached_data ensures we use the parquet cache if available
+    test_dataset = RSNADataset(test_df, config, split="test", load_cached_paths=load_cached_data)
+
+    test_loader = DataLoader(
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Validation Data
+    val_df = pd.read_csv(Config.VAL_METADATA_PATH)
+    val_dataset = RSNADataset(val_df, Config, load_cached_paths=True)
+    val_loader = DataLoader(
+        val_dataset,
+=======
+    # Load Validation Data
+    val_df = pd.read_csv(Config.VAL_METADATA_PATH)
+    val_dataset = RSNADataset(val_df, Config, split="val", load_cached_paths=True)
+    val_loader = DataLoader(
+        val_dataset,
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Threshold from previous best run
+    BASELINE_METRIC = 1.090492606163025
+
+    if validation_loss.item() < BASELINE_METRIC:
+=======
+    # Threshold from previous best run
+    BASELINE_METRIC = 0.8661673665046692
+
+    if validation_loss.item() < BASELINE_METRIC:
+>>>>>>> REPLACE
+```

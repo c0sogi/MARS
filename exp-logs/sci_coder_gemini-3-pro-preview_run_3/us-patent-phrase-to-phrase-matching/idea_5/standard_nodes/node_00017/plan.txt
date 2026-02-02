@@ -1,0 +1,578 @@
+To resolve the `torch.OutOfMemoryError` caused by the mismatch between the model size (`microsoft/deberta-v3-large`) and the available GPU memory (16GB vs. expected 40GB), I will implement the following strategies:
+
+1.  **Enable Automatic Mixed Precision (AMP) and Gradient Accumulation**: I will modify `library/engine.py` to use `torch.amp.GradScaler` and `torch.amp.autocast`. This reduces memory usage by storing activations in half-precision and allows us to simulate a larger batch size by accumulating gradients over multiple smaller steps.
+2.  **Adjust Configuration**: I will update `runfile.py` to reduce the physical batch size to 4 (from 32) and increase `gradient_accumulation_steps` to 8. This maintains the effective batch size of 32 while fitting within the 16GB VRAM limit.
+3.  **Enable Gradient Checkpointing**: I will explicitly enable gradient checkpointing in `runfile.py` to further trade off compute for memory.
+
+This approach targets the root cause (memory exhaustion) without altering the model's convergence properties.
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def run_dapt(tokenizer):
+    """
+    Performs Domain-Adaptive Pre-training (DAPT) using Masked Language Modeling.
+    Saves the pre-trained backbone to Config.dapt_model_path.
+    """
+    if not Config.use_dapt:
+        logger.info("DAPT is disabled in Config. Skipping.")
+        return
+
+    save_path = Config.dapt_model_path
+    if os.path.exists(save_path) and os.path.exists(
+        os.path.join(save_path, "config.json")
+    ):
+        logger.info(f"DAPT model already exists at {save_path}. Skipping training.")
+        return
+
+    logger.info("Starting Domain-Adaptive Pre-training (DAPT)...")
+
+    # Create DAPT directory
+    os.makedirs(save_path, exist_ok=True)
+
+    # Initialize Model for MLM
+    device = Config.device
+    model = AutoModelForMaskedLM.from_pretrained(Config.model_name)
+    model.to(device)
+    model.train()
+
+    # Data Loader
+    train_loader = get_dapt_dataloader(tokenizer)
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.dapt_lr, weight_decay=Config.weight_decay
+    )
+
+    # Scheduler
+    num_train_steps = int(len(train_loader) * Config.dapt_epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_train_steps * 0.1),
+        num_training_steps=num_train_steps,
+    )
+
+    # Training Loop
+    for epoch in range(Config.dapt_epochs):
+        losses = AverageMeter()
+        pbar = tqdm(
+            train_loader, desc=f"DAPT Epoch {epoch+1}/{Config.dapt_epochs}", leave=False
+        )
+
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = (
+                batch["labels"].to(device)
+                if "labels" in batch
+                else batch["input_ids"].clone()
+            )
+
+            outputs = model(
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels
+            )
+            loss = outputs.loss
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            losses.update(loss.item(), input_ids.size(0))
+            pbar.set_postfix(loss=losses.avg)
+
+        logger.info(f"DAPT Epoch {epoch+1} - Avg Loss: {losses.avg:.4f}")
+
+    # Save the adapted backbone
+    logger.info(f"Saving DAPT model to {save_path}")
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+
+    # Cleanup
+    del model, optimizer, scheduler, train_loader
+    torch.cuda.empty_cache()
+    gc.collect()
+=======
+def run_dapt(tokenizer):
+    """
+    Performs Domain-Adaptive Pre-training (DAPT) using Masked Language Modeling.
+    Saves the pre-trained backbone to Config.dapt_model_path.
+    """
+    if not Config.use_dapt:
+        logger.info("DAPT is disabled in Config. Skipping.")
+        return
+
+    save_path = Config.dapt_model_path
+    if os.path.exists(save_path) and os.path.exists(
+        os.path.join(save_path, "config.json")
+    ):
+        logger.info(f"DAPT model already exists at {save_path}. Skipping training.")
+        return
+
+    logger.info("Starting Domain-Adaptive Pre-training (DAPT)...")
+
+    # Create DAPT directory
+    os.makedirs(save_path, exist_ok=True)
+
+    # Initialize Model for MLM
+    device = Config.device
+    model = AutoModelForMaskedLM.from_pretrained(Config.model_name)
+    model.to(device)
+    model.train()
+
+    # Data Loader
+    train_loader = get_dapt_dataloader(tokenizer)
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.dapt_lr, weight_decay=Config.weight_decay
+    )
+
+    # Scheduler
+    # Adjust total steps for gradient accumulation
+    num_update_steps = int(len(train_loader) / Config.gradient_accumulation_steps * Config.dapt_epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_update_steps * 0.1),
+        num_training_steps=num_update_steps,
+    )
+
+    # AMP Scaler
+    scaler = torch.amp.GradScaler('cuda')
+
+    # Training Loop
+    for epoch in range(Config.dapt_epochs):
+        losses = AverageMeter()
+        pbar = tqdm(
+            train_loader, desc=f"DAPT Epoch {epoch+1}/{Config.dapt_epochs}", leave=False
+        )
+        
+        optimizer.zero_grad()
+        
+        for step, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = (
+                batch["labels"].to(device)
+                if "labels" in batch
+                else batch["input_ids"].clone()
+            )
+
+            with torch.amp.autocast('cuda'):
+                outputs = model(
+                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                )
+                loss = outputs.loss
+                # Normalize loss for accumulation
+                loss = loss / Config.gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+
+            if (step + 1) % Config.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+
+            # Log the raw loss (approximate)
+            losses.update(loss.item() * Config.gradient_accumulation_steps, input_ids.size(0))
+            pbar.set_postfix(loss=losses.avg)
+
+        logger.info(f"DAPT Epoch {epoch+1} - Avg Loss: {losses.avg:.4f}")
+
+    # Save the adapted backbone
+    logger.info(f"Saving DAPT model to {save_path}")
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+
+    # Cleanup
+    del model, optimizer, scheduler, train_loader, scaler
+    torch.cuda.empty_cache()
+    gc.collect()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_fn(
+    train_loader, model, optimizer, epoch, scheduler, device, loss_fn, awp=None
+):
+    """
+    Executes one training epoch.
+    """
+    model.train()
+    losses = AverageMeter()
+
+    # Progress bar
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
+
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        targets = batch["labels"].to(device)
+
+        # Bin targets for hybrid loss if needed
+        bin_targets = None
+        if "bin_labels" in batch:
+            bin_targets = batch["bin_labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward
+        outputs = model(input_ids, attention_mask)
+        loss = loss_fn(outputs, targets, bin_targets)
+
+        # Backward
+        loss.backward()
+
+        # Adversarial Weight Perturbation (AWP)
+        if Config.use_awp and awp is not None and epoch >= Config.awp_start_epoch:
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            adv_outputs = model(input_ids, attention_mask)
+            adv_loss = loss_fn(adv_outputs, targets, bin_targets)
+
+            adv_loss.backward()
+            awp.restore()
+
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        # Optimizer Step
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        losses.update(loss.item(), batch_size)
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+            pbar.set_postfix(loss=losses.avg, lr=scheduler.get_last_lr()[0])
+
+    return losses.avg
+=======
+def train_fn(
+    train_loader, model, optimizer, epoch, scheduler, device, loss_fn, awp=None
+):
+    """
+    Executes one training epoch with AMP and Gradient Accumulation.
+    """
+    model.train()
+    losses = AverageMeter()
+    scaler = torch.amp.GradScaler('cuda')
+
+    # Progress bar
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
+    
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        targets = batch["labels"].to(device)
+
+        bin_targets = None
+        if "bin_labels" in batch:
+            bin_targets = batch["bin_labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward with AMP
+        with torch.amp.autocast('cuda'):
+            outputs = model(input_ids, attention_mask)
+            loss = loss_fn(outputs, targets, bin_targets)
+            loss = loss / Config.gradient_accumulation_steps
+
+        # Backward
+        scaler.scale(loss).backward()
+
+        # Adversarial Weight Perturbation (AWP)
+        if Config.use_awp and awp is not None and epoch >= Config.awp_start_epoch:
+            awp.attack_step()
+
+            with torch.amp.autocast('cuda'):
+                adv_outputs = model(input_ids, attention_mask)
+                adv_loss = loss_fn(adv_outputs, targets, bin_targets)
+                adv_loss = adv_loss / Config.gradient_accumulation_steps
+
+            scaler.scale(adv_loss).backward()
+            awp.restore()
+
+        if (step + 1) % Config.gradient_accumulation_steps == 0:
+            # Gradient Clipping (must unscale first)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+            # Optimizer Step
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        losses.update(loss.item() * Config.gradient_accumulation_steps, batch_size)
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+            pbar.set_postfix(loss=losses.avg, lr=scheduler.get_last_lr()[0])
+
+    return losses.avg
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def valid_fn(val_loader, model, device, loss_fn):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    losses = AverageMeter()
+    preds = []
+    ground_truth = []
+
+    pbar = tqdm(val_loader, desc="Validation", leave=False)
+
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            targets = batch["labels"].to(device)
+
+            bin_targets = None
+            if "bin_labels" in batch:
+                bin_targets = batch["bin_labels"].to(device)
+
+            batch_size = input_ids.size(0)
+
+            outputs = model(input_ids, attention_mask)
+            loss = loss_fn(outputs, targets, bin_targets)
+
+            losses.update(loss.item(), batch_size)
+
+            # Collect predictions (Regression logits)
+            # Flatten to 1D array
+            preds.append(outputs["logits"].view(-1).cpu().numpy())
+            ground_truth.append(targets.view(-1).cpu().numpy())
+
+    predictions = np.concatenate(preds)
+    true_labels = np.concatenate(ground_truth)
+
+    score = get_score(true_labels, predictions)
+
+    return losses.avg, score
+
+
+def inference_fn(test_loader, model, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    preds = []
+
+    pbar = tqdm(test_loader, desc="Inference", leave=False)
+
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            outputs = model(input_ids, attention_mask)
+
+            # Collect regression logits
+            preds.append(outputs["logits"].view(-1).cpu().numpy())
+
+    predictions = np.concatenate(preds)
+
+    # Clip predictions to valid range [0, 1]
+    predictions = np.clip(predictions, 0, 1)
+
+    return predictions
+=======
+def valid_fn(val_loader, model, device, loss_fn):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    losses = AverageMeter()
+    preds = []
+    ground_truth = []
+
+    pbar = tqdm(val_loader, desc="Validation", leave=False)
+
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            targets = batch["labels"].to(device)
+
+            bin_targets = None
+            if "bin_labels" in batch:
+                bin_targets = batch["bin_labels"].to(device)
+
+            batch_size = input_ids.size(0)
+
+            with torch.amp.autocast('cuda'):
+                outputs = model(input_ids, attention_mask)
+                loss = loss_fn(outputs, targets, bin_targets)
+
+            losses.update(loss.item(), batch_size)
+
+            preds.append(outputs["logits"].view(-1).float().cpu().numpy())
+            ground_truth.append(targets.view(-1).float().cpu().numpy())
+
+    predictions = np.concatenate(preds)
+    true_labels = np.concatenate(ground_truth)
+
+    score = get_score(true_labels, predictions)
+
+    return losses.avg, score
+
+
+def inference_fn(test_loader, model, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    preds = []
+
+    pbar = tqdm(test_loader, desc="Inference", leave=False)
+
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            with torch.amp.autocast('cuda'):
+                outputs = model(input_ids, attention_mask)
+
+            preds.append(outputs["logits"].view(-1).float().cpu().numpy())
+
+    predictions = np.concatenate(preds)
+    predictions = np.clip(predictions, 0, 1)
+
+    return predictions
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Adjust configuration for A100 efficiency and time limits
+    Config.train_batch_size = 32  # Increase batch size for A100 (40GB VRAM)
+    Config.valid_batch_size = 64
+    Config.epochs = 3  # Limit epochs to ensure completion < 2h
+    Config.dapt_epochs = 1  # Limit DAPT epochs
+    Config.dapt_batch_size = 32
+
+    # Ensure directories exist
+=======
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Adjust configuration for 16GB VRAM (detected environment)
+    # Using small batch size + gradient accumulation to simulate large batch
+    Config.train_batch_size = 4
+    Config.valid_batch_size = 8
+    Config.dapt_batch_size = 4
+    Config.gradient_accumulation_steps = 8  # Effective batch size = 4 * 8 = 32
+    
+    Config.epochs = 3
+    Config.dapt_epochs = 1 
+
+    # Ensure directories exist
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = CustomModel(config_path=backbone_path, pretrained=True)
+    model.to(Config.device)
+
+    # =========================================================================
+    # 4. Training Setup
+    # =========================================================================
+    # Optimizer with Layer-wise Learning Rate Decay (LLRD)
+    optimizer_params = get_optimizer_params(
+        model,
+        encoder_lr=Config.learning_rate,
+        decoder_lr=Config.learning_rate * 5.0,
+        weight_decay=Config.weight_decay,
+    )
+    optimizer = torch.optim.AdamW(
+        optimizer_params, lr=Config.learning_rate, eps=Config.eps
+    )
+
+    # Scheduler
+    num_train_steps = int(len(train_loader) * Config.epochs)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_train_steps * Config.warmup_ratio),
+        num_training_steps=num_train_steps,
+    )
+=======
+    # Initialize Model
+    model = CustomModel(config_path=backbone_path, pretrained=True)
+    model.to(Config.device)
+    
+    # Enable Gradient Checkpointing to save memory
+    if hasattr(model.model, "gradient_checkpointing_enable"):
+        model.model.gradient_checkpointing_enable()
+        logger.info("Gradient Checkpointing enabled.")
+
+    # =========================================================================
+    # 4. Training Setup
+    # =========================================================================
+    # Optimizer with Layer-wise Learning Rate Decay (LLRD)
+    optimizer_params = get_optimizer_params(
+        model,
+        encoder_lr=Config.learning_rate,
+        decoder_lr=Config.learning_rate * 5.0,
+        weight_decay=Config.weight_decay,
+    )
+    optimizer = torch.optim.AdamW(
+        optimizer_params, lr=Config.learning_rate, eps=Config.eps
+    )
+
+    # Scheduler
+    # Adjust total steps for gradient accumulation
+    num_update_steps = int(len(train_loader) / Config.gradient_accumulation_steps * Config.epochs)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_update_steps * Config.warmup_ratio),
+        num_training_steps=num_update_steps,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(Config.device)
+            attention_mask = batch["attention_mask"].to(Config.device)
+            labels = batch["labels"].to(Config.device)
+
+            outputs = model(input_ids, attention_mask)
+            val_preds.append(outputs["logits"].view(-1).cpu().numpy())
+            val_targets.append(labels.view(-1).cpu().numpy())
+=======
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(Config.device)
+            attention_mask = batch["attention_mask"].to(Config.device)
+            labels = batch["labels"].to(Config.device)
+
+            with torch.amp.autocast('cuda'):
+                outputs = model(input_ids, attention_mask)
+            
+            val_preds.append(outputs["logits"].view(-1).float().cpu().numpy())
+            val_targets.append(labels.view(-1).float().cpu().numpy())
+>>>>>>> REPLACE
+```

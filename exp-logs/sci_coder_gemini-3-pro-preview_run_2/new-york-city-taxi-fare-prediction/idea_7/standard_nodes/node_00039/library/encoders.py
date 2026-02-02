@@ -1,0 +1,148 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold
+
+
+class GlobalRouteEncoder:
+    """
+    Implements Global-Scale Out-of-Fold (OOF) Target Encoding.
+
+    This encoder discretizes spatial coordinates into grid cells and computes
+    mean target values for each route (pickup_cell -> dropoff_cell).
+
+    For the training set, it uses K-Fold OOF encoding to prevent data leakage.
+    For validation/test sets, it applies the global mean computed from the full training set.
+    """
+
+    def __init__(
+        self, grid_precision, n_splits=5, random_state=42, target_col="fare_amount"
+    ):
+        """
+        Args:
+            grid_precision (int): Decimal places for coordinate rounding.
+            n_splits (int): Number of folds for OOF encoding.
+            random_state (int): Seed for reproducibility.
+            target_col (str): Name of the target variable.
+        """
+        self.grid_precision = grid_precision
+        self.n_splits = n_splits
+        self.random_state = random_state
+        self.target_col = target_col
+        self.global_map = None
+        self.global_mean = None
+        self.group_cols = ["p_lat_r", "p_lon_r", "d_lat_r", "d_lon_r"]
+
+    def _discretize(self, df):
+        """
+        Rounds coordinates to create grid cells.
+        Returns a copy of the dataframe with discretized columns.
+        """
+        df = df.copy()
+        df["p_lat_r"] = np.round(df["pickup_latitude"], self.grid_precision)
+        df["p_lon_r"] = np.round(df["pickup_longitude"], self.grid_precision)
+        df["d_lat_r"] = np.round(df["dropoff_latitude"], self.grid_precision)
+        df["d_lon_r"] = np.round(df["dropoff_longitude"], self.grid_precision)
+        return df
+
+    def fit_transform_oof(self, df):
+        """
+        Performs K-Fold OOF Target Encoding on the training set.
+
+        1. Discretizes coordinates.
+        2. Splits data into K folds.
+        3. For each fold, computes mean target of routes using out-of-fold data.
+        4. Fills NaNs with global mean.
+        5. Stores global statistics for later use in transform_global.
+
+        Args:
+            df (pd.DataFrame): Training data containing coordinates and target.
+
+        Returns:
+            pd.DataFrame: Dataframe with added 'oof_fare' column.
+        """
+        # Discretize coordinates
+        df = self._discretize(df)
+
+        # Initialize OOF column
+        df["oof_fare"] = np.nan
+
+        # Setup K-Fold
+        kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+
+        # Iterate through folds
+        for train_idx, val_idx in kf.split(df):
+            # Extract training fold data (features + target)
+            # We only need the grouping columns and the target
+            train_fold = df.iloc[train_idx][self.group_cols + [self.target_col]]
+
+            # Compute route means on the training fold
+            route_stats = (
+                train_fold.groupby(self.group_cols)[self.target_col]
+                .mean()
+                .reset_index(name="mean_fare")
+            )
+
+            # Prepare validation fold for merging
+            # We reset index to preserve original indices for assignment
+            val_fold_features = df.iloc[val_idx][self.group_cols].reset_index()
+
+            # Merge stats onto validation fold
+            merged = val_fold_features.merge(
+                route_stats, on=self.group_cols, how="left"
+            )
+
+            # Assign predicted means back to the main dataframe
+            # merged['index'] holds the original dataframe index
+            # merged['mean_fare'] holds the OOF prediction
+            update_series = pd.Series(
+                merged["mean_fare"].values, index=merged["index"].values
+            )
+            df.loc[update_series.index, "oof_fare"] = update_series
+
+        # Compute Global Stats (on full dataset) for inference
+        self.global_mean = df[self.target_col].mean()
+
+        # Fill NaNs in OOF column with global mean
+        df["oof_fare"] = df["oof_fare"].fillna(self.global_mean)
+
+        # Create and store the Global Route Map
+        # This map will be used for the test set / validation set (transform_global)
+        self.global_map = (
+            df.groupby(self.group_cols)[self.target_col].mean().reset_index()
+        )
+        self.global_map.rename(
+            columns={self.target_col: "global_avg_fare"}, inplace=True
+        )
+
+        return df
+
+    def transform_global(self, df):
+        """
+        Applies Global Target Encoding to a new dataset (Test/Val).
+        Uses the map computed during fit_transform_oof.
+
+        Args:
+            df (pd.DataFrame): Data containing coordinates.
+
+        Returns:
+            pd.DataFrame: Dataframe with added 'oof_fare' column.
+        """
+        if self.global_map is None:
+            raise ValueError(
+                "Encoder must be fitted using fit_transform_oof before calling transform_global."
+            )
+
+        # Discretize
+        df = self._discretize(df)
+
+        # Merge with global map
+        # We use left merge to preserve the input dataframe structure
+        df = df.merge(self.global_map, on=self.group_cols, how="left")
+
+        # Fill missing routes with the global mean
+        df["oof_fare"] = df["global_avg_fare"].fillna(self.global_mean)
+
+        # Drop the intermediate column from the merge
+        df = df.drop(columns=["global_avg_fare"])
+
+        return df

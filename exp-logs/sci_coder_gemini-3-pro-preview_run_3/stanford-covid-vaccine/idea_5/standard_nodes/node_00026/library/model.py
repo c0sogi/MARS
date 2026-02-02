@@ -1,0 +1,156 @@
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+class ResidualBlock1D(nn.Module):
+    """
+    A 1D Residual Block utilizing dilated convolutions to capture multi-scale features.
+    Architecture:
+        Input -> Conv1d(dilation) -> BN -> ReLU -> Dropout -> Conv1d(dilation) -> BN -> Add(Input) -> ReLU
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(ResidualBlock1D, self).__init__()
+
+        # Calculate padding to maintain sequence length: P = (K-1) * D // 2
+        # Assumes kernel_size is odd (e.g., 3)
+        padding = (kernel_size - 1) * dilation // 2
+
+        # First convolution layer
+        self.conv1 = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            bias=False,  # Bias is redundant with BatchNorm
+        )
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # Second convolution layer
+        self.conv2 = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm1d(channels)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        # Residual connection
+        out += residual
+        out = self.act(out)
+
+        return out
+
+
+class DilatedResidualBiGRU(nn.Module):
+    """
+    Dilated Residual CRNN Architecture for RNA Degradation Prediction.
+
+    Components:
+    1. Input Projection: Maps one-hot encoded inputs to feature space.
+    2. Dilated Residual Encoder: Hierarchically extracts structural motifs using increasing dilation rates.
+    3. BiGRU Backbone: Models global sequential dependencies and long-range interactions.
+    4. Output Head: Projects hidden states to the 5 target variables.
+    """
+
+    def __init__(self):
+        super(DilatedResidualBiGRU, self).__init__()
+
+        # Load hyperparameters from Config
+        input_channels = Config.NUM_CHANNELS
+        cnn_filters = Config.CNN_FILTERS
+        kernel_size = Config.CNN_KERNEL_SIZE
+        dilation_rates = Config.DILATION_RATES
+        dropout_rate = Config.DROPOUT
+        rnn_hidden = Config.RNN_HIDDEN_DIM
+        rnn_layers = Config.RNN_LAYERS
+        num_targets = Config.NUM_TARGETS
+
+        # 1. Feature Projection
+        # Projects (N, 14, L) -> (N, 64, L)
+        self.projection = nn.Conv1d(input_channels, cnn_filters, kernel_size=1)
+        self.proj_bn = nn.BatchNorm1d(cnn_filters)
+        self.proj_act = nn.ReLU()
+
+        # 2. Dilated Residual Encoder
+        # Stack blocks with geometrically increasing dilation rates
+        blocks = []
+        for rate in dilation_rates:
+            blocks.append(
+                ResidualBlock1D(
+                    channels=cnn_filters,
+                    kernel_size=kernel_size,
+                    dilation=rate,
+                    dropout=dropout_rate,
+                )
+            )
+        self.encoder = nn.Sequential(*blocks)
+
+        # 3. Recurrent Backbone (BiGRU)
+        # Input size matches CNN output channels
+        self.gru = nn.GRU(
+            input_size=cnn_filters,
+            hidden_size=rnn_hidden,
+            num_layers=rnn_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout_rate if rnn_layers > 1 else 0,
+        )
+
+        # 4. Output Head
+        # BiGRU outputs hidden_size * 2 (for forward and backward directions)
+        self.fc_dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(rnn_hidden * 2, num_targets)
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x: Input tensor of shape (Batch, Seq_Len, Channels)
+               Note: DataLoader provides (Batch, Seq_Len, Channels), but Conv1d expects (Batch, Channels, Seq_Len).
+
+        Returns:
+            out: Prediction tensor of shape (Batch, Seq_Len, Targets)
+        """
+        # Permute input for CNN: (Batch, Seq_Len, Channels) -> (Batch, Channels, Seq_Len)
+        x = x.permute(0, 2, 1)
+
+        # Projection
+        x = self.projection(x)
+        x = self.proj_bn(x)
+        x = self.proj_act(x)
+
+        # Dilated CNN Encoder
+        x = self.encoder(x)
+
+        # Permute output for RNN: (Batch, Channels, Seq_Len) -> (Batch, Seq_Len, Channels)
+        x = x.permute(0, 2, 1)
+
+        # GRU Backbone
+        # output shape: (Batch, Seq_Len, Hidden_Dim * 2)
+        # h_n shape: (Num_Layers * 2, Batch, Hidden_Dim) - not used here
+        x, _ = self.gru(x)
+
+        # Output Head
+        x = self.fc_dropout(x)
+        out = self.fc(x)
+
+        return out

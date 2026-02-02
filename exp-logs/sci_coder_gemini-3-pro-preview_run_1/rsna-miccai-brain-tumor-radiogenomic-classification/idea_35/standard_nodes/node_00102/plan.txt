@@ -1,0 +1,427 @@
+My strategy is to revert the complex 9-channel "SICAV" architecture to a robust 3-channel "Middle Slice" baseline, while maintaining the aggressive regularization that showed promise in previous experiments.
+
+1.  **Data Processing**: I will simplify the input representation from a 9-channel volume (derived from ROI-based relative depths) to a standard 3-channel image formed by stacking the middle slice of FLAIR, T1wCE, and T2w modalities. This aligns with **Cite solution_lesson_node_00002** (Middle Slice is a strong baseline) and **Cite solution_lesson_node_00036** (Independent slice selection is superior to cross-modality projection).
+2.  **Model Architecture**: I will revert the model to a standard EfficientNet-B0 with 3 input channels, removing the custom "Gaussian Weight Inflation" initialization which likely introduced noise.
+3.  **Regularization**: I will maintain the aggressive weight decay ($10^{-2}$) and non-rigid augmentations (ElasticTransform, GridDistortion) to combat overfitting on this small dataset, as recommended by **Cite solution_lesson_node_00010**.
+4.  **Training**: I will increase the number of epochs in `runfile.py` from 5 to 10, as the simplified data pipeline will be faster and less prone to immediate divergence, allowing for better convergence analysis.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Working Directory for Caching and Checkpoints
+# Using specific idea folder as requested
+WORKING_DIR = "./working/idea_35"
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+CACHE_DIR = WORKING_DIR  # Alias for clarity in data processing modules
+
+# Output Paths
+SUBMISSION_DIR = "./submission"
+os.makedirs(SUBMISSION_DIR, exist_ok=True)
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+# ==========================================
+# Data Processing Hyperparameters
+# ==========================================
+IMG_SIZE = 224
+NUM_CHANNELS = 9  # 3 modalities (FLAIR, T1wCE, T2w) * 3 depths
+RELATIVE_DEPTHS = [0.4, 0.5, 0.6]  # Scale-Invariant Relative Depth Sampling
+=======
+# Working Directory for Caching and Checkpoints
+# Using specific idea folder as requested
+WORKING_DIR = "./working/idea_36"
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+CACHE_DIR = WORKING_DIR  # Alias for clarity in data processing modules
+
+# Output Paths
+SUBMISSION_DIR = "./submission"
+os.makedirs(SUBMISSION_DIR, exist_ok=True)
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+# ==========================================
+# Data Processing Hyperparameters
+# ==========================================
+IMG_SIZE = 224
+NUM_CHANNELS = 3  # 3 modalities (FLAIR, T1wCE, T2w) - Middle Slice
+RELATIVE_DEPTHS = []  # Not used in 3-channel baseline
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def get_modality_roi(modality_path):
+    """
+    Scans all DICOM files in a modality folder to find the start and end indices
+    of the brain tissue (pixels > 0).
+
+    Returns:
+        tuple: (start_index, end_index, sorted_file_names)
+    """
+    if not os.path.exists(modality_path):
+        return 0, 0, []
+
+    files = [f for f in os.listdir(modality_path) if f.endswith(".dcm")]
+    files.sort(key=natural_sort_key)
+
+    if not files:
+        return 0, 0, []
+
+    # If there are too many files, checking every single one might be slow,
+    # but for ROI accuracy we should check. Given the constraints and hardware,
+    # we proceed with a linear scan.
+
+    has_tissue = []
+
+    for f in files:
+        f_path = os.path.join(modality_path, f)
+        # We need to read the image to check for max > 0
+        # Optimization: Use pydicom with stop_before_pixels=False to check if we can skip?
+        # No, we need pixel data.
+        img = load_dicom_slice(f_path, resize_to=IMG_SIZE)
+        if np.max(img) > 0:
+            has_tissue.append(True)
+        else:
+            has_tissue.append(False)
+
+    # Find first and last True
+    indices = [i for i, x in enumerate(has_tissue) if x]
+
+    if not indices:
+        # Fallback: use whole range if no tissue detected (unlikely but possible in bad data)
+        return 0, len(files) - 1, files
+
+    return indices[0], indices[-1], files
+
+
+def select_sicav_indices(start_idx, end_idx, depths=RELATIVE_DEPTHS):
+    """
+    Calculates file indices corresponding to specific relative depths within the ROI.
+    """
+    length = end_idx - start_idx
+    indices = []
+    for d in depths:
+        # Calculate relative position
+        rel_pos = start_idx + (length * d)
+        idx = int(round(rel_pos))
+        # Clamp to valid range
+        idx = max(start_idx, min(end_idx, idx))
+        indices.append(idx)
+    return indices
+
+
+def process_subject(row, input_dir):
+    """
+    Generates the 9-channel input tensor for a single subject using SICAV strategy.
+
+    Channels 0-2: [FLAIR, T1wCE, T2w] at 40% ROI depth
+    Channels 3-5: [FLAIR, T1wCE, T2w] at 50% ROI depth
+    Channels 6-8: [FLAIR, T1wCE, T2w] at 60% ROI depth
+    """
+    # Modalities of interest for the 9-channel tensor
+    # Note: T1w is excluded based on the strategy description.
+    modalities = ["flair", "t1wce", "t2w"]
+
+    # Store images for each modality at each depth
+    # Structure: depth_images[depth_index][modality_index]
+    depth_images = {d_idx: [] for d_idx in range(len(RELATIVE_DEPTHS))}
+
+    for mod in modalities:
+        # Construct full path
+        rel_path = row[f"{mod}_path"]
+        full_path = os.path.join(input_dir, rel_path)
+
+        # 1. Get ROI
+        start, end, files = get_modality_roi(full_path)
+
+        if not files:
+            # Handle missing modality with zeros
+            for d_idx in range(len(RELATIVE_DEPTHS)):
+                depth_images[d_idx].append(
+                    np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+                )
+            continue
+
+        # 2. Select Indices
+        indices = select_sicav_indices(start, end, RELATIVE_DEPTHS)
+
+        # 3. Load and Normalize Images
+        for d_idx, file_idx in enumerate(indices):
+            file_name = files[file_idx]
+            file_path = os.path.join(full_path, file_name)
+
+            img = load_dicom_slice(file_path, resize_to=IMG_SIZE)
+            img = min_max_normalize(img)
+            depth_images[d_idx].append(img)
+
+    # Stack into (224, 224, 9)
+    # Order:
+    # D0: FLAIR, T1wCE, T2w
+    # D1: FLAIR, T1wCE, T2w
+    # D2: FLAIR, T1wCE, T2w
+
+    channels = []
+    for d_idx in range(len(RELATIVE_DEPTHS)):
+        channels.extend(depth_images[d_idx])
+
+    # Stack along the last axis (channels)
+    tensor = np.stack(channels, axis=-1)
+    return tensor
+=======
+def process_subject(row, input_dir):
+    """
+    Generates the 3-channel input tensor for a single subject using Middle Slice strategy.
+    Channels: [FLAIR, T1wCE, T2w]
+    Cite solution_lesson_node_00002: Middle slice is a strong baseline.
+    Cite solution_lesson_node_00036: Independent slice selection is robust.
+    """
+    modalities = ["flair", "t1wce", "t2w"]
+    channels = []
+
+    for mod in modalities:
+        # Construct full path
+        rel_path = row[f"{mod}_path"]
+        full_path = os.path.join(input_dir, rel_path)
+
+        # Check existence and list files
+        if os.path.exists(full_path):
+            files = [f for f in os.listdir(full_path) if f.endswith(".dcm")]
+            files.sort(key=natural_sort_key)
+        else:
+            files = []
+
+        if not files:
+            # Handle missing modality with zeros
+            img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+        else:
+            # Select Middle Slice
+            idx = len(files) // 2
+            file_name = files[idx]
+            file_path = os.path.join(full_path, file_name)
+
+            img = load_dicom_slice(file_path, resize_to=IMG_SIZE)
+            img = min_max_normalize(img)
+
+        channels.append(img)
+
+    # Stack along the last axis (channels) -> (224, 224, 3)
+    tensor = np.stack(channels, axis=-1)
+    return tensor
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+    # 2. Process from scratch
+    print(f"Processing {split_name} data from scratch (SICAV Strategy)...")
+
+    # Select metadata file
+=======
+    # 2. Process from scratch
+    print(f"Processing {split_name} data from scratch (Middle Slice Strategy)...")
+
+    # Select metadata file
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SICAVModel(nn.Module):
+    """
+    Scale-Invariant Centroid-Aligned Volumetric (SICAV) Network.
+
+    This model uses an EfficientNet-B0 backbone modified to accept 9-channel inputs.
+    The input channels correspond to [FLAIR, T1wCE, T2w] stacked at three relative
+    depths (40%, 50%, 60%) of the brain ROI.
+
+    The first convolutional layer is initialized using Gaussian Weight Inflation to
+    preserve ImageNet priors while integrating volumetric context.
+    """
+
+    def __init__(
+        self,
+        backbone_name=BACKBONE,
+        num_channels=NUM_CHANNELS,
+        num_classes=NUM_CLASSES,
+        dropout_rate=DROPOUT_RATE,
+        pretrained=True,
+    ):
+        super(SICAVModel, self).__init__()
+
+        # 1. Load Backbone
+        # num_classes=0 removes the default classifier head, returning pooled features
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=3,  # Initialize with standard 3 channels first, then modify
+        )
+
+        # 2. Modify First Layer for 9 Channels
+        self._modify_first_layer(num_channels)
+
+        # 3. Define Classifier Head
+        # Get the number of features output by the backbone
+        num_features = self.backbone.num_features
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate), nn.Linear(num_features, num_classes)
+        )
+
+    def _modify_first_layer(self, new_in_channels):
+        """
+        Replaces the first convolutional layer to accept `new_in_channels`
+        and initializes it using Gaussian Weight Inflation.
+        """
+        # Identify the first layer. For EfficientNet in timm, it's usually 'conv_stem'.
+        # We check common names just in case, but 'conv_stem' is standard for EffNet.
+        if hasattr(self.backbone, "conv_stem"):
+            old_layer = self.backbone.conv_stem
+            layer_name = "conv_stem"
+        elif hasattr(self.backbone, "conv1"):
+            old_layer = self.backbone.conv1
+            layer_name = "conv1"
+        else:
+            raise AttributeError(
+                "Could not find the first convolutional layer in the backbone."
+            )
+
+        # Create new layer with same parameters but different in_channels
+        new_layer = nn.Conv2d(
+            in_channels=new_in_channels,
+            out_channels=old_layer.out_channels,
+            kernel_size=old_layer.kernel_size,
+            stride=old_layer.stride,
+            padding=old_layer.padding,
+            bias=old_layer.bias is not None,
+        )
+
+        # Apply Gaussian Weight Inflation
+        self._gaussian_weight_inflation(old_layer, new_layer)
+
+        # Replace the layer in the backbone
+        setattr(self.backbone, layer_name, new_layer)
+
+    def _gaussian_weight_inflation(self, old_layer, new_layer):
+        """
+        Initializes the new 9-channel weights based on the original 3-channel weights.
+
+        Strategy:
+        - Channels 3-5 (Center/50% depth): 50% of original weight energy.
+        - Channels 0-2 (Peripheral/40% depth): 25% of original weight energy.
+        - Channels 6-8 (Peripheral/60% depth): 25% of original weight energy.
+
+        This sums to 100% of the original signal magnitude, preserving initialization statistics.
+        """
+        with torch.no_grad():
+            old_weights = old_layer.weight  # Shape: (Out, 3, K, K)
+            new_weights = new_layer.weight  # Shape: (Out, 9, K, K)
+
+            # Ensure the new weights are zeroed out first
+            new_weights.zero_()
+
+            # Copy and scale weights
+            # 1. Peripheral (40% depth) -> Channels 0, 1, 2
+            new_weights[:, 0:3, :, :] = old_weights * 0.25
+
+            # 2. Center (50% depth) -> Channels 3, 4, 5
+            new_weights[:, 3:6, :, :] = old_weights * 0.50
+
+            # 3. Peripheral (60% depth) -> Channels 6, 7, 8
+            new_weights[:, 6:9, :, :] = old_weights * 0.25
+
+            # If bias exists, copy it directly
+            if old_layer.bias is not None and new_layer.bias is not None:
+                new_layer.bias = old_layer.bias
+=======
+class SICAVModel(nn.Module):
+    """
+    Standard EfficientNet-B0 Model.
+    
+    Reverted to standard 3-channel input (FLAIR, T1wCE, T2w) based on lessons learned.
+    Cite solution_lesson_node_00002: Middle slice baseline.
+    """
+
+    def __init__(
+        self,
+        backbone_name=BACKBONE,
+        num_channels=NUM_CHANNELS,
+        num_classes=NUM_CLASSES,
+        dropout_rate=DROPOUT_RATE,
+        pretrained=True,
+    ):
+        super(SICAVModel, self).__init__()
+
+        # 1. Load Backbone
+        # num_classes=0 removes the default classifier head, returning pooled features
+        # in_chans=3 allows loading standard pretrained weights without modification
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=num_channels, 
+            drop_rate=dropout_rate # Explicitly pass dropout rate to backbone if supported
+        )
+
+        # 2. Define Classifier Head
+        # Get the number of features output by the backbone
+        num_features = self.backbone.num_features
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate), nn.Linear(num_features, num_classes)
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+class SICAVDataset(Dataset):
+    """
+    PyTorch Dataset for the SICAV Network strategy.
+
+    Expects input images to be pre-processed into (H, W, 9) tensors representing:
+    - Channels 0-2: FLAIR, T1wCE, T2w at 40% Relative Depth
+    - Channels 3-5: FLAIR, T1wCE, T2w at 50% Relative Depth (Centroid)
+    - Channels 6-8: FLAIR, T1wCE, T2w at 60% Relative Depth
+
+    Strictly preserves spatial alignment by avoiding translation/scaling augmentations.
+    """
+=======
+class SICAVDataset(Dataset):
+    """
+    PyTorch Dataset for the Middle Slice strategy.
+
+    Expects input images to be pre-processed into (H, W, 3) tensors representing:
+    - Channel 0: FLAIR Middle Slice
+    - Channel 1: T1wCE Middle Slice
+    - Channel 2: T2w Middle Slice
+
+    Strictly preserves spatial alignment by avoiding translation/scaling augmentations.
+    """
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# ==========================================
+# Configuration Overrides for Fast Baseline
+# ==========================================
+# Limit epochs to ensure execution within time limits
+config.EPOCHS = 5
+# Ensure we use the working directory defined in config
+WORKING_DIR = config.WORKING_DIR
+=======
+# ==========================================
+# Configuration Overrides for Fast Baseline
+# ==========================================
+# Limit epochs to ensure execution within time limits
+config.EPOCHS = 10
+# Ensure we use the working directory defined in config
+WORKING_DIR = config.WORKING_DIR
+>>>>>>> REPLACE
+```

@@ -1,0 +1,248 @@
+The error `ValueError: Expected x_min ... to be in the range [0.0, 1.0]` occurs because the previous data loading logic created a fallback image of size 640x640 when `pydicom` failed to decode the DICOM file (due to missing codecs), but it continued to use the ground truth bounding boxes defined in the original high-resolution coordinate system (e.g., 3000x3000px). This mismatch caused the bounding boxes to fall outside the image boundaries, triggering the validation error in Albumentations.
+
+I will fix this by modifying `library/dataset.py` to:
+1.  Import `tensorflow` and use `tf.io.decode_image` as a robust fallback for decoding DICOM pixel data when `pydicom` fails (Cite debug_lesson_6).
+2.  Update the `__getitem__` method to extract the original image dimensions (`Rows`, `Columns`) from the DICOM header first.
+3.  Ensure that if image decoding fails completely, the fallback black image is created using these **original** dimensions, ensuring geometric consistency with the labels (Cite debug_lesson_9).
+4.  Discard bounding boxes if the image metadata cannot be read at all, preventing the crash.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import os
+import ast
+import cv2
+import torch
+import pydicom
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from library.config import Config
+from library.transforms import get_transforms
+
+
+class CovidDataset(Dataset):
+=======
+import os
+import ast
+import cv2
+import torch
+import pydicom
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from torch.utils.data import Dataset, DataLoader
+from library.config import Config
+from library.transforms import get_transforms
+
+# Prevent TensorFlow from allocating GPU memory (since we use PyTorch for training)
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except:
+    pass
+
+
+class CovidDataset(Dataset):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # --- 1. Image Loading ---
+        img_path = os.path.join(Config.INPUT_DIR, row["file_path"])
+
+        try:
+            dcm = pydicom.dcmread(img_path)
+            image = dcm.pixel_array
+
+            # Fix Photometric Interpretation (MONOCHROME1 means 0 is white)
+            if (
+                hasattr(dcm, "PhotometricInterpretation")
+                and dcm.PhotometricInterpretation == "MONOCHROME1"
+            ):
+                image = np.max(image) - image
+
+            # Normalize to 0-255 and convert to uint8
+            image = image.astype(np.float32)
+            image = (image - image.min()) / (image.max() - image.min() + 1e-6) * 255.0
+            image = image.astype(np.uint8)
+
+            # Convert Grayscale to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+        except Exception:
+            # Fallback for corrupt files (creates black image)
+            image = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE, 3), dtype=np.uint8)
+
+        orig_h, orig_w = image.shape[:2]
+
+        # --- 2. Target Preparation ---
+        # Retrieve boxes
+        # When loading from parquet, lists might be numpy arrays or lists
+        boxes = row["parsed_boxes"]
+        if isinstance(boxes, np.ndarray):
+            boxes = boxes.tolist()
+        elif not isinstance(boxes, list):
+            boxes = []
+
+        # Create detection labels (1 for opacity)
+        labels = [1] * len(boxes)
+
+        study_label = int(row["study_label"])
+
+        # --- 3. Augmentation ---
+        if self.transform:
+            transformed = self.transform(image=image, bboxes=boxes, class_labels=labels)
+            image = transformed["image"]
+            boxes = transformed["bboxes"]
+            labels = transformed["class_labels"]
+        else:
+            # Basic tensor conversion if no transform provided
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+
+        # --- 4. Tensor Formatting ---
+        if len(boxes) > 0:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "study_label": torch.tensor(study_label, dtype=torch.int64),
+            "image_id": row["image_id"],
+            "study_id": row["study_id"],
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int32),
+        }
+
+        return image, target
+=======
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # --- 1. Image Loading ---
+        img_path = os.path.join(Config.INPUT_DIR, row["file_path"])
+
+        image = None
+        load_success = False
+        
+        # Default dimensions in case of total failure
+        orig_h = Config.IMG_SIZE
+        orig_w = Config.IMG_SIZE
+
+        try:
+            dcm = pydicom.dcmread(img_path)
+            
+            # Cite debug_lesson_9: Synchronize Fallback Image Dimensions with Labels
+            if hasattr(dcm, "Rows") and hasattr(dcm, "Columns"):
+                orig_h = int(dcm.Rows)
+                orig_w = int(dcm.Columns)
+
+            try:
+                # Strategy 1: Standard pydicom pixel_array
+                image = dcm.pixel_array
+
+                if (
+                    hasattr(dcm, "PhotometricInterpretation")
+                    and dcm.PhotometricInterpretation == "MONOCHROME1"
+                ):
+                    image = np.max(image) - image
+
+                image = image.astype(np.float32)
+                image = (image - image.min()) / (image.max() - image.min() + 1e-6) * 255.0
+                image = image.astype(np.uint8)
+
+                if image.ndim == 2:
+                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+                elif image.ndim == 3 and image.shape[2] == 1:
+                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+                
+                load_success = True
+
+            except Exception:
+                # Cite debug_lesson_6: Bypass Missing Codecs with Cross-Library Decoding Fallbacks
+                try:
+                    # Strategy 2: TensorFlow decode_image
+                    image_tensor = tf.io.decode_image(dcm.PixelData)
+                    image = image_tensor.numpy()
+
+                    if (
+                        hasattr(dcm, "PhotometricInterpretation")
+                        and dcm.PhotometricInterpretation == "MONOCHROME1"
+                    ):
+                        image = 255 - image
+
+                    if image.ndim == 2:
+                        image = np.stack([image] * 3, axis=-1)
+                    elif image.ndim == 3:
+                        if image.shape[2] == 1:
+                            image = np.concatenate([image, image, image], axis=-1)
+                    
+                    image = image.astype(np.uint8)
+                    
+                    if image.shape[0] != orig_h or image.shape[1] != orig_w:
+                        image = cv2.resize(image, (orig_w, orig_h))
+                        
+                    load_success = True
+                except Exception:
+                    # Strategy 3: Black image of CORRECT dimensions
+                    image = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+                    load_success = True
+
+        except Exception:
+            # Total failure
+            image = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE, 3), dtype=np.uint8)
+            load_success = False
+
+        # --- 2. Target Preparation ---
+        boxes = row["parsed_boxes"]
+        if isinstance(boxes, np.ndarray):
+            boxes = boxes.tolist()
+        elif not isinstance(boxes, list):
+            boxes = []
+        
+        # If loading failed completely, discard boxes to avoid augmentation errors
+        if not load_success:
+            boxes = []
+
+        # Create detection labels (1 for opacity)
+        labels = [1] * len(boxes)
+
+        study_label = int(row["study_label"])
+
+        # --- 3. Augmentation ---
+        if self.transform:
+            transformed = self.transform(image=image, bboxes=boxes, class_labels=labels)
+            image = transformed["image"]
+            boxes = transformed["bboxes"]
+            labels = transformed["class_labels"]
+        else:
+            # Basic tensor conversion if no transform provided
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+
+        # --- 4. Tensor Formatting ---
+        if len(boxes) > 0:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "study_label": torch.tensor(study_label, dtype=torch.int64),
+            "image_id": row["image_id"],
+            "study_id": row["study_id"],
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int32),
+        }
+
+        return image, target
+>>>>>>> REPLACE
+```

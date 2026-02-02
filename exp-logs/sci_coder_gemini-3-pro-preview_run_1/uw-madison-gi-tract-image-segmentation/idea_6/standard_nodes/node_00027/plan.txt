@@ -1,0 +1,1017 @@
+Implementation strategy:
+1.  **Modify `Config`**: Update hyperparameters for a 2.5D approach (Batch Size 32, ResNet18 backbone, 3 input channels) to leverage Lesson `solution_lesson_node_00026` and `solution_lesson_node_00012`.
+2.  **Update `library/model.py`**: Replace the 3D ResNet implementation with a standard 2D ResNet-18 U-Net. This aligns with Lesson `solution_lesson_node_00026` which prioritizes 2.5D/2D approaches over full 3D for this dataset.
+3.  **Update `library/data.py`**: 
+    -   Enhance `preprocess_dataset` to capture volume depth.
+    -   Implement a `SliceDataset` that loads full volumes into memory (feasible given 220GB RAM) and yields 2.5D slices (channels: $z-1, z, z+1$) for training.
+    -   Retain `VolumetricDataset` for validation/inference but ensure it returns the full volume for the "reconstruct-then-score" validation strategy (Lesson `solution_lesson_node_00006`).
+4.  **Update `library/trainer.py`**:
+    -   Refactor the inference logic to perform slice-by-slice prediction (2.5D) on the validation volumes instead of 3D sliding windows.
+    -   Update the training loop to handle 2D batches.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # 3D Patch Size: (Depth, Height, Width)
+    # Selected based on A100 40GB memory constraints and 3D ResNet requirements
+    PATCH_SIZE = (32, 224, 224)
+    SPATIAL_SIZE = (224, 224)
+    DEPTH_SIZE = 32
+
+    # Robust Percentile Normalization
+    # Clips intensities to exclude outliers before scaling to [0, 1]
+    LOWER_PERCENTILE = 1.0
+    UPPER_PERCENTILE = 99.0
+
+    # Target Classes
+    CLASSES = ["large_bowel", "small_bowel", "stomach"]
+    NUM_CLASSES = 3
+
+    # ==============================
+    # Model Architecture
+    # ==============================
+    # Using 3D ResNet-18 as the encoder backbone
+    BACKBONE = "r3d_18"
+    IN_CHANNELS = 1
+    OUT_CHANNELS = 3
+
+    # ==============================
+    # Training Hyperparameters
+    # ==============================
+    BATCH_SIZE = 4  # Conservative batch size for 3D volumes
+    EPOCHS = 20  # Sufficient for convergence given the pre-trained backbone
+    LEARNING_RATE = 1e-3
+=======
+    # Spatial Size for 2D/2.5D inputs
+    SPATIAL_SIZE = (224, 224)
+    
+    # Robust Percentile Normalization
+    # Clips intensities to exclude outliers before scaling to [0, 1]
+    # Cite solution_lesson_node_00011
+    LOWER_PERCENTILE = 1.0
+    UPPER_PERCENTILE = 99.0
+
+    # Target Classes
+    CLASSES = ["large_bowel", "small_bowel", "stomach"]
+    NUM_CLASSES = 3
+
+    # ==============================
+    # Model Architecture
+    # ==============================
+    # Using 2D ResNet-18 as the encoder backbone (2.5D approach)
+    # Cite solution_lesson_node_00012 (ResNet speed)
+    # Cite solution_lesson_node_00026 (2.5D vs 3D)
+    BACKBONE = "resnet18"
+    IN_CHANNELS = 3  # Slice z-1, z, z+1
+    OUT_CHANNELS = 3
+
+    # ==============================
+    # Training Hyperparameters
+    # ==============================
+    BATCH_SIZE = 32  # Higher batch size for 2D
+    EPOCHS = 15
+    LEARNING_RATE = 5e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.video import r3d_18, R3D_18_Weights
+from library.config import Config
+
+
+class ConvBlock3d(nn.Module):
+    """
+    Basic 3D Convolution Block: Conv3d -> BN -> ReLU
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super(ConvBlock3d, self).__init__()
+        self.conv = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class DecoderBlock3d(nn.Module):
+    """
+    3D Decoder Block with Skip Connection.
+    Upsamples input, concatenates with skip features, and refines with convolutions.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock3d, self).__init__()
+        # We use interpolation for upsampling followed by a conv to reduce artifacts
+        # Alternatively, ConvTranspose3d could be used.
+        self.up = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+
+        # Convolution to reduce channels after concatenation
+        self.conv1 = ConvBlock3d(in_channels + skip_channels, out_channels)
+        self.conv2 = ConvBlock3d(out_channels, out_channels)
+
+    def forward(self, x, skip):
+        # Upsample
+        x = self.up(x)
+
+        # Handle potential shape mismatch due to padding/cropping in encoder
+        # x shape: (B, C, D, H, W)
+        # skip shape: (B, C_skip, D_skip, H_skip, W_skip)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(
+                x, size=skip.shape[2:], mode="trilinear", align_corners=False
+            )
+
+        # Concatenate
+        x = torch.cat([x, skip], dim=1)
+
+        # Convolve
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResNet3DUNet(nn.Module):
+    """
+    3D U-Net with ResNet-18 Backbone.
+    """
+
+    def __init__(
+        self, in_channels=Config.IN_CHANNELS, out_channels=Config.OUT_CHANNELS
+    ):
+        super(ResNet3DUNet, self).__init__()
+
+        # --- Encoder (ResNet-18 3D) ---
+        # Load pre-trained weights
+        weights = R3D_18_Weights.DEFAULT
+        self.backbone = r3d_18(weights=weights)
+
+        # Modify the first layer (Stem) to accept 'in_channels' (1 for MRI)
+        # Original: Conv3d(3, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3))
+        original_stem0 = self.backbone.stem[0]
+        self.backbone.stem[0] = nn.Conv3d(
+            in_channels,
+            original_stem0.out_channels,
+            kernel_size=original_stem0.kernel_size,
+            stride=original_stem0.stride,
+            padding=original_stem0.padding,
+            bias=False,
+        )
+
+        # Initialize the new layer with averaged weights from the pre-trained model
+        with torch.no_grad():
+            self.backbone.stem[0].weight.data = original_stem0.weight.data.mean(
+                dim=1, keepdim=True
+            )
+
+        # Encoder Layers
+        self.encoder_stem = self.backbone.stem  # Out: 64 ch, (D, H/2, W/2)
+        self.encoder_layer1 = self.backbone.layer1  # Out: 64 ch, (D, H/2, W/2)
+        self.encoder_layer2 = self.backbone.layer2  # Out: 128 ch, (D/2, H/4, W/4)
+        self.encoder_layer3 = self.backbone.layer3  # Out: 256 ch, (D/4, H/8, W/8)
+        self.encoder_layer4 = self.backbone.layer4  # Out: 512 ch, (D/8, H/16, W/16)
+
+        # --- Decoder ---
+        # Layer 4 -> Layer 3
+        # In: 512, Skip: 256 (Layer3), Out: 256
+        self.dec4 = DecoderBlock3d(512, 256, 256)
+
+        # Layer 3 -> Layer 2
+        # In: 256, Skip: 128 (Layer2), Out: 128
+        self.dec3 = DecoderBlock3d(256, 128, 128)
+
+        # Layer 2 -> Layer 1
+        # In: 128, Skip: 64 (Layer1), Out: 64
+        self.dec2 = DecoderBlock3d(128, 64, 64)
+
+        # Layer 1 -> Stem (Note: Layer1 and Stem usually have same resolution in r3d_18)
+        # We can just process Layer 1 output combined with Stem if needed, or just upsample from Layer 1 to Input.
+        # r3d_18 Stem stride is (1, 2, 2). Layer 1 stride is 1.
+        # So Layer 1 output is (D, H/2, W/2).
+        # We need to get back to (D, H, W).
+
+        # Final Upsampling Block
+        # In: 64, Out: 32
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False),
+            ConvBlock3d(64, 32),
+        )
+
+        # Final Projection
+        self.final_conv = nn.Conv3d(32, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        # x: (B, 1, D, H, W)
+
+        x_stem = self.encoder_stem(x)  # (B, 64, D, H/2, W/2)
+        x_l1 = self.encoder_layer1(x_stem)  # (B, 64, D, H/2, W/2)
+        x_l2 = self.encoder_layer2(x_l1)  # (B, 128, D/2, H/4, W/4)
+        x_l3 = self.encoder_layer3(x_l2)  # (B, 256, D/4, H/8, W/8)
+        x_l4 = self.encoder_layer4(x_l3)  # (B, 512, D/8, H/16, W/16)
+
+        # --- Decoder ---
+        d4 = self.dec4(x_l4, x_l3)  # (B, 256, D/4, H/8, W/8)
+        d3 = self.dec3(d4, x_l2)  # (B, 128, D/2, H/4, W/4)
+        d2 = self.dec2(d3, x_l1)  # (B, 64, D, H/2, W/2)
+
+        # Final Upsample to original resolution
+        # We are at (D, H/2, W/2), need (D, H, W)
+        out = self.final_up(d2)  # (B, 32, D, H, W)
+
+        # Ensure exact output size match (in case of odd dimensions)
+        if out.shape[2:] != x.shape[2:]:
+            out = F.interpolate(
+                out, size=x.shape[2:], mode="trilinear", align_corners=False
+            )
+
+        logits = self.final_conv(out)  # (B, num_classes, D, H, W)
+
+        return logits
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+from library.config import Config
+
+
+class ConvBlock2d(nn.Module):
+    """
+    Basic 2D Convolution Block: Conv2d -> BN -> ReLU
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super(ConvBlock2d, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class DecoderBlock2d(nn.Module):
+    """
+    2D Decoder Block with Skip Connection.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock2d, self).__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.conv1 = ConvBlock2d(in_channels + skip_channels, out_channels)
+        self.conv2 = ConvBlock2d(out_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
+            
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResNetUNet2D(nn.Module):
+    """
+    2D U-Net with ResNet-18 Backbone.
+    Cite solution_lesson_node_00012: Prefer ResNet backbones for speed.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, out_channels=Config.OUT_CHANNELS):
+        super(ResNetUNet2D, self).__init__()
+
+        # --- Encoder (ResNet-18) ---
+        weights = ResNet18_Weights.DEFAULT
+        self.backbone = resnet18(weights=weights)
+
+        # Modify first layer if in_channels != 3
+        # In our case, in_channels=3 (2.5D), so we can keep it or re-init if we want specific behavior.
+        # However, standard ResNet expects RGB. 2.5D is (z-1, z, z+1).
+        # We keep the pre-trained weights.
+        if in_channels != 3:
+            original_conv = self.backbone.conv1
+            self.backbone.conv1 = nn.Conv2d(
+                in_channels,
+                original_conv.out_channels,
+                kernel_size=original_conv.kernel_size,
+                stride=original_conv.stride,
+                padding=original_conv.padding,
+                bias=False,
+            )
+            # Average weights if needed, but for 3->3 we just use ImageNet weights
+
+        self.encoder_stem = nn.Sequential(
+            self.backbone.conv1,
+            self.backbone.bn1,
+            self.backbone.relu,
+            self.backbone.maxpool
+        )
+        self.encoder_layer1 = self.backbone.layer1 # 64
+        self.encoder_layer2 = self.backbone.layer2 # 128
+        self.encoder_layer3 = self.backbone.layer3 # 256
+        self.encoder_layer4 = self.backbone.layer4 # 512
+
+        # --- Decoder ---
+        self.dec4 = DecoderBlock2d(512, 256, 256)
+        self.dec3 = DecoderBlock2d(256, 128, 128)
+        self.dec2 = DecoderBlock2d(128, 64, 64)
+        
+        # Final upsampling to match input resolution
+        # ResNet stem reduces by 4 (stride 2 conv + stride 2 pool)
+        # Layer 1 output is same size as stem output (1/4)
+        # So dec2 output is 1/4 size. We need 2 more upsamples.
+        
+        self.dec1 = DecoderBlock2d(64, 64, 32) # Skip connection from stem? Stem is 64ch.
+        # Actually, let's use the features before maxpool as skip?
+        # self.backbone.relu output is 64ch, size 1/2.
+        
+        # Revised Decoder:
+        # L4 (1/32) -> L3 (1/16)
+        # L3 (1/16) -> L2 (1/8)
+        # L2 (1/8) -> L1 (1/4)
+        # L1 (1/4) -> Stem (1/2) ?
+        
+        # Let's simplify.
+        # dec4: In 512, Skip 256 -> Out 256 (Size 1/16)
+        # dec3: In 256, Skip 128 -> Out 128 (Size 1/8)
+        # dec2: In 128, Skip 64  -> Out 64  (Size 1/4)
+        
+        # Now we are at 1/4. We need to get to 1/1.
+        # We can upsample x4 or use more blocks.
+        # Let's use a final block.
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
+            ConvBlock2d(64, 32),
+            nn.Conv2d(32, out_channels, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # x: (B, 3, H, W)
+        
+        # Encoder
+        x_stem = self.backbone.conv1(x)
+        x_stem = self.backbone.bn1(x_stem)
+        x_stem = self.backbone.relu(x_stem) # (B, 64, H/2, W/2)
+        x_pool = self.backbone.maxpool(x_stem) # (B, 64, H/4, W/4)
+        
+        x_l1 = self.encoder_layer1(x_pool) # (B, 64, H/4, W/4)
+        x_l2 = self.encoder_layer2(x_l1)   # (B, 128, H/8, W/8)
+        x_l3 = self.encoder_layer3(x_l2)   # (B, 256, H/16, W/16)
+        x_l4 = self.encoder_layer4(x_l3)   # (B, 512, H/32, W/32)
+        
+        # Decoder
+        d4 = self.dec4(x_l4, x_l3)
+        d3 = self.dec3(d4, x_l2)
+        d2 = self.dec2(d3, x_l1)
+        
+        # Final
+        logits = self.final_up(d2)
+        
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class VolumetricDataset(Dataset):
+    """
+    PyTorch Dataset for 3D Volumetric Data.
+    Loads pre-processed .npy volumes and applies 3D patch sampling.
+    """
+
+    def __init__(self, metadata_df, subset="train", transform=None):
+        """
+        Args:
+            metadata_df (pd.DataFrame): Dataframe containing paths to cached .npy files.
+                                        Expected columns: ['case', 'day', 'npy_path']
+            subset (str): 'train', 'val', or 'test'.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.metadata = metadata_df
+        self.subset = subset
+        self.transform = transform
+
+        # Hyperparameters from Config
+        self.patch_size = Config.PATCH_SIZE  # (D, H, W)
+        self.spatial_size = Config.SPATIAL_SIZE  # (H, W)
+        self.num_classes = Config.NUM_CLASSES
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        npy_path = row["npy_path"]
+
+        # Load cached volume
+        # Data is stored as a dictionary: {'image': ..., 'mask': ...}
+        try:
+            data = np.load(npy_path, allow_pickle=True).item()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {npy_path}: {e}")
+
+        image_vol = data["image"]  # Shape: (D, H, W)
+
+        # Handle masks
+        if "mask" in data and data["mask"] is not None:
+            mask_vol = data["mask"]  # Shape: (D, H, W, C)
+        else:
+            # Create dummy mask for test set or missing masks
+            # Shape: (D, H, W, 3)
+            mask_vol = np.zeros(image_vol.shape + (self.num_classes,), dtype=np.float32)
+
+        # --- Patch Sampling / Processing ---
+        D, H, W = image_vol.shape
+        target_D, target_H, target_W = self.patch_size
+
+        if self.subset == "train":
+            # 1. Padding if depth is too small
+            if D < target_D:
+                pad_d = target_D - D
+                # Pad with zeros (constant).
+                # Image: (D, H, W) -> Pad D
+                image_vol = np.pad(
+                    image_vol, ((0, pad_d), (0, 0), (0, 0)), mode="constant"
+                )
+                # Mask: (D, H, W, C) -> Pad D
+                mask_vol = np.pad(
+                    mask_vol, ((0, pad_d), (0, 0), (0, 0), (0, 0)), mode="constant"
+                )
+                D = target_D  # Update D
+
+            # 2. Random Crop in Depth
+            if D > target_D:
+                start_d = np.random.randint(0, D - target_D + 1)
+            else:
+                start_d = 0
+
+            end_d = start_d + target_D
+
+            # Extract crops
+            img_crop = image_vol[start_d:end_d, :, :]
+            mask_crop = mask_vol[start_d:end_d, :, :]
+
+        else:
+            # Validation/Test: Return full volume
+            # We do not crop. The DataLoader batch_size must be 1.
+            img_crop = image_vol
+            mask_crop = mask_vol
+
+        # --- Tensor Conversion ---
+        # Image: (D, H, W) -> (C, D, H, W) where C=1
+        img_tensor = torch.from_numpy(img_crop).float().unsqueeze(0)
+
+        # Mask: (D, H, W, C) -> (C, D, H, W)
+        # Permute channel to be first
+        mask_tensor = torch.from_numpy(mask_crop).float().permute(3, 0, 1, 2)
+
+        # Ensure mask is binary (0 or 1)
+        mask_tensor = (mask_tensor > 0.5).float()
+
+        return {
+            "id": f"{row['case']}_{row['day']}",
+            "image": img_tensor,
+            "mask": mask_tensor,
+            "original_shape": torch.tensor([D, H, W]),  # Useful for reconstruction
+        }
+=======
+class SliceDataset(Dataset):
+    """
+    2.5D Slice Dataset.
+    Loads volumes into memory and yields (3, H, W) slices where channels are z-1, z, z+1.
+    Cite solution_lesson_node_00026: Prioritize 2.5D Slice Stacking.
+    """
+    def __init__(self, metadata_df, subset="train"):
+        self.metadata = metadata_df
+        self.subset = subset
+        self.volumes = {}
+        self.samples = [] # List of (case_day_key, z_index)
+        
+        print(f"Initializing SliceDataset for {subset}...")
+        
+        # Load all volumes into RAM
+        for _, row in self.metadata.iterrows():
+            key = f"{row['case']}_{row['day']}"
+            npy_path = row["npy_path"]
+            
+            try:
+                data = np.load(npy_path, allow_pickle=True).item()
+                image = data["image"] # (D, H, W)
+                
+                if "mask" in data and data["mask"] is not None:
+                    mask = data["mask"] # (D, H, W, C)
+                else:
+                    mask = None
+                
+                self.volumes[key] = {"image": image, "mask": mask}
+                
+                # Create samples for each slice
+                D = image.shape[0]
+                for z in range(D):
+                    self.samples.append((key, z))
+                    
+            except Exception as e:
+                print(f"Error loading {npy_path}: {e}")
+                
+        print(f"Loaded {len(self.volumes)} volumes, {len(self.samples)} slices.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        key, z = self.samples[idx]
+        vol_data = self.volumes[key]
+        image_vol = vol_data["image"]
+        mask_vol = vol_data["mask"]
+        
+        D, H, W = image_vol.shape
+        
+        # 2.5D Stacking: z-1, z, z+1
+        # Handle boundaries by replication
+        indices = [max(0, z-1), z, min(D-1, z+1)]
+        
+        # Stack slices -> (3, H, W)
+        img_stack = image_vol[indices, :, :]
+        
+        # Mask -> (C, H, W)
+        if mask_vol is not None:
+            mask_slice = mask_vol[z, :, :, :] # (H, W, C)
+            mask_tensor = torch.from_numpy(mask_slice).float().permute(2, 0, 1) # (C, H, W)
+            mask_tensor = (mask_tensor > 0.5).float()
+        else:
+            mask_tensor = torch.zeros((Config.NUM_CLASSES, H, W), dtype=torch.float32)
+            
+        img_tensor = torch.from_numpy(img_stack).float()
+        
+        return {
+            "image": img_tensor,
+            "mask": mask_tensor,
+            "id": f"{key}_slice_{z:04d}"
+        }
+
+class VolumetricDataset(Dataset):
+    """
+    Dataset for Validation/Testing. Returns full volumes for reconstruction.
+    """
+    def __init__(self, metadata_df, subset="val"):
+        self.metadata = metadata_df
+        self.subset = subset
+        self.num_classes = Config.NUM_CLASSES
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        npy_path = row["npy_path"]
+
+        try:
+            data = np.load(npy_path, allow_pickle=True).item()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {npy_path}: {e}")
+
+        image_vol = data["image"]  # (D, H, W)
+
+        if "mask" in data and data["mask"] is not None:
+            mask_vol = data["mask"]  # (D, H, W, C)
+        else:
+            mask_vol = np.zeros(image_vol.shape + (self.num_classes,), dtype=np.float32)
+
+        # Return full volume as tensor
+        # Image: (D, H, W) -> (1, D, H, W) - Trainer will handle 2.5D slicing
+        img_tensor = torch.from_numpy(image_vol).float().unsqueeze(0)
+        
+        # Mask: (D, H, W, C) -> (C, D, H, W)
+        mask_tensor = torch.from_numpy(mask_vol).float().permute(3, 0, 1, 2)
+        mask_tensor = (mask_tensor > 0.5).float()
+
+        return {
+            "id": f"{row['case']}_{row['day']}",
+            "image": img_tensor,
+            "mask": mask_tensor
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # 2. Create Datasets
+    train_ds = VolumetricDataset(train_df, subset="train")
+    val_ds = VolumetricDataset(val_df, subset="val")
+    test_ds = VolumetricDataset(test_df, subset="test")
+
+    # 3. Create DataLoaders
+    # Train: Batch size > 1, Shuffle, Drop Last
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+=======
+    # 2. Create Datasets
+    # Use SliceDataset for training (2.5D slices)
+    train_ds = SliceDataset(train_df, subset="train")
+    # Use VolumetricDataset for val/test (Full volumes for reconstruction)
+    val_ds = VolumetricDataset(val_df, subset="val")
+    test_ds = VolumetricDataset(test_df, subset="test")
+
+    # 3. Create DataLoaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import ResNet3DUNet
+from library.losses import BCEDiceLoss
+from library.utils import compute_metrics, rle_encode
+from library.postprocessing import keep_largest_component_3d
+
+
+class Trainer:
+    """
+    Trainer class for 3D Segmentation Model.
+    Handles training, validation (with sliding window inference), and prediction.
+    """
+
+    def __init__(self, train_loader, val_loader, test_loader=None):
+        """
+        Args:
+            train_loader (DataLoader): DataLoader for training set.
+            val_loader (DataLoader): DataLoader for validation set.
+            test_loader (DataLoader, optional): DataLoader for test set.
+        """
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.device = torch.device(Config.DEVICE)
+
+        # Initialize Model
+        self.model = ResNet3DUNet(
+            in_channels=Config.IN_CHANNELS, out_channels=Config.OUT_CHANNELS
+        ).to(self.device)
+
+        # Optimizer & Scheduler
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Cosine Annealing Scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+        )
+
+        # Loss Function
+        self.criterion = BCEDiceLoss(bce_weight=0.5, dice_weight=0.5).to(self.device)
+
+        # Inference settings
+        self.patch_size = Config.PATCH_SIZE  # (D, H, W) -> (32, 224, 224)
+        self.overlap = Config.OVERLAP
+        self.num_classes = Config.NUM_CLASSES
+
+        # Pre-compute Gaussian weight map for sliding window
+        self.weight_map = self._get_gaussian_weight_map(self.patch_size)
+
+    def _get_gaussian_weight_map(self, size, sigma_scale=1.0 / 8.0):
+        """
+        Generates a Gaussian weight map for patch merging.
+        """
+        # Create a temporary volume of ones
+        tmp = np.zeros(size)
+        # Set center pixel to 1
+        center = [s // 2 for s in size]
+        tmp[tuple(center)] = 1
+        # Apply gaussian filter. Sigma is proportional to dimension size.
+        # We use a fixed sigma based on the smallest dimension or per dimension.
+        # Here we use a heuristic sigma.
+        sigmas = [s * sigma_scale for s in size]
+        weight_map = gaussian_filter(tmp, sigma=sigmas)
+
+        # Normalize to [0, 1]
+        weight_map = weight_map / np.max(weight_map)
+        return torch.from_numpy(weight_map).float().to(self.device)
+
+    def _sliding_window_inference(self, volume):
+        """
+        Performs sliding window inference on a single volume.
+
+        Args:
+            volume (torch.Tensor): Input volume of shape (1, D, H, W).
+
+        Returns:
+            torch.Tensor: Probability map of shape (C, D, H, W).
+        """
+        self.model.eval()
+
+        # volume shape: (C_in, D, H, W) where C_in=1
+        _, D, H, W = volume.shape
+
+        patch_D, patch_H, patch_W = self.patch_size
+        stride_D = int(patch_D * (1 - self.overlap))
+        stride_H = int(patch_H * (1 - self.overlap))
+        stride_W = int(patch_W * (1 - self.overlap))
+
+        # Pad volume if dimensions are smaller than patch size
+        pad_D = max(0, patch_D - D)
+        pad_H = max(0, patch_H - H)
+        pad_W = max(0, patch_W - W)
+
+        # Also pad to ensure we can cover the edges with strides
+        # (Simple approach: pad right/bottom/back)
+        volume_padded = torch.nn.functional.pad(
+            volume, (0, pad_W, 0, pad_H, 0, pad_D), mode="constant", value=0
+        )
+
+        _, D_pad, H_pad, W_pad = volume_padded.shape
+
+        # Output accumulation tensors
+        output_sum = torch.zeros(
+            (self.num_classes, D_pad, H_pad, W_pad), device=self.device
+        )
+        count_map = torch.zeros(
+            (self.num_classes, D_pad, H_pad, W_pad), device=self.device
+        )
+
+        # Expand weight map to match number of classes: (C, D_patch, H_patch, W_patch)
+        weight_map_expanded = self.weight_map.unsqueeze(0).repeat(
+            self.num_classes, 1, 1, 1
+        )
+
+        # Sliding window loop
+        # We assume H and W fit the patch size exactly or are handled by padding,
+        # but since Config.SPATIAL_SIZE matches patch spatial size, we mostly slide over Depth.
+        # However, loop over all dims for robustness.
+
+        z_steps = list(range(0, D_pad - patch_D + 1, stride_D))
+        if z_steps[-1] != D_pad - patch_D:
+            z_steps.append(D_pad - patch_D)
+
+        y_steps = list(range(0, H_pad - patch_H + 1, stride_H))
+        if not y_steps:
+            y_steps = [0]  # Handle exact match case
+        elif y_steps[-1] != H_pad - patch_H:
+            y_steps.append(H_pad - patch_H)
+
+        x_steps = list(range(0, W_pad - patch_W + 1, stride_W))
+        if not x_steps:
+            x_steps = [0]
+        elif x_steps[-1] != W_pad - patch_W:
+            x_steps.append(W_pad - patch_W)
+
+        with torch.no_grad():
+            for z in z_steps:
+                for y in y_steps:
+                    for x in x_steps:
+                        # Extract patch: (1, 1, D_p, H_p, W_p)
+                        patch = volume_padded[
+                            :, z : z + patch_D, y : y + patch_H, x : x + patch_W
+                        ].unsqueeze(0)
+                        patch = patch.to(self.device)
+
+                        # Inference
+                        logits = self.model(patch)  # (1, C, D_p, H_p, W_p)
+                        probs = torch.sigmoid(logits).squeeze(0)  # (C, D_p, H_p, W_p)
+
+                        # Accumulate
+                        output_sum[
+                            :, z : z + patch_D, y : y + patch_H, x : x + patch_W
+                        ] += (probs * weight_map_expanded)
+                        count_map[
+                            :, z : z + patch_D, y : y + patch_H, x : x + patch_W
+                        ] += weight_map_expanded
+
+        # Average
+        # Avoid division by zero
+        count_map[count_map == 0] = 1.0
+        output_final = output_sum / count_map
+
+        # Crop back to original size
+        output_final = output_final[:, :D, :H, :W]
+
+        return output_final
+
+    def train_epoch(self, epoch):
+        self.model.train()
+        running_loss = 0.0
+        count = 0
+
+        start_time = time.time()
+
+        for batch in self.train_loader:
+            # batch['image']: (B, 1, D, H, W)
+            # batch['mask']: (B, C, D, H, W)
+            images = batch["image"].to(self.device)
+            masks = batch["mask"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            logits = self.model(images)
+            loss = self.criterion(logits, masks)
+
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            count += images.size(0)
+
+        epoch_loss = running_loss / count
+        duration = time.time() - start_time
+
+        print(
+            f"Epoch {epoch+1}/{Config.EPOCHS} - Train Loss: {epoch_loss:.6f} - Time: {duration:.2f}s"
+        )
+        return epoch_loss
+=======
+from library.model import ResNetUNet2D
+from library.losses import BCEDiceLoss
+from library.utils import compute_metrics, rle_encode
+from library.postprocessing import keep_largest_component_3d
+
+
+class Trainer:
+    """
+    Trainer class for 2.5D Segmentation Model.
+    """
+
+    def __init__(self, train_loader, val_loader, test_loader=None):
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.device = torch.device(Config.DEVICE)
+
+        # Initialize Model (2D)
+        self.model = ResNetUNet2D(
+            in_channels=Config.IN_CHANNELS, out_channels=Config.OUT_CHANNELS
+        ).to(self.device)
+
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=Config.EPOCHS, eta_min=1e-6
+        )
+
+        self.criterion = BCEDiceLoss(bce_weight=0.5, dice_weight=0.5).to(self.device)
+        self.num_classes = Config.NUM_CLASSES
+
+    def _predict_volume(self, volume):
+        """
+        Performs 2.5D inference on a full volume by iterating slices.
+        Args:
+            volume (torch.Tensor): (1, D, H, W) input volume.
+        Returns:
+            torch.Tensor: (C, D, H, W) probabilities.
+        """
+        self.model.eval()
+        
+        # volume: (1, D, H, W) -> squeeze -> (D, H, W)
+        vol = volume.squeeze(0)
+        D, H, W = vol.shape
+        
+        # Prepare output
+        probs_vol = torch.zeros((self.num_classes, D, H, W), dtype=torch.float32)
+        
+        # We process in batches for speed
+        batch_size = 32
+        
+        with torch.no_grad():
+            for i in range(0, D, batch_size):
+                end = min(i + batch_size, D)
+                indices = range(i, end)
+                
+                batch_imgs = []
+                for z in indices:
+                    # 2.5D Stack: z-1, z, z+1
+                    z_prev = max(0, z-1)
+                    z_next = min(D-1, z+1)
+                    
+                    # Stack slices
+                    stack = torch.stack([vol[z_prev], vol[z], vol[z_next]], dim=0) # (3, H, W)
+                    batch_imgs.append(stack)
+                
+                # Create batch tensor
+                batch_tensor = torch.stack(batch_imgs).to(self.device) # (B, 3, H, W)
+                
+                # Predict
+                logits = self.model(batch_tensor) # (B, C, H, W)
+                probs = torch.sigmoid(logits).cpu()
+                
+                # Store
+                probs_vol[:, i:end, :, :] = probs.permute(1, 0, 2, 3)
+                
+        return probs_vol
+
+    def train_epoch(self, epoch):
+        self.model.train()
+        running_loss = 0.0
+        count = 0
+
+        start_time = time.time()
+
+        for batch in self.train_loader:
+            # batch['image']: (B, 3, H, W)
+            # batch['mask']: (B, C, H, W)
+            images = batch["image"].to(self.device)
+            masks = batch["mask"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            logits = self.model(images)
+            loss = self.criterion(logits, masks)
+
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item() * images.size(0)
+            count += images.size(0)
+
+        epoch_loss = running_loss / count
+        duration = time.time() - start_time
+
+        print(
+            f"Epoch {epoch+1}/{Config.EPOCHS} - Train Loss: {epoch_loss:.6f} - Time: {duration:.2f}s"
+        )
+        return epoch_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Sliding Window Inference
+            # Returns (C, D, H, W) probabilities
+            pred_probs = self._sliding_window_inference(image)
+=======
+            # 2.5D Slice Inference
+            # Returns (C, D, H, W) probabilities
+            pred_probs = self._predict_volume(image)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                # Sliding Window Inference
+                pred_probs = self._sliding_window_inference(image)
+=======
+                # 2.5D Slice Inference
+                pred_probs = self._predict_volume(image)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Perform sliding window inference
+            # Returns probabilities (C, D, H, W)
+            pred_probs = trainer._sliding_window_inference(image)
+=======
+            # Perform 2.5D slice inference
+            # Returns probabilities (C, D, H, W)
+            pred_probs = trainer._predict_volume(image)
+>>>>>>> REPLACE
+```

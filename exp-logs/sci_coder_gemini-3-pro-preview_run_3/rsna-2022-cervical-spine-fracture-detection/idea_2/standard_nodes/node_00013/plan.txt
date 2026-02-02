@@ -1,0 +1,404 @@
+I will optimize the solution by removing the sequence smoothing layer and reverting to a standard Multiple Instance Learning (MIL) architecture with independent slice processing.
+
+**Strategy:**
+1.  **Remove Sequence Smoothing (Cite solution_lesson_node_00012):** I will replace the `SequenceSmoothedMIL` model with a `ResNet18MIL` architecture. The previous solution's 1D Convolution layer, intended to smooth features across the z-axis, was found to dilute sparse fracture signals in aggressively subsampled volumes (64 slices out of hundreds). Reverting to simple Global Max Pooling on independent slice features is expected to improve sensitivity to sparse anomalies.
+2.  **Enable Independent Augmentation (Cite solution_lesson_node_00012):** I will modify the data pipeline to apply augmentations independently to each slice in the bag rather than consistently across the sequence. This leverages the "Bag of Slices" assumption where independent noise injection acts as a stronger regularizer, preventing overfitting to specific volumetric artifacts.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SequenceSmoothedMIL(nn.Module):
+    """
+    Sequence-Smoothed 2.5D MIL Network for Cervical Spine Fracture Detection.
+
+    This architecture implements a Weakly Supervised 2.5D CNN-RNN Hybrid approach (using 1D Conv as RNN).
+    It processes a sequence of CT slices to detect fractures at the vertebral level and aggregates
+    them to the patient level.
+
+    Components:
+    1. Backbone: ResNet18 (2.5D input: 3 channels).
+    2. Inter-Slice Context: 1D Convolution over sequence dimension to smooth features.
+    3. Classification Head: Linear projection to 7 classes (C1-C7).
+    4. Aggregation: Global Max Pooling over sequence.
+    5. Patient Output: Max of vertebral logits.
+    """
+
+    def __init__(self, backbone_name="resnet18", pretrained=True, num_classes=7):
+        """
+        Args:
+            backbone_name (str): Name of the backbone architecture (default: resnet18).
+            pretrained (bool): Whether to load pretrained ImageNet weights.
+            num_classes (int): Number of specific fracture targets (C1-C7).
+        """
+        super(SequenceSmoothedMIL, self).__init__()
+
+        # 1. Backbone Setup
+        if backbone_name == "resnet18":
+            try:
+                # Modern torchvision API
+                weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+                self.backbone = models.resnet18(weights=weights)
+            except AttributeError:
+                # Legacy torchvision API
+                self.backbone = models.resnet18(pretrained=pretrained)
+
+            self.feature_dim = self.backbone.fc.in_features
+        else:
+            raise NotImplementedError(
+                f"Backbone {backbone_name} is not currently supported."
+            )
+
+        # Remove the original classification head (fc)
+        # We keep the pooling layer to get a (Batch, 512) vector per image
+        self.backbone.fc = nn.Identity()
+
+        # 2. Inter-Slice Context Module
+        # A 1D Convolution acts as a lightweight sequence model to smooth features
+        # across the z-axis (sequence dimension).
+        # Input shape to this layer: (Batch, Feature_Dim, Seq_Len)
+        self.context_conv = nn.Conv1d(
+            in_channels=self.feature_dim,
+            out_channels=self.feature_dim,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn_context = nn.BatchNorm1d(self.feature_dim)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 3. Classification Head
+        # Projects smoothed features to C1-C7 logits
+        # No Dropout is used here to maintain gradient stability for Max Pooling
+        self.classifier = nn.Linear(self.feature_dim, num_classes)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Seq_Len, 3, H, W)
+                              Represents a batch of exams, each with a sequence of 2.5D slices.
+        Returns:
+            torch.Tensor: Logits of shape (Batch, 8).
+                          Columns: [C1, C2, C3, C4, C5, C6, C7, patient_overall]
+        """
+        b, s, c, h, w = x.shape
+
+        # Flatten batch and sequence dimensions to process all slices through the backbone
+        # Shape: (Batch * Seq_Len, 3, H, W)
+        x = x.view(b * s, c, h, w)
+
+        # Extract features using the backbone
+        # Output Shape: (Batch * Seq_Len, Feature_Dim)
+        features = self.backbone(x)
+
+        # Reshape for the Context Module (1D Conv expects N, C, L)
+        # Shape: (Batch, Feature_Dim, Seq_Len)
+        features = features.view(b, s, self.feature_dim).permute(0, 2, 1)
+
+        # Apply Inter-Slice Smoothing (Context Module)
+        features = self.context_conv(features)
+        features = self.bn_context(features)
+        features = self.relu(features)
+
+        # Reshape back to (Batch, Seq_Len, Feature_Dim) for classification
+        features = features.permute(0, 2, 1)
+
+        # Classify each slice independently (after smoothing)
+        # Output Shape: (Batch, Seq_Len, 7)
+        logits_seq = self.classifier(features)
+
+        # 4. Aggregation: Global Max Pooling
+        # We assume that if a fracture exists in the exam, it will be detected with high confidence
+        # in at least one slice. Max pooling captures this signal.
+        # Output Shape: (Batch, 7)
+        logits_vertebrae, _ = torch.max(logits_seq, dim=1)
+
+        # 5. Patient Output Calculation
+        # Logical consistency: A patient is fractured if ANY of the C1-C7 vertebrae are fractured.
+        # In logit space, max(logits) is a soft approximation of the OR operator.
+        # Output Shape: (Batch, 1)
+        logits_overall, _ = torch.max(logits_vertebrae, dim=1, keepdim=True)
+
+        # Concatenate vertebral logits and patient overall logit
+        # Final Output Shape: (Batch, 8)
+        logits = torch.cat([logits_vertebrae, logits_overall], dim=1)
+
+        return logits
+=======
+class ResNet18MIL(nn.Module):
+    """
+    ResNet18 Multiple Instance Learning (MIL) Network for Cervical Spine Fracture Detection.
+
+    This architecture treats a CT scan as a 'bag' of independent 2.5D slices.
+    It processes each slice independently and aggregates predictions using Global Max Pooling.
+    
+    Cite solution_lesson_node_00012: Avoid Sequence Smoothing on Aggressively Subsampled Volumetric Data.
+    We remove the 1D Conv context layer to prevent signal dilution and rely on permutation-invariant
+    Max Pooling.
+
+    Components:
+    1. Backbone: ResNet18 (2.5D input: 3 channels).
+    2. Classification Head: Linear projection to 7 classes (C1-C7).
+    3. Aggregation: Global Max Pooling over the bag (sequence).
+    4. Patient Output: Max of vertebral logits.
+    """
+
+    def __init__(self, backbone_name="resnet18", pretrained=True, num_classes=7):
+        """
+        Args:
+            backbone_name (str): Name of the backbone architecture (default: resnet18).
+            pretrained (bool): Whether to load pretrained ImageNet weights.
+            num_classes (int): Number of specific fracture targets (C1-C7).
+        """
+        super(ResNet18MIL, self).__init__()
+
+        # 1. Backbone Setup
+        if backbone_name == "resnet18":
+            try:
+                # Modern torchvision API
+                weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+                self.backbone = models.resnet18(weights=weights)
+            except AttributeError:
+                # Legacy torchvision API
+                self.backbone = models.resnet18(pretrained=pretrained)
+
+            self.feature_dim = self.backbone.fc.in_features
+        else:
+            raise NotImplementedError(
+                f"Backbone {backbone_name} is not currently supported."
+            )
+
+        # Remove the original classification head (fc)
+        # We keep the pooling layer to get a (Batch, 512) vector per image
+        self.backbone.fc = nn.Identity()
+
+        # 2. Classification Head
+        # Projects features directly to C1-C7 logits
+        # No Dropout is used here to maintain gradient stability for Max Pooling (Cite solution_lesson_node_00003)
+        self.classifier = nn.Linear(self.feature_dim, num_classes)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Seq_Len, 3, H, W)
+                              Represents a batch of exams, each with a sequence of 2.5D slices.
+        Returns:
+            torch.Tensor: Logits of shape (Batch, 8).
+                          Columns: [C1, C2, C3, C4, C5, C6, C7, patient_overall]
+        """
+        b, s, c, h, w = x.shape
+
+        # Flatten batch and sequence dimensions to process all slices through the backbone
+        # Shape: (Batch * Seq_Len, 3, H, W)
+        x = x.view(b * s, c, h, w)
+
+        # Extract features using the backbone
+        # Output Shape: (Batch * Seq_Len, Feature_Dim)
+        features = self.backbone(x)
+
+        # Classify each slice independently
+        # Output Shape: (Batch * Seq_Len, 7)
+        logits_flat = self.classifier(features)
+
+        # Reshape back to (Batch, Seq_Len, 7)
+        logits_seq = logits_flat.view(b, s, -1)
+
+        # 3. Aggregation: Global Max Pooling
+        # We assume that if a fracture exists in the exam, it will be detected with high confidence
+        # in at least one slice. Max pooling captures this signal.
+        # Output Shape: (Batch, 7)
+        logits_vertebrae, _ = torch.max(logits_seq, dim=1)
+
+        # 4. Patient Output Calculation
+        # Logical consistency: A patient is fractured if ANY of the C1-C7 vertebrae are fractured.
+        # In logit space, max(logits) is a soft approximation of the OR operator.
+        # Output Shape: (Batch, 1)
+        logits_overall, _ = torch.max(logits_vertebrae, dim=1, keepdim=True)
+
+        # Concatenate vertebral logits and patient overall logit
+        # Final Output Shape: (Batch, 8)
+        logits = torch.cat([logits_vertebrae, logits_overall], dim=1)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_transforms(mode="train", img_size=256):
+    """
+    Returns Albumentations transforms.
+    Uses ReplayCompose to ensure consistent augmentation across the sequence.
+    """
+    if mode == "train":
+        return A.ReplayCompose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5
+                ),
+                A.RandomBrightnessContrast(p=0.2),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.ReplayCompose(
+            [
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+=======
+def get_transforms(mode="train", img_size=256):
+    """
+    Returns Albumentations transforms.
+    Cite solution_lesson_node_00012: We use independent augmentation per slice (A.Compose)
+    instead of consistent augmentation (A.ReplayCompose) to act as a regularizer.
+    """
+    if mode == "train":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5
+                ),
+                A.RandomBrightnessContrast(p=0.2),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose(
+            [
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # volume is (seq_len, H, W, 3)
+        # Apply transforms consistently across the sequence
+
+        # Prepare output tensor: (seq_len, 3, H, W)
+        # Albumentations expects HWC. ToTensorV2 converts to CHW.
+
+        final_sequence = []
+
+        # We need to apply the SAME random transformation to all slices in the sequence
+        # to preserve geometric consistency for the 2.5D/3D model.
+        # We use A.ReplayCompose.
+
+        # Apply transform to the first slice to generate parameters
+        first_slice = volume[0]  # H, W, 3
+        if self.transform:
+            res = self.transform(image=first_slice)
+            replay_params = res["replay"]
+            final_sequence.append(res["image"])  # Tensor (3, H, W)
+
+            # Apply replay to the rest
+            for i in range(1, self.seq_len):
+                res = A.ReplayCompose.replay(replay_params, image=volume[i])
+                final_sequence.append(res["image"])
+        else:
+            # Fallback if no transform provided (just to tensor)
+            for i in range(self.seq_len):
+                img = volume[i]
+                # Normalize manually if needed, but transform usually handles it.
+                # Assuming transform is always provided as per get_transforms
+                t = ToTensorV2()
+                final_sequence.append(t(image=img)["image"])
+
+        # Stack to (seq_len, 3, H, W)
+        data_tensor = torch.stack(final_sequence)
+=======
+        # volume is (seq_len, H, W, 3)
+        
+        # Prepare output tensor: (seq_len, 3, H, W)
+        # Albumentations expects HWC. ToTensorV2 converts to CHW.
+
+        final_sequence = []
+
+        # Cite solution_lesson_node_00012: Apply independent augmentation per slice.
+        # This prevents the model from overfitting to specific artifacts and acts as a regularizer.
+        
+        if self.transform:
+            for i in range(self.seq_len):
+                res = self.transform(image=volume[i])
+                final_sequence.append(res["image"])
+        else:
+            # Fallback if no transform provided
+            t = ToTensorV2()
+            for i in range(self.seq_len):
+                final_sequence.append(t(image=volume[i])["image"])
+
+        # Stack to (seq_len, 3, H, W)
+        data_tensor = torch.stack(final_sequence)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import SequenceSmoothedMIL
+from library.loss import HierarchicalCompoundLoss
+=======
+from library.model import ResNet18MIL
+from library.loss import HierarchicalCompoundLoss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Model
+    print("Initializing model...")
+    model = SequenceSmoothedMIL(
+        backbone_name=Config.BACKBONE, pretrained=True, num_classes=Config.N_CLASSES
+    )
+    model = model.to(device)
+=======
+    # Initialize Model
+    print("Initializing model...")
+    model = ResNet18MIL(
+        backbone_name=Config.BACKBONE, pretrained=True, num_classes=Config.N_CLASSES
+    )
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import train_model
+from library.data import get_dataloaders, get_test_dataloader
+from library.model import SequenceSmoothedMIL
+from library.utils import competition_log_loss
+=======
+from library.train import train_model
+from library.data import get_dataloaders, get_test_dataloader
+from library.model import ResNet18MIL
+from library.utils import competition_log_loss
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load the best model
+    model = SequenceSmoothedMIL(
+        backbone_name=Config.BACKBONE, pretrained=False, num_classes=Config.N_CLASSES
+    )
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+=======
+    # Load the best model
+    model = ResNet18MIL(
+        backbone_name=Config.BACKBONE, pretrained=False, num_classes=Config.N_CLASSES
+    )
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+>>>>>>> REPLACE
+```

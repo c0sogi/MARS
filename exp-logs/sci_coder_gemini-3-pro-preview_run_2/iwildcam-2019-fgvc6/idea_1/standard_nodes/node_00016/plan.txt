@@ -1,0 +1,862 @@
+To optimize the solution, I will implement a **Partial Fine-Tuning** strategy, which has been identified in the lessons as superior to Linear Probing for this dataset due to the domain shift caused by location-based splitting.
+
+Here is the summary of the changes:
+1.  **Fix Early Stopping Bug**: I will use `copy.deepcopy(model.state_dict())` when saving the best model state to ensure the checkpoint is not updated by subsequent optimizer steps (Cite `solution_lesson_node_00003`).
+2.  **Model Architecture**: I will replace the `LinearProbe` with an `AnimalModel` that utilizes a ResNet50 backbone. I will unfreeze `layer4` (the final residual block) while keeping the earlier layers frozen, enabling the model to adapt its high-level features to the specific animal shapes and ignore background noise (Cite `solution_lesson_node_00015`). The head will continue to use concatenated Global Average Pooling (GAP) and Global Max Pooling (GMP) (Cite `solution_lesson_node_00010`).
+3.  **Optimization Strategy**: I will switch from `L-BFGS` (full-batch) to `AdamW` (mini-batch) for the training loop, as L-BFGS is unstable in mini-batch regimes (Cite `solution_lesson_node_00011`). I will use a learning rate of `1e-4` suitable for fine-tuning.
+4.  **Pipeline Updates**: I will update the data loaders to shuffle the training data and refactor the training and submission logic to work with the new end-to-end model rather than pre-extracted features.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Idea-specific directory for caching features (Idea 1: Cached Linear Probing)
+    IDEA_NAME = "idea_1"
+    CACHE_DIR = os.path.join(WORKING_DIR, IDEA_NAME)
+=======
+    # Idea-specific directory for caching features (Idea 2: Partial Fine-Tuning)
+    IDEA_NAME = "idea_2"
+    CACHE_DIR = os.path.join(WORKING_DIR, IDEA_NAME)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Batch size for feature extraction (inference mode)
+    # A100 40GB allows for a large batch size with ResNet50
+    BATCH_SIZE = 256
+
+    # Training parameters for the Linear Classifier (L-BFGS)
+    EPOCHS = 50
+    LEARNING_RATE = (
+        1.0  # L-BFGS typically handles step size, but 1.0 is a standard start
+    )
+=======
+    # Batch size for fine-tuning
+    BATCH_SIZE = 64
+
+    # Training parameters for Partial Fine-Tuning (AdamW)
+    EPOCHS = 10
+    LEARNING_RATE = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+=======
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from sklearn.utils.class_weight import compute_class_weight
+from library.config import Config
+from library.utils import set_seed, calculate_macro_f1
+
+
+class LinearProbe(nn.Module):
+    """
+    A simple linear classifier.
+    Input: Concatenated features (Global Avg Pool + Global Max Pool) -> 4096 dim
+    Output: Class logits -> 23 dim
+    """
+
+    def __init__(self, input_dim, num_classes):
+        super(LinearProbe, self).__init__()
+        self.fc = nn.Linear(input_dim, num_classes)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+def train_model(
+    train_features,
+    train_targets,
+    val_features,
+    val_targets,
+    epochs=Config.EPOCHS,
+    lr=Config.LEARNING_RATE,
+    patience=5,
+):
+    """
+    Trains the LinearProbe model using L-BFGS optimizer and class weighting.
+
+    Args:
+        train_features (np.ndarray): Training feature vectors.
+        train_targets (np.ndarray): Training labels.
+        val_features (np.ndarray): Validation feature vectors.
+        val_targets (np.ndarray): Validation labels.
+        epochs (int): Maximum number of epochs.
+        lr (float): Learning rate for L-BFGS.
+        patience (int): Early stopping patience.
+
+    Returns:
+        model: The trained PyTorch model with the best validation performance.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    print(f"Initializing training on {device}...")
+
+    # Convert data to tensors
+    # Use float() to ensure float32, long() for targets
+    X_train = torch.from_numpy(train_features).float().to(device)
+    y_train = torch.from_numpy(train_targets).long().to(device)
+    X_val = torch.from_numpy(val_features).float().to(device)
+    # y_val is kept as numpy for metric calculation to avoid unnecessary GPU-CPU transfers
+
+    # 1. Handle Class Imbalance
+    # Calculate weights inversely proportional to class frequencies
+    # We assume classes 0..22 are the set.
+    present_classes = np.unique(train_targets)
+    class_weights_subset = compute_class_weight(
+        class_weight="balanced", classes=present_classes, y=train_targets
+    )
+
+    # Initialize full weight vector with 1.0 (default for missing classes)
+    class_weights_full = np.ones(Config.NUM_CLASSES, dtype=np.float32)
+    class_weights_full[present_classes] = class_weights_subset
+
+    class_weights = torch.tensor(class_weights_full, dtype=torch.float32).to(device)
+
+    # 2. Initialize Model
+    input_dim = X_train.shape[1]
+    model = LinearProbe(input_dim, Config.NUM_CLASSES).to(device)
+
+    # 3. Loss & Optimizer
+    # CrossEntropyLoss combines LogSoftmax and NLLLoss
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # L-BFGS is excellent for convex problems (linear layer) with full-batch training
+    optimizer = optim.LBFGS(model.parameters(), lr=lr, max_iter=20, history_size=10)
+
+    # 4. Training Loop
+    best_val_f1 = -1.0
+    patience_counter = 0
+    best_model_state = None
+
+    print(f"Starting training for {epochs} epochs...")
+
+    for epoch in range(epochs):
+        model.train()
+
+        # L-BFGS requires a closure function that clears gradients and returns loss
+        def closure():
+            optimizer.zero_grad()
+            outputs = model(X_train)
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            return loss
+
+        # Perform optimization step
+        loss = optimizer.step(closure)
+
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val)
+            val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
+
+        val_f1 = calculate_macro_f1(val_targets, val_preds)
+
+        print(
+            f"Epoch {epoch+1}/{epochs} | Loss: {loss.item():.6f} | Val Macro F1: {val_f1}"
+        )
+
+        # Early Stopping Check
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered. Best Val F1: {best_val_f1}")
+                break
+
+    # Load best weights
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model
+
+
+def generate_submission(
+    model, test_features, test_ids, output_path=Config.SUBMISSION_PATH
+):
+    """
+    Generates predictions for the test set and saves them to a CSV file.
+
+    Args:
+        model (nn.Module): Trained model.
+        test_features (np.ndarray): Test feature vectors.
+        test_ids (np.ndarray): Test image IDs.
+        output_path (str): Path to save the submission CSV.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    print("Generating predictions for test set...")
+    model.eval()
+
+    X_test = torch.from_numpy(test_features).float().to(device)
+
+    with torch.no_grad():
+        outputs = model(X_test)
+        predictions = torch.argmax(outputs, dim=1).cpu().numpy()
+
+    # Construct DataFrame
+    df = pd.DataFrame({"Id": test_ids, "Category": predictions})
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Save to CSV
+    df.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+=======
+import os
+import copy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from torchvision import models
+from sklearn.utils.class_weight import compute_class_weight
+from library.config import Config
+from library.utils import set_seed, calculate_macro_f1
+
+
+class AnimalModel(nn.Module):
+    """
+    ResNet50-based model for Partial Fine-Tuning.
+    Uses concatenated Global Average Pooling (GAP) and Global Max Pooling (GMP).
+    Cite solution_lesson_node_00010: Concatenate Max and Average Pooling.
+    """
+
+    def __init__(self, num_classes):
+        super(AnimalModel, self).__init__()
+        weights = models.ResNet50_Weights.IMAGENET1K_V1
+        base_model = models.resnet50(weights=weights)
+
+        # Freeze all parameters first
+        for param in base_model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze Layer 4 for Partial Fine-Tuning
+        # Cite solution_lesson_node_00015: Partial Fine-Tuning
+        for param in base_model.layer4.parameters():
+            param.requires_grad = True
+
+        # Extract feature layers (up to before avgpool)
+        self.features = nn.Sequential(*list(base_model.children())[:-2])
+        
+        # Classification head (GAP + GMP -> 4096 dim)
+        self.fc = nn.Linear(4096, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        
+        # Global Average Pooling
+        avg_pool = torch.mean(x, dim=(2, 3))
+        # Global Max Pooling
+        max_pool = torch.amax(x, dim=(2, 3))
+        
+        # Concatenate
+        x = torch.cat([avg_pool, max_pool], dim=1)
+        
+        return self.fc(x)
+    
+    def extract_features(self, x):
+        """Helper for failure analysis to get embeddings."""
+        x = self.features(x)
+        avg_pool = torch.mean(x, dim=(2, 3))
+        max_pool = torch.amax(x, dim=(2, 3))
+        return torch.cat([avg_pool, max_pool], dim=1)
+
+
+def train_model(
+    train_loader,
+    val_loader,
+    epochs=Config.EPOCHS,
+    lr=Config.LEARNING_RATE,
+    patience=3,
+):
+    """
+    Trains the AnimalModel using AdamW and mini-batch training.
+    Cite solution_lesson_node_00011: Use AdamW for mini-batch regimes.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    print(f"Initializing training on {device}...")
+
+    # 1. Handle Class Imbalance
+    # Compute weights from the dataset dataframe directly
+    train_targets = train_loader.dataset.df["Category"].values
+    present_classes = np.unique(train_targets)
+    class_weights_subset = compute_class_weight(
+        class_weight="balanced", classes=present_classes, y=train_targets
+    )
+    class_weights_full = np.ones(Config.NUM_CLASSES, dtype=np.float32)
+    class_weights_full[present_classes] = class_weights_subset
+    class_weights = torch.tensor(class_weights_full, dtype=torch.float32).to(device)
+
+    # 2. Initialize Model
+    model = AnimalModel(Config.NUM_CLASSES).to(device)
+
+    # 3. Loss & Optimizer
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    # 4. Training Loop
+    best_val_f1 = -1.0
+    patience_counter = 0
+    best_model_state = None
+
+    print(f"Starting training for {epochs} epochs...")
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * inputs.size(0)
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+
+        # Validation
+        model.eval()
+        val_preds = []
+        val_targets_all = []
+        
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                val_preds.extend(preds)
+                val_targets_all.extend(targets.numpy())
+
+        val_f1 = calculate_macro_f1(val_targets_all, val_preds)
+
+        print(
+            f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss:.6f} | Val Macro F1: {val_f1:.6f}"
+        )
+
+        # Early Stopping Check
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            # Cite solution_lesson_node_00003: Deep copy state dict
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered. Best Val F1: {best_val_f1}")
+                break
+
+    # Load best weights
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model
+
+
+def generate_submission(
+    model, test_loader, output_path=Config.SUBMISSION_PATH
+):
+    """
+    Generates predictions for the test set and saves them to a CSV file.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    print("Generating predictions for test set...")
+    model.eval()
+
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for inputs, ids in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            predictions = torch.argmax(outputs, dim=1).cpu().numpy()
+            
+            all_preds.extend(predictions)
+            all_ids.extend(ids)
+
+    # Construct DataFrame
+    df = pd.DataFrame({"Id": all_ids, "Category": all_preds})
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Save to CSV
+    df.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.feature_extractor import get_features
+from library.model import train_model, generate_submission
+
+
+def run_training(
+    load_cached_data: bool = True,
+    sample_size: int = None,
+    epochs: int = Config.EPOCHS,
+    lr: float = Config.LEARNING_RATE,
+):
+    """
+    Orchestrates the Cached Linear Probing training pipeline.
+
+    Steps:
+    1. Initialize DataLoaders for Train, Val, and Test sets.
+    2. Extract features using the frozen ResNet50 backbone.
+       - Uses caching mechanism to store/load features from disk (.npy).
+    3. Train a Linear Probe classifier using L-BFGS optimizer.
+       - Handles class imbalance and early stopping.
+    4. Generate predictions for the test set and save to submission.csv.
+
+    Args:
+        load_cached_data (bool): If True, attempts to load features from disk cache.
+                                 If False, forces re-computation of features.
+        sample_size (int, optional): If provided, limits the dataset size for debugging.
+        epochs (int): Maximum number of training epochs.
+        lr (float): Learning rate for the L-BFGS optimizer.
+    """
+    # Ensure deterministic behavior
+    set_seed(Config.SEED)
+
+    print(f"Starting execution for Idea: {Config.IDEA_NAME}")
+    if sample_size is not None:
+        print(f"Debug Mode: Limiting dataset to {sample_size} samples.")
+
+    # -------------------------------------------------------------------------
+    # 1. Data Loading
+    # -------------------------------------------------------------------------
+    print("\n[1/4] Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        sample_size=sample_size,
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. Feature Extraction (with Caching)
+    # -------------------------------------------------------------------------
+    print("\n[2/4] Extracting Features...")
+
+    # Train Set
+    print("Processing Training Data...")
+    train_features, train_targets = get_features(
+        train_loader, mode="train", load_cached_data=load_cached_data
+    )
+
+    # Validation Set
+    print("Processing Validation Data...")
+    val_features, val_targets = get_features(
+        val_loader, mode="val", load_cached_data=load_cached_data
+    )
+
+    # Test Set
+    print("Processing Test Data...")
+    test_features, test_ids = get_features(
+        test_loader, mode="test", load_cached_data=load_cached_data
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Model Training
+    # -------------------------------------------------------------------------
+    print(f"\n[3/4] Training Model (Epochs={epochs}, LR={lr})...")
+
+    # The train_model function handles:
+    # - Class weighting (Balanced)
+    # - L-BFGS Optimization
+    # - CrossEntropyLoss
+    # - Validation loop with Macro F1 score
+    # - Early Stopping
+    model = train_model(
+        train_features, train_targets, val_features, val_targets, epochs=epochs, lr=lr
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. Submission Generation
+    # -------------------------------------------------------------------------
+    print("\n[4/4] Generating Submission...")
+
+    generate_submission(
+        model, test_features, test_ids, output_path=Config.SUBMISSION_PATH
+    )
+
+    print("\nPipeline completed successfully.")
+=======
+from library.model import train_model, generate_submission
+
+
+def run_training(
+    load_cached_data: bool = True,  # Kept for signature compatibility but unused
+    sample_size: int = None,
+    epochs: int = Config.EPOCHS,
+    lr: float = Config.LEARNING_RATE,
+):
+    """
+    Orchestrates the Partial Fine-Tuning training pipeline.
+
+    Steps:
+    1. Initialize DataLoaders for Train, Val, and Test sets.
+    2. Train the AnimalModel (ResNet50 with unfrozen Layer 4) using AdamW.
+    3. Generate predictions for the test set and save to submission.csv.
+    """
+    # Ensure deterministic behavior
+    set_seed(Config.SEED)
+
+    print(f"Starting execution for Idea: {Config.IDEA_NAME}")
+    if sample_size is not None:
+        print(f"Debug Mode: Limiting dataset to {sample_size} samples.")
+
+    # -------------------------------------------------------------------------
+    # 1. Data Loading
+    # -------------------------------------------------------------------------
+    print("\n[1/3] Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        sample_size=sample_size,
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. Model Training
+    # -------------------------------------------------------------------------
+    print(f"\n[2/3] Training Model (Epochs={epochs}, LR={lr})...")
+
+    # The train_model function handles:
+    # - Partial Fine-Tuning (Layer 4 unfrozen)
+    # - Class weighting (Balanced)
+    # - AdamW Optimization
+    # - Validation loop with Macro F1 score
+    # - Early Stopping with deepcopy
+    model = train_model(
+        train_loader, val_loader, epochs=epochs, lr=lr
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Submission Generation
+    # -------------------------------------------------------------------------
+    print("\n[3/3] Generating Submission...")
+
+    generate_submission(
+        model, test_loader, output_path=Config.SUBMISSION_PATH
+    )
+
+    print("\nPipeline completed successfully.")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.feature_extractor import get_features
+from library.model import train_model, generate_submission
+
+
+def run_failure_analysis(model, val_features, val_targets):
+    """
+    Performs failure analysis on the validation set.
+    Calculates correlation between error magnitude (binary error) and input features.
+    """
+    print("\n--- Failure Analysis ---")
+    device = torch.device(Config.DEVICE)
+    model.eval()
+
+    # Convert features to tensor for inference
+    X_val = torch.from_numpy(val_features).float().to(device)
+
+    # Run inference
+    with torch.no_grad():
+        outputs = model(X_val)
+        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+    # Calculate binary error (1 if incorrect, 0 if correct)
+    errors = (preds != val_targets).astype(int)
+    error_rate = np.mean(errors)
+    print(f"Validation Error Rate: {error_rate:.4f}")
+
+    if error_rate == 0 or np.std(errors) == 0:
+        print(
+            "No variance in errors (perfect or total failure). Correlation analysis skipped."
+        )
+        return
+
+    # Calculate Pearson correlation between Error vector and each Feature dimension
+    # Vectorized implementation for speed
+
+    # Center the data
+    X_centered = val_features - val_features.mean(axis=0)
+    e_centered = errors - errors.mean()
+
+    # Compute Covariance: (E . X) / (N - 1)
+    # e_centered shape: (N,), X_centered shape: (N, 4096)
+    covariance = np.dot(e_centered, X_centered) / (len(errors) - 1)
+
+    # Compute Standard Deviations
+    X_std = val_features.std(axis=0)
+    e_std = errors.std()
+
+    # Avoid division by zero for constant features
+    valid_mask = X_std > 1e-9
+
+    correlations = np.zeros(val_features.shape[1])
+    correlations[valid_mask] = covariance[valid_mask] / (X_std[valid_mask] * e_std)
+
+    # Identify top correlations
+    # Positive correlation: High feature value -> Higher probability of Error
+    # Negative correlation: High feature value -> Lower probability of Error (Better performance)
+    top_pos_idx = np.argsort(correlations)[-5:][::-1]
+    top_neg_idx = np.argsort(correlations)[:5]
+
+    print("\nTop 5 Input Features Positively Correlated with Error:")
+    for idx in top_pos_idx:
+        print(f"  Feature {idx}: {correlations[idx]:.4f}")
+
+    print("\nTop 5 Input Features Negatively Correlated with Error:")
+    for idx in top_neg_idx:
+        print(f"  Feature {idx}: {correlations[idx]:.4f}")
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    print("Starting execution...")
+
+    # 2. Data Loading
+    # Using full dataset as the strategy is efficient
+    print("\n[1/5] Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE, num_workers=Config.NUM_WORKERS
+    )
+
+    # 3. Feature Extraction (with Caching)
+    print("\n[2/5] Extracting/Loading Features...")
+    train_features, train_targets = get_features(
+        train_loader, mode="train", load_cached_data=True
+    )
+    val_features, val_targets = get_features(
+        val_loader, mode="val", load_cached_data=True
+    )
+    test_features, test_ids = get_features(
+        test_loader, mode="test", load_cached_data=True
+    )
+
+    # 4. Model Training
+    print("\n[3/5] Training Linear Probe...")
+    model = train_model(
+        train_features,
+        train_targets,
+        val_features,
+        val_targets,
+        epochs=Config.EPOCHS,
+        lr=Config.LEARNING_RATE,
+    )
+
+    # 5. Validation Assessment & Failure Analysis
+    print("\n[4/5] Validating and Analyzing Failures...")
+
+    # Re-run inference on validation set to get final predictions for metric calculation
+    device = torch.device(Config.DEVICE)
+    model.eval()
+    X_val = torch.from_numpy(val_features).float().to(device)
+
+    with torch.no_grad():
+        outputs = model(X_val)
+        val_preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+    # Calculate and Print Metric
+    final_metric = calculate_macro_f1(val_targets, val_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # Run Failure Analysis
+    run_failure_analysis(model, val_features, val_targets)
+
+    # 6. Submission Generation
+    # Only generate submission if metric is improved
+    baseline_metric = 0.23933755219510608
+
+    if final_metric > baseline_metric:
+        print(
+            f"\n[5/5] Generating Submission (Metric {final_metric:.6f} > {baseline_metric:.6f})..."
+        )
+        generate_submission(
+            model, test_features, test_ids, output_path=Config.SUBMISSION_PATH
+        )
+    else:
+        print(
+            f"\n[5/5] Skipping Submission: Metric {final_metric:.6f} did not improve baseline {baseline_metric:.6f}."
+        )
+
+    print("\nPipeline completed successfully.")
+=======
+from library.model import train_model, generate_submission
+
+
+def run_failure_analysis(model, val_loader):
+    """
+    Performs failure analysis on the validation set.
+    Calculates correlation between error magnitude (binary error) and input features.
+    """
+    print("\n--- Failure Analysis ---")
+    device = torch.device(Config.DEVICE)
+    model.eval()
+
+    all_features = []
+    all_preds = []
+    all_targets = []
+
+    # Run inference to get features and predictions
+    print("Extracting features and predictions for failure analysis...")
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs = inputs.to(device)
+            # Get embeddings using the helper method
+            features = model.extract_features(inputs)
+            outputs = model.fc(features)
+            preds = torch.argmax(outputs, dim=1)
+            
+            all_features.append(features.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(targets.numpy())
+
+    val_features = np.concatenate(all_features, axis=0)
+    preds = np.concatenate(all_preds, axis=0)
+    val_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate binary error (1 if incorrect, 0 if correct)
+    errors = (preds != val_targets).astype(int)
+    error_rate = np.mean(errors)
+    print(f"Validation Error Rate: {error_rate:.4f}")
+
+    if error_rate == 0 or np.std(errors) == 0:
+        print(
+            "No variance in errors (perfect or total failure). Correlation analysis skipped."
+        )
+        return
+
+    # Calculate Pearson correlation between Error vector and each Feature dimension
+    # Vectorized implementation for speed
+
+    # Center the data
+    X_centered = val_features - val_features.mean(axis=0)
+    e_centered = errors - errors.mean()
+
+    # Compute Covariance: (E . X) / (N - 1)
+    # e_centered shape: (N,), X_centered shape: (N, 4096)
+    covariance = np.dot(e_centered, X_centered) / (len(errors) - 1)
+
+    # Compute Standard Deviations
+    X_std = val_features.std(axis=0)
+    e_std = errors.std()
+
+    # Avoid division by zero for constant features
+    valid_mask = X_std > 1e-9
+
+    correlations = np.zeros(val_features.shape[1])
+    correlations[valid_mask] = covariance[valid_mask] / (X_std[valid_mask] * e_std)
+
+    # Identify top correlations
+    # Positive correlation: High feature value -> Higher probability of Error
+    # Negative correlation: High feature value -> Lower probability of Error (Better performance)
+    top_pos_idx = np.argsort(correlations)[-5:][::-1]
+    top_neg_idx = np.argsort(correlations)[:5]
+
+    print("\nTop 5 Input Features Positively Correlated with Error:")
+    for idx in top_pos_idx:
+        print(f"  Feature {idx}: {correlations[idx]:.4f}")
+
+    print("\nTop 5 Input Features Negatively Correlated with Error:")
+    for idx in top_neg_idx:
+        print(f"  Feature {idx}: {correlations[idx]:.4f}")
+    
+    return val_targets, preds
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    print("Starting execution...")
+
+    # 2. Data Loading
+    print("\n[1/4] Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE, num_workers=Config.NUM_WORKERS
+    )
+
+    # 3. Model Training
+    print("\n[2/4] Training AnimalModel (Partial Fine-Tuning)...")
+    model = train_model(
+        train_loader,
+        val_loader,
+        epochs=Config.EPOCHS,
+        lr=Config.LEARNING_RATE,
+    )
+
+    # 4. Validation Assessment & Failure Analysis
+    print("\n[3/4] Validating and Analyzing Failures...")
+
+    # Run Failure Analysis (which also computes metrics)
+    val_targets, val_preds = run_failure_analysis(model, val_loader)
+
+    # Calculate and Print Metric
+    final_metric = calculate_macro_f1(val_targets, val_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Submission Generation
+    # Only generate submission if metric is improved
+    baseline_metric = 0.3674631922482031
+
+    if final_metric > baseline_metric:
+        print(
+            f"\n[4/4] Generating Submission (Metric {final_metric:.6f} > {baseline_metric:.6f})..."
+        )
+        generate_submission(
+            model, test_loader, output_path=Config.SUBMISSION_PATH
+        )
+    else:
+        print(
+            f"\n[4/4] Skipping Submission: Metric {final_metric:.6f} did not improve baseline {baseline_metric:.6f}."
+        )
+
+    print("\nPipeline completed successfully.")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,372 @@
+To optimize the solution, I will implement the following changes based on the provided lessons:
+
+1.  **Architecture Optimization (Cite {solution_lesson_node_00009})**: I will replace the `ResUNet` architecture in `library/model.py` with a standard `UNet` that uses **Bilinear Upsampling** followed by Convolutions instead of Transposed Convolutions. The previous solution showed that Transposed Convolutions introduced artifacts and performed significantly worse than the simpler U-Net approach.
+2.  **Extended Convergence (Cite {solution_lesson_node_00003})**: I will increase the training duration in `runfile.py` from 100 to 350 epochs to allow the model to fully converge on the augmented dataset.
+3.  **Scheduler Decoupling (Cite {solution_lesson_node_00007})**: I will set `T_MAX` to 1000 in `runfile.py` (decoupled from the 350 epoch limit) to prevent the learning rate from decaying too quickly, ensuring the optimizer remains active throughout the training phase.
+
+I will update `library/model.py` to define the new architecture and modify `library/train.py`, `library/inference.py`, and `runfile.py` to use the `UNet` class instead of `ResUNet`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- Training Hyperparameters ---
+    # Extended duration for convergence on augmented data
+    NUM_EPOCHS = 400
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+
+    # --- Scheduler (Cosine Annealing) ---
+    # Decoupled horizon: T_MAX significantly larger than NUM_EPOCHS
+    # to keep learning rate active throughout training
+    T_MAX = 1500
+    ETA_MIN = 1e-6
+=======
+    # --- Training Hyperparameters ---
+    # Extended duration for convergence on augmented data
+    NUM_EPOCHS = 350
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+
+    # --- Scheduler (Cosine Annealing) ---
+    # Decoupled horizon: T_MAX significantly larger than NUM_EPOCHS
+    # to keep learning rate active throughout training
+    T_MAX = 1000
+    ETA_MIN = 1e-6
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ResidualBlock(nn.Module):
+    """
+    A Residual Block consisting of two 3x3 convolutions with Batch Normalization and ReLU.
+    Includes a skip connection (identity mapping) to facilitate gradient flow and
+    mitigate the vanishing gradient problem in deep networks.
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(ResidualBlock, self).__init__()
+
+        # First convolution block
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Second convolution block
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Shortcut connection
+        # If input and output channels differ, use 1x1 conv to match dimensions
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=1, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class ResUNet(nn.Module):
+    """
+    Residual U-Net Architecture.
+    Combines the symmetric U-Net encoder-decoder structure with Residual Blocks
+    to enable deeper architectures and better feature learning for denoising.
+    """
+
+    def __init__(
+        self,
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ):
+        super(ResUNet, self).__init__()
+
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # --- Encoder (Contracting Path) ---
+        # Construct downsampling layers based on feature depths
+        current_in_channels = in_channels
+        for feature in features[:-1]:
+            self.downs.append(ResidualBlock(current_in_channels, feature))
+            current_in_channels = feature
+
+        # --- Bottleneck ---
+        # The bridge between encoder and decoder
+        self.bottleneck = ResidualBlock(features[-2], features[-1])
+
+        # --- Decoder (Expanding Path) ---
+        # Construct upsampling layers in reverse feature order
+        for feature in reversed(features[:-1]):
+            # Up-convolution (Transpose Conv) doubles spatial dim, halves channels
+            # Input channels: feature*2 (from previous layer), Output: feature
+            self.ups.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
+            # Residual Block processes the concatenated features
+            # Input channels: feature*2 (skip connection + upsampled), Output: feature
+            self.ups.append(ResidualBlock(feature * 2, feature))
+
+        # --- Final Output Layer ---
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        skip_connections = []
+
+        # Encoder pass
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        # Bottleneck
+        x = self.bottleneck(x)
+
+        # Reverse skip connections for easy access during decoding
+        skip_connections = skip_connections[::-1]
+
+        # Decoder pass
+        for i in range(0, len(self.ups), 2):
+            # Apply Up-convolution
+            x = self.ups[i](x)
+
+            # Retrieve corresponding skip connection
+            skip_connection = skip_connections[i // 2]
+
+            # Handle potential dimension mismatch (e.g. if input size was odd)
+            if x.shape != skip_connection.shape:
+                x = TF.resize(x, size=skip_connection.shape[2:])
+
+            # Concatenate along channel dimension
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+
+            # Apply Residual Block
+            x = self.ups[i + 1](concat_skip)
+
+        return self.final_conv(x)
+=======
+class DoubleConv(nn.Module):
+    """
+    Standard Double Convolution Block: (Conv3x3 -> BN -> ReLU) x 2
+    """
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    """
+    Standard U-Net Architecture with Bilinear Upsampling.
+    Replaces Transposed Convolutions with Upsampling + Convolution to avoid checkerboard artifacts.
+    Cite {solution_lesson_node_00009}
+    """
+
+    def __init__(
+        self,
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ):
+        super(UNet, self).__init__()
+
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # --- Encoder (Contracting Path) ---
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature
+
+        # --- Bottleneck ---
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+
+        # --- Decoder (Expanding Path) ---
+        for feature in reversed(features):
+            # Upsampling + Convolution
+            self.ups.append(
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+                    nn.Conv2d(feature * 2, feature, kernel_size=1),
+                )
+            )
+            # Double Conv on concatenated features
+            self.ups.append(DoubleConv(feature * 2, feature))
+
+        # --- Final Output Layer ---
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        skip_connections = []
+
+        # Encoder pass
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        # Bottleneck
+        x = self.bottleneck(x)
+
+        # Reverse skip connections
+        skip_connections = skip_connections[::-1]
+
+        # Decoder pass
+        for i in range(0, len(self.ups), 2):
+            x = self.ups[i](x)
+            skip_connection = skip_connections[i // 2]
+
+            if x.shape != skip_connection.shape:
+                x = TF.resize(x, size=skip_connection.shape[2:])
+
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[i + 1](concat_skip)
+
+        return self.final_conv(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import ResUNet
+from library.utils import seed_everything, calculate_rmse, pad_image, unpad_image
+=======
+from library.model import UNet
+from library.utils import seed_everything, calculate_rmse, pad_image, unpad_image
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Residual U-Net
+    model = ResUNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+=======
+    # Initialize U-Net
+    model = UNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import ResUNet
+from library.dataset import get_dataloaders
+=======
+from library.model import UNet
+from library.dataset import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = ResUNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+=======
+    # Initialize Model
+    model = UNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ResUNet
+from library.train import train_one_epoch, validate, predict_tensor
+=======
+from library.model import UNet
+from library.train import train_one_epoch, validate, predict_tensor
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_pipeline():
+    # --- 1. Configuration & Setup ---
+    # Override Config for a fast baseline execution
+    Config.NUM_EPOCHS = 100
+    Config.T_MAX = 100
+
+    # Set seeds for reproducibility
+=======
+def run_pipeline():
+    # --- 1. Configuration & Setup ---
+    # Extended convergence as per Cite {solution_lesson_node_00003}
+    Config.NUM_EPOCHS = 350
+    # Decoupled horizon as per Cite {solution_lesson_node_00007}
+    Config.T_MAX = 1000
+
+    # Set seeds for reproducibility
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- 3. Model Initialization ---
+    model = ResUNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+=======
+    # --- 3. Model Initialization ---
+    model = UNet(
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        features=Config.FEATURES,
+    ).to(device)
+>>>>>>> REPLACE
+```

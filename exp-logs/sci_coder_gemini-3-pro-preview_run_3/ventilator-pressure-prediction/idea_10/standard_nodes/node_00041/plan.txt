@@ -1,0 +1,420 @@
+Based on the lessons learned, specifically **Lesson 00014** (simple Bi-LSTM outperforms complex hybrids for this physical task) and **Lesson 00039** (hybrid architectures converge slowly and require extended training), I will optimize the solution by replacing the `NCPNet` hybrid architecture with a high-capacity **Deep Bidirectional LSTM**.
+
+The previous solution suffered from instability and poor convergence (MAE ~1.24) due to the complexity of the hybrid model combined with an insufficient training budget (10 epochs). The failure analysis showed the model struggled with integral terms (`vol_C`, `u_in_cumsum`), confirming **Lesson 00032** which emphasizes that RNN capacity is crucial for modeling accumulated states.
+
+My strategy is to:
+1.  **Architecture**: Replace the TCN-LSTM hybrid with a pure, deep (4-layer) Bidirectional LSTM (`DeepLSTM`). This aligns the architecture with the integral nature of the pressure dynamics (Cite **Lesson 00014**, **Lesson 00032**).
+2.  **Training Budget**: Increase `EPOCHS` from 10 to 50 and remove the override in `runfile.py` to allow the model to converge properly (Cite **Lesson 00039**).
+3.  **Batch Size**: Set `BATCH_SIZE` to 256 to balance gradient noise for generalization (Cite **Lesson 00018**) with execution speed to ensure completion within the 4-hour limit.
+4.  **Environment**: Update the working directory to `./working/optimized` to ensure a clean training run.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Output/Working data (Writeable)
+    # Using specific subdirectory for this idea to avoid conflicts
+    WORKING_DIR = "./working/idea_10"
+    SUBMISSION_DIR = "./submission"
+=======
+    # Output/Working data (Writeable)
+    # Using specific subdirectory for this idea to avoid conflicts
+    WORKING_DIR = "./working/optimized"
+    SUBMISSION_DIR = "./submission"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Training
+    # Small batch size (128) for gradient noise injection (Lesson 18)
+    BATCH_SIZE = 128
+    # Extended training budget for hybrid convergence (Lesson 39)
+    EPOCHS = 80
+=======
+    # Training
+    # Moderate batch size (256) to balance gradient noise (Cite Lesson 00018) and runtime
+    BATCH_SIZE = 256
+    # Sufficient epochs for LSTM convergence (Cite Lesson 00039)
+    EPOCHS = 50
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Architecture: Non-Causal Pyramidal TCN (Branch 1)
+    # Wide kernel (7) for smoothing physical signals (Lesson 26)
+    TCN_KERNEL_SIZE = 7
+    # Base channels, will be doubled in pyramidal structure (Lesson 24)
+    TCN_BASE_CHANNELS = 64
+    # Number of layers (determines dilation 1, 2, 4, 8...)
+    TCN_LAYERS = 4
+    TCN_DROPOUT = 0.1
+
+    # Architecture: Bidirectional LSTM (Branch 2)
+    # High capacity for integral dynamics (Lesson 32)
+    LSTM_HIDDEN_DIM = 512
+    LSTM_LAYERS = 3
+    LSTM_DROPOUT = 0.1
+
+    # Fusion Head
+    # Deep dense layers after concatenation
+    HEAD_HIDDEN_DIMS = [512, 256]
+=======
+    # Architecture: Deep Bidirectional LSTM
+    # High capacity for integral dynamics (Cite Lesson 00032)
+    # Simplified architecture for better convergence (Cite Lesson 00014)
+    LSTM_HIDDEN_DIM = 512
+    LSTM_LAYERS = 4
+    LSTM_DROPOUT = 0.1
+
+    # Head
+    HEAD_HIDDEN_DIMS = [512, 256]
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class PyramidalTCNBlock(nn.Module):
+    """
+    A single block of the Pyramidal TCN.
+
+    Features:
+    - Dilated 1D Convolution with Large Kernel (7)
+    - Centered Padding (Non-Causal)
+    - GELU Activation
+    - Residual Connection (with 1x1 projection if channels change)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super().__init__()
+
+        # Calculate padding for "Centered Padding" to maintain sequence length
+        # padding = dilation * (kernel_size - 1) / 2
+        # For kernel_size=7, (k-1)=6, so padding is 3 * dilation.
+        padding = int(dilation * (kernel_size - 1) / 2)
+
+        self.conv = nn.Conv1d(
+            in_channels, out_channels, kernel_size, padding=padding, dilation=dilation
+        )
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+        # Projection for residual connection if dimensions change
+        self.downsample = None
+        if in_channels != out_channels:
+            self.downsample = nn.Conv1d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Length)
+        residual = x
+
+        out = self.conv(x)
+        out = self.act(out)
+        out = self.drop(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(residual)
+
+        return out + residual
+
+
+class NCPNet(nn.Module):
+    """
+    Non-Causal Pyramidal Context-Aware Network (NCP-Net).
+
+    A hybrid architecture combining:
+    1. A Pyramidal TCN branch for fast, resistive dynamics (Non-Causal, Wide Kernel).
+    2. A High-Capacity Bidirectional LSTM branch for slow, elastic dynamics (Integral).
+    3. A Deep Dense Fusion Head without global residual connections.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        input_dim = len(Config.FEATURE_COLS)
+
+        # =====================================================================
+        # Branch 1: Non-Causal Pyramidal TCN (Resistive Stream)
+        # =====================================================================
+        self.tcn_base_channels = Config.TCN_BASE_CHANNELS
+        self.tcn_kernel_size = Config.TCN_KERNEL_SIZE
+        self.tcn_layers_count = Config.TCN_LAYERS
+        self.tcn_dropout = Config.TCN_DROPOUT
+
+        # Initial projection to base channel dimension
+        self.tcn_input_proj = nn.Conv1d(input_dim, self.tcn_base_channels, 1)
+
+        self.tcn_layers = nn.ModuleList()
+        current_channels = self.tcn_base_channels
+
+        for i in range(self.tcn_layers_count):
+            # Pyramidal Scaling: Double channels every layer
+            out_channels = current_channels * 2
+            dilation = 2**i
+
+            block = PyramidalTCNBlock(
+                in_channels=current_channels,
+                out_channels=out_channels,
+                kernel_size=self.tcn_kernel_size,
+                dilation=dilation,
+                dropout=self.tcn_dropout,
+            )
+            self.tcn_layers.append(block)
+            current_channels = out_channels
+
+        self.tcn_output_dim = current_channels
+
+        # =====================================================================
+        # Branch 2: High-Capacity Bidirectional LSTM (Elastic Stream)
+        # =====================================================================
+        self.lstm_hidden_dim = Config.LSTM_HIDDEN_DIM
+        self.lstm_layers = Config.LSTM_LAYERS
+        self.lstm_dropout = Config.LSTM_DROPOUT
+
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=self.lstm_hidden_dim,
+            num_layers=self.lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=self.lstm_dropout if self.lstm_layers > 1 else 0,
+        )
+
+        # Bidirectional output is 2 * hidden_dim
+        self.lstm_output_dim = self.lstm_hidden_dim * 2
+
+        # =====================================================================
+        # Fusion Head: Coupled Latent Integration
+        # =====================================================================
+        # Concatenate TCN and LSTM outputs
+        fusion_dim = self.tcn_output_dim + self.lstm_output_dim
+
+        head_layers = []
+        in_dim = fusion_dim
+
+        # Deep Dense MLP
+        for hidden_dim in Config.HEAD_HIDDEN_DIMS:
+            head_layers.append(nn.Linear(in_dim, hidden_dim))
+            head_layers.append(nn.GELU())
+            head_layers.append(nn.Dropout(0.1))
+            in_dim = hidden_dim
+
+        # Final prediction layer
+        head_layers.append(nn.Linear(in_dim, 1))
+
+        self.head = nn.Sequential(*head_layers)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights for stability.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        nn.init.constant_(param.data, 0)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq_Len, Input_Dim)
+        Returns:
+            out: Predicted pressure of shape (Batch, Seq_Len, 1)
+        """
+        # ---------------------------------------------------------------------
+        # Branch 1: TCN Forward
+        # ---------------------------------------------------------------------
+        # Permute to (Batch, Channels, Seq_Len) for Conv1d
+        x_tcn = x.transpose(1, 2)
+        x_tcn = self.tcn_input_proj(x_tcn)
+
+        for layer in self.tcn_layers:
+            x_tcn = layer(x_tcn)
+
+        # Permute back to (Batch, Seq_Len, Channels)
+        x_tcn = x_tcn.transpose(1, 2)
+
+        # ---------------------------------------------------------------------
+        # Branch 2: LSTM Forward
+        # ---------------------------------------------------------------------
+        # LSTM takes (Batch, Seq_Len, Input_Dim)
+        x_lstm, _ = self.lstm(x)
+
+        # ---------------------------------------------------------------------
+        # Fusion
+        # ---------------------------------------------------------------------
+        # Concatenate along the feature dimension
+        fused = torch.cat([x_tcn, x_lstm], dim=2)
+
+        # Pass through MLP Head
+        out = self.head(fused)
+
+        return out
+=======
+class DeepLSTM(nn.Module):
+    """
+    Deep Bidirectional LSTM Network.
+
+    Simplified architecture focusing on Recurrent Capacity for integral dynamics.
+    Cite Lesson 00014: Simple Bi-LSTM alignment with physical dynamics.
+    Cite Lesson 00032: Priority on RNN capacity.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        input_dim = len(Config.FEATURE_COLS)
+
+        # =====================================================================
+        # Backbone: High-Capacity Bidirectional LSTM
+        # =====================================================================
+        self.lstm_hidden_dim = Config.LSTM_HIDDEN_DIM
+        self.lstm_layers = Config.LSTM_LAYERS
+        self.lstm_dropout = Config.LSTM_DROPOUT
+
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=self.lstm_hidden_dim,
+            num_layers=self.lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=self.lstm_dropout if self.lstm_layers > 1 else 0,
+        )
+
+        # Bidirectional output is 2 * hidden_dim
+        self.lstm_output_dim = self.lstm_hidden_dim * 2
+
+        # =====================================================================
+        # Head: Deep Dense MLP
+        # =====================================================================
+        head_layers = []
+        in_dim = self.lstm_output_dim
+
+        for hidden_dim in Config.HEAD_HIDDEN_DIMS:
+            head_layers.append(nn.Linear(in_dim, hidden_dim))
+            head_layers.append(nn.GELU())
+            head_layers.append(nn.Dropout(0.1))
+            in_dim = hidden_dim
+
+        # Final prediction layer
+        head_layers.append(nn.Linear(in_dim, 1))
+
+        self.head = nn.Sequential(*head_layers)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights for stability.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        nn.init.constant_(param.data, 0)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq_Len, Input_Dim)
+        Returns:
+            out: Predicted pressure of shape (Batch, Seq_Len, 1)
+        """
+        # LSTM takes (Batch, Seq_Len, Input_Dim)
+        x_lstm, _ = self.lstm(x)
+
+        # Pass through MLP Head
+        out = self.head(x_lstm)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import NCPNet
+
+
+class Trainer:
+    """
+    Manages the training, validation, and checkpointing of the NCP-Net model.
+    """
+
+    def __init__(self, model=None):
+        """
+        Initialize the Trainer.
+
+        Args:
+            model (nn.Module, optional): A pre-instantiated model. If None, initializes NCPNet.
+        """
+        self.device = get_device()
+        self.model = model if model is not None else NCPNet()
+        self.model.to(self.device)
+=======
+from library.model import DeepLSTM
+
+
+class Trainer:
+    """
+    Manages the training, validation, and checkpointing of the DeepLSTM model.
+    """
+
+    def __init__(self, model=None):
+        """
+        Initialize the Trainer.
+
+        Args:
+            model (nn.Module, optional): A pre-instantiated model. If None, initializes DeepLSTM.
+        """
+        self.device = get_device()
+        self.model = model if model is not None else DeepLSTM()
+        self.model.to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import NCPNet
+
+
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Override Config for Fast Baseline Execution
+    # Limit epochs to ensure completion within 2 hours on A100
+    Config.EPOCHS = 10
+
+    # Ensure reproducibility
+=======
+from library.model import DeepLSTM
+
+
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Ensure reproducibility
+>>>>>>> REPLACE
+```

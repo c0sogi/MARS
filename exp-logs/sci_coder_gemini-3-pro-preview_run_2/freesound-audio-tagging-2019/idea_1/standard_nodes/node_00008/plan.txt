@@ -1,0 +1,334 @@
+I will implement the following optimization strategy based on the provided lessons:
+
+1.  **Cross-Modal Transfer Learning (Cite solution_lesson_node_00006)**: I will replace the custom scratch-trained MobileNetV2 with a standard `mobilenet_v2` from `torchvision`, pre-trained on ImageNet. To adapt the RGB model to single-channel spectrograms, I will initialize the first convolutional layer by summing the pre-trained weights along the channel dimension.
+2.  **Global Max Pooling (Cite solution_lesson_node_00002)**: I will override the default Global Average Pooling of the pre-trained model with Global Max Pooling to prevent signal dilution caused by zero-padding in variable-length audio clips.
+3.  **Mixup Augmentation (Cite solution_lesson_node_00007)**: I will introduce Mixup augmentation in the training loop with a uniform distribution ($\alpha=1.0$) to improve generalization in this multi-label setting.
+4.  **Extended Training (Cite solution_lesson_node_00005)**: I will increase `MAX_EPOCHS` to 50 to ensure the model has sufficient time to converge, relying on the existing Early Stopping mechanism to prevent overfitting.
+
+Here are the code changes:
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+def _make_divisible(v, divisor, min_value=None):
+    """
+    Ensures that all layers have a channel number that is divisible by 8.
+    This is important for optimizing performance on hardware accelerators.
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+class ConvBNReLU(nn.Sequential):
+    """
+    Standard block: Conv2d -> BatchNorm2d -> ReLU6
+    """
+
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1):
+        padding = (kernel_size - 1) // 2
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU6(inplace=True),
+        )
+
+
+class InvertedResidual(nn.Module):
+    """
+    Inverted Residual Block (MobileNetV2 Block).
+    Structure: Pointwise (Expansion) -> Depthwise -> Pointwise (Projection)
+    """
+
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super(InvertedResidual, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2]
+
+        hidden_dim = int(round(inp * expand_ratio))
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        if expand_ratio != 1:
+            # Pointwise Convolution (Expansion)
+            layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1))
+
+        layers.extend(
+            [
+                # Depthwise Convolution
+                ConvBNReLU(hidden_dim, hidden_dim, stride=stride, groups=hidden_dim),
+                # Pointwise Convolution (Projection) - No non-linearity
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            ]
+        )
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class AudioMobileNet(nn.Module):
+    """
+    Lightweight 2D CNN based on MobileNetV2 architecture.
+    Adapted for Audio Spectrogram inputs.
+    """
+
+    def __init__(self, width_mult=1.0):
+        super(AudioMobileNet, self).__init__()
+
+        input_channel = 32
+        last_channel = 1280
+        num_classes = Config.NUM_CLASSES
+
+        # MobileNetV2 Configuration:
+        # t: expansion factor, c: output channels, n: number of blocks, s: stride
+        inverted_residual_setting = [
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        # Build first layer
+        input_channel = _make_divisible(input_channel * width_mult, 8)
+        self.last_channel = (
+            _make_divisible(last_channel * width_mult, 8)
+            if width_mult > 1.0
+            else last_channel
+        )
+
+        # Initial Feature Extraction
+        # Input channels defined in Config (1 for Log-Mel Spectrogram)
+        self.features = [ConvBNReLU(Config.IN_CHANNELS, input_channel, stride=2)]
+
+        # Build Inverted Residual Blocks
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c * width_mult, 8)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                self.features.append(
+                    InvertedResidual(
+                        input_channel, output_channel, stride, expand_ratio=t
+                    )
+                )
+                input_channel = output_channel
+
+        # Build Last Convolutional Layer
+        self.features.append(
+            ConvBNReLU(input_channel, self.last_channel, kernel_size=1)
+        )
+
+        self.features = nn.Sequential(*self.features)
+
+        # Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(self.last_channel, num_classes),
+        )
+
+        # Weight Initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram of shape (Batch, 1, Freq, Time)
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes)
+        """
+        # Feature Extraction
+        x = self.features(x)
+
+        # Global Max Pooling
+        # Collapses spatial dimensions (Freq, Time) to (1, 1)
+        # Uses Max Pooling to avoid signal dilution from zero-padding (Cite solution_lesson_node_00002)
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+=======
+import torch
+import torch.nn as nn
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from library.config import Config
+
+
+class AudioMobileNet(nn.Module):
+    """
+    MobileNetV2 based model using Transfer Learning from ImageNet.
+    Adapted for 1-channel Audio Spectrograms using Kernel Summation.
+    """
+
+    def __init__(self):
+        super(AudioMobileNet, self).__init__()
+        
+        # Load pre-trained MobileNetV2
+        # Cite solution_lesson_node_00006
+        weights = MobileNet_V2_Weights.IMAGENET1K_V1
+        self.base_model = mobilenet_v2(weights=weights)
+
+        # Modify the first layer to accept 1 channel instead of 3
+        # We sum the weights of the RGB channels to preserve the filters' spatial structure
+        # Cite solution_lesson_node_00006
+        original_conv = self.base_model.features[0][0]
+        new_conv = nn.Conv2d(
+            in_channels=1,
+            out_channels=original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=original_conv.bias is not None
+        )
+        
+        with torch.no_grad():
+            new_conv.weight[:] = original_conv.weight.sum(dim=1, keepdim=True)
+            if original_conv.bias is not None:
+                new_conv.bias[:] = original_conv.bias
+        
+        self.base_model.features[0][0] = new_conv
+
+        # Modify the classifier head for the specific number of audio classes
+        # MobileNetV2 classifier is a Sequential(Dropout, Linear)
+        in_features = self.base_model.classifier[1].in_features
+        self.base_model.classifier[1] = nn.Linear(in_features, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram of shape (Batch, 1, Freq, Time)
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes)
+        """
+        # Feature Extraction
+        x = self.base_model.features(x)
+
+        # Global Max Pooling
+        # We replace the standard Global Average Pooling to avoid signal dilution
+        # caused by zero-padding in variable length audio clips.
+        # Cite solution_lesson_node_00002
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.base_model.classifier(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+=======
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        # Apply Mixup Augmentation
+        # Cite solution_lesson_node_00006 (Mixup usage)
+        # Cite solution_lesson_node_00007 (Uniform distribution alpha=1.0)
+        alpha = 1.0
+        lam = np.random.beta(alpha, alpha)
+        
+        batch_size = images.size(0)
+        index = torch.randperm(batch_size).to(device)
+
+        mixed_images = lam * images + (1 - lam) * images[index]
+        mixed_targets = lam * targets + (1 - lam) * targets[index]
+
+        optimizer.zero_grad()
+        outputs = model(mixed_images)
+        loss = criterion(outputs, mixed_targets)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==== 1. Setup & Configuration ====
+    # Increase epochs for better convergence
+    Config.MAX_EPOCHS = 30
+
+    # Set seeds for reproducibility
+=======
+    # ==== 1. Setup & Configuration ====
+    # Increase epochs for better convergence (Cite solution_lesson_node_00005)
+    Config.MAX_EPOCHS = 50
+
+    # Set seeds for reproducibility
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==== 6. Submission Logic ====
+    threshold = 0.6388546084534379
+    if val_score > threshold:
+=======
+    # ==== 6. Submission Logic ====
+    threshold = 0.8105477777438791
+    if val_score > threshold:
+>>>>>>> REPLACE
+```

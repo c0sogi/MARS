@@ -1,0 +1,269 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement the following optimizations:
+
+1.  **Restore Effective Batch Size to 32**: I will modify `library/config.py` to increase `gradient_accumulation_steps` from 4 to 8. With a physical batch size of 4, this yields an effective batch size of 32. Lesson `solution_lesson_node_00027` explicitly identified that reducing the effective batch size to 16 caused a performance regression.
+2.  **Adjust Training Epochs**: I will increase `num_epochs` from 3 to 4 in `library/config.py`. Since increasing the batch size reduces the total number of update steps per epoch, adding an epoch ensures the model has sufficient steps to converge, addressing the schedule compression issue highlighted in Lesson `solution_lesson_node_00011`.
+3.  **Simplify to Supervised Ensemble**: I will modify `runfile.py` to remove the Teacher-Student pseudo-labeling workflow. Lesson `solution_lesson_node_00027` and `solution_lesson_node_00013` suggest that a complex pipeline often fails to outperform a well-tuned baseline if the base models are suboptimal. By focusing on a pure supervised ensemble of 3 models trained with the optimized batch size, we aim to reliably exceed the threshold without the noise and overhead of pseudo-labeling.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Batch sizes
+    train_batch_size = 4  # Physical batch size per step (fits in GPU memory)
+    valid_batch_size = 16
+    gradient_accumulation_steps = 4  # Effective batch size = 4 * 4 = 16
+
+    # Optimization
+    learning_rate = 1e-5
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+
+    # Scheduler
+    num_epochs = 3
+    scheduler_type = "linear"
+    warmup_ratio = 0.1
+=======
+    # Batch sizes
+    train_batch_size = 4  # Physical batch size per step (fits in GPU memory)
+    valid_batch_size = 16
+    gradient_accumulation_steps = 8  # Effective batch size = 4 * 8 = 32 Cite solution_lesson_node_00027
+
+    # Optimization
+    learning_rate = 1e-5
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+
+    # Scheduler
+    num_epochs = 4  # Increased to compensate for fewer steps per epoch Cite solution_lesson_node_00011
+    scheduler_type = "linear"
+    warmup_ratio = 0.1
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Teacher Ensemble Training
+    # We train multiple models with different seeds to create a robust teacher ensemble.
+    # This ensemble will be used to generate pseudo-labels for the test set.
+
+    teacher_val_preds = []
+    teacher_test_preds = []
+
+    # We need to keep track of validation labels for the metric calculation
+    val_labels = val_df["Insult"].values
+
+    for seed in Config.seeds:
+        set_seed(seed)
+
+        # Create DataLoaders for this seed
+        # Teacher trains on train_df, validates on val_df
+        train_loader, val_loader, test_loader = create_dataloaders(
+            tokenizer=tokenizer,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            load_cached_data=True,
+        )
+
+        # Initialize Model
+        model = DebertaV3Classifier(Config.model_name)
+        model.to(device)
+
+        # Train Teacher Model
+        save_name = f"teacher_seed_{seed}.bin"
+        model, best_auc = train_runner(
+            train_loader, val_loader, model, save_name=save_name
+        )
+
+        # Inference on Validation (for Ensemble Metric)
+        val_probs = inference_fn(val_loader, model, device)
+        teacher_val_preds.append(val_probs)
+
+        # Inference on Test (for Pseudo-Labeling)
+        test_probs = inference_fn(test_loader, model, device)
+        teacher_test_preds.append(test_probs)
+
+        # Cleanup to save memory
+        del model, train_loader, val_loader, test_loader
+        torch.cuda.empty_cache()
+
+    # 5. Validation Assessment & Failure Analysis
+    # Average predictions from the teacher ensemble
+    avg_val_preds = np.mean(teacher_val_preds, axis=0)
+
+    # Calculate Final Validation Metric
+    final_val_auc = roc_auc_score(val_labels, avg_val_preds)
+    print(f"Final Validation Metric: {final_val_auc}")
+
+    # Failure Analysis: Correlation between error magnitude and comment length
+    errors = np.abs(val_labels - avg_val_preds)
+    # Ensure we use the decoded length
+    lengths = val_df["Comment"].apply(len).values
+
+    correlation = np.corrcoef(errors, lengths)[0, 1]
+    print(f"Correlation between Error Magnitude and Comment Length: {correlation}")
+
+    # Check Threshold before proceeding
+    THRESHOLD = 0.9639490968801314
+    if final_val_auc <= THRESHOLD:
+        print(
+            f"Validation metric {final_val_auc} is not higher than threshold {THRESHOLD}. Exiting."
+        )
+        return
+
+    # 6. Pseudo-Labeling
+    # Average test predictions from the teacher ensemble
+    avg_test_preds = np.mean(teacher_test_preds, axis=0)
+
+    # Combine Train and Val for the base of the Student model (maximizing data usage)
+    full_train_df = pd.concat([train_df, val_df], ignore_index=True)
+
+    # Create Augmented Dataset (Train + Val + High Confidence Test Samples)
+    augmented_df = prepare_augmented_data(full_train_df, test_df, avg_test_preds)
+
+    # 7. Student Ensemble Training
+    # Train new models on the augmented dataset
+
+    student_test_preds = []
+
+    for seed in Config.seeds:
+        set_seed(seed)
+
+        # Create DataLoaders
+        # We use augmented_df for training.
+        # We pass val_df for the 'val_loader' required by train_runner,
+        # but note that val data is now partly in the training set, so val metrics will be biased (high).
+        # This is acceptable as we are optimizing for final test performance.
+        train_loader, val_loader, test_loader = create_dataloaders(
+            tokenizer=tokenizer,
+            train_df=augmented_df,
+            val_df=val_df,
+            test_df=test_df,
+            load_cached_data=True,
+        )
+
+        # Initialize Student Model
+        model = DebertaV3Classifier(Config.model_name)
+        model.to(device)
+
+        # Train Student Model
+        save_name = f"student_seed_{seed}.bin"
+        model, best_auc = train_runner(
+            train_loader, val_loader, model, save_name=save_name
+        )
+
+        # Inference on Test
+        test_probs = inference_fn(test_loader, model, device)
+        student_test_preds.append(test_probs)
+
+        # Cleanup
+        del model, train_loader, val_loader, test_loader
+        torch.cuda.empty_cache()
+
+    # 8. Submission
+    avg_student_preds = np.mean(student_test_preds, axis=0)
+=======
+    # 4. Ensemble Training
+    # We train multiple models with different seeds to create a robust ensemble.
+    # Cite solution_lesson_node_00013: Simplicity Over Sophistication (removing Teacher-Student loop)
+    # Cite solution_lesson_node_00027: Prioritize base model optimization (BS=32) over pipeline complexity.
+
+    val_preds = []
+    test_preds = []
+
+    # We need to keep track of validation labels for the metric calculation
+    val_labels = val_df["Insult"].values
+
+    for seed in Config.seeds:
+        set_seed(seed)
+
+        # Create DataLoaders for this seed
+        train_loader, val_loader, test_loader = create_dataloaders(
+            tokenizer=tokenizer,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            load_cached_data=True,
+        )
+
+        # Initialize Model
+        model = DebertaV3Classifier(Config.model_name)
+        model.to(device)
+
+        # Train Model
+        save_name = f"model_seed_{seed}.bin"
+        model, best_auc = train_runner(
+            train_loader, val_loader, model, save_name=save_name
+        )
+
+        # Inference on Validation (for Ensemble Metric)
+        val_probs = inference_fn(val_loader, model, device)
+        val_preds.append(val_probs)
+
+        # Inference on Test
+        test_probs = inference_fn(test_loader, model, device)
+        test_preds.append(test_probs)
+
+        # Cleanup to save memory
+        del model, train_loader, val_loader, test_loader
+        torch.cuda.empty_cache()
+
+    # 5. Validation Assessment & Failure Analysis
+    # Average predictions from the ensemble
+    avg_val_preds = np.mean(val_preds, axis=0)
+
+    # Calculate Final Validation Metric
+    final_val_auc = roc_auc_score(val_labels, avg_val_preds)
+    print(f"Final Validation Metric: {final_val_auc}")
+
+    # Failure Analysis: Correlation between error magnitude and comment length
+    errors = np.abs(val_labels - avg_val_preds)
+    # Ensure we use the decoded length
+    lengths = val_df["Comment"].apply(len).values
+
+    correlation = np.corrcoef(errors, lengths)[0, 1]
+    print(f"Correlation between Error Magnitude and Comment Length: {correlation}")
+
+    # Check Threshold before proceeding
+    THRESHOLD = 0.9639490968801314
+    if final_val_auc <= THRESHOLD:
+        print(
+            f"Validation metric {final_val_auc} is not higher than threshold {THRESHOLD}. Exiting."
+        )
+        return
+
+    # 6. Submission
+    avg_test_preds = np.mean(test_preds, axis=0)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load sample submission to ensure correct format
+    sample_sub_path = "./input/sample_submission_null.csv"
+    if os.path.exists(sample_sub_path):
+        sub_df = pd.read_csv(sample_sub_path)
+        sub_df["Insult"] = avg_student_preds
+    else:
+        # Fallback if sample file is missing
+        sub_df = test_df.copy()
+        sub_df["Insult"] = avg_student_preds
+        # Ensure Insult is the first column
+        cols = ["Insult"] + [c for c in sub_df.columns if c != "Insult"]
+        sub_df = sub_df[cols]
+=======
+    # Load sample submission to ensure correct format
+    sample_sub_path = "./input/sample_submission_null.csv"
+    if os.path.exists(sample_sub_path):
+        sub_df = pd.read_csv(sample_sub_path)
+        sub_df["Insult"] = avg_test_preds
+    else:
+        # Fallback if sample file is missing
+        sub_df = test_df.copy()
+        sub_df["Insult"] = avg_test_preds
+        # Ensure Insult is the first column
+        cols = ["Insult"] + [c for c in sub_df.columns if c != "Insult"]
+        sub_df = sub_df[cols]
+>>>>>>> REPLACE
+```

@@ -1,0 +1,197 @@
+Based on the failure analysis of the previous solution and the provided lessons, I will implement the following optimizations:
+
+1.  **Architecture Simplification (Native Input Adaptation)**: I will remove the custom "Stem" module (SEBlock + 1x1 Convolution) that was prepended to the backbone. The previous execution showed this caused gradient explosion (Val Loss > 1e7). Instead, I will modify the EfficientNet-B0 backbone to accept the 2.5D input directly using `in_chans`, allowing `timm` to properly initialize the weights (recycling pretrained RGB weights). This addresses the root cause of the divergence **Cite solution_lesson_node_00030**.
+
+2.  **Input Dimensionality Reduction**: I will reduce `SLICES_PER_MODALITY` from 32 to 16. Previous experiments showed that increasing slice density to 32 degraded performance and increased overfitting compared to 16 or 20 slices **Cite solution_lesson_node_00013**. This also aligns with the successful configuration in Lesson 00015.
+
+3.  **Resolution Optimization**: I will reduce `IMG_SIZE` from 256 to 224. This matches the standard input size for EfficientNet-B0, reducing computational overhead and potentially improving generalization as noted in **Cite solution_lesson_node_00015**.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Working and Output Directories
+WORKING_DIR = "./working/idea_7"
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+# Submission Path
+SUBMISSION_DIR = "./submission"
+os.makedirs(SUBMISSION_DIR, exist_ok=True)
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+# ==========================================
+# Data Hyperparameters
+# ==========================================
+# Idea: High-Density Uniform Sampling (32 slices per modality)
+SLICES_PER_MODALITY = 32
+MODALITIES = ["FLAIR", "T1w", "T1wCE", "T2w"]
+NUM_MODALITIES = len(MODALITIES)
+
+# Total input channels = 32 slices * 4 modalities = 128
+IN_CHANNELS = SLICES_PER_MODALITY * NUM_MODALITIES
+
+# Image Spatial Dimensions
+IMG_SIZE = 256
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+# Channel-Attention Stem settings
+STEM_REDUCTION_RATIO = 8  # For SE Block in the stem
+BOTTLENECK_CHANNELS = 64  # Compress 128 -> 64 before backbone
+=======
+# Working and Output Directories
+WORKING_DIR = "./working/idea_8"
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+# Submission Path
+SUBMISSION_DIR = "./submission"
+os.makedirs(SUBMISSION_DIR, exist_ok=True)
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+# ==========================================
+# Data Hyperparameters
+# ==========================================
+# Idea: Uniform Sampling (16 slices per modality) - Cite solution_lesson_node_00013
+SLICES_PER_MODALITY = 16
+MODALITIES = ["FLAIR", "T1w", "T1wCE", "T2w"]
+NUM_MODALITIES = len(MODALITIES)
+
+# Total input channels = 16 slices * 4 modalities = 64
+IN_CHANNELS = SLICES_PER_MODALITY * NUM_MODALITIES
+
+# Image Spatial Dimensions - Cite solution_lesson_node_00015
+IMG_SIZE = 224
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block for channel-wise attention.
+    Performs global average pooling, followed by a reduction/expansion FC network
+    to rescale input channels based on their importance.
+    """
+
+    def __init__(self, in_channels, reduction=8):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Squeeze: Global Average Pooling -> (B, C)
+        y = self.avg_pool(x).view(b, c)
+        # Excitation: FC Layers -> (B, C, 1, 1)
+        y = self.fc(y).view(b, c, 1, 1)
+        # Scale: Reweight channels
+        return x * y
+
+
+class MGMTNet(nn.Module):
+    """
+    Channel-Attention Compressed 2.5D Network.
+
+    Architecture:
+    1. Input: (B, 128, 256, 256) - 128 channels from 4 modalities * 32 slices.
+    2. Stem:
+       - SEBlock: Learns to suppress empty/irrelevant slices.
+       - Bottleneck: 1x1 Conv reduces 128 channels -> 64 channels.
+    3. Backbone: EfficientNet-B0 (modified input) -> Global Average Pooling -> Linear.
+    4. Output: Single logit for binary classification.
+    """
+
+    def __init__(self):
+        super(MGMTNet, self).__init__()
+
+        # Retrieve hyperparameters from config
+        in_channels = config.IN_CHANNELS
+        reduction = config.STEM_REDUCTION_RATIO
+        bottleneck_channels = config.BOTTLENECK_CHANNELS
+        backbone_name = config.BACKBONE_NAME
+
+        # 1. Channel-Attention Stem
+        self.se_block = SEBlock(in_channels, reduction)
+
+        # 2. Channel Bottleneck
+        # Linear compression from 128 to 64 channels using 1x1 convolution.
+        # Bias is False as it typically feeds into a normalization layer (in the backbone).
+        self.bottleneck = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=bottleneck_channels,
+            kernel_size=1,
+            stride=1,
+            bias=False,
+        )
+
+        # 3. Backbone
+        # EfficientNet-B0 initialized with pretrained weights.
+        # Modified to accept 'bottleneck_channels' (64) as input.
+        # Output is set to 1 class (logit).
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=True, in_chans=bottleneck_channels, num_classes=1
+        )
+
+    def forward(self, x):
+        # x shape: (B, 128, 256, 256)
+
+        # Apply Channel Attention (Soft Slice Selection)
+        x = self.se_block(x)
+
+        # Apply Channel Compression
+        x = self.bottleneck(x)
+
+        # Apply Backbone and Classification Head
+        # Output shape: (B, 1)
+        x = self.backbone(x)
+
+        return x
+=======
+class MGMTNet(nn.Module):
+    """
+    2.5D Stacked Network using Native Input Adaptation.
+    
+    Architecture:
+    1. Input: (B, 64, 224, 224) - 64 channels from 4 modalities * 16 slices.
+    2. Backbone: EfficientNet-B0 initialized with in_chans=64.
+       - Uses timm's native weight recycling to adapt pretrained RGB weights to 64 channels.
+       - Cite solution_lesson_node_00030: Native adaptation prevents gradient explosion compared to custom stems.
+    3. Output: Single logit for binary classification.
+    """
+
+    def __init__(self):
+        super(MGMTNet, self).__init__()
+
+        # Retrieve hyperparameters from config
+        in_channels = config.IN_CHANNELS
+        backbone_name = config.BACKBONE_NAME
+
+        # Backbone
+        # EfficientNet-B0 initialized with pretrained weights.
+        # Modified to accept 'in_channels' (64) directly.
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=True, in_chans=in_channels, num_classes=1
+        )
+
+    def forward(self, x):
+        # x shape: (B, 64, 224, 224)
+        
+        # Apply Backbone and Classification Head
+        # Output shape: (B, 1)
+        x = self.backbone(x)
+
+        return x
+>>>>>>> REPLACE
+```

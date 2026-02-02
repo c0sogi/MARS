@@ -1,0 +1,604 @@
+To improve the model's performance on "tail" classes (e.g., `MONEY`, `DECIMAL`) while maintaining high accuracy on frequent classes, I will implement a **Hybrid Neuro-Symbolic Architecture**.
+
+**Strategy:**
+1.  **Cache Invalidation**: I will update the `MODEL_STATS_PATH` in `library/config.py` to `ngram_neural_stats_v2.npy`. This ensures the pipeline re-runs the training phase instead of loading the old, non-neural statistics, directly addressing the silent failure observed in previous attempts (Cite solution_lesson_node_00002).
+2.  **Neural Fallback**: I will create a new `library/neural_model.py` module containing a character-level Seq2Seq model (Bi-GRU Encoder-Decoder). This model will be trained on unique `(before, after)` pairs from the training set to learn generative normalization rules for complex tokens.
+3.  **Hybrid Logic**: I will modify `library/ngram_model.py` to integrate this neural model. The system will first attempt the Hierarchical N-gram Lookup (Trigram -> Bigram -> Unigram) (Cite solution_lesson_node_00001). If the lookup fails (returns `NaN`), the system will check if the token contains digits. If it does, it will pass the token to the Neural Model for prediction; otherwise, it will fall back to Identity. This targeted fallback prevents the neural model from hallucinating on rare proper nouns while allowing it to solve unseen numerical expressions.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Used to store processed sequence data (parquet) and model statistics (npy)
+    # This enables the deterministic caching logic required by the task.
+    TRAIN_CACHE_PATH = os.path.join(WORKING_DIR, "train_sequences.parquet")
+    VAL_CACHE_PATH = os.path.join(WORKING_DIR, "val_sequences.parquet")
+    TEST_CACHE_PATH = os.path.join(WORKING_DIR, "test_sequences.parquet")
+    MODEL_STATS_PATH = os.path.join(WORKING_DIR, "ngram_stats.npy")
+
+    # --- Data Schema ---
+=======
+    # Used to store processed sequence data (parquet) and model statistics (npy)
+    # This enables the deterministic caching logic required by the task.
+    TRAIN_CACHE_PATH = os.path.join(WORKING_DIR, "train_sequences.parquet")
+    VAL_CACHE_PATH = os.path.join(WORKING_DIR, "val_sequences.parquet")
+    TEST_CACHE_PATH = os.path.join(WORKING_DIR, "test_sequences.parquet")
+    # Updated filename to invalidate cache and force training of the new hybrid model
+    MODEL_STATS_PATH = os.path.join(WORKING_DIR, "ngram_neural_stats_v2.npy")
+
+    # --- Data Schema ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/neural_model.py
+<<<<<<< SEARCH
+=======
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import random
+import logging
+import pandas as pd
+
+logger = logging.getLogger("NeuralModel")
+
+class CharTokenizer:
+    def __init__(self):
+        self.char2id = {}
+        self.id2char = {}
+        self.pad_token = "<PAD>"
+        self.sos_token = "<SOS>"
+        self.eos_token = "<EOS>"
+        self.unk_token = "<UNK>"
+        self.special_tokens = [self.pad_token, self.sos_token, self.eos_token, self.unk_token]
+    
+    def fit(self, texts):
+        unique_chars = set()
+        for text in texts:
+            unique_chars.update(str(text))
+        
+        # Sort for determinism
+        sorted_chars = sorted(list(unique_chars))
+        
+        self.id2char = {i: token for i, token in enumerate(self.special_tokens)}
+        for i, char in enumerate(sorted_chars):
+            self.id2char[len(self.special_tokens) + i] = char
+            
+        self.char2id = {v: k for k, v in self.id2char.items()}
+        
+    def encode(self, text, add_special_tokens=True):
+        text = str(text)
+        ids = [self.char2id.get(c, self.char2id[self.unk_token]) for c in text]
+        if add_special_tokens:
+            ids = [self.char2id[self.sos_token]] + ids + [self.char2id[self.eos_token]]
+        return ids
+    
+    def decode(self, ids):
+        chars = []
+        for i in ids:
+            token = self.id2char.get(i, self.unk_token)
+            if token == self.eos_token:
+                break
+            if token not in self.special_tokens:
+                chars.append(token)
+        return "".join(chars)
+    
+    def __len__(self):
+        return len(self.char2id)
+
+class Seq2SeqDataset(Dataset):
+    def __init__(self, src_texts, tgt_texts, tokenizer):
+        self.src_texts = src_texts
+        self.tgt_texts = tgt_texts
+        self.tokenizer = tokenizer
+        
+    def __len__(self):
+        return len(self.src_texts)
+    
+    def __getitem__(self, idx):
+        src = self.tokenizer.encode(self.src_texts[idx], add_special_tokens=False) # Encoder doesn't strictly need SOS/EOS but good practice
+        tgt = self.tokenizer.encode(self.tgt_texts[idx], add_special_tokens=True)
+        return torch.tensor(src), torch.tensor(tgt)
+
+def collate_fn(batch):
+    src_list, tgt_list = zip(*batch)
+    src_lens = [len(x) for x in src_list]
+    tgt_lens = [len(x) for x in tgt_list]
+    
+    # Pad
+    src_padded = torch.nn.utils.rnn.pad_sequence(src_list, batch_first=True, padding_value=0)
+    tgt_padded = torch.nn.utils.rnn.pad_sequence(tgt_list, batch_first=True, padding_value=0)
+    
+    return src_padded, tgt_padded, torch.tensor(src_lens), torch.tensor(tgt_lens)
+
+class Seq2SeqModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, device):
+        super().__init__()
+        self.device = device
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.encoder = nn.GRU(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        # Decoder input dim is embed_dim, hidden is hidden_dim * 2 (because of bidirectional encoder)
+        self.decoder = nn.GRU(embed_dim, hidden_dim * 2, batch_first=True)
+        self.fc = nn.Linear(hidden_dim * 2, vocab_size)
+        self.dropout = nn.Dropout(0.2)
+        
+    def forward(self, src, tgt, src_lens):
+        # src: [batch, src_len]
+        # tgt: [batch, tgt_len]
+        
+        # Encoder
+        embedded = self.dropout(self.embedding(src))
+        packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, src_lens.cpu(), batch_first=True, enforce_sorted=False)
+        _, hidden = self.encoder(packed)
+        
+        # Reshape hidden: (2, batch, hidden) -> (1, batch, 2*hidden) for decoder
+        hidden = torch.cat([hidden[-2], hidden[-1]], dim=1).unsqueeze(0)
+        
+        # Decoder (Teacher Forcing)
+        # Embed target (exclude last token for input)
+        tgt_input = tgt[:, :-1]
+        dec_embedded = self.dropout(self.embedding(tgt_input))
+        
+        output, _ = self.decoder(dec_embedded, hidden)
+        prediction = self.fc(output)
+        return prediction
+
+def train_neural_module(df_train, device_name="cpu", epochs=5, batch_size=256):
+    logger.info(f"Training Neural Module on device: {device_name}")
+    device = torch.device(device_name)
+    
+    # Filter for unique pairs
+    # We prioritize pairs where before != after to learn normalization
+    logger.info("Preparing data for neural training...")
+    # Get unique pairs
+    unique_pairs = df_train[["before", "after"]].drop_duplicates()
+    
+    # Focus on changed or digit-containing tokens + random sample of others
+    # This is a heuristic to balance the dataset
+    mask_changed = unique_pairs["before"] != unique_pairs["after"]
+    mask_digit = unique_pairs["before"].str.contains(r'\d', na=False)
+    
+    important_pairs = unique_pairs[mask_changed | mask_digit]
+    other_pairs = unique_pairs[~(mask_changed | mask_digit)]
+    
+    # Sample others to not overwhelm
+    if len(other_pairs) > 50000:
+        other_pairs = other_pairs.sample(50000, random_state=42)
+        
+    train_pairs = pd.concat([important_pairs, other_pairs])
+    logger.info(f"Training on {len(train_pairs)} unique pairs.")
+    
+    src_texts = train_pairs["before"].astype(str).tolist()
+    tgt_texts = train_pairs["after"].astype(str).tolist()
+    
+    # Tokenizer
+    tokenizer = CharTokenizer()
+    tokenizer.fit(src_texts + tgt_texts)
+    
+    # Dataset
+    dataset = Seq2SeqDataset(src_texts, tgt_texts, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=2)
+    
+    # Model
+    model = Seq2SeqModel(len(tokenizer), 64, 256, device).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    
+    # Training Loop
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for src, tgt, src_lens, _ in dataloader:
+            src, tgt = src.to(device), tgt.to(device)
+            
+            optimizer.zero_grad()
+            output = model(src, tgt, src_lens)
+            
+            # Output: [batch, seq_len-1, vocab]
+            # Tgt: [batch, seq_len] -> remove SOS (first token) for label
+            tgt_labels = tgt[:, 1:]
+            
+            # Flatten
+            output = output.reshape(-1, len(tokenizer))
+            tgt_labels = tgt_labels.reshape(-1)
+            
+            loss = criterion(output, tgt_labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss / len(dataloader):.4f}")
+        
+    return model, tokenizer
+
+def batch_predict_neural(model, tokenizer, texts, device_name="cpu"):
+    device = torch.device(device_name)
+    model.to(device)
+    model.eval()
+    
+    preds = []
+    
+    dataset = Seq2SeqDataset(texts, [""]*len(texts), tokenizer)
+    loader = DataLoader(dataset, batch_size=256, collate_fn=collate_fn, shuffle=False, num_workers=2)
+    
+    with torch.no_grad():
+        for src, _, src_lens, _ in loader:
+            src = src.to(device)
+            
+            # Encode
+            embedded = model.embedding(src)
+            packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, src_lens.cpu(), batch_first=True, enforce_sorted=False)
+            _, hidden = model.encoder(packed)
+            hidden = torch.cat([hidden[-2], hidden[-1]], dim=1).unsqueeze(0)
+            
+            # Decode
+            batch_size = src.size(0)
+            input_token = torch.full((batch_size, 1), tokenizer.char2id[tokenizer.sos_token], device=device, dtype=torch.long)
+            
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            decoded_seqs = [[] for _ in range(batch_size)]
+            
+            for _ in range(100): # max len
+                dec_emb = model.embedding(input_token)
+                output, hidden = model.decoder(dec_emb, hidden)
+                logits = model.fc(output) # [batch, 1, vocab]
+                top1 = logits.argmax(2) # [batch, 1]
+                
+                tokens = top1.squeeze(1).cpu().numpy()
+                
+                for i, token in enumerate(tokens):
+                    if not finished[i]:
+                        if token == tokenizer.char2id[tokenizer.eos_token]:
+                            finished[i] = True
+                        else:
+                            decoded_seqs[i].append(token)
+                
+                if finished.all():
+                    break
+                
+                input_token = top1
+            
+            # Decode to string
+            for seq in decoded_seqs:
+                preds.append(tokenizer.decode(seq))
+                
+    return preds
+>>>>>>> REPLACE
+```
+
+```diff
+library/ngram_model.py
+<<<<<<< SEARCH
+from library.data_processor import get_data
+
+logger = setup_logger("NgramModel")
+
+
+class HierarchicalLookupModel:
+    """
+    A Non-Parametric Hierarchical N-gram model for text normalization.
+    It memorizes the most frequent mapping for tokens based on varying context window sizes.
+    """
+
+    def __init__(self):
+        self.l1_dict = {}  # Unigram: current -> target
+        self.l2_left_dict = {}  # Bigram: (prev, current) -> target
+        self.l2_right_dict = {}  # Bigram: (current, next) -> target
+        self.l3_dict = {}  # Trigram: (prev, current, next) -> target
+
+    def fit(self, df: pd.DataFrame):
+        """
+        Learns the N-gram mappings from the provided dataframe.
+        Expects df to have <BOS> and <EOS> tokens and be sorted by sentence_id, token_id.
+        """
+        logger.info("Fitting HierarchicalLookupModel...")
+
+        # Ensure string types for input/output to avoid type mismatches
+        df[Config.INPUT_COL] = df[Config.INPUT_COL].astype(str)
+        df[Config.TARGET_COL] = df[Config.TARGET_COL].astype(str)
+
+        # --- 1. Generate Context ---
+        # Since data is sorted (BOS -> Token0 -> ... -> EOS), we can shift to get context.
+        # Shift(1) gives previous token, Shift(-1) gives next token.
+        logger.info("Generating context columns...")
+        df["prev"] = df[Config.INPUT_COL].shift(1).fillna(Config.BOS_TOKEN)
+        df["next"] = df[Config.INPUT_COL].shift(-1).fillna(Config.EOS_TOKEN)
+
+        # --- 2. Filter Data ---
+        # We only want to learn mappings for actual tokens, not the boundary markers.
+        # Boundary markers serve only as context.
+        mask = (df[Config.INPUT_COL] != Config.BOS_TOKEN) & (
+            df[Config.INPUT_COL] != Config.EOS_TOKEN
+        )
+        df_clean = df[mask].copy()
+
+        # Clean up original df reference to save memory if possible
+        gc.collect()
+
+        # --- 3. Compute Modes ---
+        def get_mode_map(data, keys, target):
+            """
+            Groups by keys and finds the most frequent target value.
+            Returns a dictionary mapping key -> best_target.
+            """
+            logger.info(f"Computing mode map for keys: {keys}")
+
+            # Count occurrences of each (key..., target) tuple
+            counts = data.groupby(keys + [target]).size().reset_index(name="count")
+
+            # Sort by count descending so the most frequent appears first
+            counts = counts.sort_values("count", ascending=False)
+
+            # Drop duplicates on keys, keeping the first (most frequent)
+            best = counts.drop_duplicates(subset=keys)
+
+            # Convert to dictionary
+            if len(keys) == 1:
+                return dict(zip(best[keys[0]], best[target]))
+            else:
+                # Create tuple keys for dictionary lookup
+                return dict(zip(zip(*[best[k] for k in keys]), best[target]))
+
+        # L3: Trigram (prev, cur, next)
+        self.l3_dict = get_mode_map(
+            df_clean, ["prev", Config.INPUT_COL, "next"], Config.TARGET_COL
+        )
+
+        # L2 Left: Bigram (prev, cur)
+        self.l2_left_dict = get_mode_map(
+            df_clean, ["prev", Config.INPUT_COL], Config.TARGET_COL
+        )
+
+        # L2 Right: Bigram (cur, next)
+        self.l2_right_dict = get_mode_map(
+            df_clean, [Config.INPUT_COL, "next"], Config.TARGET_COL
+        )
+
+        # L1: Unigram (cur)
+        self.l1_dict = get_mode_map(df_clean, [Config.INPUT_COL], Config.TARGET_COL)
+
+        logger.info(
+            f"Model fitted. Dictionary sizes - L3: {len(self.l3_dict)}, L2L: {len(self.l2_left_dict)}, L2R: {len(self.l2_right_dict)}, L1: {len(self.l1_dict)}"
+        )
+
+    def predict(self, df: pd.DataFrame) -> list:
+        """
+        Predicts normalized text for the given dataframe.
+        Expects df to have <BOS> and <EOS> tokens and be sorted.
+        Returns a list of predictions corresponding to the non-boundary rows.
+        """
+        logger.info("Predicting with HierarchicalLookupModel...")
+
+        # Ensure string types
+        df[Config.INPUT_COL] = df[Config.INPUT_COL].astype(str)
+
+        # --- 1. Generate Context ---
+        df["prev"] = df[Config.INPUT_COL].shift(1).fillna(Config.BOS_TOKEN)
+        df["next"] = df[Config.INPUT_COL].shift(-1).fillna(Config.EOS_TOKEN)
+
+        # --- 2. Filter Data ---
+        mask = (df[Config.INPUT_COL] != Config.BOS_TOKEN) & (
+            df[Config.INPUT_COL] != Config.EOS_TOKEN
+        )
+        df_clean = df[mask].copy()
+
+        # --- 3. Hierarchical Lookup ---
+        # We use pandas Series mapping for vectorized lookup.
+        # The 'combine_first' method fills NaNs in the calling series with values from the argument.
+        # Order: L3 -> L2 Left -> L2 Right -> L1 -> Identity
+
+        logger.info("Mapping L3 (Trigram)...")
+        l3_keys = list(
+            zip(df_clean["prev"], df_clean[Config.INPUT_COL], df_clean["next"])
+        )
+        # Create Series with correct index to ensure alignment
+        preds = pd.Series(l3_keys, index=df_clean.index).map(self.l3_dict)
+
+        logger.info("Mapping L2 Left (Bigram)...")
+        l2_left_keys = list(zip(df_clean["prev"], df_clean[Config.INPUT_COL]))
+        preds_l2_left = pd.Series(l2_left_keys, index=df_clean.index).map(
+            self.l2_left_dict
+        )
+        preds = preds.combine_first(preds_l2_left)
+
+        logger.info("Mapping L2 Right (Bigram)...")
+        l2_right_keys = list(zip(df_clean[Config.INPUT_COL], df_clean["next"]))
+        preds_l2_right = pd.Series(l2_right_keys, index=df_clean.index).map(
+            self.l2_right_dict
+        )
+        preds = preds.combine_first(preds_l2_right)
+
+        logger.info("Mapping L1 (Unigram)...")
+        preds_l1 = df_clean[Config.INPUT_COL].map(self.l1_dict)
+        preds = preds.combine_first(preds_l1)
+
+        logger.info("Applying Identity fallback...")
+        # If still NaN (unseen token), return the original input
+        preds = preds.fillna(df_clean[Config.INPUT_COL])
+
+        return preds.tolist()
+
+    def get_stats(self):
+        """Returns the learned dictionaries."""
+        return {
+            "l1": self.l1_dict,
+            "l2_left": self.l2_left_dict,
+            "l2_right": self.l2_right_dict,
+            "l3": self.l3_dict,
+        }
+
+    def load_stats(self, stats):
+        """Loads dictionaries from a stats object."""
+        self.l1_dict = stats["l1"]
+        self.l2_left_dict = stats["l2_left"]
+        self.l2_right_dict = stats["l2_right"]
+        self.l3_dict = stats["l3"]
+=======
+from library.data_processor import get_data
+import torch
+from library.neural_model import train_neural_module, batch_predict_neural, Seq2SeqModel, CharTokenizer
+
+logger = setup_logger("NgramModel")
+
+
+class HierarchicalLookupModel:
+    """
+    A Hybrid Neuro-Symbolic model for text normalization.
+    It uses Hierarchical N-gram lookup for frequent tokens and a Neural Seq2Seq model for rare/complex tokens.
+    """
+
+    def __init__(self):
+        self.l1_dict = {}  # Unigram: current -> target
+        self.l2_left_dict = {}  # Bigram: (prev, current) -> target
+        self.l2_right_dict = {}  # Bigram: (current, next) -> target
+        self.l3_dict = {}  # Trigram: (prev, current, next) -> target
+        
+        # Neural components
+        self.neural_model = None
+        self.tokenizer = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def fit(self, df: pd.DataFrame):
+        """
+        Learns the N-gram mappings and trains the Neural fallback model.
+        """
+        logger.info("Fitting HierarchicalLookupModel...")
+
+        # Ensure string types
+        df[Config.INPUT_COL] = df[Config.INPUT_COL].astype(str)
+        df[Config.TARGET_COL] = df[Config.TARGET_COL].astype(str)
+
+        # --- 1. Generate Context ---
+        logger.info("Generating context columns...")
+        df["prev"] = df[Config.INPUT_COL].shift(1).fillna(Config.BOS_TOKEN)
+        df["next"] = df[Config.INPUT_COL].shift(-1).fillna(Config.EOS_TOKEN)
+
+        # --- 2. Filter Data ---
+        mask = (df[Config.INPUT_COL] != Config.BOS_TOKEN) & (
+            df[Config.INPUT_COL] != Config.EOS_TOKEN
+        )
+        df_clean = df[mask].copy()
+        gc.collect()
+
+        # --- 3. Compute Modes (N-gram) ---
+        def get_mode_map(data, keys, target):
+            counts = data.groupby(keys + [target]).size().reset_index(name="count")
+            counts = counts.sort_values("count", ascending=False)
+            best = counts.drop_duplicates(subset=keys)
+            if len(keys) == 1:
+                return dict(zip(best[keys[0]], best[target]))
+            else:
+                return dict(zip(zip(*[best[k] for k in keys]), best[target]))
+
+        logger.info("Building N-gram dictionaries...")
+        self.l3_dict = get_mode_map(df_clean, ["prev", Config.INPUT_COL, "next"], Config.TARGET_COL)
+        self.l2_left_dict = get_mode_map(df_clean, ["prev", Config.INPUT_COL], Config.TARGET_COL)
+        self.l2_right_dict = get_mode_map(df_clean, [Config.INPUT_COL, "next"], Config.TARGET_COL)
+        self.l1_dict = get_mode_map(df_clean, [Config.INPUT_COL], Config.TARGET_COL)
+
+        logger.info(f"N-gram stats - L3: {len(self.l3_dict)}, L1: {len(self.l1_dict)}")
+
+        # --- 4. Train Neural Model ---
+        logger.info("Training Neural Fallback Model...")
+        self.neural_model, self.tokenizer = train_neural_module(df_clean, device_name=self.device)
+
+    def predict(self, df: pd.DataFrame) -> list:
+        """
+        Predicts normalized text using N-gram lookup with Neural fallback.
+        """
+        logger.info("Predicting with Hybrid Model...")
+
+        df[Config.INPUT_COL] = df[Config.INPUT_COL].astype(str)
+        df["prev"] = df[Config.INPUT_COL].shift(1).fillna(Config.BOS_TOKEN)
+        df["next"] = df[Config.INPUT_COL].shift(-1).fillna(Config.EOS_TOKEN)
+
+        mask = (df[Config.INPUT_COL] != Config.BOS_TOKEN) & (df[Config.INPUT_COL] != Config.EOS_TOKEN)
+        df_clean = df[mask].copy()
+
+        # --- N-gram Lookup ---
+        logger.info("Applying N-gram Lookup...")
+        l3_keys = list(zip(df_clean["prev"], df_clean[Config.INPUT_COL], df_clean["next"]))
+        preds = pd.Series(l3_keys, index=df_clean.index).map(self.l3_dict)
+
+        l2_left_keys = list(zip(df_clean["prev"], df_clean[Config.INPUT_COL]))
+        preds = preds.combine_first(pd.Series(l2_left_keys, index=df_clean.index).map(self.l2_left_dict))
+
+        l2_right_keys = list(zip(df_clean[Config.INPUT_COL], df_clean["next"]))
+        preds = preds.combine_first(pd.Series(l2_right_keys, index=df_clean.index).map(self.l2_right_dict))
+
+        preds = preds.combine_first(df_clean[Config.INPUT_COL].map(self.l1_dict))
+
+        # --- Neural Fallback ---
+        # Identify missing predictions
+        missing_mask = preds.isna()
+        missing_count = missing_mask.sum()
+        
+        if missing_count > 0 and self.neural_model is not None:
+            logger.info(f"Applying Neural Fallback for {missing_count} tokens...")
+            
+            # Filter: Only apply neural model to tokens containing digits or symbols (heuristic)
+            # This prevents over-normalizing rare proper nouns which should be Identity.
+            # We assume proper nouns don't contain digits.
+            tokens_to_predict = df_clean.loc[missing_mask, Config.INPUT_COL]
+            
+            # Regex: contains digit
+            digit_mask = tokens_to_predict.str.contains(r'\d', regex=True)
+            neural_candidates = tokens_to_predict[digit_mask]
+            
+            if len(neural_candidates) > 0:
+                logger.info(f"Running Neural Model on {len(neural_candidates)} candidates (containing digits)...")
+                neural_preds_list = batch_predict_neural(
+                    self.neural_model, 
+                    self.tokenizer, 
+                    neural_candidates.tolist(), 
+                    device_name=self.device
+                )
+                
+                # Update predictions
+                neural_preds_series = pd.Series(neural_preds_list, index=neural_candidates.index)
+                preds.update(neural_preds_series)
+
+        # --- Identity Fallback ---
+        logger.info("Applying Identity fallback...")
+        preds = preds.fillna(df_clean[Config.INPUT_COL])
+
+        return preds.tolist()
+
+    def get_stats(self):
+        """Returns the learned dictionaries and neural model state."""
+        stats = {
+            "l1": self.l1_dict,
+            "l2_left": self.l2_left_dict,
+            "l2_right": self.l2_right_dict,
+            "l3": self.l3_dict,
+        }
+        if self.neural_model:
+            stats["neural_state"] = self.neural_model.state_dict()
+            stats["tokenizer"] = self.tokenizer
+            # Save hyperparams to reconstruct model
+            stats["model_config"] = {
+                "vocab_size": len(self.tokenizer),
+                "embed_dim": 64,
+                "hidden_dim": 256
+            }
+        return stats
+
+    def load_stats(self, stats):
+        """Loads dictionaries and neural model."""
+        self.l1_dict = stats["l1"]
+        self.l2_left_dict = stats["l2_left"]
+        self.l2_right_dict = stats["l2_right"]
+        self.l3_dict = stats["l3"]
+        
+        if "neural_state" in stats:
+            logger.info("Loading Neural Model from stats...")
+            self.tokenizer = stats["tokenizer"]
+            cfg = stats["model_config"]
+            self.neural_model = Seq2SeqModel(cfg["vocab_size"], cfg["embed_dim"], cfg["hidden_dim"], self.device)
+            self.neural_model.load_state_dict(stats["neural_state"])
+            self.neural_model.to(self.device)
+>>>>>>> REPLACE
+```

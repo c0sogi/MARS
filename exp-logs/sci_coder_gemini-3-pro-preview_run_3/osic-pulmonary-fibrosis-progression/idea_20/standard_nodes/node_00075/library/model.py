@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from library.config import Config
+
+
+class TSCRNet(nn.Module):
+    """
+    Time-Shortcut Cascaded Residual Network (TSCR-Net).
+
+    A hybrid CNN-MLP architecture that predicts lung function decline.
+    Features:
+    1. Fine-tuned EfficientNet-B2 backbone (Top-2 stages unfrozen).
+    2. Dual-stream topology with Cascaded Interaction (Clinical -> Visual).
+    3. Residual Fusion mechanism.
+    4. Time-Aware Uncertainty Shortcut for physically consistent confidence estimation.
+    """
+
+    def __init__(self):
+        super(TSCRNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # 1. Image Branch (Fine-Tuned Content-Adaptive 2.5D)
+        # ---------------------------------------------------------------------
+        # Load Backbone
+        # num_classes=0 removes the classifier, global_pool='avg' gives pooled features
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=True,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+            global_pool="avg",
+        )
+
+        # Feature dimension of EfficientNet-B2 (typically 1408)
+        self.img_feature_dim = self.backbone.num_features
+
+        # Projection Layer: Maps high-dim image features to compact latent space
+        self.img_projector = nn.Linear(self.img_feature_dim, Config.PROJECTION_DIM)
+
+        # Apply selective freezing (unfreeze top 2 stages)
+        self._set_backbone_trainable_layers()
+
+        # ---------------------------------------------------------------------
+        # 2. Stream A: The Clinical Anchor (Over-Parameterized Trajectory)
+        # ---------------------------------------------------------------------
+        # Input: Baseline FVC, Relative Time, Age, Sex, SmokingStatus (5 features)
+        self.tabular_input_dim = 5
+
+        self.stream_a = nn.Sequential(
+            nn.Linear(self.tabular_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, Config.HIDDEN_DIM),  # Output: H_clin (64)
+        )
+
+        # ---------------------------------------------------------------------
+        # 3. Stream B: The Conditional Visual Stream (Cascaded Input)
+        # ---------------------------------------------------------------------
+        # Input: Concat[Image Projection (64), H_clin (64)] -> 128
+        # This cascade forces the visual stream to learn residuals relative to clinical expectation
+        self.stream_b_input_dim = Config.PROJECTION_DIM + Config.HIDDEN_DIM
+
+        self.stream_b = nn.Sequential(
+            nn.Linear(self.stream_b_input_dim, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM),  # Output: H_resid (64)
+        )
+
+        # ---------------------------------------------------------------------
+        # 4. Heads
+        # ---------------------------------------------------------------------
+        # Mean Head: Projects H_final (64) -> 1
+        self.mean_head = nn.Linear(Config.HIDDEN_DIM, 1)
+
+        # Uncertainty Head (The Shortcut): Projects Concat[H_final (64), |t_rel| (1)] -> 1
+        # Explicitly feeding absolute time helps model the "Uncertainty Cone"
+        self.sigma_head = nn.Linear(Config.HIDDEN_DIM + 1, 1)
+
+    def _set_backbone_trainable_layers(self):
+        """
+        Freezes the entire backbone, then unfreezes the top two stages.
+        For EfficientNet, this corresponds to the last blocks and the conv_head.
+        """
+        # 1. Freeze everything
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # 2. Unfreeze top layers
+        # EfficientNet implementation in timm uses 'blocks' container.
+        # B2 has 7 blocks (0-6). We unfreeze blocks 5 and 6, and the conv_head/bn2.
+        trainable_modules = [
+            self.backbone.blocks[5],
+            self.backbone.blocks[6],
+            self.backbone.conv_head,
+            self.backbone.bn2,
+        ]
+
+        for module in trainable_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+
+    def forward(self, image, tabular, time_abs):
+        """
+        Forward pass of TSCR-Net.
+
+        Args:
+            image (Tensor): (B, 3, H, W) - Stacked CT slices
+            tabular (Tensor): (B, 5) - [BaseFVC, RelTime, Age, Sex, Smoke]
+            time_abs (Tensor): (B, 1) - Absolute relative time for shortcut
+
+        Returns:
+            mu (Tensor): (B, 1) - Predicted FVC (Z-score scaled)
+            sigma (Tensor): (B, 1) - Predicted Confidence (Z-score scaled)
+        """
+        # --- Image Branch ---
+        # Extract features
+        img_feats = self.backbone(image)  # (B, num_features)
+        img_proj = self.img_projector(img_feats)  # (B, 64)
+
+        # --- Stream A (Clinical) ---
+        h_clin = self.stream_a(tabular)  # (B, 64)
+
+        # --- Stream B (Visual Cascade) ---
+        # Concatenate Image Projection and Clinical Latent
+        combined_input = torch.cat([img_proj, h_clin], dim=1)  # (B, 128)
+        h_resid = self.stream_b(combined_input)  # (B, 64)
+
+        # --- Fusion ---
+        # Residual addition: Final State = Clinical Expectation + Visual Correction
+        h_final = h_clin + h_resid  # (B, 64)
+
+        # --- Heads ---
+        # Mean Prediction
+        mu = self.mean_head(h_final)
+
+        # Sigma Prediction (Shortcut)
+        # Concatenate H_final with absolute time
+        sigma_input = torch.cat([h_final, time_abs], dim=1)  # (B, 65)
+        raw_sigma = self.sigma_head(sigma_input)
+
+        # Apply Softplus + Epsilon for positivity
+        sigma = F.softplus(raw_sigma) + Config.SIGMA_EPSILON
+
+        return mu, sigma

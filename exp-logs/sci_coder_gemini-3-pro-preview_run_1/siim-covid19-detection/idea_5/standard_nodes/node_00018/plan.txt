@@ -1,0 +1,444 @@
+Implementation Strategy:
+1.  **Revert to Standard U-Net**: I will replace the `ResNet18AttentionUNet` with a standard `ResNet18UNet` by removing the Attention Gates and simplifying the decoder blocks. Empirical evidence from Lesson `solution_lesson_node_00015` indicates that Attention Gates degrade performance (0.47 -> 0.35 mAP) on this dataset because the targets (lung opacities) are diffuse and lack rigid boundaries, which causes the attention mechanism to suppress valid signals.
+2.  **Align Validation Metric**: I will update the `evaluate` function in `library/engine.py` to calculate a composite mAP that includes both study-level classification (classes 0-3) and image-level opacity detection (class 4). Following Lesson `solution_lesson_node_00017`, evaluating only the opacity detection under-reports the model's true performance relative to the competition metric. I will implement this by treating study-level predictions as 1-pixel bounding boxes covering the whole image context.
+3.  **Update Execution Script**: I will update `runfile.py` to instantiate the corrected `ResNet18UNet` model class.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class AttentionBlock(nn.Module):
+    """
+    Attention Gate for U-Net skip connections.
+    Uses a coarser gating signal (g) to filter the features from the skip connection (x).
+    """
+
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        # g: gating signal (from coarser layer)
+        # x: skip connection (from finer layer)
+
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+
+        # Downsample x1 to match g1 spatial dimensions for addition
+        if g1.shape[2:] != x1.shape[2:]:
+            x1 = F.interpolate(
+                x1, size=g1.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        # Combine and activate
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+
+        # Upsample attention map back to x size
+        if psi.shape[2:] != x.shape[2:]:
+            psi = F.interpolate(
+                psi, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        return x * psi
+
+
+class UpBlock(nn.Module):
+    """
+    Decoder Block with Attention Gate.
+    Flow: Attention(Skip, Input) -> Upsample(Input) -> Concat -> ConvBlock
+    """
+
+    def __init__(self, in_c, skip_c, out_c):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        # Internal channels for attention usually half of skip channels or similar
+        self.attn = AttentionBlock(F_g=in_c, F_l=skip_c, F_int=skip_c // 2)
+        self.conv = ConvBlock(in_c + skip_c, out_c)
+
+    def forward(self, x, skip):
+        # x: input from previous decoder layer (coarser)
+        # skip: skip connection from encoder (finer)
+
+        # 1. Apply Attention Gate to skip connection
+        # We use 'x' (before upsampling) as the gating signal
+        skip_att = self.attn(g=x, x=skip)
+
+        # 2. Upsample input
+        x_up = self.up(x)
+
+        # 3. Handle potential padding issues (if odd dimensions)
+        if x_up.shape[2:] != skip_att.shape[2:]:
+            x_up = F.interpolate(
+                x_up, size=skip_att.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        # 4. Concatenate
+        x_cat = torch.cat([x_up, skip_att], dim=1)
+
+        # 5. Convolve
+        return self.conv(x_cat)
+
+
+class ResNet18AttentionUNet(nn.Module):
+    """
+    Multi-Task U-Net with ResNet18 Encoder and Attention Gates.
+    Outputs:
+        1. Class Logits (Study Level)
+        2. Segmentation Logits (Image Level)
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True):
+        super().__init__()
+
+        # --- Encoder (ResNet18) ---
+        # Load weights if pretrained
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        base_model = models.resnet18(weights=weights)
+
+        self.initial = nn.Sequential(base_model.conv1, base_model.bn1, base_model.relu)
+        self.maxpool = base_model.maxpool
+
+        self.layer1 = base_model.layer1  # 64 channels
+        self.layer2 = base_model.layer2  # 128 channels
+        self.layer3 = base_model.layer3  # 256 channels
+        self.layer4 = base_model.layer4  # 512 channels (Bottleneck)
+
+        # --- Classification Head ---
+        # Attached to the bottleneck
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_class = nn.Linear(512, num_classes)
+
+        # --- Decoder (Attention U-Net) ---
+        # Up4: Input 512 (Bottleneck), Skip 256 (Layer3) -> Out 256
+        self.up4 = UpBlock(512, 256, 256)
+
+        # Up3: Input 256, Skip 128 (Layer2) -> Out 128
+        self.up3 = UpBlock(256, 128, 128)
+
+        # Up2: Input 128, Skip 64 (Layer1) -> Out 64
+        self.up2 = UpBlock(128, 64, 64)
+
+        # Up1: Input 64, Skip 64 (Initial) -> Out 32
+        self.up1 = UpBlock(64, 64, 32)
+
+        # --- Segmentation Head ---
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder Path ---
+        x0 = self.initial(x)  # (B, 64, H/2, W/2)
+        x1 = self.maxpool(x0)  # (B, 64, H/4, W/4)
+        x1 = self.layer1(x1)  # (B, 64, H/4, W/4) -> Skip for Up2
+        x2 = self.layer2(x1)  # (B, 128, H/8, W/8) -> Skip for Up3
+        x3 = self.layer3(x2)  # (B, 256, H/16, W/16) -> Skip for Up4
+        x4 = self.layer4(x3)  # (B, 512, H/32, W/32) -> Bottleneck
+
+        # --- Classification Branch ---
+        pool = self.avgpool(x4)
+        flat = torch.flatten(pool, 1)
+        class_logits = self.fc_class(flat)
+
+        # --- Decoder Path ---
+        d4 = self.up4(x4, x3)  # -> (B, 256, H/16, W/16)
+        d3 = self.up3(d4, x2)  # -> (B, 128, H/8, W/8)
+        d2 = self.up2(d3, x1)  # -> (B, 64, H/4, W/4)
+        d1 = self.up1(d2, x0)  # -> (B, 32, H/2, W/2)
+
+        # --- Segmentation Branch ---
+        seg_logits = self.final_conv(d1)  # (B, 1, H/2, W/2)
+
+        # Final upsample to match input resolution (H, W)
+        seg_logits = F.interpolate(
+            seg_logits, size=x.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        return class_logits, seg_logits
+=======
+class UpBlock(nn.Module):
+    """
+    Standard Decoder Block.
+    Flow: Upsample(Input) -> Concat(Skip) -> ConvBlock
+    """
+
+    def __init__(self, in_c, skip_c, out_c):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.conv = ConvBlock(in_c + skip_c, out_c)
+
+    def forward(self, x, skip):
+        # x: input from previous decoder layer (coarser)
+        # skip: skip connection from encoder (finer)
+
+        # 1. Upsample input
+        x_up = self.up(x)
+
+        # 2. Handle potential padding issues (if odd dimensions)
+        if x_up.shape[2:] != skip.shape[2:]:
+            x_up = F.interpolate(
+                x_up, size=skip.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        # 3. Concatenate
+        x_cat = torch.cat([x_up, skip], dim=1)
+
+        # 4. Convolve
+        return self.conv(x_cat)
+
+
+class ResNet18UNet(nn.Module):
+    """
+    Multi-Task U-Net with ResNet18 Encoder (Standard U-Net, no Attention).
+    Cite solution_lesson_node_00015: Attention Gates degrade performance on diffuse targets.
+    Outputs:
+        1. Class Logits (Study Level)
+        2. Segmentation Logits (Image Level)
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, pretrained=True):
+        super().__init__()
+
+        # --- Encoder (ResNet18) ---
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        base_model = models.resnet18(weights=weights)
+
+        self.initial = nn.Sequential(base_model.conv1, base_model.bn1, base_model.relu)
+        self.maxpool = base_model.maxpool
+
+        self.layer1 = base_model.layer1  # 64 channels
+        self.layer2 = base_model.layer2  # 128 channels
+        self.layer3 = base_model.layer3  # 256 channels
+        self.layer4 = base_model.layer4  # 512 channels (Bottleneck)
+
+        # --- Classification Head ---
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_class = nn.Linear(512, num_classes)
+
+        # --- Decoder (Standard U-Net) ---
+        self.up4 = UpBlock(512, 256, 256)
+        self.up3 = UpBlock(256, 128, 128)
+        self.up2 = UpBlock(128, 64, 64)
+        self.up1 = UpBlock(64, 64, 32)
+
+        # --- Segmentation Head ---
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder Path ---
+        x0 = self.initial(x)
+        x1 = self.maxpool(x0)
+        x1 = self.layer1(x1)  # Skip for Up2
+        x2 = self.layer2(x1)  # Skip for Up3
+        x3 = self.layer3(x2)  # Skip for Up4
+        x4 = self.layer4(x3)  # Bottleneck
+
+        # --- Classification Branch ---
+        pool = self.avgpool(x4)
+        flat = torch.flatten(pool, 1)
+        class_logits = self.fc_class(flat)
+
+        # --- Decoder Path ---
+        d4 = self.up4(x4, x3)
+        d3 = self.up3(d4, x2)
+        d2 = self.up2(d3, x1)
+        d1 = self.up1(d2, x0)
+
+        # --- Segmentation Branch ---
+        seg_logits = self.final_conv(d1)
+        seg_logits = F.interpolate(
+            seg_logits, size=x.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        return class_logits, seg_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.config import (
+    LOSS_WEIGHTS,
+    CLASS_LABELS,
+    WORKING_DIR,
+    SUBMISSION_PATH,
+    TEST_META,
+    DEVICE,
+)
+=======
+from library.config import (
+    LOSS_WEIGHTS,
+    CLASS_LABELS,
+    WORKING_DIR,
+    SUBMISSION_PATH,
+    TEST_META,
+    DEVICE,
+    NUM_CLASSES,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Iterate batch
+            batch_size = images.size(0)
+            for i in range(batch_size):
+                # GT processing
+                gt_mask = masks[i].cpu().numpy()  # (1, H, W)
+                gt_boxes_i = get_box_from_mask(gt_mask)
+                all_gt_boxes.append(gt_boxes_i)
+                # All GT objects are "opacity" (class 1 for mAP purpose)
+                all_gt_labels.append([1] * len(gt_boxes_i))
+
+                # Prediction processing
+                pred_cls = pred_classes[i]
+
+                # Gating: If predicted "Negative for Pneumonia" (index 0), suppress boxes
+                if pred_cls == 0:
+                    all_pred_boxes.append([])
+                    all_pred_scores.append([])
+                    all_pred_labels.append([])
+                else:
+                    # Extract boxes from mask
+                    pred_mask = seg_probs[i].cpu().numpy()
+                    pred_boxes_i = get_box_from_mask(pred_mask, threshold=0.5)
+
+                    # Score: Mean probability within the box
+                    scores_i = []
+                    for box in pred_boxes_i:
+                        xmin, ymin, xmax, ymax = box
+                        region = pred_mask[0, ymin:ymax, xmin:xmax]
+                        if region.size > 0:
+                            scores_i.append(float(np.mean(region)))
+                        else:
+                            scores_i.append(0.0)
+
+                    all_pred_boxes.append(pred_boxes_i)
+                    all_pred_scores.append(scores_i)
+                    all_pred_labels.append(
+                        [1] * len(pred_boxes_i)
+                    )  # Class 1 for opacity
+=======
+            # Iterate batch
+            batch_size = images.size(0)
+            for i in range(batch_size):
+                # --- Ground Truth ---
+                img_gt_boxes = []
+                img_gt_labels = []
+
+                # 1. Study Label GT (Classes 0-3)
+                # Add 1-pixel box for the correct study label
+                gt_label_idx = int(labels[i].item())
+                img_gt_boxes.append([0, 0, 1, 1])
+                img_gt_labels.append(gt_label_idx)
+
+                # 2. Opacity GT (Class 4)
+                gt_mask = masks[i].cpu().numpy()  # (1, H, W)
+                gt_opacity_boxes = get_box_from_mask(gt_mask)
+                
+                for box in gt_opacity_boxes:
+                    img_gt_boxes.append(box)
+                    img_gt_labels.append(NUM_CLASSES)  # Class 4 is Opacity
+
+                all_gt_boxes.append(img_gt_boxes)
+                all_gt_labels.append(img_gt_labels)
+
+                # --- Predictions ---
+                img_pred_boxes = []
+                img_pred_scores = []
+                img_pred_labels = []
+
+                # 1. Study Label Predictions (Classes 0-3)
+                # Add 1-pixel box for each study class with its probability
+                # Cite solution_lesson_node_00017: Composite metric alignment
+                for c in range(NUM_CLASSES):
+                    score = float(class_probs[i, c].item())
+                    img_pred_boxes.append([0, 0, 1, 1])
+                    img_pred_scores.append(score)
+                    img_pred_labels.append(c)
+
+                # 2. Opacity Predictions (Class 4)
+                pred_cls = pred_classes[i]
+
+                # Gating: If predicted "Negative for Pneumonia" (index 0), suppress opacity boxes
+                if pred_cls != 0:
+                    pred_mask = seg_probs[i].cpu().numpy()
+                    pred_opacity_boxes = get_box_from_mask(pred_mask, threshold=0.5)
+
+                    for box in pred_opacity_boxes:
+                        xmin, ymin, xmax, ymax = box
+                        region = pred_mask[0, ymin:ymax, xmin:xmax]
+                        score = float(np.mean(region)) if region.size > 0 else 0.0
+                        
+                        img_pred_boxes.append(box)
+                        img_pred_scores.append(score)
+                        img_pred_labels.append(NUM_CLASSES) # Class 4 is Opacity
+
+                all_pred_boxes.append(img_pred_boxes)
+                all_pred_scores.append(img_pred_scores)
+                all_pred_labels.append(img_pred_labels)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ResNet18AttentionUNet
+from library.engine import train_one_epoch, evaluate, inference
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Setup
+    seed_everything(SEED)
+
+    # 2. Data Loading
+    # Using full dataset to ensure we hit the metric threshold.
+    # ResNet18 on A100 is fast enough for 20 epochs within 2 hours.
+    train_loader, val_loader, test_loader = get_dataloaders(
+        load_cached_data=True, debug=False
+    )
+
+    # 3. Model & Optimizer
+    model = ResNet18AttentionUNet(pretrained=True)
+=======
+from library.model import ResNet18UNet
+from library.engine import train_one_epoch, evaluate, inference
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Setup
+    seed_everything(SEED)
+
+    # 2. Data Loading
+    # Using full dataset to ensure we hit the metric threshold.
+    # ResNet18 on A100 is fast enough for 20 epochs within 2 hours.
+    train_loader, val_loader, test_loader = get_dataloaders(
+        load_cached_data=True, debug=False
+    )
+
+    # 3. Model & Optimizer
+    # Cite solution_lesson_node_00015: Revert to Standard U-Net (remove Attention)
+    model = ResNet18UNet(pretrained=True)
+>>>>>>> REPLACE
+```

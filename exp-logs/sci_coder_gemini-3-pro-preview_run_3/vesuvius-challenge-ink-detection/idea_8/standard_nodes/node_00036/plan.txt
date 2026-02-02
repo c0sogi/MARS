@@ -1,0 +1,496 @@
+The following changes implement a simplified **Sequential Dilated FCN** architecture (renamed `InkDetector`) to replace the `FRDUNet`. This addresses **Lesson 00035**, which states that U-Net skip connections can propagate noise in low-SNR volumetric segmentation, and **Lesson 00004**, which demonstrated that lean backbones generalize better. Additionally, the batch size is increased to 32 and Batch Normalization is restored, following **Lesson 00025**, to improve training stability and gradient quality.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Architecture (Full-Resolution Dilated U-Net)
+    # =========================================================================
+    IN_CHANNELS = 1  # Grayscale input
+    PROJECTION_CHANNELS = 32  # Compressed depth feature space
+    BACKBONE_CHANNELS = 64  # Base channel width for the dilated backbone
+    DILATION_RATES = [1, 2, 4, 8, 16]  # Sequential dilation hierarchy
+    GROUP_NORM_GROUPS = 8  # Number of groups for Group Normalization
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 8  # Adjusted for A100 memory with full resolution
+    NUM_EPOCHS = 20  # Max epochs (Early stopping will likely intervene)
+=======
+    # =========================================================================
+    # Model Architecture (Sequential Dilated FCN)
+    # =========================================================================
+    IN_CHANNELS = 1  # Grayscale input
+    PROJECTION_CHANNELS = 32  # Compressed depth feature space
+    BACKBONE_CHANNELS = 32  # Lean backbone for better generalization (Cite Lesson 00004)
+    DILATION_RATES = [1, 2, 4, 8]  # Sequential dilation hierarchy (Cite Lesson 00003)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32  # Increased for stable BN statistics (Cite Lesson 00025)
+    NUM_EPOCHS = 20  # Max epochs (Early stopping will likely intervene)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedResidualBlock(nn.Module):
+    """
+    A Residual Block with Dilated Convolutions and Group Normalization.
+    Maintains full spatial resolution (padding = dilation).
+    """
+
+    def __init__(self, in_channels, out_channels, dilation, groups=8):
+        super(DilatedResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.gn1 = nn.GroupNorm(groups, out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.gn2 = nn.GroupNorm(groups, out_channels)
+
+        # Identity mapping adjustment if channel dimensions change
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, bias=False
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.gn2(out)
+
+        out += residual
+        out = self.act(out)
+        return out
+
+
+class FusionBlock(nn.Module):
+    """
+    Fuses features from the deeper path with skip connections from the encoder.
+    Uses Concatenation -> Conv -> GN -> ReLU.
+    """
+
+    def __init__(self, in_channels_deep, in_channels_skip, out_channels, groups=8):
+        super(FusionBlock, self).__init__()
+
+        total_in_channels = in_channels_deep + in_channels_skip
+
+        self.conv = nn.Conv2d(
+            total_in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.gn = nn.GroupNorm(groups, out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x_deep, x_skip):
+        # Concatenate along channel dimension
+        x = torch.cat([x_deep, x_skip], dim=1)
+        x = self.conv(x)
+        x = self.gn(x)
+        x = self.act(x)
+        return x
+
+
+class FRDUNet(nn.Module):
+    """
+    Full-Resolution Dilated U-Net.
+
+    Architecture:
+    1. Projection: Compress Z-depth (65) -> Projection Channels.
+    2. Encoder: Sequential Dilated Residual Blocks (r=1, 2, 4, 8, 16).
+    3. Decoder: Iterative aggregation of deep features with encoder skip connections.
+    4. Head: 1x1 Conv to binary logits.
+    """
+
+    def __init__(self):
+        super(FRDUNet, self).__init__()
+
+        # --- 1. Learnable 2.5D Projection ---
+        # Compresses the Z-dimension (treated as input channels) into a feature space
+        self.projection = nn.Sequential(
+            nn.Conv2d(
+                Config.Z_DEPTH, Config.PROJECTION_CHANNELS, kernel_size=1, bias=False
+            ),
+            nn.GroupNorm(Config.GROUP_NORM_GROUPS, Config.PROJECTION_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- 2. Dilated Encoder (Backbone) ---
+        self.encoder_blocks = nn.ModuleList()
+
+        in_ch = Config.PROJECTION_CHANNELS
+        out_ch = Config.BACKBONE_CHANNELS
+
+        for dilation in Config.DILATION_RATES:
+            block = DilatedResidualBlock(
+                in_ch, out_ch, dilation=dilation, groups=Config.GROUP_NORM_GROUPS
+            )
+            self.encoder_blocks.append(block)
+            # Subsequent blocks input channels match the backbone width
+            in_ch = out_ch
+
+        # --- 3. Iterative Aggregation Decoder ---
+        self.decoder_blocks = nn.ModuleList()
+
+        # We fuse from the second-to-last block upwards.
+        # If we have N blocks, we have N-1 fusion steps.
+        # Deep input is always BACKBONE_CHANNELS.
+        # Skip input is always BACKBONE_CHANNELS (since all encoder blocks output this).
+
+        num_fusion_steps = len(Config.DILATION_RATES) - 1
+
+        for _ in range(num_fusion_steps):
+            fusion = FusionBlock(
+                in_channels_deep=Config.BACKBONE_CHANNELS,
+                in_channels_skip=Config.BACKBONE_CHANNELS,
+                out_channels=Config.BACKBONE_CHANNELS,
+                groups=Config.GROUP_NORM_GROUPS,
+            )
+            self.decoder_blocks.append(fusion)
+
+        # --- 4. Classification Head ---
+        self.classifier = nn.Conv2d(Config.BACKBONE_CHANNELS, 1, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (B, Z, H, W) or (B, 1, Z, H, W).
+               Z is expected to be Config.Z_DEPTH (65).
+        """
+        # Handle potential extra channel dim from dataloaders
+        if x.dim() == 5:
+            x = x.squeeze(1)
+
+        # 1. Projection
+        x = self.projection(x)  # (B, 32, H, W)
+
+        # 2. Encoder Pass
+        enc_features = []
+        curr = x
+        for block in self.encoder_blocks:
+            curr = block(curr)
+            enc_features.append(curr)
+
+        # enc_features contains [feat_r1, feat_r2, feat_r4, feat_r8, feat_r16]
+
+        # 3. Decoder Pass
+        # Start with the deepest feature map
+        curr_deep = enc_features[-1]
+
+        # Iterate through fusion blocks
+        # We need to match fusion blocks with skip connections in reverse order.
+        # Fusion 0 uses skip -2 (second to last)
+        # Fusion 1 uses skip -3
+        # ...
+        for i, fusion_block in enumerate(self.decoder_blocks):
+            skip_idx = -2 - i
+            skip_feat = enc_features[skip_idx]
+
+            curr_deep = fusion_block(curr_deep, skip_feat)
+
+        # 4. Classification
+        logits = self.classifier(curr_deep)
+
+        return logits
+=======
+class DilatedResidualBlock(nn.Module):
+    """
+    A Residual Block with Dilated Convolutions and Batch Normalization.
+    Maintains full spatial resolution (padding = dilation).
+    """
+
+    def __init__(self, in_channels, out_channels, dilation):
+        super(DilatedResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Identity mapping adjustment if channel dimensions change
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, bias=False
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.act(out)
+        return out
+
+
+class InkDetector(nn.Module):
+    """
+    Sequential Dilated FCN (Cite Lesson 00035).
+    Replaces U-Net skip connections with a purely sequential hierarchical backbone
+    to avoid propagating noise in low-SNR volumetric data.
+    """
+
+    def __init__(self):
+        super(InkDetector, self).__init__()
+
+        # --- 1. Learnable 2.5D Projection ---
+        self.projection = nn.Sequential(
+            nn.Conv2d(
+                Config.Z_DEPTH, Config.PROJECTION_CHANNELS, kernel_size=1, bias=False
+            ),
+            nn.BatchNorm2d(Config.PROJECTION_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- 2. Dilated Encoder (Backbone) ---
+        self.encoder_blocks = nn.ModuleList()
+
+        in_ch = Config.PROJECTION_CHANNELS
+        out_ch = Config.BACKBONE_CHANNELS
+
+        for dilation in Config.DILATION_RATES:
+            block = DilatedResidualBlock(in_ch, out_ch, dilation=dilation)
+            self.encoder_blocks.append(block)
+            in_ch = out_ch
+
+        # --- 3. Classification Head ---
+        self.classifier = nn.Conv2d(out_ch, 1, kernel_size=1)
+
+    def forward(self, x):
+        # Handle potential extra channel dim
+        if x.dim() == 5:
+            x = x.squeeze(1)
+
+        # 1. Projection
+        x = self.projection(x)
+
+        # 2. Sequential Backbone
+        for block in self.encoder_blocks:
+            x = block(x)
+
+        # 3. Classification
+        logits = self.classifier(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import FRDUNet
+from library.losses import BCEDiceLoss
+=======
+from library.model import InkDetector
+from library.losses import BCEDiceLoss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # --- Model Setup ---
+    print("Initializing Model...")
+    model = FRDUNet().to(device)
+
+    optimizer = optim.AdamW(
+=======
+    # --- Model Setup ---
+    print("Initializing Model...")
+    model = InkDetector().to(device)
+
+    optimizer = optim.AdamW(
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def inference_and_submission(load_cached_data=True):
+    """
+    Loads the best model, runs inference on the test set, and creates submission.csv.
+    """
+    from library.utils import rle_encode
+
+    device = torch.device(Config.DEVICE)
+
+    # Load Model
+    model = FRDUNet().to(device)
+    if not Config.BEST_MODEL_PATH.exists():
+        print("No best model found. Skipping inference.")
+        return
+=======
+def inference_and_submission(load_cached_data=True):
+    """
+    Loads the best model, runs inference on the test set, and creates submission.csv.
+    """
+    from library.utils import rle_encode
+
+    device = torch.device(Config.DEVICE)
+
+    # Load Model
+    model = InkDetector().to(device)
+    if not Config.BEST_MODEL_PATH.exists():
+        print("No best model found. Skipping inference.")
+        return
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.model import FRDUNet
+from library.dataset import InkDataset
+=======
+from library.config import Config
+from library.model import InkDetector
+from library.dataset import InkDataset
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+def generate_submission(load_cached_data=True):
+    """
+    Main inference pipeline:
+    1. Loads best model.
+    2. Optimizes threshold on validation set (if available).
+    3. Predicts on test set.
+    4. Generates RLE submission file.
+    """
+    device = torch.device(Config.DEVICE)
+
+    # Load Model
+    model = FRDUNet().to(device)
+    if not Config.BEST_MODEL_PATH.exists():
+        print(f"Error: Best model not found at {Config.BEST_MODEL_PATH}")
+        return
+=======
+def generate_submission(load_cached_data=True):
+    """
+    Main inference pipeline:
+    1. Loads best model.
+    2. Optimizes threshold on validation set (if available).
+    3. Predicts on test set.
+    4. Generates RLE submission file.
+    """
+    device = torch.device(Config.DEVICE)
+
+    # Load Model
+    model = InkDetector().to(device)
+    if not Config.BEST_MODEL_PATH.exists():
+        print(f"Error: Best model not found at {Config.BEST_MODEL_PATH}")
+        return
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import train_model
+from library.inference import predict_full_mask, generate_submission
+from library.model import FRDUNet
+
+
+def main():
+    # 1. Setup
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+
+    # Ensure the submission directory exists as per prompt requirement
+    submission_dir = Path("./submission")
+    submission_dir.mkdir(parents=True, exist_ok=True)
+
+    # Monkey-patch Config to save submission to the correct path required by the prompt
+    Config.SUBMISSION_PATH = submission_dir / "submission.csv"
+
+    # 2. Train
+    # Run the training loop. This will save 'best_model.pth' in the working directory.
+    # We use load_cached_data=True to speed up data loading if cache exists.
+    train_model(load_cached_data=True)
+
+    # 3. Validation & Metric Calculation
+    # We need to manually calculate the metric to print it in the exact format required.
+    device = torch.device(Config.DEVICE)
+    model = FRDUNet().to(device)
+=======
+from library.train import train_model
+from library.inference import predict_full_mask, generate_submission
+from library.model import InkDetector
+
+
+def main():
+    # 1. Setup
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+
+    # Ensure the submission directory exists as per prompt requirement
+    submission_dir = Path("./submission")
+    submission_dir.mkdir(parents=True, exist_ok=True)
+
+    # Monkey-patch Config to save submission to the correct path required by the prompt
+    Config.SUBMISSION_PATH = submission_dir / "submission.csv"
+
+    # 2. Train
+    # Run the training loop. This will save 'best_model.pth' in the working directory.
+    # We use load_cached_data=True to speed up data loading if cache exists.
+    train_model(load_cached_data=True)
+
+    # 3. Validation & Metric Calculation
+    # We need to manually calculate the metric to print it in the exact format required.
+    device = torch.device(Config.DEVICE)
+    model = InkDetector().to(device)
+>>>>>>> REPLACE
+```

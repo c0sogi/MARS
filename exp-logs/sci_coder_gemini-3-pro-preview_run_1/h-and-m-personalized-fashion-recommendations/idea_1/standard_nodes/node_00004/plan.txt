@@ -1,0 +1,324 @@
+Implementation Strategy:
+I will implement the **Cascading Item-Item Collaborative Filtering** approach described in the lesson `solution_lesson_node_00003`. This involves modifying the `TrendRepurchaseCascade` model to include an intermediate stage that computes item-item similarities based on user purchase history. Specifically, I will:
+
+1.  **Modify `library/model.py`**:
+    *   Import `scipy.sparse` and `sklearn.preprocessing`.
+    *   Update the `TrendRepurchaseCascade` class to:
+        *   Construct a time-weighted sparse User-Item matrix ($X$) in `fit`.
+        *   Compute the Item-Item similarity matrix $S = X_{norm}^T X_{norm}$ (Cosine Similarity).
+        *   In `predict`, compute candidate scores via matrix multiplication ($R = X_{batch} S$) for users with insufficient repurchase history.
+        *   Fill prediction slots in the order: Repurchase $\rightarrow$ Collaborative Filtering $\rightarrow$ Global Trend.
+
+2.  **Modify `runfile.py`**:
+    *   Update the submission logic to strictly follow the requirement: only generate a submission if the validation MAP@12 exceeds `0.026450038479740607`.
+
+3.  **Optimization**:
+    *   Use sparse matrix operations (`scipy.sparse`) to handle the high dimensionality (1.3M users, ~100k items) efficiently within the memory limits.
+    *   Implement batch processing in `predict` to manage memory usage during score computation.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import pandas as pd
+import numpy as np
+import os
+from library.config import Config
+from library.utils import set_seed
+from library.metrics import calculate_map12
+from library.data_loader import load_filtered_transactions
+
+
+class TrendRepurchaseCascade:
+    """
+    A heuristic model combining Global Trend (Time-Decayed Popularity)
+    and Personal History (Repurchase).
+
+    The model operates in two stages:
+    1. Trend: Calculates a global score for items based on sales velocity.
+    2. History: Retrieves a user's recent purchases.
+
+    Prediction is a cascade: History -> Fill with Trend.
+    """
+
+    def __init__(self, top_k=12, decay_alpha=2.5):
+        self.top_k = top_k
+        self.decay_alpha = decay_alpha
+        self.global_trend = []
+        self.customer_history = {}
+
+    def fit(self, df):
+        """
+        Fits the model components using the provided transaction DataFrame.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing columns:
+                'customer_id' (int): Mapped customer index.
+                'article_id' (int): Mapped article index.
+                'days_elapsed' (int): Days since the transaction (0 = most recent).
+        """
+        # --- 1. Global Trend Calculation ---
+        # Formula: Score = Sum(1 / (days_elapsed + alpha))
+        # We use numpy arrays for efficient computation
+        days = df["days_elapsed"].values
+        # Calculate weight for each transaction
+        weights = 1.0 / (days + self.decay_alpha)
+
+        # Aggregate weights by article_id
+        # Create a temporary DF for grouping
+        trend_df = pd.DataFrame(
+            {"article_id": df["article_id"].values, "weight": weights}
+        )
+        global_scores = trend_df.groupby("article_id")["weight"].sum()
+
+        # Sort by score descending and take top K
+        self.global_trend = (
+            global_scores.sort_values(ascending=False).head(self.top_k).index.tolist()
+        )
+
+        # --- 2. Customer History Construction ---
+        # We want a list of articles for each customer, ordered by recency.
+        # days_elapsed=0 is the most recent.
+
+        # Sort by customer then by recency (days_elapsed ascending)
+        # We select only necessary columns to save memory
+        hist_df = df[["customer_id", "article_id", "days_elapsed"]].sort_values(
+            ["customer_id", "days_elapsed"], ascending=[True, True]
+        )
+
+        # Group by customer and collect article_ids into lists
+        # This creates a dict: {customer_idx: [art_idx_recent, art_idx_older, ...]}
+        self.customer_history = (
+            hist_df.groupby("customer_id")["article_id"].apply(list).to_dict()
+        )
+
+        return self
+
+    def predict(self, customer_ids):
+        """
+        Generates predictions for the given list of customer IDs.
+
+        Args:
+            customer_ids (iterable): List or array of mapped customer integer indices.
+
+        Returns:
+            list of lists: Each inner list contains 'top_k' article integer indices.
+        """
+        predictions = []
+        global_trend = self.global_trend
+        top_k = self.top_k
+        # Localize lookup for speed
+        history_get = self.customer_history.get
+
+        for cid in customer_ids:
+            # Retrieve user history (default to empty list if new user)
+            user_history = history_get(cid, [])
+
+            selection = []
+            seen = set()
+
+            # Step A: Fill with Personal History
+            for item in user_history:
+                if item not in seen:
+                    selection.append(item)
+                    seen.add(item)
+                    if len(selection) >= top_k:
+                        break
+
+            # Step B: Fill with Global Trend if slots remain
+            if len(selection) < top_k:
+                for item in global_trend:
+                    if item not in seen:
+                        selection.append(item)
+                        seen.add(item)
+                        if len(selection) >= top_k:
+                            break
+
+            predictions.append(selection)
+
+        return predictions
+=======
+import pandas as pd
+import numpy as np
+import os
+import scipy.sparse as sp
+from sklearn.preprocessing import normalize
+from library.config import Config
+from library.utils import set_seed
+from library.metrics import calculate_map12
+from library.data_loader import load_filtered_transactions
+
+
+class TrendRepurchaseCascade:
+    """
+    A heuristic model combining Global Trend, Item-Item CF, and Repurchase.
+    
+    Structure:
+    1. Repurchase (Personal History)
+    2. Item-Item Collaborative Filtering (Cite solution_lesson_node_00003)
+    3. Global Trend (Time-Decayed Popularity)
+    """
+
+    def __init__(self, top_k=12, decay_alpha=2.5):
+        self.top_k = top_k
+        self.decay_alpha = decay_alpha
+        self.global_trend = []
+        self.customer_history = {}
+        self.similarity_matrix = None
+        self.n_articles = 0
+
+    def fit(self, df):
+        """
+        Fits the model components using the provided transaction DataFrame.
+        """
+        # --- 1. Global Trend Calculation ---
+        days = df["days_elapsed"].values
+        weights = 1.0 / (days + self.decay_alpha)
+
+        trend_df = pd.DataFrame(
+            {"article_id": df["article_id"].values, "weight": weights}
+        )
+        global_scores = trend_df.groupby("article_id")["weight"].sum()
+        self.global_trend = (
+            global_scores.sort_values(ascending=False).head(self.top_k).index.tolist()
+        )
+
+        # --- 2. Customer History Construction ---
+        hist_df = df[["customer_id", "article_id", "days_elapsed"]].sort_values(
+            ["customer_id", "days_elapsed"], ascending=[True, True]
+        )
+        self.customer_history = (
+            hist_df.groupby("customer_id")["article_id"].apply(list).to_dict()
+        )
+
+        # --- 3. Item-Item CF Matrix Construction ---
+        # Cite solution_lesson_node_00003
+        print("Constructing Item-Item Similarity Matrix...")
+        self.n_articles = int(df["article_id"].max()) + 1
+        
+        # Create sparse user-item matrix with time-decay weights
+        # We use the same weights as Global Trend to prioritize recent interactions
+        X = sp.csr_matrix(
+            (weights, (df["customer_id"], df["article_id"])),
+            shape=(int(df["customer_id"].max()) + 1, self.n_articles)
+        )
+        
+        # Normalize columns (items) to compute Cosine Similarity between items
+        # axis=0 normalizes each feature (column)
+        X_norm = normalize(X, axis=0)
+        
+        # Compute Item-Item Similarity: S = X^T * X
+        # This computes the cosine similarity between item vectors
+        self.similarity_matrix = X_norm.T @ X_norm
+        
+        # Zero out diagonal to prevent self-recommendation in CF step
+        self.similarity_matrix.setdiag(0)
+        
+        return self
+
+    def predict(self, customer_ids):
+        """
+        Generates predictions using Cascade: Repurchase -> CF -> Trend.
+        """
+        predictions = []
+        global_trend = self.global_trend
+        top_k = self.top_k
+        
+        # Batch processing for efficient matrix multiplication
+        batch_size = 1000
+        n_users = len(customer_ids)
+        
+        print(f"Predicting for {n_users} users in batches...")
+        
+        for start_idx in range(0, n_users, batch_size):
+            end_idx = min(start_idx + batch_size, n_users)
+            batch_ids = customer_ids[start_idx:end_idx]
+            
+            # Build User-History Matrix for this batch
+            # We treat query history as binary (1 if present) for simplicity
+            rows = []
+            cols = []
+            for i, cid in enumerate(batch_ids):
+                hist = self.customer_history.get(cid, [])
+                # Use unique items in history for the query vector
+                unique_hist = list(set(hist))
+                rows.extend([i] * len(unique_hist))
+                cols.extend(unique_hist)
+            
+            # Compute CF Scores: User_History @ Item_Similarity
+            batch_scores = None
+            if len(rows) > 0 and self.similarity_matrix is not None:
+                X_batch = sp.csr_matrix(
+                    (np.ones(len(rows)), (rows, cols)),
+                    shape=(len(batch_ids), self.n_articles)
+                )
+                batch_scores = X_batch @ self.similarity_matrix
+
+            # Generate predictions for each user in batch
+            for i, cid in enumerate(batch_ids):
+                user_history = self.customer_history.get(cid, [])
+                selection = []
+                seen = set()
+
+                # A. Repurchase (History)
+                for item in user_history:
+                    if item not in seen:
+                        selection.append(item)
+                        seen.add(item)
+                        if len(selection) >= top_k:
+                            break
+
+                # B. Collaborative Filtering
+                # Cite solution_lesson_node_00003
+                if len(selection) < top_k and batch_scores is not None:
+                    # Get scores for this user
+                    user_scores = batch_scores.getrow(i)
+                    
+                    if user_scores.nnz > 0:
+                        # Extract indices and values
+                        candidates = user_scores.indices
+                        scores = user_scores.data
+                        
+                        # Sort by score descending
+                        # Since it's sparse, sorting is usually fast enough
+                        sorted_indices = np.argsort(scores)[::-1]
+                        
+                        for idx in sorted_indices:
+                            item = candidates[idx]
+                            if item not in seen:
+                                selection.append(item)
+                                seen.add(item)
+                                if len(selection) >= top_k:
+                                    break
+
+                # C. Global Trend
+                if len(selection) < top_k:
+                    for item in global_trend:
+                        if item not in seen:
+                            selection.append(item)
+                            seen.add(item)
+                            if len(selection) >= top_k:
+                                break
+
+                predictions.append(selection)
+
+        return predictions
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Submission
+    print("\n--- Generating Submission ---")
+    # run_submission handles full retraining (on all weeks) and test prediction
+    run_submission()
+=======
+    # 3. Submission
+    if map_score > 0.026450038479740607:
+        print("\n--- Generating Submission ---")
+        # run_submission handles full retraining (on all weeks) and test prediction
+        run_submission()
+    else:
+        print(f"\nScore {map_score} did not meet threshold 0.02645 for submission.")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,284 @@
+# Python Script for Metadata Generation
+```
+import pandas as pd
+import numpy as np
+import os
+import glob
+from sklearn.model_selection import StratifiedGroupKFold
+
+
+def generate_metadata():
+    # Define paths
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    TRAIN_CSV = os.path.join(INPUT_DIR, "train.csv")
+    TEST_CSV = os.path.join(INPUT_DIR, "test.csv")
+    TRAIN_BBOX_CSV = os.path.join(INPUT_DIR, "train_bounding_boxes.csv")
+
+    # Create metadata directory
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # 1. Process Training Data
+    # ---------------------------------------------------------
+    print("Loading training data...")
+    df_train = pd.read_csv(TRAIN_CSV)
+
+    # Load bounding box info to check availability
+    if os.path.exists(TRAIN_BBOX_CSV):
+        bbox_df = pd.read_csv(TRAIN_BBOX_CSV)
+        bbox_uids = set(bbox_df["StudyInstanceUID"].unique())
+    else:
+        bbox_uids = set()
+
+    # Add metadata columns
+    # Path relative to ./input
+    df_train["image_path"] = df_train["StudyInstanceUID"].apply(
+        lambda x: os.path.join("train_images", x)
+    )
+
+    # Check for segmentation file
+    # Segmentation files are named <StudyInstanceUID>.nii in segmentations/
+    df_train["segmentation_path"] = df_train["StudyInstanceUID"].apply(
+        lambda x: os.path.join("segmentations", f"{x}.nii")
+    )
+    # We only keep the path if the file actually exists, else None or empty
+    # To be efficient, we check existence against the filesystem
+    # Since checking one by one can be slow if many, we list the dir first
+    seg_dir = os.path.join(INPUT_DIR, "segmentations")
+    existing_segs = set()
+    if os.path.exists(seg_dir):
+        existing_segs = set(os.listdir(seg_dir))
+
+    df_train["has_segmentation"] = df_train["StudyInstanceUID"].apply(
+        lambda x: f"{x}.nii" in existing_segs
+    )
+    # If not exists, we can leave the path or set to None. Let's keep the path but rely on has_segmentation flag,
+    # or better, set path to NaN if not exists to be clean.
+    df_train.loc[~df_train["has_segmentation"], "segmentation_path"] = None
+
+    # Check for bounding box
+    df_train["has_bounding_box"] = df_train["StudyInstanceUID"].apply(
+        lambda x: x in bbox_uids
+    )
+
+    # ---------------------------------------------------------
+    # 2. Split Train/Validation
+    # ---------------------------------------------------------
+    print("Splitting data into Train (80%) and Validation (20%)...")
+    # We use StratifiedGroupKFold to ensure patients are not split and classes are balanced
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+
+    # X is dummy, y is target for stratification, groups is patient ID
+    X = df_train.index
+    y = df_train["patient_overall"]
+    groups = df_train["StudyInstanceUID"]
+
+    # Generate the splits. We only need the first fold to define our Val set (1/5 = 20%)
+    train_idx, val_idx = next(sgkf.split(X, y, groups))
+
+    train_metadata = df_train.iloc[train_idx].copy()
+    val_metadata = df_train.iloc[val_idx].copy()
+
+    # Save to metadata
+    train_metadata.to_csv(os.path.join(METADATA_DIR, "train_metadata.csv"), index=False)
+    val_metadata.to_csv(os.path.join(METADATA_DIR, "val_metadata.csv"), index=False)
+
+    print(f"Saved train_metadata.csv ({len(train_metadata)} rows)")
+    print(f"Saved val_metadata.csv ({len(val_metadata)} rows)")
+
+    # ---------------------------------------------------------
+    # 3. Process Test Data
+    # ---------------------------------------------------------
+    print("Processing test data...")
+    df_test = pd.read_csv(TEST_CSV)
+
+    # Test csv has multiple rows per study (prediction types). We need unique studies for loading data.
+    # However, the metadata file should probably facilitate the submission structure or data loading.
+    # Usually data loading iterates over studies. Let's create a study-level metadata file.
+    unique_test_studies = df_test["StudyInstanceUID"].unique()
+    test_metadata = pd.DataFrame({"StudyInstanceUID": unique_test_studies})
+
+    test_metadata["image_path"] = test_metadata["StudyInstanceUID"].apply(
+        lambda x: os.path.join("test_images", x)
+    )
+
+    test_metadata.to_csv(os.path.join(METADATA_DIR, "test_metadata.csv"), index=False)
+    print(f"Saved test_metadata.csv ({len(test_metadata)} rows)")
+
+
+def validate_metadata():
+    print("\nStarting Validation Checks...")
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+
+    # Load files
+    train_df = pd.read_csv(os.path.join(METADATA_DIR, "train_metadata.csv"))
+    val_df = pd.read_csv(os.path.join(METADATA_DIR, "val_metadata.csv"))
+    test_df = pd.read_csv(os.path.join(METADATA_DIR, "test_metadata.csv"))
+
+    # 1. Summary Statistics
+    print("-" * 30)
+    print("Summary Statistics:")
+    print(f"Train set: {len(train_df)} samples")
+    print(f"Val set:   {len(val_df)} samples")
+    print(f"Test set:  {len(test_df)} samples")
+
+    print("\nClass Distribution (patient_overall):")
+    print(f"Train:\n{train_df['patient_overall'].value_counts(normalize=True)}")
+    print(f"Val:\n{val_df['patient_overall'].value_counts(normalize=True)}")
+
+    # 2. Check Overlap (Group Split Verification)
+    train_uids = set(train_df["StudyInstanceUID"])
+    val_uids = set(val_df["StudyInstanceUID"])
+    overlap = train_uids.intersection(val_uids)
+
+    if overlap:
+        raise AssertionError(
+            f"Data Leakage detected! {len(overlap)} StudyInstanceUIDs found in both train and val."
+        )
+    print("\nGroup Split Check: PASSED (No overlap between train and val patients)")
+
+    # 3. File Path Verification
+    print("\nVerifying File Paths...")
+
+    def check_paths(df, name):
+        # Sample 1000 or all
+        n_sample = min(1000, len(df))
+        sample = df.sample(n=n_sample, random_state=42)
+
+        missing_count = 0
+        missing_samples = []
+
+        for idx, row in sample.iterrows():
+            rel_path = row["image_path"]
+            full_path = os.path.join(INPUT_DIR, rel_path)
+
+            # Check if directory exists (since these are image folders)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(rel_path)
+
+        missing_ratio = missing_count / n_sample
+        print(f"[{name}] Checked {n_sample} paths. Missing ratio: {missing_ratio:.4f}")
+
+        if missing_ratio > 0.5:
+            print("Sample missing paths:", missing_samples)
+            raise FileNotFoundError(
+                f"More than 50% of file paths in {name} are invalid."
+            )
+
+    check_paths(train_df, "Train")
+    check_paths(val_df, "Validation")
+    # For test, we check if the folders exist. Note: In some kaggle envs, test images might not match test.csv fully if hidden,
+    # but based on prompt instructions we check what we generated.
+    check_paths(test_df, "Test")
+
+    print("\nAll validation checks passed successfully.")
+
+
+if __name__ == "__main__":
+    generate_metadata()
+    validate_metadata()
+
+```
+
+# Script Execution Output:
+Loading training data...
+Splitting data into Train (80%) and Validation (20%)...
+Saved train_metadata.csv (161 rows)
+Saved val_metadata.csv (41 rows)
+Processing test data...
+Saved test_metadata.csv (1817 rows)
+
+Starting Validation Checks...
+------------------------------
+Summary Statistics:
+Train set: 161 samples
+Val set:   41 samples
+Test set:  1817 samples
+
+Class Distribution (patient_overall):
+Train:
+patient_overall
+0    0.52795
+1    0.47205
+Name: proportion, dtype: float64
+Val:
+patient_overall
+0    0.560976
+1    0.439024
+Name: proportion, dtype: float64
+
+Group Split Check: PASSED (No overlap between train and val patients)
+
+Verifying File Paths...
+[Train] Checked 161 paths. Missing ratio: 0.0000
+[Validation] Checked 41 paths. Missing ratio: 0.0000
+[Test] Checked 1000 paths. Missing ratio: 0.0000
+
+All validation checks passed successfully.
+Execution time: a second (time limit is an hour).
+
+# Document
+Based on the provided Python script and its execution output, here is the detailed documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for approximately 80% of the original training dataset (161 samples). It includes the unique Study ID, ground truth labels for fractures (both patient-level and specific vertebrae C1-C7), paths to the image directories, and flags indicating the availability of auxiliary data (segmentations and bounding boxes).
+    *   **Purpose:** This file is the primary input for the training data loader. It allows the model to map specific study IDs to their corresponding DICOM image folders and target labels while ensuring that patients in this set are distinct from those in the validation set.
+*   **Schema / Structure:**
+    *   **Format:** CSV (Comma Separated Values)
+    *   **Columns:**
+        *   `StudyInstanceUID` (String): Unique identifier for the scan.
+        *   `patient_overall` (Integer): Target label (1 if any fracture exists, 0 otherwise).
+        *   `C1` through `C7` (Integer): Target labels for specific vertebrae (1 if fractured, 0 otherwise).
+        *   `image_path` (String): Relative path to the folder containing DICOM images (e.g., `train_images/1.2.826...`).
+        *   `segmentation_path` (String or Empty): Relative path to the NIFTI segmentation file if it exists, otherwise empty/null.
+        *   `has_segmentation` (Boolean): True if a segmentation file exists for this study.
+        *   `has_bounding_box` (Boolean): True if bounding box data exists for this study in the original source.
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_train = pd.read_csv("./metadata/train_metadata.csv")
+    ```
+
+### 2. `./metadata/val_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for the remaining 20% of the original training dataset (41 samples). It follows the exact same structure as `train_metadata.csv`.
+    *   **Purpose:** Used for model validation and hyperparameter tuning. The split was created using `StratifiedGroupKFold`, ensuring that there is no patient overlap between the training and validation sets (preventing data leakage) while maintaining a similar distribution of fracture cases.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Columns:** Identical to `train_metadata.csv` (see above).
+    *   **Example Row:**
+        *   `StudyInstanceUID`: "1.2.826.0.1.3680043.10051"
+        *   `patient_overall`: 1
+        *   `C1`...`C7`: [0, 1, 0, 0, 0, 0, 0]
+        *   `image_path`: "train_images/1.2.826.0.1.3680043.10051"
+        *   `segmentation_path`: None
+        *   `has_segmentation`: False
+        *   `has_bounding_box`: False
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_val = pd.read_csv("./metadata/val_metadata.csv")
+    ```
+
+### 3. `./metadata/test_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the unique Study Instance UIDs for the test set (1817 samples). Unlike the raw `test.csv` provided by the host (which contains multiple rows per study for different prediction targets), this file aggregates the data to one row per study.
+    *   **Purpose:** Used during the inference phase. The inference script iterates through these rows to locate the test image directories (`test_images/`) and generate predictions for all required sub-types (C1-C7 and patient_overall) for each study.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Columns:**
+        *   `StudyInstanceUID` (String): Unique identifier for the scan.
+        *   `image_path` (String): Relative path to the folder containing test DICOM images (e.g., `test_images/1.2.826...`).
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_test = pd.read_csv("./metadata/test_metadata.csv")
+    ```

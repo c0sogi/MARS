@@ -1,0 +1,387 @@
+Based on the lessons learned, specifically **Lesson 00008** ("Prioritize Data Volume and Simple Objectives over Metric Learning") and **Lesson 00004** ("Mitigating Overconfidence and Sparsity"), I will optimize the solution by switching from the complex ArcFace metric learning objective to a standard Cross-Entropy classification approach and maximizing the training data volume.
+
+1.  **Simplify Model Architecture (Cite solution_lesson_node_00008)**: I will modify `library/model.py` to replace the `ArcMarginProduct` head with a standard `nn.Linear` layer. This removes the need for margin-based training, which was found to converge slower and perform worse than simple classification on this dataset.
+2.  **Maximize Data Volume and Throughput (Cite solution_lesson_node_00004)**: I will update `runfile.py` to increase the training subset from 500,000 to 1,500,000 (covering the full dataset). To accommodate this increased volume within the time limit, I will modify `library/config.py` to increase the `BATCH_SIZE` to 1024 and reduce `EPOCHS` to 3.
+3.  **Update Training Engine**: I will adjust `library/engine.py` to remove the `species_label` argument from the model's forward pass, as standard classification models do not require ground truth labels during inference/forward propagation, unlike ArcFace.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ArcFace Head Parameters (Metric Learning)
+    ARCFACE_SCALE = 30.0
+    ARCFACE_MARGIN = 0.50
+
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    SEED = 42
+    BATCH_SIZE = 256  # Optimized for A100 40GB VRAM
+    EPOCHS = 12  # Targeted for 24h runtime with full dataset
+=======
+    # ArcFace Head Parameters (Metric Learning)
+    # ARCFACE_SCALE = 30.0  # Removed for standard classification
+    # ARCFACE_MARGIN = 0.50 # Removed for standard classification
+
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    SEED = 42
+    BATCH_SIZE = 1024  # Increased for throughput (Cite solution_lesson_node_00004)
+    EPOCHS = 3  # Reduced to fit runtime with more data (Cite solution_lesson_node_00004)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ArcMarginProduct(nn.Module):
+    r"""
+    Implement of large margin arc distance: :
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            s: norm of input feature
+            m: margin
+            cos(theta + m)
+    """
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        s=30.0,
+        m=0.50,
+        easy_margin=False,
+        ls_eps=0.0,
+    ):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.ls_eps = ls_eps  # label smoothing
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input, label=None):
+        # --------------------------- cos(theta) & phi(theta) ---------------------------
+        # cosine = input . weight / (|input| * |weight|)
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+
+        # If no label is provided (inference), just return scaled cosine similarities
+        if label is None:
+            return cosine * self.s
+
+        # --------------------------- cos(theta + m) ---------------------------
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m
+
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        # --------------------------- convert label to one-hot ---------------------------
+        # Create one_hot mask for the target labels
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+
+        # Optional: Label smoothing on the mask itself
+        if self.ls_eps > 0:
+            one_hot = (1 - self.ls_eps) * one_hot + self.ls_eps / self.out_features
+
+        # --------------------------- output ---------------------------
+        # Apply margin only to the target class
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+
+        return output
+
+
+class HierarchicalEfficientNet(nn.Module):
+    """
+    Hierarchical EfficientNet with ArcFace for Species and Linear heads for Family/Order.
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        num_classes=Config.NUM_CLASSES,
+        num_families=1,  # Should be provided by the training script
+        num_orders=1,
+        embedding_dim=Config.EMBEDDING_DIM,
+        dropout=Config.DROPOUT,
+        s=Config.ARCFACE_SCALE,
+        m=Config.ARCFACE_MARGIN,
+    ):
+        super(HierarchicalEfficientNet, self).__init__()
+
+        # 1. Backbone
+        # num_classes=0 means we get the pooled feature vector
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0
+        )
+        self.num_features = self.backbone.num_features
+
+        # 2. Embedding / Projection Layer
+        # Projects backbone features to a lower dimensional embedding space for ArcFace
+        self.embedding_layer = nn.Sequential(
+            nn.Linear(self.num_features, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+            nn.Dropout(dropout),
+        )
+
+        # 3. Heads
+        # Species Head: Metric Learning (ArcFace)
+        self.species_head = ArcMarginProduct(embedding_dim, num_classes, s=s, m=m)
+
+        # Auxiliary Heads: Standard Classification
+        self.family_head = nn.Linear(embedding_dim, num_families)
+        self.order_head = nn.Linear(embedding_dim, num_orders)
+
+    def forward(self, x, species_label=None):
+        """
+        Args:
+            x: Input images [B, C, H, W]
+            species_label: Ground truth species labels [B].
+                           Required during training for ArcFace margin calculation.
+                           Can be None during inference.
+        Returns:
+            species_logits, family_logits, order_logits
+        """
+        # Extract features from backbone
+        features = self.backbone(x)
+
+        # Project to embedding space
+        embeddings = self.embedding_layer(features)
+
+        # Forward pass through heads
+        species_logits = self.species_head(embeddings, species_label)
+        family_logits = self.family_head(embeddings)
+        order_logits = self.order_head(embeddings)
+
+        return species_logits, family_logits, order_logits
+=======
+class HierarchicalEfficientNet(nn.Module):
+    """
+    Hierarchical EfficientNet with Standard Linear Heads for Species, Family, and Order.
+    Simplified from ArcFace to improve convergence on large-scale data (Cite solution_lesson_node_00008).
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        num_classes=Config.NUM_CLASSES,
+        num_families=1,
+        num_orders=1,
+        embedding_dim=Config.EMBEDDING_DIM,
+        dropout=Config.DROPOUT,
+        # s and m removed as ArcFace is replaced
+    ):
+        super(HierarchicalEfficientNet, self).__init__()
+
+        # 1. Backbone
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0
+        )
+        self.num_features = self.backbone.num_features
+
+        # 2. Embedding / Projection Layer
+        self.embedding_layer = nn.Sequential(
+            nn.Linear(self.num_features, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+            nn.Dropout(dropout),
+        )
+
+        # 3. Heads
+        # Species Head: Standard Classification (Linear)
+        self.species_head = nn.Linear(embedding_dim, num_classes)
+
+        # Auxiliary Heads: Standard Classification
+        self.family_head = nn.Linear(embedding_dim, num_families)
+        self.order_head = nn.Linear(embedding_dim, num_orders)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input images [B, C, H, W]
+        Returns:
+            species_logits, family_logits, order_logits
+        """
+        # Extract features from backbone
+        features = self.backbone(x)
+
+        # Project to embedding space
+        embeddings = self.embedding_layer(features)
+
+        # Forward pass through heads
+        species_logits = self.species_head(embeddings)
+        family_logits = self.family_head(embeddings)
+        order_logits = self.order_head(embeddings)
+
+        return species_logits, family_logits, order_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # For ArcFace, we need to pass a label to the model to apply the margin.
+        # With CutMix, we have two targets. We pass the primary target (target_a)
+        # to apply the margin relative to the dominant class.
+        species_target_a = targets["species"][0]
+
+        optimizer.zero_grad()
+
+        with autocast():
+            # Forward pass
+            # outputs = (species_logits, family_logits, order_logits)
+            outputs = model(images, species_label=species_target_a)
+
+            # Compute Loss
+            loss = criterion(outputs, targets)
+=======
+        optimizer.zero_grad()
+
+        with autocast():
+            # Forward pass
+            # outputs = (species_logits, family_logits, order_logits)
+            outputs = model(images)
+
+            # Compute Loss
+            loss = criterion(outputs, targets)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Forward pass
+            # Pass species_label=None for inference (no margin applied)
+            outputs = model(images, species_label=None)
+            species_logits, family_logits, order_logits = outputs
+=======
+            # Forward pass
+            outputs = model(images)
+            species_logits, family_logits, order_logits = outputs
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Subsample training data for fast baseline (e.g., top 500k samples)
+    # The dataframe is already shuffled in the metadata generation step
+    FAST_TRAIN_SIZE = 500000
+    if len(train_dataset.df) > FAST_TRAIN_SIZE:
+        print(
+            f"Subsampling training set from {len(train_dataset.df)} to {FAST_TRAIN_SIZE} for fast baseline."
+        )
+        train_dataset.df = train_dataset.df.iloc[:FAST_TRAIN_SIZE].reset_index(
+            drop=True
+        )
+=======
+    # Use full training data (or as much as possible) to address long-tail (Cite solution_lesson_node_00004)
+    FAST_TRAIN_SIZE = 1500000
+    if len(train_dataset.df) > FAST_TRAIN_SIZE:
+        print(
+            f"Subsampling training set from {len(train_dataset.df)} to {FAST_TRAIN_SIZE}."
+        )
+        train_dataset.df = train_dataset.df.iloc[:FAST_TRAIN_SIZE].reset_index(
+            drop=True
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("Initializing Model...")
+    model = HierarchicalEfficientNet(
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        num_classes=Config.NUM_CLASSES,
+        num_families=num_families,
+        num_orders=num_orders,
+        embedding_dim=Config.EMBEDDING_DIM,
+        dropout=Config.DROPOUT,
+        s=Config.ARCFACE_SCALE,
+        m=Config.ARCFACE_MARGIN,
+    )
+    model = model.to(device)
+=======
+    print("Initializing Model...")
+    model = HierarchicalEfficientNet(
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        num_classes=Config.NUM_CLASSES,
+        num_families=num_families,
+        num_orders=num_orders,
+        embedding_dim=Config.EMBEDDING_DIM,
+        dropout=Config.DROPOUT,
+    )
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        for images, species, families, orders in val_loader:
+            images = images.to(device)
+            # Forward pass (inference mode)
+            outputs = model(images, species_label=None)
+            species_logits = outputs[0]
+            preds = torch.argmax(species_logits, dim=1).cpu()
+            all_preds.append(preds)
+            all_targets.append(species)
+=======
+        for images, species, families, orders in val_loader:
+            images = images.to(device)
+            # Forward pass (inference mode)
+            outputs = model(images)
+            species_logits = outputs[0]
+            preds = torch.argmax(species_logits, dim=1).cpu()
+            all_preds.append(preds)
+            all_targets.append(species)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        model.eval()
+        with torch.no_grad():
+            for images, image_ids in test_loader:
+                images = images.to(device)
+
+                # Inference
+                outputs = model(images, species_label=None)
+                species_logits = outputs[0]
+                preds = torch.argmax(species_logits, dim=1).cpu().numpy()
+
+                submission_ids.extend(image_ids.numpy())
+                submission_preds.extend(preds)
+=======
+        model.eval()
+        with torch.no_grad():
+            for images, image_ids in test_loader:
+                images = images.to(device)
+
+                # Inference
+                outputs = model(images)
+                species_logits = outputs[0]
+                preds = torch.argmax(species_logits, dim=1).cpu().numpy()
+
+                submission_ids.extend(image_ids.numpy())
+                submission_preds.extend(preds)
+>>>>>>> REPLACE
+```

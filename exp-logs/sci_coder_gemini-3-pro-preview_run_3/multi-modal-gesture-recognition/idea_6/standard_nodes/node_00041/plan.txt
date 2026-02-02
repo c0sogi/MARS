@@ -1,0 +1,707 @@
+To optimize the solution, I will implement **Kinematically Consistent Augmentation** and **Gated Temporal Convolutions**, as suggested by the lessons learned.
+
+1.  **Kinematically Consistent Augmentation (Cite `solution_lesson_node_00032`, `solution_lesson_node_00029`)**:
+    The previous solution applied random noise to the concatenated feature vector (Position, Velocity, Acceleration). This breaks the physical relationship between the derivatives and the position. I will modify the `data_loader.py` to:
+    -   Store raw skeleton positions and audio separately in the cache.
+    -   In the `GestureDataset.__getitem__` method, apply random 3D rotations and scaling to the **raw positions** first.
+    -   Compute Velocity and Acceleration **on-the-fly** from the augmented positions. This ensures that the dynamic features (derivatives) are mathematically consistent with the augmented spatial trajectory.
+
+2.  **Gated Temporal Convolutions (Cite `solution_lesson_node_00032`)**:
+    I will modify the `DilatedResidualLayer` in `model.py` to replace the standard ReLU activation with a Gated Activation unit ($ \tanh(x) \times \sigma(g) $). This mechanism, inspired by WaveNet, allows the network to better control the flow of information through time and sharpen decision boundaries, which is crucial for frame-wise segmentation.
+
+3.  **Threshold Update**:
+    I will update the submission threshold in `runfile.py` to `0.2251` as requested.
+
+Here are the code changes:
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedResidualLayer(nn.Module):
+    """
+    A single dilated residual block for the TCN.
+    Conv1d (Dilated) -> ReLU -> Dropout -> Conv1d (1x1) -> Residual Add
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(DilatedResidualLayer, self).__init__()
+
+        # Calculate padding to keep temporal dimension same
+        # For kernel_size 3:
+        # dilation 1 -> pad 1
+        # dilation 2 -> pad 2
+        # dilation 4 -> pad 4
+        padding = (kernel_size - 1) * dilation // 2
+
+        self.conv_dilated = nn.Conv1d(
+            channels, channels, kernel_size, padding=padding, dilation=dilation
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        self.conv_1x1 = nn.Conv1d(channels, channels, 1)
+
+    def forward(self, x):
+        out = self.conv_dilated(x)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv_1x1(out)
+        return x + out
+=======
+class DilatedResidualLayer(nn.Module):
+    """
+    A single dilated residual block for the TCN using Gated Activations.
+    Conv1d (Dilated) -> Split(Filter, Gate) -> Tanh * Sigmoid -> Dropout -> Conv1d (1x1) -> Residual Add
+    Cite solution_lesson_node_00032: Gated Temporal Convolutions.
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(DilatedResidualLayer, self).__init__()
+
+        # Calculate padding to keep temporal dimension same
+        padding = (kernel_size - 1) * dilation // 2
+
+        # Gated Activation requires double the output channels (Filter + Gate)
+        self.conv_dilated = nn.Conv1d(
+            channels, channels * 2, kernel_size, padding=padding, dilation=dilation
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.conv_1x1 = nn.Conv1d(channels, channels, 1)
+
+    def forward(self, x):
+        out = self.conv_dilated(x)
+        
+        # Split into filter and gate
+        filter, gate = out.chunk(2, dim=1)
+        
+        # Gated Activation: tanh(filter) * sigmoid(gate)
+        out = torch.tanh(filter) * torch.sigmoid(gate)
+        
+        out = self.dropout(out)
+        out = self.conv_1x1(out)
+        return x + out
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def compute_skeleton_features(mat_path):
+    """
+    Extracts Position, Velocity, and Acceleration from skeleton data.
+    Returns: numpy array of shape (NumFrames, 180)
+    """
+    mat = load_mat_file(mat_path)
+    if mat is None or "Video" not in mat:
+        # Return zeros if data is missing
+        # We assume a default length or handle it upstream.
+        # Here we return None to indicate failure.
+        return None
+
+    video = mat["Video"]
+    if not hasattr(video, "Frames"):
+        return None
+
+    frames = video.Frames
+    num_frames = len(frames)
+
+    # 20 joints, 3 coords (X, Y, Z)
+    # Shape: (T, 20, 3)
+    # Initialize with NaNs to detect missing data later if needed, or zeros
+    pos_data = np.zeros(
+        (num_frames, config.SKELETON_JOINTS, config.SKELETON_COORDS), dtype=np.float32
+    )
+
+    for i, frame in enumerate(frames):
+        if hasattr(frame, "Skeleton") and hasattr(frame.Skeleton, "WorldPosition"):
+            wp = frame.Skeleton.WorldPosition
+            # Check if WorldPosition is valid (sometimes it's empty or struct)
+            try:
+                # Assuming wp has X, Y, Z attributes or is an array
+                if hasattr(wp, "X") and hasattr(wp, "Y") and hasattr(wp, "Z"):
+                    # Some mat files might have multiple skeletons, we take the first tracked one usually
+                    # But here WorldPosition seems to be direct coordinates
+                    pos_data[i, :, 0] = wp.X
+                    pos_data[i, :, 1] = wp.Y
+                    pos_data[i, :, 2] = wp.Z
+                elif (
+                    isinstance(wp, (np.ndarray, list))
+                    and len(wp) == config.SKELETON_JOINTS
+                ):
+                    # Fallback if structure is different but array-like
+                    pos_data[i] = wp
+            except:
+                # If extraction fails for a frame, copy previous frame
+                if i > 0:
+                    pos_data[i] = pos_data[i - 1]
+        else:
+            if i > 0:
+                pos_data[i] = pos_data[i - 1]
+
+    # Convert mm to meters for stability
+    pos_data = pos_data / 1000.0
+
+    # Compute Velocity (First Derivative)
+    # V_t = P_t - P_{t-1}
+    # Pad first frame with 0
+    velocity = np.zeros_like(pos_data)
+    velocity[1:] = pos_data[1:] - pos_data[:-1]
+
+    # Compute Acceleration (Second Derivative)
+    # A_t = V_t - V_{t-1}
+    # Pad first frame with 0 (effectively first 2 frames are affected)
+    acceleration = np.zeros_like(velocity)
+    acceleration[1:] = velocity[1:] - velocity[:-1]
+
+    # Flatten features: (T, 20, 9) -> (T, 180)
+    # Concatenate along last dimension: Pos, Vel, Acc
+    combined = np.concatenate([pos_data, velocity, acceleration], axis=2)
+    flattened = combined.reshape(num_frames, -1)
+
+    return flattened
+=======
+def compute_skeleton_features(mat_path):
+    """
+    Extracts raw Position from skeleton data.
+    Derivatives will be computed on-the-fly to allow consistent augmentation.
+    Returns: numpy array of shape (NumFrames, 60) -> Flattened (20*3)
+    """
+    mat = load_mat_file(mat_path)
+    if mat is None or "Video" not in mat:
+        return None
+
+    video = mat["Video"]
+    if not hasattr(video, "Frames"):
+        return None
+
+    frames = video.Frames
+    num_frames = len(frames)
+
+    # 20 joints, 3 coords (X, Y, Z)
+    pos_data = np.zeros(
+        (num_frames, config.SKELETON_JOINTS, config.SKELETON_COORDS), dtype=np.float32
+    )
+
+    for i, frame in enumerate(frames):
+        if hasattr(frame, "Skeleton") and hasattr(frame.Skeleton, "WorldPosition"):
+            wp = frame.Skeleton.WorldPosition
+            try:
+                if hasattr(wp, "X") and hasattr(wp, "Y") and hasattr(wp, "Z"):
+                    pos_data[i, :, 0] = wp.X
+                    pos_data[i, :, 1] = wp.Y
+                    pos_data[i, :, 2] = wp.Z
+                elif (
+                    isinstance(wp, (np.ndarray, list))
+                    and len(wp) == config.SKELETON_JOINTS
+                ):
+                    pos_data[i] = wp
+            except:
+                if i > 0:
+                    pos_data[i] = pos_data[i - 1]
+        else:
+            if i > 0:
+                pos_data[i] = pos_data[i - 1]
+
+    # Convert mm to meters for stability
+    pos_data = pos_data / 1000.0
+    
+    # Flatten to (T, 60) for storage
+    return pos_data.reshape(num_frames, -1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def process_sample(row):
+    """
+    Process a single sample row from metadata.
+    """
+    sample_id = row["sample_id"]
+    data_path = os.path.join(config.INPUT_DIR, row["data_path"])
+    audio_path = os.path.join(config.INPUT_DIR, row["audio_path"])
+
+    # 1. Skeleton Features
+    skeleton_feats = compute_skeleton_features(data_path)
+    if skeleton_feats is None:
+        # Fallback for completely broken files (should be rare/non-existent based on metadata check)
+        # Assume a small length to avoid crashes, will likely be filtered or fail gracefully
+        print(f"Warning: Failed to load skeleton for {sample_id}")
+        return None, None
+
+    num_frames = skeleton_feats.shape[0]
+
+    # 2. Audio Features
+    audio_feats = compute_audio_features(audio_path, num_frames)
+
+    # 3. Concatenate (Early Fusion)
+    # Skeleton: (T, 180), Audio: (T, 13) -> (T, 193)
+    features = np.concatenate([skeleton_feats, audio_feats], axis=1).astype(np.float32)
+
+    # 4. Labels
+    # Initialize background (class 0)
+    labels = np.zeros(num_frames, dtype=np.int64)
+
+    if "parsed_labels" in row and isinstance(row["parsed_labels"], list):
+        for label_info in row["parsed_labels"]:
+            # Metadata is 1-based (Matlab convention), convert to 0-based
+            # begin is inclusive, end is inclusive in Matlab
+            # Python slice: [start, end)
+            start_frame = max(0, int(label_info["begin"]) - 1)
+            end_frame = min(num_frames, int(label_info["end"]))
+            label_id = int(label_info["id"])
+
+            if start_frame < end_frame:
+                labels[start_frame:end_frame] = label_id
+
+    return features, labels
+=======
+def process_sample(row):
+    """
+    Process a single sample row from metadata.
+    Returns: ((pos_feats, audio_feats), labels)
+    """
+    sample_id = row["sample_id"]
+    data_path = os.path.join(config.INPUT_DIR, row["data_path"])
+    audio_path = os.path.join(config.INPUT_DIR, row["audio_path"])
+
+    # 1. Skeleton Features (Raw Position: T, 60)
+    pos_feats = compute_skeleton_features(data_path)
+    if pos_feats is None:
+        print(f"Warning: Failed to load skeleton for {sample_id}")
+        return None, None
+
+    num_frames = pos_feats.shape[0]
+
+    # 2. Audio Features (T, 13)
+    audio_feats = compute_audio_features(audio_path, num_frames)
+
+    # 3. Labels
+    labels = np.zeros(num_frames, dtype=np.int64)
+    if "parsed_labels" in row and isinstance(row["parsed_labels"], list):
+        for label_info in row["parsed_labels"]:
+            start_frame = max(0, int(label_info["begin"]) - 1)
+            end_frame = min(num_frames, int(label_info["end"]))
+            label_id = int(label_info["id"])
+            if start_frame < end_frame:
+                labels[start_frame:end_frame] = label_id
+
+    # Return components separately to allow on-the-fly augmentation
+    return (pos_feats.astype(np.float32), audio_feats.astype(np.float32)), labels
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def load_data_dict(metadata_path, cache_name, load_cached_data=True):
+    """
+    Loads data into a dictionary {sample_id: (features, labels)}.
+    Uses caching to speed up subsequent runs.
+    """
+    cache_path = os.path.join(config.WORKING_DIR, f"{cache_name}.npz")
+
+    if load_cached_data and os.path.exists(cache_path):
+        print(f"Loading cached data from {cache_path}...")
+        try:
+            with np.load(cache_path, allow_pickle=True) as data:
+                # Reconstruct dictionary
+                # npz stores arrays with keys. We stored 'ids', 'features', 'labels' arrays of objects
+                ids = data["ids"]
+                features = data["features"]
+                labels = data["labels"]
+
+                data_dict = {}
+                for i, sample_id in enumerate(ids):
+                    data_dict[sample_id] = (features[i], labels[i])
+                return data_dict
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    # Compute from scratch
+    print(f"Processing data from {metadata_path}...")
+    df = pd.read_csv(metadata_path)
+
+    # Parse JSON labels if string
+    if "labels" in df.columns:
+        df["parsed_labels"] = df["labels"].apply(
+            lambda x: json.loads(x) if isinstance(x, str) else []
+        )
+
+    data_dict = {}
+    ids_list = []
+    features_list = []
+    labels_list = []
+
+    for idx, row in df.iterrows():
+        result = process_sample(row)
+        if result[0] is not None:
+            feats, labs = result
+            data_dict[row["sample_id"]] = (feats, labs)
+
+            ids_list.append(row["sample_id"])
+            features_list.append(feats)
+            labels_list.append(labs)
+
+    # Save to cache
+    # We use object array for features/labels because they have variable lengths
+    np.savez_compressed(
+        cache_path,
+        ids=np.array(ids_list),
+        features=np.array(features_list, dtype=object),
+        labels=np.array(labels_list, dtype=object),
+    )
+    print(f"Saved cache to {cache_path}")
+
+    return data_dict
+=======
+def load_data_dict(metadata_path, cache_name, load_cached_data=True):
+    """
+    Loads data into a dictionary {sample_id: ((pos, audio), labels)}.
+    Uses caching to speed up subsequent runs.
+    Updated to use _v2 cache for separated features.
+    """
+    # Change cache name to avoid loading incompatible data
+    cache_name = f"{cache_name}_v2"
+    cache_path = os.path.join(config.WORKING_DIR, f"{cache_name}.npz")
+
+    if load_cached_data and os.path.exists(cache_path):
+        print(f"Loading cached data from {cache_path}...")
+        try:
+            with np.load(cache_path, allow_pickle=True) as data:
+                ids = data["ids"]
+                features = data["features"] # Array of tuples (pos, audio)
+                labels = data["labels"]
+
+                data_dict = {}
+                for i, sample_id in enumerate(ids):
+                    data_dict[sample_id] = (features[i], labels[i])
+                return data_dict
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    print(f"Processing data from {metadata_path}...")
+    df = pd.read_csv(metadata_path)
+
+    if "labels" in df.columns:
+        df["parsed_labels"] = df["labels"].apply(
+            lambda x: json.loads(x) if isinstance(x, str) else []
+        )
+
+    data_dict = {}
+    ids_list = []
+    features_list = []
+    labels_list = []
+
+    for idx, row in df.iterrows():
+        result = process_sample(row)
+        if result[0] is not None:
+            # result is ((pos, audio), labels)
+            feats, labs = result
+            data_dict[row["sample_id"]] = (feats, labs)
+
+            ids_list.append(row["sample_id"])
+            features_list.append(feats)
+            labels_list.append(labs)
+
+    np.savez_compressed(
+        cache_path,
+        ids=np.array(ids_list),
+        features=np.array(features_list, dtype=object),
+        labels=np.array(labels_list, dtype=object),
+    )
+    print(f"Saved cache to {cache_path}")
+
+    return data_dict
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+class GestureDataset(Dataset):
+    def __init__(
+        self,
+        data_dict,
+        mode="train",
+        window_size=config.WINDOW_SIZE,
+        stride=config.STRIDE,
+        augment=False,
+    ):
+        """
+        Args:
+            data_dict: Dictionary {sample_id: (features, labels)}
+            mode: 'train' (sliding windows) or 'val'/'test' (full sequences)
+            augment: Boolean, whether to apply data augmentation (noise)
+        """
+        self.mode = mode
+        self.window_size = window_size
+        self.stride = stride
+        self.augment = augment
+        self.data = []
+
+        # Pre-process indices
+        sorted_ids = sorted(data_dict.keys())
+
+        if self.mode == "train":
+            # Create sliding windows
+            for sample_id in sorted_ids:
+                feats, labs = data_dict[sample_id]
+                num_frames = feats.shape[0]
+
+                # If sequence is shorter than window, pad it?
+                # Or just take one window padded.
+                if num_frames < self.window_size:
+                    # We will handle padding in __getitem__
+                    self.data.append(
+                        {
+                            "sample_id": sample_id,
+                            "features": feats,
+                            "labels": labs,
+                            "start_idx": 0,
+                            "is_short": True,
+                        }
+                    )
+                else:
+                    # Generate windows
+                    for start_idx in range(
+                        0, num_frames - self.window_size + 1, self.stride
+                    ):
+                        self.data.append(
+                            {
+                                "sample_id": sample_id,
+                                "features": feats,  # Store reference, not copy
+                                "labels": labs,
+                                "start_idx": start_idx,
+                                "is_short": False,
+                            }
+                        )
+        else:
+            # Full sequences
+            for sample_id in sorted_ids:
+                feats, labs = data_dict[sample_id]
+                self.data.append(
+                    {"sample_id": sample_id, "features": feats, "labels": labs}
+                )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+
+        if self.mode == "train":
+            feats = item["features"]
+            labs = item["labels"]
+
+            if item["is_short"]:
+                # Pad short sequence
+                seq_len = feats.shape[0]
+                pad_len = self.window_size - seq_len
+
+                # Pad features with zeros
+                feats_padded = np.pad(feats, ((0, pad_len), (0, 0)), mode="constant")
+                # Pad labels with background (0)
+                labs_padded = np.pad(
+                    labs, (0, pad_len), mode="constant", constant_values=0
+                )
+
+                feat_out = torch.from_numpy(feats_padded)
+                lab_out = torch.from_numpy(labs_padded)
+            else:
+                start = item["start_idx"]
+                end = start + self.window_size
+
+                window_feats = feats[start:end]
+                window_labs = labs[start:end]
+
+                feat_out = torch.from_numpy(window_feats)
+                lab_out = torch.from_numpy(window_labs)
+
+            # Apply Augmentation
+            if self.augment:
+                # Clone to avoid modifying shared memory/cache
+                feat_out = feat_out.clone()
+                if torch.rand(1).item() < config.AUGMENT_PROB:
+                    # Add noise to skeleton features (first 180 dimensions)
+                    # Cite solution_lesson_node_00005 (Robustness via noise)
+                    noise = (
+                        torch.randn_like(feat_out[:, : config.INPUT_DIM_SKELETON])
+                        * config.AUGMENT_NOISE_STD
+                    )
+                    feat_out[:, : config.INPUT_DIM_SKELETON] += noise
+
+            return feat_out, lab_out
+
+        else:
+            # Return full sequence
+            # Note: Batch size must be 1 or use custom collate
+            return (
+                torch.from_numpy(item["features"]),
+                torch.from_numpy(item["labels"]),
+                item["sample_id"],
+            )
+=======
+class GestureDataset(Dataset):
+    def __init__(
+        self,
+        data_dict,
+        mode="train",
+        window_size=config.WINDOW_SIZE,
+        stride=config.STRIDE,
+        augment=False,
+    ):
+        self.mode = mode
+        self.window_size = window_size
+        self.stride = stride
+        self.augment = augment
+        self.data = []
+
+        sorted_ids = sorted(data_dict.keys())
+
+        if self.mode == "train":
+            for sample_id in sorted_ids:
+                (pos, audio), labs = data_dict[sample_id]
+                num_frames = pos.shape[0]
+
+                if num_frames < self.window_size:
+                    self.data.append({
+                        "sample_id": sample_id,
+                        "pos": pos, "audio": audio, "labels": labs,
+                        "start_idx": 0, "is_short": True
+                    })
+                else:
+                    for start_idx in range(0, num_frames - self.window_size + 1, self.stride):
+                        self.data.append({
+                            "sample_id": sample_id,
+                            "pos": pos, "audio": audio, "labels": labs,
+                            "start_idx": start_idx, "is_short": False
+                        })
+        else:
+            for sample_id in sorted_ids:
+                (pos, audio), labs = data_dict[sample_id]
+                self.data.append({
+                    "sample_id": sample_id,
+                    "pos": pos, "audio": audio, "labels": labs
+                })
+
+    def _augment_position(self, pos_data):
+        # pos_data: (T, 60) -> (T, 20, 3)
+        T_dim = pos_data.shape[0]
+        pos_3d = pos_data.reshape(T_dim, 20, 3)
+        
+        # Random Scaling
+        scale = np.random.uniform(0.9, 1.1)
+        pos_3d = pos_3d * scale
+        
+        # Random Rotation around Y-axis (Gravity)
+        angle_deg = np.random.uniform(-15, 15)
+        rad = np.deg2rad(angle_deg)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        # Ry matrix
+        # [cos  0  sin]
+        # [0    1  0  ]
+        # [-sin 0  cos]
+        # Apply to each point
+        x = pos_3d[:, :, 0]
+        z = pos_3d[:, :, 2]
+        new_x = x * cos_a + z * sin_a
+        new_z = -x * sin_a + z * cos_a
+        pos_3d[:, :, 0] = new_x
+        pos_3d[:, :, 2] = new_z
+        
+        return pos_3d.reshape(T_dim, 60)
+
+    def _compute_derivatives_and_concat(self, pos, audio):
+        # pos: (T, 60)
+        # audio: (T, 13)
+        
+        # Reshape to (T, 20, 3) for derivative calc
+        T_dim = pos.shape[0]
+        p = pos.reshape(T_dim, 20, 3)
+        
+        # Velocity
+        v = np.zeros_like(p)
+        v[1:] = p[1:] - p[:-1]
+        
+        # Acceleration
+        a = np.zeros_like(v)
+        a[1:] = v[1:] - v[:-1]
+        
+        # Flatten and Concat
+        # (T, 20, 3) -> (T, 60)
+        p_flat = p.reshape(T_dim, -1)
+        v_flat = v.reshape(T_dim, -1)
+        a_flat = a.reshape(T_dim, -1)
+        
+        # (T, 180 + 13)
+        return np.concatenate([p_flat, v_flat, a_flat, audio], axis=1).astype(np.float32)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+
+        if self.mode == "train":
+            pos = item["pos"]
+            audio = item["audio"]
+            labs = item["labels"]
+
+            # Slice
+            if item["is_short"]:
+                pos_window = pos
+                audio_window = audio
+                lab_window = labs
+                # Padding handled after feature computation
+            else:
+                start = item["start_idx"]
+                end = start + self.window_size
+                pos_window = pos[start:end]
+                audio_window = audio[start:end]
+                lab_window = labs[start:end]
+
+            # Augment Position (Kinematically Consistent)
+            # Cite solution_lesson_node_00032
+            if self.augment and torch.rand(1).item() < config.AUGMENT_PROB:
+                pos_window = self._augment_position(pos_window)
+
+            # Compute Features on-the-fly
+            # Cite solution_lesson_node_00029 (Consistency)
+            features = self._compute_derivatives_and_concat(pos_window, audio_window)
+
+            # Pad if short
+            if item["is_short"]:
+                pad_len = self.window_size - features.shape[0]
+                features = np.pad(features, ((0, pad_len), (0, 0)), mode="constant")
+                lab_window = np.pad(lab_window, (0, pad_len), mode="constant", constant_values=0)
+
+            return torch.from_numpy(features), torch.from_numpy(lab_window)
+
+        else:
+            # Full sequence
+            pos = item["pos"]
+            audio = item["audio"]
+            labs = item["labels"]
+            
+            # No augmentation for val/test
+            features = self._compute_derivatives_and_concat(pos, audio)
+            
+            return (
+                torch.from_numpy(features),
+                torch.from_numpy(labs),
+                item["sample_id"],
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Conditional Submission
+    THRESHOLD = 0.30627871362940273
+
+    if final_metric < THRESHOLD:
+=======
+    # 7. Conditional Submission
+    THRESHOLD = 0.2251
+
+    if final_metric < THRESHOLD:
+>>>>>>> REPLACE
+```

@@ -1,0 +1,131 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from library import config
+
+
+class ArcMarginProduct(nn.Module):
+    """
+    Implement of large margin cosine distance:
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        s: norm of input feature
+        m: margin
+        cos(theta + m)
+    """
+
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input, label=None):
+        # --------------------------- cos(theta) & phi(theta + m) ---------------------------
+        # L2 Normalize input and weights
+        # input: (batch, in_features)
+        # weight: (out_features, in_features)
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+
+        # If inference (no label), return scaled cosine similarity
+        if label is None:
+            return cosine * self.s
+
+        # --------------------------- Training ---------------------------
+        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+
+        # cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
+        phi = cosine * self.cos_m - sine * self.sin_m
+
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            # For numerical stability and to handle theta + m > pi
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        # Create one-hot encoding for labels
+        # label shape: (batch_size)
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+
+        # Apply margin only to the ground truth class
+        # output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output = (one_hot * phi) + (cosine * (1.0 - one_hot))
+
+        # Scale the logits
+        output *= self.s
+
+        return output
+
+
+class ResNetArcFace(nn.Module):
+    """
+    ResNet Backbone with ArcFace Head.
+    Optimized for high-cardinality classification.
+    """
+
+    def __init__(self, num_species, backbone_name="resnet18", pretrained=True):
+        super(ResNetArcFace, self).__init__()
+
+        # 1. Backbone
+        weights = "DEFAULT" if pretrained else None
+        if backbone_name == "resnet18":
+            self.backbone = models.resnet18(weights=weights)
+            in_features = self.backbone.fc.in_features
+        elif backbone_name == "resnet50":
+            self.backbone = models.resnet50(weights=weights)
+            in_features = self.backbone.fc.in_features
+        else:
+            # Default fallback
+            self.backbone = models.resnet18(weights=weights)
+            in_features = 512
+
+        # Remove original fully connected layer
+        self.backbone.fc = nn.Identity()
+
+        # 2. Embedding Layer (Bottleneck)
+        self.embedding_dim = config.EMBEDDING_DIM
+
+        self.bn1 = nn.BatchNorm1d(in_features)
+        self.dropout = nn.Dropout(p=0.4)
+        self.fc_embedding = nn.Linear(in_features, self.embedding_dim)
+        self.bn2 = nn.BatchNorm1d(self.embedding_dim)
+
+        # 3. Head: Species (ArcFace)
+        self.species_head = ArcMarginProduct(
+            in_features=self.embedding_dim,
+            out_features=num_species,
+            s=config.ARCFACE_SCALE,
+            m=config.ARCFACE_MARGIN,
+        )
+
+    def forward(self, x, species_label=None):
+        """
+        Args:
+            x (torch.Tensor): Input images (Batch, 3, H, W)
+            species_label (torch.Tensor, optional): Ground truth species labels.
+        Returns:
+            species_logits: Output of ArcFace head.
+        """
+        features = self.backbone(x)
+
+        features = self.bn1(features)
+        features = self.dropout(features)
+        embedding = self.fc_embedding(features)
+        embedding = self.bn2(embedding)
+
+        species_logits = self.species_head(embedding, species_label)
+
+        return species_logits

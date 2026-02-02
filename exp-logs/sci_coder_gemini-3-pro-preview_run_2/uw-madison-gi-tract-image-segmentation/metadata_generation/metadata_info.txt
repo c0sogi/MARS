@@ -1,0 +1,368 @@
+# Python Script for Metadata Generation
+```
+import os
+import glob
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GroupShuffleSplit
+import random
+
+# Constants
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_CSV_PATH = os.path.join(INPUT_DIR, "train.csv")
+TEST_CSV_PATH = os.path.join(
+    INPUT_DIR, "test.csv"
+)  # Using test.csv as it defines the test set structure
+RANDOM_STATE = 42
+
+
+def parse_filename_info(filename):
+    """
+    Parses the filename to extract slice number, width, height, and spacing.
+    Format: slice_{number}_{width}_{height}_{spacing_w}_{spacing_h}.png
+    """
+    # Remove extension
+    base = os.path.splitext(filename)[0]
+    parts = base.split("_")
+
+    # Expected parts: ['slice', '0001', '360', '310', '1.50', '1.50']
+    if len(parts) < 6:
+        return None
+
+    slice_num = parts[1]
+    width = int(parts[2])
+    height = int(parts[3])
+    spacing_w = float(parts[4])
+    spacing_h = float(parts[5])
+
+    return {
+        "slice_id": slice_num,
+        "img_width": width,
+        "img_height": height,
+        "pixel_spacing_w": spacing_w,
+        "pixel_spacing_h": spacing_h,
+    }
+
+
+def scan_directory(subfolder):
+    """
+    Scans input/{subfolder} (e.g., 'train' or 'test') to build a dataframe of file paths and metadata.
+    Constructs the 'id' column to match the CSV format: case{case}_day{day}_slice_{slice}
+    """
+    root_path = os.path.join(INPUT_DIR, subfolder)
+    data = []
+
+    # Walk through the directory
+    # Structure: caseXXX / caseXXX_dayYY / scans / slice_....png
+    for root, dirs, files in os.walk(root_path):
+        for file in files:
+            if file.endswith(".png"):
+                # Extract path components
+                # root ends with .../caseXXX_dayYY/scans
+                parent_dir = os.path.basename(os.path.dirname(root))  # caseXXX_dayYY
+
+                # Parse case and day from directory name
+                # Format: case123_day20
+                try:
+                    case_str, day_str = parent_dir.split("_")
+                    case_id = case_str.replace("case", "")
+                    day_id = day_str.replace("day", "")
+                except ValueError:
+                    continue  # Skip if folder structure doesn't match
+
+                # Parse filename info
+                info = parse_filename_info(file)
+                if info is None:
+                    continue
+
+                # Construct ID: case{case}_day{day}_slice_{slice}
+                # Note: The CSV IDs use the slice number from the filename (e.g., 0001)
+                img_id = f"{case_str}_{day_str}_slice_{info['slice_id']}"
+
+                # Relative path from ./input
+                abs_path = os.path.join(root, file)
+                rel_path = os.path.relpath(abs_path, INPUT_DIR)
+
+                row = {
+                    "id": img_id,
+                    "file_path": rel_path,
+                    "case": int(case_id),
+                    "day": int(day_id),
+                    "slice": int(info["slice_id"]),
+                    "img_width": info["img_width"],
+                    "img_height": info["img_height"],
+                    "pixel_spacing_w": info["pixel_spacing_w"],
+                    "pixel_spacing_h": info["pixel_spacing_h"],
+                }
+                data.append(row)
+
+    return pd.DataFrame(data)
+
+
+def verify_files(df, name):
+    """
+    Verifies that a sample of file paths in the dataframe exist.
+    """
+    if "file_path" not in df.columns:
+        return
+
+    paths = df["file_path"].unique()
+    n_check = min(1000, len(paths))
+    if n_check == 0:
+        return
+
+    # Randomly select paths
+    sample_paths = np.random.choice(paths, n_check, replace=False)
+
+    missing_count = 0
+    missing_samples = []
+
+    for p in sample_paths:
+        full_path = os.path.join(INPUT_DIR, p)
+        if not os.path.exists(full_path):
+            missing_count += 1
+            if len(missing_samples) < 5:
+                missing_samples.append(p)
+
+    ratio = missing_count / n_check
+    print(f"[{name}] Missing file ratio: {ratio:.4f} ({missing_count}/{n_check})")
+
+    if len(missing_samples) > 0:
+        print(f"[{name}] Sample missing files: {missing_samples}")
+
+    if ratio > 0.5:
+        raise FileNotFoundError(f"Too many missing files in {name} metadata.")
+
+
+def main():
+    print("Starting metadata generation...")
+
+    # 1. Scan Directories
+    print("Scanning train directory...")
+    train_files_df = scan_directory("train")
+    print(f"Found {len(train_files_df)} images in train.")
+
+    print("Scanning test directory...")
+    test_files_df = scan_directory("test")
+    print(f"Found {len(test_files_df)} images in test.")
+
+    # 2. Load CSVs
+    print("Loading CSV files...")
+    train_csv = pd.read_csv(TRAIN_CSV_PATH)
+    test_csv = pd.read_csv(TEST_CSV_PATH)
+
+    # 3. Merge Metadata
+    # train.csv is long format (multiple rows per image id for different classes)
+    # We merge file info into the CSV data.
+    print("Merging train metadata...")
+    train_full = pd.merge(train_csv, train_files_df, on="id", how="inner")
+
+    # Check if we lost data during merge
+    if len(train_full) == 0:
+        raise ValueError("Merge resulted in empty train dataset. Check ID formats.")
+
+    # test.csv also needs file info
+    print("Merging test metadata...")
+    test_full = pd.merge(test_csv, test_files_df, on="id", how="inner")
+
+    # 4. Split Train/Val
+    # We must split by 'case' to avoid data leakage (Group Sampling)
+    print("Splitting train/validation...")
+    splitter = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=RANDOM_STATE)
+
+    # We split based on unique cases
+    groups = train_full["case"]
+    train_idx, val_idx = next(splitter.split(train_full, groups=groups))
+
+    train_meta = train_full.iloc[train_idx].copy()
+    val_meta = train_full.iloc[val_idx].copy()
+
+    # 5. Save Metadata
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    train_meta_path = os.path.join(METADATA_DIR, "train_metadata.csv")
+    val_meta_path = os.path.join(METADATA_DIR, "val_metadata.csv")
+    test_meta_path = os.path.join(METADATA_DIR, "test_metadata.csv")
+
+    train_meta.to_csv(train_meta_path, index=False)
+    val_meta.to_csv(val_meta_path, index=False)
+    test_full.to_csv(test_meta_path, index=False)
+
+    print(f"Saved metadata to {METADATA_DIR}")
+
+    # 6. Verification and Statistics
+    print("\n=== Verification & Statistics ===")
+
+    # Load back data to verify
+    df_train = pd.read_csv(train_meta_path)
+    df_val = pd.read_csv(val_meta_path)
+    df_test = pd.read_csv(test_meta_path)
+
+    # Stats
+    print(
+        f"Train set: {len(df_train)} rows, {df_train['id'].nunique()} unique images, {df_train['case'].nunique()} unique cases."
+    )
+    print(
+        f"Val set:   {len(df_val)} rows, {df_val['id'].nunique()} unique images, {df_val['case'].nunique()} unique cases."
+    )
+    print(f"Test set:  {len(df_test)} rows, {df_test['id'].nunique()} unique images.")
+
+    # Class distribution
+    print("\nTrain Class Distribution:")
+    print(df_train["class"].value_counts())
+    print("\nVal Class Distribution:")
+    print(df_val["class"].value_counts())
+
+    # Verify Split Logic (Disjoint Cases)
+    train_cases = set(df_train["case"].unique())
+    val_cases = set(df_val["case"].unique())
+    intersection = train_cases.intersection(val_cases)
+
+    if len(intersection) > 0:
+        raise AssertionError(
+            f"Data Leakage detected! Cases {intersection} are in both train and val."
+        )
+    print("\nSplit verification passed: No case overlap between train and val.")
+
+    # Verify File Existence
+    verify_files(df_train, "Train")
+    verify_files(df_val, "Val")
+    verify_files(df_test, "Test")
+
+    print("\nAll checks passed successfully.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+# Script Execution Output:
+Starting metadata generation...
+Scanning train directory...
+Found 31696 images in train.
+Scanning test directory...
+Found 6800 images in test.
+Loading CSV files...
+Merging train metadata...
+Merging test metadata...
+Splitting train/validation...
+Saved metadata to ./metadata
+
+=== Verification & Statistics ===
+Train set: 73152 rows, 24384 unique images, 60 unique cases.
+Val set:   21936 rows, 7312 unique images, 16 unique cases.
+Test set:  20400 rows, 6800 unique images.
+
+Train Class Distribution:
+class
+large_bowel    24384
+small_bowel    24384
+stomach        24384
+Name: count, dtype: int64
+
+Val Class Distribution:
+class
+large_bowel    7312
+small_bowel    7312
+stomach        7312
+Name: count, dtype: int64
+
+Split verification passed: No case overlap between train and val.
+[Train] Missing file ratio: 0.0000 (0/1000)
+[Val] Missing file ratio: 0.0000 (0/1000)
+[Test] Missing file ratio: 0.0000 (0/1000)
+
+All checks passed successfully.
+Execution time: 6 seconds (time limit is an hour).
+
+# Document
+Based on the provided Python script and its execution output, here is the detailed documentation for the files generated in the `./metadata` directory.
+
+### 1. `train_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata and ground truth information for the **training split** (approximately 80% of the original training cases). It is the result of merging the original `train.csv` labels with file system metadata (paths, image dimensions, pixel spacing) extracted from the image filenames.
+    *   **Purpose:** This file is the primary manifest for training the segmentation model. It maps specific image IDs to their physical file locations and their corresponding Run-Length Encoded (RLE) segmentation masks. The data is split by `case` ID to ensure no data leakage occurs between this set and the validation set.
+
+*   **Schema / Structure:**
+    *   **Format:** CSV (Comma Separated Values)
+    *   **Columns:**
+        *   `id` (str): Unique identifier for the slice (e.g., `case101_day20_slice_0001`).
+        *   `class` (str): The organ class associated with the row (values: `large_bowel`, `small_bowel`, `stomach`).
+        *   `segmentation` (str): RLE-encoded binary mask. Contains pairs of start-pixel and run-length. `NaN` or empty if no mask exists for this class on this slice.
+        *   `file_path` (str): Relative path to the image file from the input root (e.g., `train/case101/case101_day20/scans/slice_0001...png`).
+        *   `case` (int): The case ID number.
+        *   `day` (int): The day number of the scan.
+        *   `slice` (int): The slice index number.
+        *   `img_width` (int): Width of the image in pixels.
+        *   `img_height` (int): Height of the image in pixels.
+        *   `pixel_spacing_w` (float): Physical width of a pixel in mm.
+        *   `pixel_spacing_h` (float): Physical height of a pixel in mm.
+    *   **Example Row:**
+        ```text
+        case101_day20_slice_0001,large_bowel,,train/case101/case101_day20/scans/slice_0001_266_266_1.50_1.50.png,101,20,1,266,266,1.5,1.5
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_train = pd.read_csv("./metadata/train_metadata.csv")
+    ```
+
+---
+
+### 2. `val_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata and ground truth information for the **validation split** (approximately 20% of the original training cases).
+    *   **Purpose:** This file is used to evaluate the model's performance during training. Crucially, the cases (patients) present in this file are **disjoint** from those in `train_metadata.csv`. This ensures that the validation metrics reflect the model's ability to generalize to unseen patients.
+
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Columns:** Identical to `train_metadata.csv`.
+        *   `id`, `class`, `segmentation`, `file_path`, `case`, `day`, `slice`, `img_width`, `img_height`, `pixel_spacing_w`, `pixel_spacing_h`.
+    *   **Example Row:**
+        ```text
+        case110_day12_slice_0001,stomach,,train/case110/case110_day12/scans/slice_0001_360_310_1.50_1.50.png,110,12,1,360,310,1.5,1.5
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_val = pd.read_csv("./metadata/val_metadata.csv")
+    ```
+
+---
+
+### 3. `test_metadata.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains metadata for the test set images. It merges the submission template IDs with the actual file paths and physical properties extracted from the `./input/test` directory.
+    *   **Purpose:** This file is used during the inference phase. It provides the file paths needed to load images for prediction and the metadata (like image size) required to format the predictions correctly for submission.
+
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Columns:**
+        *   `id` (str): Unique identifier for the slice.
+        *   `class` (str): The organ class to predict.
+        *   `predicted` (str): Placeholder column (often from the sample submission file), usually empty or example data.
+        *   `file_path` (str): Relative path to the image file (e.g., `test/case110/...`).
+        *   `case` (int): The case ID number.
+        *   `day` (int): The day number.
+        *   `slice` (int): The slice index.
+        *   `img_width` (int): Width of the image.
+        *   `img_height` (int): Height of the image.
+        *   `pixel_spacing_w` (float): Physical pixel width.
+        *   `pixel_spacing_h` (float): Physical pixel height.
+    *   **Example Row:**
+        ```text
+        case123_day20_slice_0001,large_bowel,1 1 5 2,test/case123/case123_day20/scans/slice_0001_266_266_1.50_1.50.png,123,20,1,266,266,1.5,1.5
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_test = pd.read_csv("./metadata/test_metadata.csv")
+    ```

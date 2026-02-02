@@ -1,0 +1,193 @@
+To improve the model's performance and stability, I will implement the following changes:
+
+1.  **Model Architecture (Embedding-Space Aggregation)**: I will replace the existing Instance-Space Aggregation (Top-K Mean Pooling) with **Embedding-Space Attention Aggregation** in `library/model.py`. Instead of predicting probabilities for each slice and averaging them, the model will extract feature embeddings for each slice, aggregate them using a learnable attention mechanism into a single study-level embedding, and then classify the study. This approach preserves feature context and is more robust for MIL tasks (Cite solution_lesson_node_00005).
+
+2.  **Hyperparameter Optimization**: I will increase the `BATCH_SIZE` from 2 to 8 in `library/config.py`. The available NVIDIA A100 GPU has sufficient memory to handle larger batches, which will improve gradient estimation stability and training throughput.
+
+3.  **Submission Threshold**: I will update the validation metric threshold in `runfile.py` to `0.8754510283470154` as requested, ensuring predictions are generated only if the model meets the stricter performance requirement.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FractureMILModel(nn.Module):
+    """
+    2D Multiple Instance Learning (MIL) Model for Cervical Spine Fracture Detection.
+
+    This model treats a 3D CT scan as a 'bag' of 2D slices. It processes each slice
+    independently using a 2D CNN backbone and aggregates the predictions using
+    Max-Pooling to generate a study-level probability for each fracture type.
+    """
+
+    def __init__(self, model_name="efficientnet_b0", pretrained=True):
+        """
+        Args:
+            model_name (str): The name of the timm backbone to use (default: efficientnet_b0).
+            pretrained (bool): Whether to load pretrained ImageNet weights.
+        """
+        super(FractureMILModel, self).__init__()
+
+        # Initialize the 2D CNN backbone using timm.
+        # - in_chans=1: Adapts the first layer for grayscale CT inputs.
+        # - num_classes=Config.N_CLASSES (8): Sets the final linear layer to output
+        #   logits for C1-C7 and patient_overall.
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            in_chans=Config.IN_CHANNELS,
+            num_classes=Config.N_CLASSES,
+        )
+
+    def forward(self, x):
+        """
+        Forward pass of the MIL model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Slices, Channels, Height, Width).
+
+        Returns:
+            torch.Tensor: Predicted probabilities of shape (Batch, N_CLASSES).
+        """
+        # Unpack dimensions
+        # b: Batch size (number of studies)
+        # s: Number of slices per study
+        # c: Channels (1)
+        # h, w: Image height and width
+        b, s, c, h, w = x.shape
+
+        # 1. Collapse Batch and Slice dimensions
+        # Reshape to (Batch * Slices, C, H, W) to process all slices as independent images
+        x = x.view(b * s, c, h, w)
+
+        # 2. Slice-level Inference
+        # Pass through the backbone to get logits for each slice
+        # Shape: (Batch * Slices, N_CLASSES)
+        logits = self.backbone(x)
+
+        # 3. Reshape back to Study structure
+        # Shape: (Batch, Slices, N_CLASSES)
+        logits = logits.view(b, s, Config.N_CLASSES)
+
+        # 4. Activation
+        # Convert slice-level logits to probabilities [0, 1]
+        slice_probs = torch.sigmoid(logits)
+
+        # 5. MIL Aggregation (Top-k Mean Pooling)
+        # Instead of Max-Pooling which is unstable in low-data regimes, we average
+        # the probabilities of the top k most confident slices.
+        # Cite solution_lesson_node_00002
+        topk_probs, _ = torch.topk(slice_probs, k=Config.TOP_K, dim=1)
+
+        # Shape: (Batch, N_CLASSES)
+        probs = torch.mean(topk_probs, dim=1)
+
+        return probs
+=======
+class FractureMILModel(nn.Module):
+    """
+    2D Multiple Instance Learning (MIL) Model for Cervical Spine Fracture Detection.
+
+    This model treats a 3D CT scan as a 'bag' of 2D slices.
+    It uses Embedding-Space Aggregation (Attention) to combine slice features
+    into a study-level representation before classification.
+    Cite solution_lesson_node_00005
+    """
+
+    def __init__(self, model_name="efficientnet_b0", pretrained=True):
+        """
+        Args:
+            model_name (str): The name of the timm backbone to use (default: efficientnet_b0).
+            pretrained (bool): Whether to load pretrained ImageNet weights.
+        """
+        super(FractureMILModel, self).__init__()
+
+        # Initialize the 2D CNN backbone using timm.
+        # num_classes=0 returns the global pool features (embedding) instead of logits.
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            in_chans=Config.IN_CHANNELS,
+            num_classes=0,
+        )
+
+        self.feature_dim = self.backbone.num_features
+
+        # Attention Mechanism
+        # Learn to weight slices based on their feature content
+        self.attention = nn.Sequential(
+            nn.Linear(self.feature_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+        # Final Classifier
+        # Maps aggregated study embedding to class probabilities
+        self.classifier = nn.Linear(self.feature_dim, Config.N_CLASSES)
+
+    def forward(self, x):
+        """
+        Forward pass of the MIL model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Slices, Channels, Height, Width).
+
+        Returns:
+            torch.Tensor: Predicted probabilities of shape (Batch, N_CLASSES).
+        """
+        # Unpack dimensions
+        b, s, c, h, w = x.shape
+
+        # 1. Collapse Batch and Slice dimensions
+        x = x.view(b * s, c, h, w)
+
+        # 2. Slice-level Feature Extraction
+        # Shape: (Batch * Slices, FeatureDim)
+        features = self.backbone(x)
+
+        # 3. Reshape back to Study structure
+        # Shape: (Batch, Slices, FeatureDim)
+        features = features.view(b, s, self.feature_dim)
+
+        # 4. Attention Aggregation
+        # Calculate attention scores
+        attn_weights = self.attention(features)  # (Batch, Slices, 1)
+        attn_weights = torch.softmax(attn_weights, dim=1)
+
+        # Weighted sum of features
+        # Shape: (Batch, FeatureDim)
+        study_embedding = torch.sum(features * attn_weights, dim=1)
+
+        # 5. Classification
+        logits = self.classifier(study_embedding)
+        probs = torch.sigmoid(logits)
+
+        return probs
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training settings
+    BATCH_SIZE = 2  # Batch size of studies (bags)
+    EPOCHS = 10
+=======
+    # Training settings
+    BATCH_SIZE = 8  # Batch size of studies (bags)
+    EPOCHS = 10
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Threshold from previous best run
+    BASELINE_METRIC = 1.090492606163025
+
+    if validation_loss.item() < BASELINE_METRIC:
+=======
+    # Threshold from previous best run
+    BASELINE_METRIC = 0.8754510283470154
+
+    if validation_loss.item() < BASELINE_METRIC:
+>>>>>>> REPLACE
+```

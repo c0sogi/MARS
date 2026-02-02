@@ -1,0 +1,300 @@
+To improve the model's performance, I will implement a strategy based on the "Current Best Solution" described in the provided lessons, specifically targeting the architectural regressions introduced in the previous solution.
+
+1.  **Backbone Optimization**: I will revert the backbone from `tf_efficientnetv2_s` to `tf_efficientnet_b0.ns_jft_in1k`. Lesson `solution_lesson_node_00030` and `solution_lesson_node_00011` highlight the robustness of EfficientNet-B0 (with Batch Norm) for this dataset compared to other variants that may struggle with initialization on standardized spectrograms.
+2.  **Pooling Strategy**: I will replace the Generalized Mean Pooling (GeM) with a combination of **Global Average Pooling (GAP)** and **Global Max Pooling (GMP)** applied to all three streams: On-Target, Off-Target, and the Difference map. Lesson `solution_lesson_node_00027` demonstrates that explicitly providing max-pooled features from source streams helps the model identify sparse high-intensity anomalies ("needles").
+3.  **Explicit Spatial Difference**: I will remove the "Adaptive Difference" (learnable scalar) and use explicit spatial subtraction (`f_on - f_off`). Lesson `solution_lesson_node_00022` and `solution_lesson_node_00019` emphasize that hard-coding this relationship provides a strong inductive bias for signal isolation.
+4.  **Training Duration**: I will increase the training epochs to 15 in the configuration and remove the override in the runfile. Lesson `solution_lesson_node_00024` indicates that maximizing data exposure and training time is critical for low-SNR anomaly detection.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Model Architecture
+    # ==========================================
+    # Using EfficientNet-V2-Small via timm
+    BACKBONE = "tf_efficientnetv2_s.in1k"
+    PRETRAINED = True
+
+    # Generalized Mean Pooling initial p-value
+    GEM_P = 3.0
+
+    # Dropout rate for the classifier head
+    DROP_RATE = 0.2
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+
+    # Batch Size: A100 40GB can handle 32-64 for V2-Small.
+    # Using 32 to be safe with gradient accumulation if needed.
+    BATCH_SIZE = 32
+
+    # Training Duration
+    EPOCHS = 15
+=======
+    # Model Architecture
+    # ==========================================
+    # Using EfficientNet-B0 (Noisy Student weights) - Cite solution_lesson_node_00011
+    BACKBONE = "tf_efficientnet_b0.ns_jft_in1k"
+    PRETRAINED = True
+
+    # Dropout rate for the classifier head
+    DROP_RATE = 0.2
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+
+    # Batch Size
+    BATCH_SIZE = 32
+
+    # Training Duration - Cite solution_lesson_node_00024
+    EPOCHS = 15
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GeM(nn.Module):
+    """
+    Generalized Mean Pooling layer.
+    """
+
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        # Global pooling: output (B, C)
+        return self.gem(x, p=self.p, eps=self.eps)
+
+    def gem(self, x, p=3.0, eps=1e-6):
+        return (
+            F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1)))
+            .pow(1.0 / p)
+            .squeeze(-1)
+            .squeeze(-1)
+        )
+
+    def __repr__(self):
+        return (
+            self.__class__.__name__
+            + "("
+            + "p="
+            + "{:.4f}".format(self.p.data.tolist()[0])
+            + ", "
+            + "eps="
+            + str(self.eps)
+            + ")"
+        )
+
+
+class SiameseEfficientNetV2(nn.Module):
+    """
+    Siamese EfficientNet-V2 with Adaptive Difference and GeM Pooling.
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        in_channels=Config.IN_CHANNELS,
+    ):
+        super(SiameseEfficientNetV2, self).__init__()
+
+        # Load Backbone
+        # We use num_classes=0 to get the feature map before the classifier
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            in_chans=in_channels,
+            features_only=True,
+            out_indices=(4,),  # Get the last feature map
+        )
+
+        # Get feature dimension dynamically
+        dummy_input = torch.randn(1, in_channels, Config.IMG_HEIGHT, Config.IMG_WIDTH)
+        with torch.no_grad():
+            features = self.backbone(dummy_input)
+            # features is a list because features_only=True
+            last_feat = features[-1]
+            self.num_features = last_feat.shape[1]
+
+        # Adaptive Difference Scale Parameter
+        # Shape: (1, C, 1, 1) for channel-wise scaling
+        self.scale = nn.Parameter(torch.ones(1, self.num_features, 1, 1))
+
+        # GeM Pooling Layers
+        self.gem_on = GeM(p=Config.GEM_P)
+        self.gem_off = GeM(p=Config.GEM_P)
+        self.gem_diff = GeM(p=Config.GEM_P)
+
+        # Classifier Head
+        # Input dimension is 3 * num_features (On + Off + Diff)
+        self.head = nn.Sequential(
+            nn.Dropout(Config.DROP_RATE), nn.Linear(self.num_features * 3, 1)
+        )
+
+    def forward(self, x):
+        # x shape: (B, 6, H, W)
+        # Split into On-Target (Stream A) and Off-Target (Stream B)
+        # According to dataset.py, indices are [0, 2, 4, 1, 3, 5]
+        # So first 3 are On, last 3 are Off.
+        x_on = x[:, :3, :, :]
+        x_off = x[:, 3:, :, :]
+
+        # Shared Backbone Feature Extraction
+        # backbone(x) returns a list of features, we want the last one
+        f_on = self.backbone(x_on)[-1]
+        f_off = self.backbone(x_off)[-1]
+
+        # Adaptive Difference
+        # F_diff = F_on - (w * F_off)
+        f_diff = f_on - (self.scale * f_off)
+
+        # GeM Pooling
+        v_on = self.gem_on(f_on)
+        v_off = self.gem_off(f_off)
+        v_diff = self.gem_diff(f_diff)
+
+        # Concatenate
+        v_cat = torch.cat([v_on, v_off, v_diff], dim=1)
+
+        # Classification
+        logits = self.head(v_cat)
+
+        return logits
+=======
+class SiameseEfficientNet(nn.Module):
+    """
+    Siamese EfficientNet with Explicit Spatial Difference and GAP+GMP Pooling.
+    Cite solution_lesson_node_00027, solution_lesson_node_00022
+    """
+
+    def __init__(
+        self,
+        backbone_name=Config.BACKBONE,
+        pretrained=True,
+        in_channels=Config.IN_CHANNELS,
+    ):
+        super(SiameseEfficientNet, self).__init__()
+
+        # Load Backbone
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            in_chans=in_channels,
+            features_only=True,
+            out_indices=(4,),  # Get the last feature map
+        )
+
+        # Get feature dimension dynamically
+        dummy_input = torch.randn(1, in_channels, Config.IMG_HEIGHT, Config.IMG_WIDTH)
+        with torch.no_grad():
+            features = self.backbone(dummy_input)
+            last_feat = features[-1]
+            self.num_features = last_feat.shape[1]
+
+        # Classifier Head
+        # Input: 3 streams (On, Off, Diff) * 2 poolings (GAP, GMP) * num_features
+        # Cite solution_lesson_node_00027
+        self.head = nn.Sequential(
+            nn.Dropout(Config.DROP_RATE),
+            nn.Linear(self.num_features * 6, 1)  # Simple Linear Head (Cite solution_lesson_node_00021)
+        )
+
+    def forward(self, x):
+        # x shape: (B, 6, H, W)
+        x_on = x[:, :3, :, :]
+        x_off = x[:, 3:, :, :]
+
+        # Shared Backbone Feature Extraction
+        f_on = self.backbone(x_on)[-1]
+        f_off = self.backbone(x_off)[-1]
+
+        # Explicit Spatial Difference (Cite solution_lesson_node_00022)
+        f_diff = f_on - f_off
+
+        # Global Average Pooling
+        gap_on = F.adaptive_avg_pool2d(f_on, (1, 1)).squeeze(-1).squeeze(-1)
+        gap_off = F.adaptive_avg_pool2d(f_off, (1, 1)).squeeze(-1).squeeze(-1)
+        gap_diff = F.adaptive_avg_pool2d(f_diff, (1, 1)).squeeze(-1).squeeze(-1)
+
+        # Global Max Pooling (Cite solution_lesson_node_00027)
+        gmp_on = F.adaptive_max_pool2d(f_on, (1, 1)).squeeze(-1).squeeze(-1)
+        gmp_off = F.adaptive_max_pool2d(f_off, (1, 1)).squeeze(-1).squeeze(-1)
+        gmp_diff = F.adaptive_max_pool2d(f_diff, (1, 1)).squeeze(-1).squeeze(-1)
+
+        # Concatenate all features
+        v_cat = torch.cat([gap_on, gmp_on, gap_off, gmp_off, gap_diff, gmp_diff], dim=1)
+
+        # Classification
+        logits = self.head(v_cat)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SiameseEfficientNetV2
+from library.engine import train_model, create_submission, validate
+
+
+def run():
+    # 1. Setup and Configuration
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    # Override Config for fast baseline execution
+    # A100 is powerful, but we limit epochs to ensure we stay well within limits
+    Config.EPOCHS = 8
+    device = torch.device(Config.DEVICE)
+
+    print(f"Running Idea 9: Siamese EfficientNet-V2 + GeM + Adaptive Diff")
+    print(f"Device: {device}")
+    print(f"Epochs: {Config.EPOCHS}")
+=======
+from library.model import SiameseEfficientNet
+from library.engine import train_model, create_submission, validate
+
+
+def run():
+    # 1. Setup and Configuration
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    # Use Config.EPOCHS directly (15) to ensure convergence (Cite solution_lesson_node_00024)
+    device = torch.device(Config.DEVICE)
+
+    print(f"Running Improved Solution: Siamese EfficientNet-B0 + GAP/GMP + Explicit Diff")
+    print(f"Device: {device}")
+    print(f"Epochs: {Config.EPOCHS}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = SiameseEfficientNetV2(pretrained=Config.PRETRAINED).to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = SiameseEfficientNet(pretrained=Config.PRETRAINED).to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```

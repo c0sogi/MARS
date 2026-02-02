@@ -1,0 +1,57 @@
+Based on the lessons learned from previous experiments, I propose the **Domain-Adapted DeBERTa-v3 with Topology-Aware Stacking**.
+
+This strategy introduces three structural evolutions:
+1.  **Domain-Adaptive Pre-Training (DAPT):** Addresses the small dataset size (~4.4k) by adapting the powerful `deberta-v3-large` backbone to the StackExchange domain using unsupervised Masked Language Modeling (MLM) before fine-tuning.
+2.  **Topology-Aware Feature Selection:** Explicitly enforces causal constraints by splitting the regression heads. Question-specific targets are predicted solely from Question features ($h_Q$), while Answer-specific targets use the full interaction set ($h_{CLS}, h_Q, h_A, h_{diff}$). This drastically reduces feature dimensionality for the majority of targets, directly addressing the "Curse of Dimensionality" (Cite solution_lesson_node_00015).
+3.  **Stacked Generalization:** Utilizes a Cross-Validated Stacking ensemble to combine the adapted DeBERTa model with the efficient MPNet model, leveraging the "Fine-Tune then Ridge" paradigm (Cite solution_lesson_node_00004).
+
+### Model
+The architecture is a **Stacking Ensemble** of two distinct Cross-Encoder streams, feeding into **Topology-Aware Ridge Solvers**.
+
+1.  **Stream 1: Domain-Adapted DeBERTa-v3-Large**
+    *   **Backbone:** `microsoft/deberta-v3-large`.
+    *   **Adaptation:** Pre-trained on the concatenated Train and Test text via Masked Language Modeling (MLM) to adapt the tokenizer and embeddings to the technical domain.
+    *   **Architecture:** Cross-Encoder processing `[CLS] Question [SEP] Answer`.
+    *   **Feature Extraction:** Extracts Segment-Aware features ($h_{CLS}, h_Q, h_A, h_{diff}$). Crucially, $h_Q$ and $h_A$ are pooled using **tokenizer-derived masks** (`sequence_ids`) to ensure strict separation of Question and Answer contexts (Cite solution_lesson_node_00016).
+
+2.  **Stream 2: MPNet-Base**
+    *   **Backbone:** `sentence-transformers/all-mpnet-base-v2`.
+    *   **Role:** Provides diversity and stable semantic representations (Cite solution_lesson_node_00012).
+    *   **Feature Extraction:** Identical Segment-Aware extraction ($h'_{CLS}, h'_Q, h'_A, h'_{diff}$).
+
+3.  **Topology-Aware Solvers (Level 1 & Level 2)**
+    *   Instead of a single regressor for all 30 targets, we deploy two specialized solvers per stream:
+        *   **Q-Solver:** Predicts the 21 `question_` targets using **only** the Question embedding ($h_Q$). This enforces the constraint that question quality is independent of the answer, removing noise and reducing feature dimensionality.
+        *   **A-Solver:** Predicts the 9 `answer_` targets using the full interaction vector $[h_{CLS}, h_Q, h_A, h_{diff}]$. This preserves the explicit interaction modeling required for relevance/ranking (Cite solution_lesson_node_00001).
+
+### Data
+1.  **Domain Adaptation Corpus:** Concatenate all text fields (`question_title`, `question_body`, `answer`) from both `train.csv` and `test.csv` to create a raw corpus for MLM.
+2.  **Preprocessing:**
+    *   Format inputs as `[CLS] Title + Body [SEP] Answer [SEP]`.
+    *   Tokenize with a max length of 512.
+    *   Generate binary masks using `tokenizer.sequence_ids()` to identify Question vs. Answer tokens for pooling (Cite solution_lesson_node_00016).
+3.  **Caching:** Implement strict caching of extracted features ($h_Q, h_A, \dots$) for all folds and splits to decouple neural inference from the iterative Ridge training (Cite solution_lesson_node_00003).
+
+### Training
+1.  **Phase 1: Domain Adaptation (DAPT)**
+    *   Train `deberta-v3-large` on the unlabeled corpus using the Masked Language Modeling objective.
+    *   Train for 3 epochs with a small learning rate (e.g., 1e-5) to adapt the embeddings without catastrophic forgetting.
+
+2.  **Phase 2: Supervised Fine-Tuning (Cross-Validation)**
+    *   Use **4-Fold GroupShuffleSplit** (grouped by `question_body`) to prevent leakage.
+    *   Fine-tune both backbones (Adapted DeBERTa and MPNet) on the training folds using `BCEWithLogitsLoss`.
+    *   **Stopping Criteria:** Monitor **Validation Loss** and stop immediately upon plateauing to prevent overfitting the embeddings to the temporary head (Cite solution_lesson_node_00013).
+    *   **Optimization:** Use `AdamW` with a physical batch size of 4 or 8 and minimal gradient accumulation to maximize update frequency (Cite solution_lesson_node_00007).
+
+3.  **Phase 3: Topology-Aware Stacking**
+    *   **Level 1:** For each fold, extract features and train the **Q-Solver** (on $h_Q$) and **A-Solver** (on full features) using `RidgeCV`. Generate Out-Of-Fold (OOF) predictions.
+    *   **Level 2:** Concatenate OOF predictions from Stream 1 and Stream 2. Train a final Meta-Ridge Regressor (again, split into Q-Stacker and A-Stacker) to map model predictions to ground truth.
+
+### Evaluation
+1.  **Inference:**
+    *   Pass test data through Stream 1 and Stream 2 models to extract features.
+2.  **Prediction:**
+    *   **Stream 1:** Use its Q-Solver to predict question labels and A-Solver for answer labels.
+    *   **Stream 2:** Repeat for MPNet.
+    *   **Stacking:** Feed the concatenated predictions into the Level 2 Meta-Stacker to produce the final 30 probabilities.
+3.  **Post-processing:** Clip predictions to [0, 1].

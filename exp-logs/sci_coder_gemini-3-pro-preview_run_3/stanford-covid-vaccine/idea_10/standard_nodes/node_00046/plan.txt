@@ -1,0 +1,725 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement the following optimizations:
+
+1.  **Remove Auxiliary Reconstruction Task**: As detailed in **Lesson `solution_lesson_node_00044`**, simultaneous masked reconstruction offers no gain over pure supervision for this task and adds unnecessary complexity. I will remove the masking logic from the dataset, the reconstruction head from the model, and the composite loss function.
+2.  **Correct Validation Metric Calculation**: The previous solution suffered from optimistic bias by averaging batch RMSEs instead of calculating the RMSE of the global dataset (**Lesson `solution_lesson_node_00045`**). I will update the evaluation loop to aggregate predictions and compute the MCRMSE globally, ensuring that model checkpointing and early stopping are based on the true metric.
+3.  **Architecture Simplification**: I will revert to the effective `Conv1d -> GELU -> BiGRU` architecture (**Lesson `solution_lesson_node_00027`**), which was identified as the current best approach before the failed masked reconstruction experiment.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Strategy Specifics (Masked Reconstruction)
+    # ==========================================
+    # Probability of masking an input position (vector becomes zero) during training
+    MASK_PROB = 0.15
+
+    # Weight (Lambda) for the auxiliary CrossEntropy reconstruction loss
+    # Total Loss = MCRMSE + (RECON_LOSS_WEIGHT * CrossEntropy)
+    RECON_LOSS_WEIGHT = 0.5
+
+    # ==========================================
+=======
+    # ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class RNADataset(Dataset):
+    """
+    PyTorch Dataset for RNA Degradation Prediction.
+    Implements dynamic input masking for the auxiliary reconstruction task.
+    """
+
+    def __init__(self, inputs, targets=None, mode="train", mask_prob=0.15):
+        """
+        Args:
+            inputs (np.ndarray): Input features of shape (N, 107, 14).
+            targets (np.ndarray, optional): Target values of shape (N, 107, 5).
+            mode (str): 'train', 'val', or 'test'.
+            mask_prob (float): Probability of masking a position during training.
+        """
+        self.inputs = inputs
+        self.targets = targets
+        self.mode = mode
+        self.mask_prob = mask_prob
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        # Convert input to tensor: Shape (107, 14)
+        input_tensor = torch.tensor(self.inputs[idx], dtype=torch.float32)
+
+        # Handle Targets
+        if self.targets is not None:
+            # Shape (107, 5)
+            target_tensor = torch.tensor(self.targets[idx], dtype=torch.float32)
+        else:
+            # Dummy targets for test set
+            target_tensor = torch.zeros(
+                (Config.SEQ_LENGTH, Config.OUTPUT_DIM), dtype=torch.float32
+            )
+
+        # Dynamic Masking Logic
+        if self.mode == "train" and self.mask_prob > 0:
+            # Generate a boolean mask: True where we want to mask the input
+            # Shape (107,)
+            mask_bool = torch.rand(Config.SEQ_LENGTH) < self.mask_prob
+
+            # Create masked input (clone to avoid modifying original)
+            masked_input = input_tensor.clone()
+
+            # Apply mask: Set feature vectors at masked positions to zero
+            masked_input[mask_bool] = 0.0
+
+            # Convert mask to float for loss calculation (1.0 = masked, 0.0 = unmasked)
+            mask_tensor = mask_bool.float()
+
+            # Return: Masked Input (for model), Original Input (for recon target), Regression Targets, Mask
+            return masked_input, input_tensor, target_tensor, mask_tensor
+        else:
+            # Validation/Test: No masking
+            mask_tensor = torch.zeros(Config.SEQ_LENGTH, dtype=torch.float32)
+            return input_tensor, input_tensor, target_tensor, mask_tensor
+=======
+class RNADataset(Dataset):
+    """
+    PyTorch Dataset for RNA Degradation Prediction.
+    """
+
+    def __init__(self, inputs, targets=None, mode="train"):
+        """
+        Args:
+            inputs (np.ndarray): Input features of shape (N, 107, 14).
+            targets (np.ndarray, optional): Target values of shape (N, 107, 5).
+            mode (str): 'train', 'val', or 'test'.
+        """
+        self.inputs = inputs
+        self.targets = targets
+        self.mode = mode
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        # Convert input to tensor: Shape (107, 14)
+        input_tensor = torch.tensor(self.inputs[idx], dtype=torch.float32)
+
+        # Handle Targets
+        if self.targets is not None:
+            # Shape (107, 5)
+            target_tensor = torch.tensor(self.targets[idx], dtype=torch.float32)
+        else:
+            # Dummy targets for test set
+            target_tensor = torch.zeros(
+                (Config.SEQ_LENGTH, Config.OUTPUT_DIM), dtype=torch.float32
+            )
+
+        return input_tensor, target_tensor
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # Initialize Datasets
+    # Train: Enable masking
+    train_dataset = RNADataset(
+        train_inputs, train_targets, mode="train", mask_prob=Config.MASK_PROB
+    )
+    # Val/Test: Disable masking
+    val_dataset = RNADataset(val_inputs, val_targets, mode="val", mask_prob=0.0)
+    test_dataset = RNADataset(test_inputs, test_targets, mode="test", mask_prob=0.0)
+=======
+    # Initialize Datasets
+    train_dataset = RNADataset(train_inputs, train_targets, mode="train")
+    val_dataset = RNADataset(val_inputs, val_targets, mode="val")
+    test_dataset = RNADataset(test_inputs, test_targets, mode="test")
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MaskedBiGRU(nn.Module):
+    """
+    Masked-Reconstruction Regularized BiGRU Model.
+
+    This model implements a multi-task learning architecture:
+    1.  Main Task: Regression of RNA degradation rates.
+    2.  Auxiliary Task: Reconstruction of masked input features (Sequence, Structure, Loop Type).
+
+    Architecture:
+    - Input: (Batch, Seq_Len, 14)
+    - Stem: Conv1d (Kernel=3) -> GELU
+    - Backbone: Bidirectional GRU (2 layers)
+    - Head 1: Linear -> 5 targets (Regression)
+    - Head 2: Linear -> 14 features (Reconstruction)
+    """
+
+    def __init__(self):
+        super(MaskedBiGRU, self).__init__()
+
+        # Retrieve hyperparameters from Config
+        self.input_dim = Config.INPUT_DIM  # 14
+        self.hidden_dim = Config.HIDDEN_DIM  # 256
+        self.num_layers = Config.NUM_LAYERS  # 2
+        self.dropout = Config.DROPOUT  # 0.3
+        self.bidirectional = Config.BIDIRECTIONAL  # True
+        self.cnn_filters = Config.CNN_FILTERS  # 256
+        self.cnn_kernel = Config.CNN_KERNEL_SIZE  # 3
+        self.output_dim = Config.OUTPUT_DIM  # 5
+
+        # 1. Convolutional Stem
+        # Projects sparse inputs to dense embeddings and aggregates local context.
+        # Padding ensures output length matches input length.
+        padding = (self.cnn_kernel - 1) // 2
+        self.stem = nn.Conv1d(
+            in_channels=self.input_dim,
+            out_channels=self.cnn_filters,
+            kernel_size=self.cnn_kernel,
+            padding=padding,
+        )
+        self.activation = nn.GELU()
+
+        # 2. BiGRU Backbone
+        # Captures global sequence dependencies.
+        self.gru = nn.GRU(
+            input_size=self.cnn_filters,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+        )
+
+        # Determine the dimension of the GRU output
+        self.gru_output_dim = (
+            self.hidden_dim * 2 if self.bidirectional else self.hidden_dim
+        )
+
+        # 3. Regression Head (Main Task)
+        # Predicts: reactivity, deg_Mg_pH10, deg_pH10, deg_Mg_50C, deg_50C
+        self.regression_head = nn.Linear(self.gru_output_dim, self.output_dim)
+
+        # 4. Reconstruction Head (Auxiliary Task)
+        # Predicts the original one-hot encoded vectors for masked positions.
+        self.reconstruction_head = nn.Linear(self.gru_output_dim, self.input_dim)
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Seq_Len, 14).
+
+        Returns:
+            reg_out (torch.Tensor): Regression predictions of shape (Batch, Seq_Len, 5).
+            recon_out (torch.Tensor): Reconstruction logits of shape (Batch, Seq_Len, 14).
+        """
+        # Input x: (Batch, Seq_Len, Channels=14)
+
+        # Permute for Conv1d: (Batch, Channels, Seq_Len)
+        x = x.permute(0, 2, 1)
+
+        # Apply Stem
+        x = self.stem(x)
+        x = self.activation(x)
+
+        # Permute back for GRU: (Batch, Seq_Len, Channels=256)
+        x = x.permute(0, 2, 1)
+
+        # Apply Backbone
+        # gru_out: (Batch, Seq_Len, Hidden_Dim * Directions)
+        gru_out, _ = self.gru(x)
+
+        # Apply Heads
+        reg_out = self.regression_head(gru_out)
+        recon_out = self.reconstruction_head(gru_out)
+
+        return reg_out, recon_out
+=======
+class BiGRURegressor(nn.Module):
+    """
+    Standard BiGRU Regressor with Convolutional Stem.
+    Cite solution_lesson_node_00027: Convolutional Input Stems for Sparse Sequence Data.
+    Cite solution_lesson_node_00044: Simultaneous Masked Reconstruction Offers No Gain.
+
+    Architecture:
+    - Input: (Batch, Seq_Len, 14)
+    - Stem: Conv1d (Kernel=3) -> GELU
+    - Backbone: Bidirectional GRU (2 layers)
+    - Head: Linear -> 5 targets (Regression)
+    """
+
+    def __init__(self):
+        super(BiGRURegressor, self).__init__()
+
+        # Retrieve hyperparameters from Config
+        self.input_dim = Config.INPUT_DIM
+        self.hidden_dim = Config.HIDDEN_DIM
+        self.num_layers = Config.NUM_LAYERS
+        self.dropout = Config.DROPOUT
+        self.bidirectional = Config.BIDIRECTIONAL
+        self.cnn_filters = Config.CNN_FILTERS
+        self.cnn_kernel = Config.CNN_KERNEL_SIZE
+        self.output_dim = Config.OUTPUT_DIM
+
+        # 1. Convolutional Stem
+        padding = (self.cnn_kernel - 1) // 2
+        self.stem = nn.Conv1d(
+            in_channels=self.input_dim,
+            out_channels=self.cnn_filters,
+            kernel_size=self.cnn_kernel,
+            padding=padding,
+        )
+        self.activation = nn.GELU()
+
+        # 2. BiGRU Backbone
+        self.gru = nn.GRU(
+            input_size=self.cnn_filters,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+            bidirectional=self.bidirectional,
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+        )
+
+        self.gru_output_dim = (
+            self.hidden_dim * 2 if self.bidirectional else self.hidden_dim
+        )
+
+        # 3. Regression Head
+        self.regression_head = nn.Linear(self.gru_output_dim, self.output_dim)
+
+    def forward(self, x):
+        # Input x: (Batch, Seq_Len, Channels=14)
+        x = x.permute(0, 2, 1)
+
+        x = self.stem(x)
+        x = self.activation(x)
+
+        x = x.permute(0, 2, 1)
+
+        gru_out, _ = self.gru(x)
+
+        reg_out = self.regression_head(gru_out)
+
+        return reg_out
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import MaskedBiGRU
+
+
+def train_fn(model, dataloader, optimizer, device, scheduler=None):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+    running_reg_loss = 0.0
+    running_recon_loss = 0.0
+    dataset_size = 0
+
+    # Reconstruction loss criterion (MSE for one-hot reconstruction)
+    recon_criterion = nn.MSELoss()
+
+    for batch_idx, (masked_input, original_input, targets, mask) in enumerate(
+        dataloader
+    ):
+        masked_input = masked_input.to(device)
+        original_input = original_input.to(device)
+        targets = targets.to(device)
+        mask = mask.to(device)
+
+        batch_size = masked_input.size(0)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        # reg_out: (Batch, 107, 5)
+        # recon_out: (Batch, 107, 14)
+        reg_out, recon_out = model(masked_input)
+
+        # --- 1. Main Task: Regression Loss ---
+        # Only score the first SEQ_SCORED (68) positions
+        # Targets are already padded, but we only care about valid positions for the metric
+        reg_out_scored = reg_out[:, : library.config.Config.SEQ_SCORED, :]
+        targets_scored = targets[:, : library.config.Config.SEQ_SCORED, :]
+
+        loss_reg = mcrmse_loss(reg_out_scored, targets_scored)
+
+        # --- 2. Auxiliary Task: Reconstruction Loss ---
+        # Calculate loss only on masked positions
+        # mask shape: (Batch, 107). 1.0 means masked.
+        # Flatten for easier indexing
+        mask_flat = mask.view(-1).bool()
+
+        if mask_flat.sum() > 0:
+            recon_out_flat = recon_out.view(-1, library.config.Config.INPUT_DIM)
+            original_input_flat = original_input.view(
+                -1, library.config.Config.INPUT_DIM
+            )
+
+            # Select only masked vectors
+            recon_masked = recon_out_flat[mask_flat]
+            original_masked = original_input_flat[mask_flat]
+
+            loss_recon = recon_criterion(recon_masked, original_masked)
+        else:
+            loss_recon = torch.tensor(0.0, device=device)
+
+        # --- 3. Composite Loss ---
+        loss = loss_reg + (library.config.Config.RECON_LOSS_WEIGHT * loss_recon)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Update metrics
+        running_loss += loss.item() * batch_size
+        running_reg_loss += loss_reg.item() * batch_size
+        running_recon_loss += loss_recon.item() * batch_size
+        dataset_size += batch_size
+
+    # Calculate average losses
+    epoch_loss = running_loss / dataset_size
+    epoch_reg_loss = running_reg_loss / dataset_size
+    epoch_recon_loss = running_recon_loss / dataset_size
+
+    return epoch_loss, epoch_reg_loss, epoch_recon_loss
+
+
+def eval_fn(model, dataloader, device):
+    """
+    Evaluates the model on the validation set.
+    Returns the MCRMSE score.
+    """
+    model.eval()
+    running_mcrmse = 0.0
+    dataset_size = 0
+
+    with torch.no_grad():
+        for inputs, _, targets, _ in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            batch_size = inputs.size(0)
+
+            # Forward pass (only regression output needed)
+            reg_out, _ = model(inputs)
+
+            # Score only the valid positions
+            reg_out_scored = reg_out[:, : library.config.Config.SEQ_SCORED, :]
+            targets_scored = targets[:, : library.config.Config.SEQ_SCORED, :]
+
+            # Filter for scored columns ONLY (reactivity, deg_Mg_pH10, deg_Mg_50C)
+            reg_out_scored = reg_out_scored[
+                :, :, library.config.Config.SCORED_COLS_INDICES
+            ]
+            targets_scored = targets_scored[
+                :, :, library.config.Config.SCORED_COLS_INDICES
+            ]
+
+            # Calculate metric
+            loss = mcrmse_loss(reg_out_scored, targets_scored)
+
+            running_mcrmse += loss.item() * batch_size
+            dataset_size += batch_size
+
+    avg_mcrmse = running_mcrmse / dataset_size
+    return avg_mcrmse
+
+
+def run_training(train_loader, val_loader):
+    """
+    Main training loop with Early Stopping and Model Checkpointing.
+    """
+    seed_everything(library.config.Config.SEED)
+    device = torch.device(library.config.Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # Initialize Model
+    model = MaskedBiGRU()
+    model.to(device)
+=======
+from library.model import BiGRURegressor
+
+
+def train_fn(model, dataloader, optimizer, device, scheduler=None):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+    dataset_size = 0
+
+    for batch_idx, (inputs, targets) in enumerate(dataloader):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        batch_size = inputs.size(0)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        reg_out = model(inputs)
+
+        # Score only the valid positions for loss calculation
+        reg_out_scored = reg_out[:, : library.config.Config.SEQ_SCORED, :]
+        targets_scored = targets[:, : library.config.Config.SEQ_SCORED, :]
+
+        loss = mcrmse_loss(reg_out_scored, targets_scored)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Update metrics
+        running_loss += loss.item() * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    return epoch_loss
+
+
+def eval_fn(model, dataloader, device):
+    """
+    Evaluates the model on the validation set.
+    Returns the Global MCRMSE score.
+    Cite solution_lesson_node_00045: Correct Aggregation of Non-Linear Metrics.
+    """
+    model.eval()
+    
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            reg_out = model(inputs)
+
+            # Score only the valid positions
+            reg_out_scored = reg_out[:, : library.config.Config.SEQ_SCORED, :]
+            targets_scored = targets[:, : library.config.Config.SEQ_SCORED, :]
+
+            # Filter for scored columns ONLY (reactivity, deg_Mg_pH10, deg_Mg_50C)
+            reg_out_scored = reg_out_scored[
+                :, :, library.config.Config.SCORED_COLS_INDICES
+            ]
+            targets_scored = targets_scored[
+                :, :, library.config.Config.SCORED_COLS_INDICES
+            ]
+            
+            all_preds.append(reg_out_scored)
+            all_targets.append(targets_scored)
+
+    # Concatenate all batches to compute global metric
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    # Calculate global metric
+    global_mcrmse = mcrmse_loss(all_preds, all_targets)
+    
+    return global_mcrmse.item()
+
+
+def run_training(train_loader, val_loader):
+    """
+    Main training loop with Early Stopping and Model Checkpointing.
+    """
+    seed_everything(library.config.Config.SEED)
+    device = torch.device(library.config.Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # Initialize Model
+    model = BiGRURegressor()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for epoch in range(library.config.Config.EPOCHS):
+        # Train
+        train_loss, train_reg, train_recon = train_fn(
+            model, train_loader, optimizer, device
+        )
+
+        # Validate
+        val_mcrmse = eval_fn(model, val_loader, device)
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics
+        print(
+            f"Epoch {epoch+1}/{library.config.Config.EPOCHS} | "
+            f"LR: {current_lr:.2e} | "
+            f"Train Loss: {train_loss:.6f} (Reg: {train_reg:.6f}, Recon: {train_recon:.6f}) | "
+            f"Val MCRMSE: {val_mcrmse}"
+        )
+=======
+    for epoch in range(library.config.Config.EPOCHS):
+        # Train
+        train_loss = train_fn(model, train_loader, optimizer, device)
+
+        # Validate
+        val_mcrmse = eval_fn(model, val_loader, device)
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Print Metrics
+        print(
+            f"Epoch {epoch+1}/{library.config.Config.EPOCHS} | "
+            f"LR: {current_lr:.2e} | "
+            f"Train Loss: {train_loss:.6f} | "
+            f"Val MCRMSE: {val_mcrmse:.6f}"
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MaskedBiGRU
+from library.engine import run_training
+
+
+def main():
+    # 1. Setup
+    seed_everything(library.config.Config.SEED)
+    device = torch.device(library.config.Config.DEVICE)
+
+    # Ensure submission directory exists as per prompt requirement
+    submission_dir = "./submission"
+    os.makedirs(submission_dir, exist_ok=True)
+    submission_file_path = os.path.join(submission_dir, "submission.csv")
+
+    print("Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = get_dataloaders(
+        train_batch_size=library.config.Config.BATCH_SIZE,
+        val_batch_size=library.config.Config.BATCH_SIZE,
+        load_cached_data=True,
+    )
+
+    # 2. Training
+    # run_training handles initialization, training loop, early stopping, and saving best model
+    print("Starting Training...")
+    best_mcrmse_from_training = run_training(train_loader, val_loader)
+
+    # 3. Validation & Failure Analysis
+    print("\nRunning Validation and Failure Analysis...")
+
+    # Load Best Model
+    model = MaskedBiGRU()
+    model.load_state_dict(
+        torch.load(library.config.Config.MODEL_SAVE_PATH, map_location=device)
+    )
+    model.to(device)
+    model.eval()
+
+    val_preds = []
+    val_targets = []
+    val_inputs = []
+
+    with torch.no_grad():
+        for inputs, _, targets, _ in val_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            # Inference
+            reg_out, _ = model(inputs)
+
+            # Store data for analysis (move to CPU to save GPU memory)
+            val_preds.append(reg_out.cpu())
+            val_targets.append(targets.cpu())
+            val_inputs.append(inputs.cpu())
+=======
+from library.model import BiGRURegressor
+from library.engine import run_training
+
+
+def main():
+    # 1. Setup
+    seed_everything(library.config.Config.SEED)
+    device = torch.device(library.config.Config.DEVICE)
+
+    # Ensure submission directory exists as per prompt requirement
+    submission_dir = "./submission"
+    os.makedirs(submission_dir, exist_ok=True)
+    submission_file_path = os.path.join(submission_dir, "submission.csv")
+
+    print("Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = get_dataloaders(
+        train_batch_size=library.config.Config.BATCH_SIZE,
+        val_batch_size=library.config.Config.BATCH_SIZE,
+        load_cached_data=True,
+    )
+
+    # 2. Training
+    # run_training handles initialization, training loop, early stopping, and saving best model
+    print("Starting Training...")
+    best_mcrmse_from_training = run_training(train_loader, val_loader)
+
+    # 3. Validation & Failure Analysis
+    print("\nRunning Validation and Failure Analysis...")
+
+    # Load Best Model
+    model = BiGRURegressor()
+    model.load_state_dict(
+        torch.load(library.config.Config.MODEL_SAVE_PATH, map_location=device)
+    )
+    model.to(device)
+    model.eval()
+
+    val_preds = []
+    val_targets = []
+    val_inputs = []
+
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            # Inference
+            reg_out = model(inputs)
+
+            # Store data for analysis (move to CPU to save GPU memory)
+            val_preds.append(reg_out.cpu())
+            val_targets.append(targets.cpu())
+            val_inputs.append(inputs.cpu())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        with torch.no_grad():
+            for inputs, _, _, _ in test_loader:
+                inputs = inputs.to(device)
+                reg_out, _ = model(inputs)
+                test_preds.append(reg_out.cpu())
+=======
+        with torch.no_grad():
+            for inputs, _ in test_loader:
+                inputs = inputs.to(device)
+                reg_out = model(inputs)
+                test_preds.append(reg_out.cpu())
+>>>>>>> REPLACE
+```

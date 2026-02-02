@@ -1,0 +1,708 @@
+I will implement the `CoordAttResNet18CRNN` which integrates Coordinate Attention into a ResNet18 backbone, utilizing ImageNet pre-trained weights adapted for single-channel input [Cite solution_lesson_node_00047][Cite solution_lesson_node_00020]. I will revert the spectrogram resolution to a hop length of 64 (32ms) to avoid signal dilution and reduce computational cost [Cite solution_lesson_node_00025]. I will also adjust the SpecAugment time masking parameter to align with the new temporal resolution and the short duration of the target signal [Cite solution_lesson_node_00011]. This approach replaces the computationally expensive and ineffective CSK architecture from the previous solution [Cite solution_lesson_node_00054].
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Spectrogram Parameters
+    # N_FFT=256 at 2000Hz -> ~128ms window
+    # HOP_LENGTH=16 at 2000Hz -> ~8ms step.
+    # For 2.0s (4000 samples), this yields 4000/16 = 250 time frames.
+    # With Time-Preserving strides (total stride 8 in time), final seq len is ~31.
+    N_MELS = 128
+    N_FFT = 256
+    HOP_LENGTH = 16
+    F_MIN = 20
+    F_MAX = 1000  # Nyquist frequency
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "CSKResNet18CRNN"
+    NUM_CLASSES = 1
+    IN_CHANNELS = 1  # Using 1-channel Log-Mel Spectrogram
+=======
+    # Spectrogram Parameters
+    # N_FFT=256 at 2000Hz -> ~128ms window
+    # HOP_LENGTH=64 at 2000Hz -> ~32ms step.
+    # For 2.0s (4000 samples), this yields 4000/64 = 62 time frames.
+    N_MELS = 128
+    N_FFT = 256
+    HOP_LENGTH = 64
+    F_MIN = 20
+    F_MAX = 1000  # Nyquist frequency
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "CoordAttResNet18CRNN"
+    NUM_CLASSES = 1
+    IN_CHANNELS = 1  # Using 1-channel Log-Mel Spectrogram
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # SpecAugment Parameters
+    # Time Mask: Max 200ms.
+    # With HOP_LENGTH=16 (8ms), 200ms approx 25 frames.
+    TIME_MASK_PARAM = 25
+    FREQ_MASK_PARAM = 20
+=======
+    # SpecAugment Parameters
+    # Time Mask: Max ~200ms.
+    # With HOP_LENGTH=64 (32ms), 200ms approx 6-7 frames.
+    TIME_MASK_PARAM = 7
+    FREQ_MASK_PARAM = 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/csk_resnet.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+
+
+class CoordinateAttentionFusion(nn.Module):
+    """
+    Computes attention weights for fusing multiple branches using
+    Coordinate Attention logic (pooling along H and W separately).
+    """
+
+    def __init__(self, channels, reduction=16, num_branches=2):
+        super(CoordinateAttentionFusion, self).__init__()
+        self.num_branches = num_branches
+
+        # Reduction dimension
+        mid_channels = max(8, channels // reduction)
+
+        self.conv_reduce = nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(mid_channels)
+        self.act = nn.ReLU(inplace=True)
+
+        # Expansion to num_branches * channels
+        self.conv_h = nn.Conv2d(
+            mid_channels, channels * num_branches, kernel_size=1, bias=False
+        )
+        self.conv_w = nn.Conv2d(
+            mid_channels, channels * num_branches, kernel_size=1, bias=False
+        )
+
+    def forward(self, x):
+        """
+        x: Input tensor of shape (N, C, H, W) representing the sum of branches.
+        Returns: Attention weights of shape (N, num_branches, C, H, W)
+        """
+        n, c, h, w = x.size()
+
+        # 1. Coordinate Pooling
+        # Pool H -> (N, C, H, 1)
+        x_h = F.adaptive_avg_pool2d(x, (h, 1))
+        # Pool W -> (N, C, 1, W)
+        x_w = F.adaptive_avg_pool2d(x, (1, w))
+
+        # 2. Concat for shared processing
+        # Permute x_w to (N, C, W, 1) to stack with x_h along spatial dim
+        x_w_perm = x_w.permute(0, 1, 3, 2)
+
+        # Concat: (N, C, H+W, 1)
+        y = torch.cat([x_h, x_w_perm], dim=2)
+
+        # 3. Reduction
+        y = self.conv_reduce(y)
+        y = self.bn(y)
+        y = self.act(y)
+
+        # 4. Split
+        x_h_feat, x_w_feat = torch.split(y, [h, w], dim=2)
+
+        # Restore x_w_feat shape: (N, mid, W, 1) -> (N, mid, 1, W)
+        x_w_feat = x_w_feat.permute(0, 1, 3, 2)
+
+        # 5. Expansion to generate weights per branch
+        # (N, K*C, H, 1)
+        attn_h = self.conv_h(x_h_feat)
+        # (N, K*C, 1, W)
+        attn_w = self.conv_w(x_w_feat)
+
+        # Reshape to (N, K, C, H, 1) and (N, K, C, 1, W)
+        attn_h = attn_h.view(n, self.num_branches, c, h, 1)
+        attn_w = attn_w.view(n, self.num_branches, c, 1, w)
+
+        # 6. Combine and Softmax
+        # We sum the attention scores from H and W context
+        # Then apply softmax across the 'branches' dimension (dim 1)
+        attn = attn_h + attn_w
+        attn = F.softmax(attn, dim=1)
+
+        return attn
+
+
+class CSKConv(nn.Module):
+    """
+    Coordinate-Selective-Kernel Convolution.
+    Features two branches with different kernel sizes/dilations, fused
+    via Coordinate Attention weights.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1, groups=1, dilation=1):
+        super(CSKConv, self).__init__()
+
+        # Branch 1: Standard 3x3
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=dilation,
+                dilation=dilation,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Branch 2: Dilated 3x3 (Effective 5x5 context)
+        # We increase dilation to capture larger context
+        eff_dilation = dilation * 2
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=eff_dilation,
+                dilation=eff_dilation,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Fusion
+        self.fusion = CoordinateAttentionFusion(
+            out_channels, reduction=16, num_branches=2
+        )
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+
+        # Stack branches: (N, 2, C, H, W)
+        branches = torch.stack([b1, b2], dim=1)
+
+        # Sum for attention calculation
+        u = b1 + b2
+
+        # Get weights: (N, 2, C, H, W)
+        weights = self.fusion(u)
+
+        # Weighted sum
+        out = torch.sum(branches * weights, dim=1)
+        return out
+
+
+class CSKBlock(nn.Module):
+    """
+    ResNet BasicBlock where the second convolution is replaced by CSKConv.
+    """
+
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(CSKBlock, self).__init__()
+
+        # 1st Conv: Standard 3x3
+        self.conv1 = nn.Conv2d(
+            inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 2nd Conv: CSK Conv (Multi-scale fusion)
+        # Note: stride is handled in conv1, so stride here is 1
+        self.conv2 = CSKConv(planes, planes, stride=1)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Time, Features)
+        w = self.attention(x)  # (Batch, Time, 1)
+        out = torch.sum(x * w, dim=1)  # (Batch, Features)
+        return out
+
+
+class CSKResNet18CRNN(nn.Module):
+    def __init__(self):
+        super(CSKResNet18CRNN, self).__init__()
+
+        # ==========================
+        # 1. Backbone: CSK-ResNet18
+        # ==========================
+        self.inplanes = 64
+
+        # Stem
+        # Adapt first conv for 1-channel input if needed, but standard ResNet is 3.
+        # We define it explicitly for IN_CHANNELS.
+        self.conv1 = nn.Conv2d(
+            Config.IN_CHANNELS, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # Layers
+        # Layer 1: 64 filters, stride 1
+        self.layer1 = self._make_layer(CSKBlock, 64, 2, stride=1)
+        # Layer 2: 128 filters, stride 2
+        self.layer2 = self._make_layer(CSKBlock, 128, 2, stride=2)
+        # Layer 3: 256 filters, stride (2, 1) -> Preserves Time
+        self.layer3 = self._make_layer(CSKBlock, 256, 2, stride=(2, 1))
+        # Layer 4: 512 filters, stride (2, 1) -> Preserves Time
+        self.layer4 = self._make_layer(CSKBlock, 512, 2, stride=(2, 1))
+
+        # ==========================
+        # 2. Temporal Modeling
+        # ==========================
+        # Bi-GRU
+        # Input size is 512 (channels from layer4)
+        self.rnn = nn.GRU(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1,
+        )
+
+        # ==========================
+        # 3. Aggregation & Head
+        # ==========================
+        # Attention Pooling (512 features from Bi-GRU)
+        self.attn_pool = AttentionPooling(512)
+
+        # Classifier
+        self.fc = nn.Linear(512, Config.NUM_CLASSES)
+
+        # Weight Initialization
+        self._init_weights()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+
+        # Check stride type (int or tuple)
+        stride_h = stride[0] if isinstance(stride, tuple) else stride
+        stride_w = stride[1] if isinstance(stride, tuple) else stride
+
+        if stride_h != 1 or stride_w != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.inplanes,
+                    planes * block.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # x: (N, 1, F, T)
+
+        # Backbone
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        # Shape: (N, 512, F', T')
+
+        # Frequency Pooling
+        # Pool completely along Frequency axis to get (N, 512, 1, T')
+        x = torch.mean(x, dim=2, keepdim=True)
+
+        # Prepare for RNN
+        # (N, 512, 1, T') -> (N, 512, T')
+        x = x.squeeze(2)
+        # (N, 512, T') -> (N, T', 512)
+        x = x.permute(0, 2, 1)
+
+        # RNN
+        self.rnn.flatten_parameters()
+        x, _ = self.rnn(x)  # (N, T', 512)
+
+        # Attention Pooling
+        x = self.attn_pool(x)  # (N, 512)
+
+        # Classifier
+        x = self.fc(x)  # (N, 1)
+
+        return x
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision.models import ResNet18_Weights
+from library.config import Config
+
+
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+
+        return out
+
+
+class CABasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(CABasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+        
+        self.ca = CoordAtt(planes, planes)
+        
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = self.ca(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Time, Features)
+        w = self.attention(x)  # (Batch, Time, 1)
+        out = torch.sum(x * w, dim=1)  # (Batch, Features)
+        return out
+
+
+class CoordAttResNet18CRNN(nn.Module):
+    def __init__(self):
+        super(CoordAttResNet18CRNN, self).__init__()
+
+        # ==========================
+        # 1. Backbone: ResNet18 with CoordAtt
+        # ==========================
+        self.inplanes = 64
+
+        # Stem
+        self.conv1 = nn.Conv2d(
+            Config.IN_CHANNELS, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # Layers
+        self.layer1 = self._make_layer(CABasicBlock, 64, 2, stride=1)
+        self.layer2 = self._make_layer(CABasicBlock, 128, 2, stride=2)
+        self.layer3 = self._make_layer(CABasicBlock, 256, 2, stride=(2, 1))
+        self.layer4 = self._make_layer(CABasicBlock, 512, 2, stride=(2, 1))
+
+        # ==========================
+        # 2. Temporal Modeling
+        # ==========================
+        self.rnn = nn.GRU(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1,
+        )
+
+        # ==========================
+        # 3. Aggregation & Head
+        # ==========================
+        self.attn_pool = AttentionPooling(512)
+        self.fc = nn.Linear(512, Config.NUM_CLASSES)
+
+        # Initialize Weights
+        self._init_weights()
+        self._load_pretrained()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        stride_h = stride[0] if isinstance(stride, tuple) else stride
+        stride_w = stride[1] if isinstance(stride, tuple) else stride
+
+        if stride_h != 1 or stride_w != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.inplanes,
+                    planes * block.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def _load_pretrained(self):
+        try:
+            print("Loading ImageNet weights...")
+            resnet18 = torchvision.models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            pretrained_dict = resnet18.state_dict()
+            model_dict = self.state_dict()
+
+            # Filter out unnecessary keys and handle shape mismatches
+            new_dict = {}
+            for k, v in pretrained_dict.items():
+                if k in model_dict:
+                    if model_dict[k].shape == v.shape:
+                        new_dict[k] = v
+                    elif k == "conv1.weight":
+                        # Average 3 channels to 1
+                        print("Adapting first conv layer from 3 channels to 1...")
+                        new_dict[k] = v.mean(dim=1, keepdim=True)
+            
+            model_dict.update(new_dict)
+            self.load_state_dict(model_dict)
+            print("Pretrained weights loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load pretrained weights: {e}")
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        # Frequency Pooling
+        x = torch.mean(x, dim=2, keepdim=True)
+        x = x.squeeze(2)
+        x = x.permute(0, 2, 1)
+
+        self.rnn.flatten_parameters()
+        x, _ = self.rnn(x)
+        x = self.attn_pool(x)
+        x = self.fc(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.csk_resnet import CSKResNet18CRNN
+
+
+class WhaleCRNN(CSKResNet18CRNN):
+    """
+    Wrapper for the Time-Preserving CSK-ResNet-18 CRNN architecture.
+    Inherits from the library implementation to satisfy the requirement
+    of implementing the WhaleCRNN class while utilizing the provided components.
+    """
+
+    def __init__(self):
+        super(WhaleCRNN, self).__init__()
+=======
+from library.csk_resnet import CoordAttResNet18CRNN
+
+
+class WhaleCRNN(CoordAttResNet18CRNN):
+    """
+    Wrapper for the Time-Preserving CoordAtt-ResNet-18 CRNN architecture.
+    Inherits from the library implementation to satisfy the requirement
+    of implementing the WhaleCRNN class while utilizing the provided components.
+    """
+
+    def __init__(self):
+        super(WhaleCRNN, self).__init__()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.csk_resnet import CSKResNet18CRNN
+from library.utils import set_seed, compute_auc
+
+
+class Trainer:
+    """
+    Manages the training, validation, and prediction processes for the Whale Detection model.
+    """
+
+    def __init__(self, device=None):
+        self.device = device if device else torch.device(Config.DEVICE)
+        self.model = CSKResNet18CRNN().to(self.device)
+=======
+from library.csk_resnet import CoordAttResNet18CRNN
+from library.utils import set_seed, compute_auc
+
+
+class Trainer:
+    """
+    Manages the training, validation, and prediction processes for the Whale Detection model.
+    """
+
+    def __init__(self, device=None):
+        self.device = device if device else torch.device(Config.DEVICE)
+        self.model = CoordAttResNet18CRNN().to(self.device)
+>>>>>>> REPLACE
+```

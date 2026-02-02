@@ -1,0 +1,553 @@
+To improve the model's performance and robustness, I will implement a **5-Fold Cross-Validation Ensemble** strategy, integrating the strengths of the previous Dual-Stream architecture with the stability of a full ensemble.
+
+**Strategy:**
+1.  **Full Ensemble Training (Cite solution_lesson_node_00038):** I will revert from the "Proxy Protocol" (1 fold) to a full 5-fold training loop. While the single-model Dual-Stream approach (Idea 13) was efficient, ensembling is the most reliable method to push the Jaccard score from ~0.706 to >0.709 by reducing variance and improving generalization.
+2.  **Extended Training Schedule (Cite solution_lesson_node_00037):** I will increase the training duration from 2 to 3 epochs. The presence of Dropout (0.1) in the custom head allows the model to train longer without overfitting, enabling the backbone to better adapt to the task.
+3.  **Dual-Stream Architecture (Cite solution_lesson_node_00039):** I will retain the Dual-Stream Convolutional Head from the previous solution, as it proved to be a more effective per-model architecture than the shared head.
+4.  **Robust Validation on Hold-Out Set:** Instead of validating on a subset of the training data, I will use the dedicated `validation_metadata.csv` (20% hold-out) for the final performance assessment. This ensures the reported metric is unbiased and directly comparable to the leaderboard.
+5.  **Logit-Level Ensembling (Cite solution_lesson_node_00021):** I will implement `inference_fn_ensemble` to average the logits from all 5 models before decoding. This maximizes the joint probability of the span boundaries across the ensemble.
+
+**Implementation Details:**
+-   **Config:** Update `N_FOLDS` to 5 and `EPOCHS` to 3.
+-   **Data:** Add `get_eval_loader` to facilitate loading the validation hold-out set.
+-   **Engine:** Replace single-model inference with `inference_fn_ensemble`.
+-   **Runfile:** Orchestrate the 5-fold training, model saving, and ensemble evaluation.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # =========================================================================
+    N_FOLDS = 3
+    EPOCHS = 4
+
+    # Batch Sizes (Adjusted for A100 40GB with Large model)
+=======
+    # Training Hyperparameters
+    # =========================================================================
+    N_FOLDS = 5
+    EPOCHS = 3
+
+    # Batch Sizes (Adjusted for A100 40GB with Large model)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_test_loader(load_cached_data=True, debug=False):
+    """
+    Creates test DataLoader and returns the test dataframe (for IDs).
+    """
+    tokenizer = AutoTokenizer.from_pretrained(Config.TOKENIZER_PATH)
+    test_df = pd.read_csv(Config.TEST_META)
+
+    if debug:
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+
+    prefix = "test_debug" if debug else "test"
+
+    input_ids, attention_mask, start_targets, end_targets, offsets = process_data(
+        test_df, tokenizer, Config.MAX_LEN, prefix, load_cached_data=load_cached_data
+    )
+
+    # Create Dataset (Targets are zeros/ignored for test)
+    test_dataset = TweetDataset(
+        input_ids, attention_mask, start_targets, end_targets, offsets
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.VALID_BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return test_loader, test_df
+=======
+def get_eval_loader(df, prefix="eval", load_cached_data=True):
+    """
+    Creates a DataLoader for evaluation (validation or test) from a DataFrame.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(Config.TOKENIZER_PATH)
+    
+    input_ids, attention_mask, start_targets, end_targets, offsets = process_data(
+        df, tokenizer, Config.MAX_LEN, prefix, load_cached_data=load_cached_data
+    )
+
+    dataset = TweetDataset(
+        input_ids, attention_mask, start_targets, end_targets, offsets
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=Config.VALID_BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return loader
+
+
+def get_test_loader(load_cached_data=True, debug=False):
+    """
+    Legacy wrapper for compatibility.
+    """
+    test_df = pd.read_csv(Config.TEST_META)
+    if debug:
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+    
+    prefix = "test_debug" if debug else "test"
+    loader = get_eval_loader(test_df, prefix=prefix, load_cached_data=load_cached_data)
+    return loader, test_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def inference_fn(test_loader, model, device, test_df):
+    model.eval()
+    all_start_logits = []
+    all_end_logits = []
+    all_offsets = []
+
+    with torch.no_grad():
+        for d in test_loader:
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            offsets = d["offsets"].cpu().numpy()
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+
+            all_start_logits.append(start_logits.cpu().numpy())
+            all_end_logits.append(end_logits.cpu().numpy())
+            all_offsets.append(offsets)
+
+    start_preds = np.concatenate(all_start_logits)
+    end_preds = np.concatenate(all_end_logits)
+    offsets_preds = np.concatenate(all_offsets)
+
+    final_predictions = []
+
+    for i, row in test_df.iterrows():
+        text = normalize_text(str(row["text"]))
+        sentiment = str(row["sentiment"])
+
+        # Neutral Strategy: Return full text
+        if sentiment == "neutral":
+            final_predictions.append(f'"{text}"')
+            continue
+
+        s_logits = start_preds[i]
+        e_logits = end_preds[i]
+        offsets = offsets_preds[i]
+
+        sum_logits = np.add.outer(s_logits, e_logits)
+        mask = np.triu(np.ones_like(sum_logits))
+        sum_logits[mask == 0] = -float("inf")
+
+        best_idx = np.argmax(sum_logits)
+        best_start, best_end = np.unravel_index(best_idx, sum_logits.shape)
+
+        if best_start < len(offsets) and best_end < len(offsets):
+            start_char = offsets[best_start][0]
+            end_char = offsets[best_end][1]
+            pred_text = text[start_char:end_char]
+        else:
+            pred_text = text
+
+        final_predictions.append(f'"{pred_text}"')
+
+    return final_predictions
+=======
+def inference_fn_ensemble(loader, models, device, df):
+    for model in models:
+        model.eval()
+    
+    all_start_logits = []
+    all_end_logits = []
+    all_offsets = []
+
+    with torch.no_grad():
+        for d in loader:
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            offsets = d["offsets"].cpu().numpy()
+
+            # Accumulate logits from all models
+            avg_start_logits = None
+            avg_end_logits = None
+
+            for model in models:
+                start_logits, end_logits = model(input_ids, attention_mask)
+                
+                if avg_start_logits is None:
+                    avg_start_logits = start_logits.cpu().numpy()
+                    avg_end_logits = end_logits.cpu().numpy()
+                else:
+                    avg_start_logits += start_logits.cpu().numpy()
+                    avg_end_logits += end_logits.cpu().numpy()
+            
+            # Average
+            avg_start_logits /= len(models)
+            avg_end_logits /= len(models)
+
+            all_start_logits.append(avg_start_logits)
+            all_end_logits.append(avg_end_logits)
+            all_offsets.append(offsets)
+
+    start_preds = np.concatenate(all_start_logits)
+    end_preds = np.concatenate(all_end_logits)
+    offsets_preds = np.concatenate(all_offsets)
+
+    final_predictions = []
+
+    for i, row in df.iterrows():
+        text = normalize_text(str(row["text"]))
+        sentiment = str(row["sentiment"])
+
+        # Neutral Strategy: Return full text
+        if sentiment == "neutral":
+            final_predictions.append(f'"{text}"')
+            continue
+
+        s_logits = start_preds[i]
+        e_logits = end_preds[i]
+        offsets = offsets_preds[i]
+
+        sum_logits = np.add.outer(s_logits, e_logits)
+        mask = np.triu(np.ones_like(sum_logits))
+        sum_logits[mask == 0] = -float("inf")
+
+        best_idx = np.argmax(sum_logits)
+        best_start, best_end = np.unravel_index(best_idx, sum_logits.shape)
+
+        if best_start < len(offsets) and best_end < len(offsets):
+            start_char = offsets[best_start][0]
+            end_char = offsets[best_end][1]
+            pred_text = text[start_char:end_char]
+        else:
+            pred_text = text
+
+        final_predictions.append(f'"{pred_text}"')
+
+    return final_predictions
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.data import get_data_loaders, get_test_loader
+from library.model import TweetModel
+from library.engine import train_fn, eval_fn, inference_fn, get_optimizer_params
+
+
+def run():
+    # 1. Setup and Configuration
+    seed_everything(Config.SEED)
+    device = Config.DEVICE
+
+    # Fast baseline overrides
+    Config.EPOCHS = 2  # Reduce epochs for speed
+    Config.DEBUG = False
+
+    print(f"Starting execution on device: {device}")
+
+    # 2. Data Loading (Fold 0)
+    # Load training and validation loaders for the first fold
+    train_loader, val_loader = get_data_loaders(fold=0, load_cached_data=True)
+
+    # 3. Model Initialization
+    model = TweetModel()
+    model.to(device)
+
+    optimizer_params = get_optimizer_params(model)
+    optimizer = torch.optim.AdamW(optimizer_params, lr=Config.LR_MAX, eps=Config.EPS)
+
+    num_train_steps = int(len(train_loader) * Config.EPOCHS)
+    num_warmup_steps = int(num_train_steps * Config.NUM_WARMUP_STEPS_RATIO)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps, num_train_steps
+    )
+
+    # 4. Training Loop
+    best_jaccard = 0.0
+
+    # We need a validation dataframe subset for the eval_fn during training
+    # Reconstruct the fold split to get the non-neutral validation dataframe
+    full_train_df = pd.read_csv(Config.TRAIN_META)
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+    splits = list(skf.split(full_train_df, full_train_df["sentiment"]))
+    _, val_idx = splits[0]
+
+    # Filter for non-neutrals for the training-loop validation (matching val_loader)
+    if Config.FILTER_NEUTRAL:
+        is_not_neutral = full_train_df["sentiment"] != "neutral"
+        val_mask = is_not_neutral.iloc[val_idx].values
+        val_idx_active = val_idx[val_mask]
+        val_df_active = full_train_df.iloc[val_idx_active].reset_index(drop=True)
+    else:
+        val_df_active = full_train_df.iloc[val_idx].reset_index(drop=True)
+
+    print("Starting Training...")
+    for epoch in range(Config.EPOCHS):
+        train_loss = train_fn(train_loader, model, optimizer, device, scheduler)
+        val_loss, val_jaccard = eval_fn(val_loader, model, device, val_df_active)
+
+        # print(f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Jaccard: {val_jaccard:.4f}")
+
+        if val_jaccard > best_jaccard:
+            best_jaccard = val_jaccard
+            torch.save(model.state_dict(), Config.MODEL_PATH)
+
+    # 5. Final Validation Assessment (Entire Hold-out Set)
+    print("Performing Final Validation...")
+
+    # Load best model
+    model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Get the FULL validation set (including neutrals)
+    val_df_full = full_train_df.iloc[val_idx].reset_index(drop=True)
+
+    # Split into active (non-neutral) and neutral for separate processing
+    val_df_active_full = val_df_full[val_df_full["sentiment"] != "neutral"].reset_index(
+        drop=True
+    )
+    val_df_neutral_full = val_df_full[
+        val_df_full["sentiment"] == "neutral"
+    ].reset_index(drop=True)
+
+    final_scores = []
+    text_lens = []
+    sentiments_encoded = []  # 0: neg, 1: neu, 2: pos
+
+    # A. Process Non-Neutrals (Active)
+    # We reuse the val_loader which corresponds exactly to val_df_active
+    # inference_fn returns quoted strings, we strip quotes for metric calc
+    active_preds_quoted = inference_fn(val_loader, model, device, val_df_active_full)
+    active_preds = [p.strip('"') for p in active_preds_quoted]
+
+    for i, pred in enumerate(active_preds):
+        target = normalize_text(str(val_df_active_full.iloc[i]["selected_text"]))
+        score = jaccard(pred, target)
+        final_scores.append(score)
+
+        # Features for failure analysis
+        txt = str(val_df_active_full.iloc[i]["text"])
+        text_lens.append(len(txt))
+        sent = val_df_active_full.iloc[i]["sentiment"]
+        sentiments_encoded.append(0 if sent == "negative" else 2)
+
+    # B. Process Neutrals (Identity Prediction)
+    for i, row in val_df_neutral_full.iterrows():
+        text = normalize_text(str(row["text"]))
+        target = normalize_text(str(row["selected_text"]))
+        # Neutral strategy: predict full text
+        score = jaccard(text, target)
+        final_scores.append(score)
+
+        # Features
+        text_lens.append(len(str(row["text"])))
+        sentiments_encoded.append(1)
+
+    # Compute Final Metric
+    final_metric = np.mean(final_scores)
+    print(f"Final Validation Metric: {final_metric:.16f}")
+
+    # 6. Failure Analysis
+    print("Performing Failure Analysis...")
+    errors = 1.0 - np.array(final_scores)
+    text_lens = np.array(text_lens)
+    sentiments_encoded = np.array(sentiments_encoded)
+
+    # Correlations
+    if len(errors) > 1:
+        corr_len = np.corrcoef(errors, text_lens)[0, 1]
+        corr_sent = np.corrcoef(errors, sentiments_encoded)[0, 1]
+    else:
+        corr_len = 0.0
+        corr_sent = 0.0
+
+    print(f"Correlation (Error vs Text Length): {corr_len:.4f}")
+    print(f"Correlation (Error vs Sentiment): {corr_sent:.4f}")
+
+    # 7. Submission Generation
+    if final_metric > 0.7093:
+        print("Validation metric threshold met. Generating submission...")
+        test_loader, test_df = get_test_loader(load_cached_data=True)
+
+        # inference_fn handles the neutral strategy internally for the test set
+        predictions = inference_fn(test_loader, model, device, test_df)
+
+        submission_df = pd.DataFrame(
+            {"textID": test_df["textID"], "selected_text": predictions}
+        )
+
+        submission_df.to_csv(Config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved to {Config.SUBMISSION_PATH}")
+    else:
+        print(
+            f"Validation metric {final_metric:.4f} did not meet threshold 0.7093. Submission skipped."
+        )
+=======
+from library.data import get_data_loaders, get_eval_loader
+from library.model import TweetModel
+from library.engine import train_fn, eval_fn, inference_fn_ensemble, get_optimizer_params
+
+
+def run():
+    # 1. Setup and Configuration
+    seed_everything(Config.SEED)
+    device = Config.DEVICE
+    
+    # Ensure Config is respected (remove overrides)
+    print(f"Starting execution on device: {device}")
+    print(f"Folds: {Config.N_FOLDS}, Epochs: {Config.EPOCHS}")
+
+    # 2. Training Loop (All Folds)
+    model_paths = []
+    
+    # Load full train df for splitting logic
+    full_train_df = pd.read_csv(Config.TRAIN_META)
+    skf = StratifiedKFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
+    splits = list(skf.split(full_train_df, full_train_df["sentiment"]))
+
+    for fold in range(Config.N_FOLDS):
+        print(f"\n{'='*20} Fold {fold+1}/{Config.N_FOLDS} {'='*20}")
+        
+        # Load Data
+        train_loader, val_loader = get_data_loaders(fold=fold, load_cached_data=True)
+        
+        # Get Validation DF for this fold (active only for monitoring)
+        _, val_idx = splits[fold]
+        if Config.FILTER_NEUTRAL:
+            is_not_neutral = full_train_df["sentiment"] != "neutral"
+            val_mask = is_not_neutral.iloc[val_idx].values
+            val_idx_active = val_idx[val_mask]
+            val_df_active = full_train_df.iloc[val_idx_active].reset_index(drop=True)
+        else:
+            val_df_active = full_train_df.iloc[val_idx].reset_index(drop=True)
+
+        # Initialize Model
+        model = TweetModel()
+        model.to(device)
+        
+        optimizer_params = get_optimizer_params(model)
+        optimizer = torch.optim.AdamW(optimizer_params, lr=Config.LR_MAX, eps=Config.EPS)
+        
+        num_train_steps = int(len(train_loader) * Config.EPOCHS)
+        num_warmup_steps = int(num_train_steps * Config.NUM_WARMUP_STEPS_RATIO)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_train_steps)
+        
+        # Train
+        best_jaccard = 0.0
+        fold_model_path = os.path.join(Config.WORKING_DIR, f"model_fold_{fold}.bin")
+        
+        for epoch in range(Config.EPOCHS):
+            train_loss = train_fn(train_loader, model, optimizer, device, scheduler)
+            val_loss, val_jaccard = eval_fn(val_loader, model, device, val_df_active)
+            
+            print(f"Epoch {epoch+1} | Val Jaccard: {val_jaccard:.5f}")
+            
+            if val_jaccard > best_jaccard:
+                best_jaccard = val_jaccard
+                torch.save(model.state_dict(), fold_model_path)
+        
+        print(f"Fold {fold+1} Best Jaccard: {best_jaccard:.5f}")
+        model_paths.append(fold_model_path)
+        
+        # Cleanup
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # 3. Final Validation Assessment (Ensemble on Hold-out Set)
+    print("\nPerforming Final Validation on Hold-out Set (VAL_META)...")
+    
+    # Load Validation Data (The true hold-out set)
+    val_holdout_df = pd.read_csv(Config.VAL_META)
+    val_loader = get_eval_loader(val_holdout_df, prefix="val_holdout")
+    
+    # Load All Models
+    models = []
+    for path in model_paths:
+        m = TweetModel()
+        m.load_state_dict(torch.load(path, map_location=device))
+        m.to(device)
+        m.eval()
+        models.append(m)
+        
+    # Ensemble Inference
+    # inference_fn_ensemble handles neutral strategy and decoding
+    val_preds_quoted = inference_fn_ensemble(val_loader, models, device, val_holdout_df)
+    val_preds = [p.strip('"') for p in val_preds_quoted]
+    
+    # Compute Metrics
+    final_scores = []
+    text_lens = []
+    sentiments_encoded = []
+    
+    for i, row in val_holdout_df.iterrows():
+        target = normalize_text(str(row["selected_text"]))
+        pred = val_preds[i]
+        score = jaccard(pred, target)
+        final_scores.append(score)
+        
+        # Features
+        text_lens.append(len(str(row["text"])))
+        sent = row["sentiment"]
+        if sent == "negative": s_code = 0
+        elif sent == "neutral": s_code = 1
+        else: s_code = 2
+        sentiments_encoded.append(s_code)
+        
+    final_metric = np.mean(final_scores)
+    print(f"Final Validation Metric: {final_metric:.16f}")
+    
+    # 4. Failure Analysis
+    print("Performing Failure Analysis...")
+    errors = 1.0 - np.array(final_scores)
+    text_lens = np.array(text_lens)
+    sentiments_encoded = np.array(sentiments_encoded)
+
+    if len(errors) > 1:
+        corr_len = np.corrcoef(errors, text_lens)[0, 1]
+        corr_sent = np.corrcoef(errors, sentiments_encoded)[0, 1]
+    else:
+        corr_len = 0.0
+        corr_sent = 0.0
+
+    print(f"Correlation (Error vs Text Length): {corr_len:.4f}")
+    print(f"Correlation (Error vs Sentiment): {corr_sent:.4f}")
+
+    # 5. Submission Generation
+    if final_metric > 0.7093:
+        print("Validation metric threshold met. Generating submission...")
+        
+        test_df = pd.read_csv(Config.TEST_META)
+        test_loader = get_eval_loader(test_df, prefix="test")
+        
+        predictions = inference_fn_ensemble(test_loader, models, device, test_df)
+        
+        submission_df = pd.DataFrame(
+            {"textID": test_df["textID"], "selected_text": predictions}
+        )
+
+        submission_df.to_csv(Config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved to {Config.SUBMISSION_PATH}")
+    else:
+        print(
+            f"Validation metric {final_metric:.4f} did not meet threshold 0.7093. Submission skipped."
+        )
+>>>>>>> REPLACE
+```

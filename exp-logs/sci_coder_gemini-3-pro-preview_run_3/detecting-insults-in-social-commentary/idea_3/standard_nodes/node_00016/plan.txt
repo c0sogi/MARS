@@ -1,0 +1,411 @@
+To optimize the solution, I will implement a strategy based on the provided lessons, focusing on stability, efficiency, and proven architectural choices for small datasets.
+
+1.  **Backbone & Batch Size**: I will revert the model backbone from `deberta-v3-large` to `roberta-large`. This allows me to increase the `train_batch_size` from 8 back to 16, ensuring more stable gradient estimates and training dynamics, which is critical for small datasets (Cite solution_lesson_node_00015).
+2.  **Model Architecture**: I will replace the complex `AttentionPooling` and `Multi-Sample Dropout` with a simpler **Mean Pooling** head and standard **Dropout** (rate 0.2). Complex heads often overfit on small data, while Mean Pooling has been empirically shown to perform better here (Cite solution_lesson_node_00007, solution_lesson_node_00013).
+3.  **Regularization via Freezing**: I will explicitly freeze the embeddings and the bottom 6 layers of the `roberta-large` encoder. This reduces the trainable parameter space, preventing overfitting and improving training efficiency (Cite solution_lesson_node_00010).
+4.  **Optimization**: I will remove the Layer-wise Learning Rate Decay (LLRD) and revert to a standard optimizer configuration. Simplicity in the optimization pipeline is preferred when the dataset is not large enough to justify complex parameter-specific schedules (Cite solution_lesson_node_00013).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    model_path = "microsoft/deberta-v3-large"
+    max_len = 160
+    target_col = "Insult"
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    epochs = 4
+    train_batch_size = 8  # Adjusted for DeBERTa-Large on 40GB GPU
+    valid_batch_size = 16
+    learning_rate = 1e-5
+    min_lr = 1e-7
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+
+    # ==========================================
+    # Advanced / Regularization
+    # ==========================================
+    # Layer-wise Learning Rate Decay
+    llrd_decay = 0.9
+
+    # Multi-Sample Dropout Rates
+    dropout_rates = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+    # Scheduler
+=======
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    model_path = "roberta-large"
+    max_len = 160
+    target_col = "Insult"
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    epochs = 4
+    train_batch_size = 16
+    valid_batch_size = 16
+    learning_rate = 1e-5
+    min_lr = 1e-7
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+
+    # ==========================================
+    # Advanced / Regularization
+    # ==========================================
+    dropout = 0.2
+
+    # Scheduler
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class AttentionPooling(nn.Module):
+    """
+    Attention Pooling (Weighted Layer Pooling) mechanism.
+    Learns a weight for each token's embedding to dynamically emphasize specific tokens.
+    """
+
+    def __init__(self, hidden_size):
+        super(AttentionPooling, self).__init__()
+        self.W = nn.Linear(hidden_size, hidden_size)
+        self.V = nn.Linear(hidden_size, 1)
+        self.tanh = nn.Tanh()
+
+    def forward(self, last_hidden_state, attention_mask):
+        """
+        Args:
+            last_hidden_state: (batch_size, seq_len, hidden_size)
+            attention_mask: (batch_size, seq_len)
+        Returns:
+            context_vector: (batch_size, hidden_size)
+        """
+        # Calculate attention scores
+        # h = tanh(W * H)
+        h = self.tanh(self.W(last_hidden_state))
+
+        # score = V * h
+        score = self.V(h).squeeze(-1)  # (batch_size, seq_len)
+
+        # Mask padding tokens so they don't contribute to the weighted sum
+        if attention_mask is not None:
+            # Set score of padding tokens to a very small number
+            score = score.masked_fill(attention_mask == 0, -1e9)
+
+        # Calculate weights via Softmax
+        weights = torch.softmax(score, dim=-1).unsqueeze(-1)  # (batch_size, seq_len, 1)
+
+        # Compute weighted sum of hidden states
+        context_vector = torch.sum(
+            last_hidden_state * weights, dim=1
+        )  # (batch_size, hidden_size)
+
+        return context_vector
+
+
+class InsultModel(nn.Module):
+    """
+    Main model architecture for Insult Detection.
+    Backbone: DeBERTa-v3-Large
+    Head: Attention Pooling + Multi-Sample Dropout
+    """
+
+    def __init__(self):
+        super(InsultModel, self).__init__()
+
+        # Load Transformer Configuration and Backbone
+        self.config = AutoConfig.from_pretrained(Config.model_path)
+        self.backbone = AutoModel.from_pretrained(Config.model_path, config=self.config)
+
+        # Initialize Custom Components
+        self.pooling = AttentionPooling(self.config.hidden_size)
+
+        # Multi-Sample Dropout: Create a list of dropout layers with different rates
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in Config.dropout_rates])
+
+        # Final Classification Layer
+        self.fc = nn.Linear(self.config.hidden_size, 1)
+
+        # Initialize weights for custom layers
+        self._init_weights(self.pooling)
+        self._init_weights(self.fc)
+
+    def _init_weights(self, module):
+        """
+        Initialize weights for custom modules using the backbone's initializer range.
+        """
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass of the model.
+        Returns:
+            logits: (batch_size, 1) - Raw scores before sigmoid
+        """
+        # Pass through Backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = (
+            outputs.last_hidden_state
+        )  # (batch_size, seq_len, hidden_size)
+
+        # Apply Attention Pooling
+        feature = self.pooling(
+            last_hidden_state, attention_mask
+        )  # (batch_size, hidden_size)
+
+        # Apply Multi-Sample Dropout
+        # Pass the feature through multiple dropout masks and the same linear layer
+        logits_list = []
+        for dropout in self.dropouts:
+            dropped_feature = dropout(feature)
+            logits_list.append(self.fc(dropped_feature))
+
+        # Average the logits from all dropout samples
+        # Stack: (num_dropouts, batch_size, 1) -> Mean dim 0 -> (batch_size, 1)
+        logits = torch.mean(torch.stack(logits_list, dim=0), dim=0)
+
+        return logits
+=======
+class InsultModel(nn.Module):
+    """
+    Main model architecture for Insult Detection.
+    Backbone: RoBERTa-Large
+    Head: Mean Pooling + Standard Dropout
+    """
+
+    def __init__(self):
+        super(InsultModel, self).__init__()
+
+        # Load Transformer Configuration and Backbone
+        self.config = AutoConfig.from_pretrained(Config.model_path)
+        self.backbone = AutoModel.from_pretrained(Config.model_path, config=self.config)
+
+        # Freeze Embeddings and Bottom 6 Layers
+        self._freeze_layers()
+
+        # Final Classification Head
+        self.dropout = nn.Dropout(Config.dropout)
+        self.fc = nn.Linear(self.config.hidden_size, 1)
+
+        # Initialize weights
+        self._init_weights(self.fc)
+
+    def _freeze_layers(self):
+        # Freeze Embeddings
+        for param in self.backbone.embeddings.parameters():
+            param.requires_grad = False
+
+        # Freeze bottom 6 encoder layers
+        # RoBERTa encoder layers are accessible via backbone.encoder.layer
+        for i in range(6):
+            for param in self.backbone.encoder.layer[i].parameters():
+                param.requires_grad = False
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask):
+        # Pass through Backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state
+
+        # Mean Pooling
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        )
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+
+        # Dropout and Classification
+        feature = self.dropout(mean_embeddings)
+        logits = self.fc(feature)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+    """
+    Constructs the parameter groups for the optimizer with Layer-wise Learning Rate Decay (LLRD).
+
+    Args:
+        model (nn.Module): The model to optimize.
+        encoder_lr (float): Base learning rate for the transformer backbone.
+        decoder_lr (float): Learning rate for the classification head.
+        weight_decay (float): Weight decay coefficient.
+
+    Returns:
+        list: List of parameter group dictionaries.
+    """
+    # DeBERTa-v3-large usually has 24 layers.
+    # We want higher LR at the top (near head) and lower LR at the bottom.
+
+    # Identify named parameters
+    named_parameters = list(model.named_parameters())
+
+    # Separate backbone (encoder) and head (decoder/custom layers)
+    # The model structure in library/model.py defines self.backbone
+
+    # We will assign layers based on string matching
+    # backbone.embeddings -> Layer 0 (conceptually bottom)
+    # backbone.encoder.layer.0 ... layer.23
+    # pooling, fc -> Head
+
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    optimizer_parameters = []
+
+    # 1. Handle Head Parameters (Pooling, FC, Dropouts)
+    # These get the highest learning rate (decoder_lr)
+    head_params = []
+    for name, params in named_parameters:
+        if "backbone" not in name:
+            head_params.append((name, params))
+
+    optimizer_parameters.append(
+        {
+            "params": [
+                p for n, p in head_params if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": weight_decay,
+            "lr": decoder_lr,
+        }
+    )
+    optimizer_parameters.append(
+        {
+            "params": [p for n, p in head_params if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": decoder_lr,
+        }
+    )
+
+    # 2. Handle Backbone Parameters with LLRD
+    # DeBERTa-v3-large has 24 layers.
+    # We assume the config matches standard DeBERTa-v3-large.
+    # If we can't determine layer count dynamically easily without instantiating config,
+    # we assume 24 for 'large' or iterate to find max.
+
+    # Let's group by layer index.
+    # Embeddings are layer -1 (or effectively the start).
+
+    layers = [[] for _ in range(25)]  # 0-23 layers + embeddings
+
+    for name, params in named_parameters:
+        if "backbone" in name:
+            if "embeddings" in name:
+                layers[0].append((name, params))
+            elif "encoder.layer." in name:
+                # Extract layer index
+                # name format: backbone.encoder.layer.15.output...
+                try:
+                    layer_idx = int(name.split("encoder.layer.")[1].split(".")[0])
+                    # Store in layers list. Index 0 is embeddings, so layer 0 is index 1.
+                    layers[layer_idx + 1].append((name, params))
+                except:
+                    # Fallback for other backbone params (e.g. final layer norm if exists outside layers)
+                    layers[-1].append((name, params))
+            else:
+                # Other backbone components (like relative_attention if not in layer)
+                layers[0].append((name, params))
+
+    # Apply decay
+    # Top layer (23) gets encoder_lr
+    # Layer i gets encoder_lr * (decay ** (23 - i))
+    # Embeddings get encoder_lr * (decay ** 24)
+
+    # Reverse iterate to assign LRs
+    # layers[24] corresponds to encoder layer 23
+    # layers[1] corresponds to encoder layer 0
+    # layers[0] corresponds to embeddings
+
+    num_layers = len(layers)
+
+    for i in range(num_layers):
+        # Calculate depth from top.
+        # i=24 (top) -> depth=0
+        # i=0 (bottom) -> depth=24
+        depth = (num_layers - 1) - i
+        lr = encoder_lr * (Config.llrd_decay**depth)
+
+        layer_params = layers[i]
+        if not layer_params:
+            continue
+
+        optimizer_parameters.append(
+            {
+                "params": [
+                    p for n, p in layer_params if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": weight_decay,
+                "lr": lr,
+            }
+        )
+        optimizer_parameters.append(
+            {
+                "params": [
+                    p for n, p in layer_params if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+                "lr": lr,
+            }
+        )
+
+    return optimizer_parameters
+=======
+def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+    """
+    Constructs the parameter groups for the optimizer.
+    Uses standard grouping (weight decay vs no weight decay).
+    Ignores LLRD to keep optimization simple and stable.
+    """
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    optimizer_parameters = []
+    
+    # We use encoder_lr (which is passed as learning_rate in runfile) for all parameters
+    # since we removed LLRD.
+    lr = encoder_lr
+
+    # Group all parameters
+    optimizer_parameters = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay) and p.requires_grad
+            ],
+            "weight_decay": weight_decay,
+            "lr": lr,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay) and p.requires_grad
+            ],
+            "weight_decay": 0.0,
+            "lr": lr,
+        },
+    ]
+
+    return optimizer_parameters
+>>>>>>> REPLACE
+```

@@ -1,0 +1,375 @@
+Implementation Strategy:
+1.  **Robust Data Ingestion (Cite solution_lesson_node_00001):** Implement a custom, manual DICOM parser in a new file `library/data_utils.py`. This bypasses the missing `pydicom` dependency and the failure of `opencv`/`rasterio` to read the specific DICOM format, ensuring the model trains on actual pixel data instead of black images.
+2.  **Centralized Data Access (Cite solution_lesson_node_00003):** Update `library/dataset.py` to use this new parser for loading training images. Crucially, update `library/trainer.py` and `runfile.py` to use the same parser to retrieve original image dimensions. This fixes the coordinate space mismatch that caused the 0.0 mAP by ensuring bounding boxes are rescaled correctly during evaluation.
+3.  **Hyperparameter Tuning:** Increase `NUM_EPOCHS` from 5 to 10 in `runfile.py` to allow the model sufficient time to converge on the real image features, balancing the 4-hour runtime limit.
+
+```diff
+library/data_utils.py
+<<<<<<< SEARCH
+=======
+import numpy as np
+import os
+
+def read_dicom(path):
+    """
+    Manually reads a DICOM file to extract pixel data and dimensions.
+    This is a robust fallback for environments where pydicom is missing.
+    Assumes uncompressed pixel data located at the end of the file.
+    """
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+            
+        # Helper to find tag value (Simple Heuristic)
+        # Rows: (0028, 0010) -> b'\x28\x00\x10\x00'
+        # Cols: (0028, 0011) -> b'\x28\x00\x11\x00'
+        
+        def get_short_value(tag_bytes, data):
+            idx = data.find(tag_bytes)
+            if idx == -1: return None
+            # Skip Tag (4)
+            # Heuristic: Try to find the value in the next 12 bytes
+            # Explicit VR might have 2 bytes VR + 2 bytes len, or 2 bytes VR + 2 reserved + 4 len
+            # Implicit VR has 4 bytes len
+            # We just look for the value which is likely 2 bytes at offset 8 or similar.
+            # A safer way for Rows/Cols (US) is to look for the value at offset 8 (Implicit) or 8 (Explicit US)
+            # If explicit US: Tag(4) + 'US'(2) + Len(2) + Val(2) -> Offset 8
+            # If implicit: Tag(4) + Len(4) + Val(2) -> Offset 8
+            # So offset 8 is a good bet for US.
+            try:
+                return int.from_bytes(data[idx+8:idx+10], 'little')
+            except:
+                return None
+
+        rows = get_short_value(b'\x28\x00\x10\x00', data)
+        cols = get_short_value(b'\x28\x00\x11\x00', data)
+        
+        if rows is None or cols is None:
+            return None, (None, None)
+            
+        # Pixel Data Tag (7FE0, 0010)
+        # We assume data is at the end of the file for uncompressed DICOM
+        expected_pixels = rows * cols
+        expected_bytes = expected_pixels * 2 # Assuming 16-bit
+        
+        if len(data) >= expected_bytes:
+            # Take from end
+            pixel_bytes = data[-expected_bytes:]
+            img = np.frombuffer(pixel_bytes, dtype=np.uint16).reshape((rows, cols))
+            
+            # Check Photometric Interpretation for MONOCHROME1 (0 is white)
+            # Tag (0028, 0004)
+            mono_idx = data.find(b'\x28\x00\x04\x00')
+            if mono_idx != -1:
+                # Search nearby for "MONOCHROME1"
+                chunk = data[mono_idx:mono_idx+50]
+                if b'MONOCHROME1' in chunk:
+                    img = np.max(img) - img
+            
+            return img, (rows, cols)
+            
+        return None, (rows, cols)
+        
+    except Exception:
+        return None, (None, None)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import rasterio
+from library.config import Config
+
+# =========================================================================
+# Helper Functions for CenterNet Targets
+=======
+import rasterio
+from library.config import Config
+from library.data_utils import read_dicom
+
+# =========================================================================
+# Helper Functions for CenterNet Targets
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def load_image(self, image_id, file_path):
+        # Cache Check
+        cache_path = os.path.join(self.cache_dir, f"{image_id}.npy")
+        if self.load_cached_data and os.path.exists(cache_path):
+            try:
+                return np.load(cache_path)
+            except Exception:
+                pass  # Fallback to loading from source if cache is corrupt
+
+        # Construct full path
+        full_path = os.path.join(Config.INPUT_DIR, file_path)
+
+        img = None
+
+        # Strategy 1: Pydicom
+        try:
+            import pydicom
+
+            dcm = pydicom.dcmread(full_path)
+            img = dcm.pixel_array
+
+            # Handle Photometric Interpretation if needed (simple inversion)
+            if (
+                hasattr(dcm, "PhotometricInterpretation")
+                and dcm.PhotometricInterpretation == "MONOCHROME1"
+            ):
+                img = np.amax(img) - img
+        except (ImportError, Exception):
+            pass
+
+        # Strategy 1.5: Rasterio (Backup for DICOM)
+        if img is None:
+            try:
+                with rasterio.open(full_path) as src:
+                    img = src.read(1)
+            except Exception:
+                pass
+
+        # Strategy 2: OpenCV
+        if img is None:
+            try:
+                img = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                pass
+
+        # Fallback
+        if img is None:
+            # Return None to signal failure so we don't use invalid boxes
+            return None
+
+        # Normalization (Percentile)
+=======
+    def load_image(self, image_id, file_path):
+        # Cache Check
+        cache_path = os.path.join(self.cache_dir, f"{image_id}.npy")
+        if self.load_cached_data and os.path.exists(cache_path):
+            try:
+                return np.load(cache_path)
+            except Exception:
+                pass  # Fallback to loading from source if cache is corrupt
+
+        # Construct full path
+        full_path = os.path.join(Config.INPUT_DIR, file_path)
+
+        img = None
+
+        # Strategy 1: Manual DICOM Parser (Robust)
+        img, _ = read_dicom(full_path)
+
+        # Strategy 2: OpenCV (Fallback)
+        if img is None:
+            try:
+                img = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                pass
+
+        # Fallback
+        if img is None:
+            # Return None to signal failure so we don't use invalid boxes
+            return None
+
+        # Normalization (Percentile)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.inference import (
+    decode_predictions,
+    rescale_bboxes,
+    convert_to_prediction_string,
+)
+=======
+from library.inference import (
+    decode_predictions,
+    rescale_bboxes,
+    convert_to_prediction_string,
+)
+from library.data_utils import read_dicom
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Pre-fetch metadata to get paths
+        test_meta = pd.read_csv(Config.TEST_META_PATH)
+        path_map = dict(zip(test_meta["image_id"], test_meta["file_path"]))
+
+        import cv2
+
+        try:
+            import pydicom
+        except ImportError:
+            pydicom = None
+
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(test_loader):
+                imgs = batch_data["image"].to(self.device)
+                image_ids = batch_data["image_id"]
+
+                # Forward
+                outputs = self.model(imgs)
+
+                # Decode
+                detections = decode_predictions(
+                    outputs["hm"], outputs["wh"], outputs["reg"], K=Config.TOP_K
+                )
+
+                # Get original shapes for this batch
+                original_shapes = []
+                for img_id in image_ids:
+                    # We need to find the original size.
+                    # This is expensive but necessary since dataset doesn't return it.
+                    f_path = path_map.get(img_id)
+                    full_path = os.path.join(Config.INPUT_DIR, f_path)
+
+                    h, w = Config.IMG_SIZE, Config.IMG_SIZE  # Default fallback
+
+                    # Try reading header only for speed
+                    if pydicom:
+                        try:
+                            dcm = pydicom.dcmread(full_path, stop_before_pixels=True)
+                            h, w = dcm.Rows, dcm.Columns
+                        except:
+                            pass
+
+                    # Fallback to CV2 if pydicom failed or not present, but CV2 reads pixels
+                    if (h == Config.IMG_SIZE) and os.path.exists(full_path):
+                        try:
+                            # Just read shape
+                            img_tmp = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+                            if img_tmp is not None:
+                                h, w = img_tmp.shape[:2]
+                        except:
+                            pass
+
+                    original_shapes.append((h, w))
+
+                # Rescale
+                rescaled_dets = rescale_bboxes(detections, original_shapes)
+=======
+        # Pre-fetch metadata to get paths
+        test_meta = pd.read_csv(Config.TEST_META_PATH)
+        path_map = dict(zip(test_meta["image_id"], test_meta["file_path"]))
+
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(test_loader):
+                imgs = batch_data["image"].to(self.device)
+                image_ids = batch_data["image_id"]
+
+                # Forward
+                outputs = self.model(imgs)
+
+                # Decode
+                detections = decode_predictions(
+                    outputs["hm"], outputs["wh"], outputs["reg"], K=Config.TOP_K
+                )
+
+                # Get original shapes for this batch
+                original_shapes = []
+                for img_id in image_ids:
+                    f_path = path_map.get(img_id)
+                    full_path = os.path.join(Config.INPUT_DIR, f_path)
+
+                    # Use robust reader
+                    _, (rows, cols) = read_dicom(full_path)
+                    
+                    if rows is not None and cols is not None:
+                        h, w = rows, cols
+                    else:
+                        h, w = Config.IMG_SIZE, Config.IMG_SIZE
+
+                    original_shapes.append((h, w))
+
+                # Rescale
+                rescaled_dets = rescale_bboxes(detections, original_shapes)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.dataset import VinBigDataDataset
+from library.inference import decode_predictions, rescale_bboxes
+from library.model import CenterNet
+=======
+from library.dataset import VinBigDataDataset
+from library.inference import decode_predictions, rescale_bboxes
+from library.model import CenterNet
+from library.data_utils import read_dicom
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # --- 1. Configuration ---
+    # Override defaults for a fast but effective baseline
+    Config.NUM_EPOCHS = 5
+    Config.DEBUG = False
+
+    print(f"Starting Runfile. Device: {Config.DEVICE}, Epochs: {Config.NUM_EPOCHS}")
+=======
+def main():
+    # --- 1. Configuration ---
+    # Override defaults for a fast but effective baseline
+    Config.NUM_EPOCHS = 10
+    Config.DEBUG = False
+
+    print(f"Starting Runfile. Device: {Config.DEVICE}, Epochs: {Config.NUM_EPOCHS}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Retrieve Original Shapes for Rescaling
+            original_shapes = []
+            for img_id in img_ids:
+                path = img_id_to_path.get(img_id)
+                full_path = os.path.join(Config.INPUT_DIR, path)
+                h, w = Config.IMG_SIZE, Config.IMG_SIZE
+
+                # Try reading dimensions using rasterio (robust) or cv2
+                try:
+                    with rasterio.open(full_path) as src:
+                        h, w = src.height, src.width
+                except:
+                    try:
+                        img_tmp = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+                        if img_tmp is not None:
+                            h, w = img_tmp.shape[:2]
+                    except:
+                        pass  # Default to IMG_SIZE if all fails
+
+                original_shapes.append((h, w))
+=======
+            # Retrieve Original Shapes for Rescaling
+            original_shapes = []
+            for img_id in img_ids:
+                path = img_id_to_path.get(img_id)
+                full_path = os.path.join(Config.INPUT_DIR, path)
+                
+                # Use robust reader
+                _, (rows, cols) = read_dicom(full_path)
+                
+                if rows is not None and cols is not None:
+                    h, w = rows, cols
+                else:
+                    h, w = Config.IMG_SIZE, Config.IMG_SIZE
+
+                original_shapes.append((h, w))
+>>>>>>> REPLACE
+```

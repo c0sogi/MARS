@@ -1,0 +1,174 @@
+import os
+import glob
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedShuffleSplit
+
+# Constants
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+VAL_SIZE = 0.2
+
+
+def generate_metadata():
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Loading raw metadata...")
+    # Load train.csv
+    train_csv_path = os.path.join(INPUT_DIR, "train.csv")
+    df = pd.read_csv(train_csv_path)
+
+    # Construct relative file paths for training data
+    # The files are located in input/train/{segment_id}.csv
+    df["file_path"] = df["segment_id"].apply(
+        lambda x: os.path.join("train", f"{x}.csv")
+    )
+
+    # Stratified Split for Regression
+    # We bin the continuous target 'time_to_eruption' to perform stratified splitting
+    # This ensures the validation set has a representative distribution of eruption times
+    num_bins = 10
+    df["target_bins"] = pd.qcut(
+        df["time_to_eruption"], q=num_bins, labels=False, duplicates="drop"
+    )
+
+    split = StratifiedShuffleSplit(
+        n_splits=1, test_size=VAL_SIZE, random_state=RANDOM_STATE
+    )
+
+    train_idx, val_idx = next(split.split(df, df["target_bins"]))
+
+    train_df = df.iloc[train_idx].copy()
+    val_df = df.iloc[val_idx].copy()
+
+    # Drop the temporary binning column
+    train_df.drop(columns=["target_bins"], inplace=True)
+    val_df.drop(columns=["target_bins"], inplace=True)
+
+    print(f"Split completed. Train shape: {train_df.shape}, Val shape: {val_df.shape}")
+
+    # Generate Test Metadata
+    # Test files are in input/test/*.csv. We need to scan the directory.
+    test_files = glob.glob(os.path.join(INPUT_DIR, "test", "*.csv"))
+    test_data = []
+    for fp in test_files:
+        # Extract segment_id from filename
+        filename = os.path.basename(fp)
+        segment_id = os.path.splitext(filename)[0]
+        # Path relative to input directory
+        rel_path = os.path.join("test", filename)
+        test_data.append({"segment_id": int(segment_id), "file_path": rel_path})
+
+    test_df = pd.DataFrame(test_data)
+    print(f"Test metadata generated. Shape: {test_df.shape}")
+
+    # Save metadata
+    train_save_path = os.path.join(METADATA_DIR, "train.csv")
+    val_save_path = os.path.join(METADATA_DIR, "val.csv")
+    test_save_path = os.path.join(METADATA_DIR, "test.csv")
+
+    train_df.to_csv(train_save_path, index=False)
+    val_df.to_csv(val_save_path, index=False)
+    test_df.to_csv(test_save_path, index=False)
+
+    print(f"Metadata saved to {METADATA_DIR}")
+
+    return train_save_path, val_save_path, test_save_path
+
+
+def validate_metadata(train_path, val_path, test_path):
+    print("\nStarting Validation Checks...")
+
+    # Load datasets
+    train_df = pd.read_csv(train_path)
+    val_df = pd.read_csv(val_path)
+    test_df = pd.read_csv(test_path)
+
+    # 1. Print Summary Statistics
+    print("\n--- Summary Statistics ---")
+    print(f"Train Set: {len(train_df)} samples")
+    print(f"Train Target Mean: {train_df['time_to_eruption'].mean():.2f}")
+    print(f"Train Target Std: {train_df['time_to_eruption'].std():.2f}")
+
+    print(f"Val Set: {len(val_df)} samples")
+    print(f"Val Target Mean: {val_df['time_to_eruption'].mean():.2f}")
+    print(f"Val Target Std: {val_df['time_to_eruption'].std():.2f}")
+
+    print(f"Test Set: {len(test_df)} samples")
+
+    # 2. Check File Paths
+    print("\n--- Checking File Paths ---")
+
+    def check_paths(df, name):
+        if "file_path" not in df.columns:
+            return
+
+        # Select up to 1000 random paths
+        n_check = min(1000, len(df))
+        sample_paths = df["file_path"].sample(n=n_check, random_state=RANDOM_STATE)
+
+        missing_count = 0
+        missing_samples = []
+
+        for rel_path in sample_paths:
+            full_path = os.path.join(INPUT_DIR, rel_path)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(rel_path)
+
+        missing_ratio = missing_count / n_check
+        print(f"{name}: Checked {n_check} paths. Missing ratio: {missing_ratio:.4f}")
+
+        if missing_ratio > 0.5:
+            print("Sample missing paths:", missing_samples)
+            raise FileNotFoundError(
+                f"More than 50% of file paths in {name} are missing."
+            )
+
+    check_paths(train_df, "Train")
+    check_paths(val_df, "Val")
+    check_paths(test_df, "Test")
+
+    # 3. Verify Validation Split Requirements
+    print("\n--- Verifying Split Logic ---")
+
+    # Check Split Ratio
+    total_train_val = len(train_df) + len(val_df)
+    actual_val_ratio = len(val_df) / total_train_val
+    print(f"Actual Validation Ratio: {actual_val_ratio:.4f} (Target: {VAL_SIZE})")
+
+    # Allow small floating point deviation
+    assert (
+        abs(actual_val_ratio - VAL_SIZE) < 0.01
+    ), f"Validation split ratio mismatch. Expected {VAL_SIZE}, got {actual_val_ratio}"
+
+    # Check Stratification (Distribution Similarity)
+    # We compare the mean and standard deviation of the target variable.
+    # Since we used stratified splitting based on quantiles, the stats should be close.
+    train_mean = train_df["time_to_eruption"].mean()
+    val_mean = val_df["time_to_eruption"].mean()
+
+    # Calculate percentage difference in means
+    mean_diff_pct = abs(train_mean - val_mean) / train_mean
+    print(f"Difference in target means: {mean_diff_pct:.2%}")
+
+    # We expect the distributions to be reasonably close (e.g., within 10% for mean)
+    # given the stratified sampling on bins.
+    if mean_diff_pct > 0.1:
+        raise AssertionError(
+            "Validation set distribution deviates significantly from training set. Stratification may have failed."
+        )
+
+    print("Validation checks passed successfully.")
+
+
+if __name__ == "__main__":
+    try:
+        t_path, v_path, te_path = generate_metadata()
+        validate_metadata(t_path, v_path, te_path)
+    except Exception as e:
+        print(f"\nERROR: Script failed with exception: {e}")
+        raise e

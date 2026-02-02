@@ -1,0 +1,323 @@
+To improve the model's performance, I will implement the following optimizations based on the provided lessons:
+
+1.  **Increase Batch Size to 64**: I will increase `BATCH_SIZE` from 32 to 64 in `library/config.py`. As noted in **Lesson ID: solution_lesson_node_00186**, wide architectures with Batch Normalization require larger batch sizes to maintain stable statistics and convergence. The reduction to 32 in the previous solution was a primary cause of performance degradation.
+
+2.  **Simplify Readout Architecture**: I will revert the complex "Tri-Path Readout" to a "Robust Dual-Path" configuration in `library/model.py`.
+    *   **Remove Global Contrast Path**: I will remove the explicit "Peak-Shadow Difference" path (Path C). **Lesson ID: solution_lesson_node_00135** and **solution_lesson_node_00171** suggest that adding complex, lower-level statistical shortcuts or multiplicative gating often degrades performance in noisy SAR data compared to allowing the network to learn these features via standard concatenation.
+    *   **Remove Pre-Fusion Batch Normalization**: I will remove the Batch Normalization layers applied to the individual feature branches (Spatial and Intensity) immediately before concatenation. **Lesson ID: solution_lesson_node_00162** explicitly warns that normalizing branches independently destroys the relative scaling information (signal magnitude) critical for distinguishing bright targets.
+
+3.  **Rename Model Class**: I will rename `CA_WBN` (Contrast-Augmented Wide-Body Network) to `RDP_WBN` (Robust Dual-Path Wide-Body Network) to reflect these structural changes and update all references in `library/trainer.py` and `runfile.py`.
+
+4.  **Maintain Metadata Embedding**: I will preserve the 2-layer MLP for metadata embedding, as **Lesson ID: solution_lesson_node_00158** confirms that a hidden layer is necessary for effective scalar fusion.
+
+These changes aim to restore the stability and representational power of the "Current Best Solution" (Idea 31) referenced in the lessons.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+NUM_FOLDS = 5
+BATCH_SIZE = 32
+LEARNING_RATE = 2e-4  # "Low and Slow" strategy
+=======
+NUM_FOLDS = 5
+BATCH_SIZE = 64
+LEARNING_RATE = 2e-4  # "Low and Slow" strategy
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CA_WBN(nn.Module):
+    """
+    Contrast-Augmented Wide-Body Network.
+    """
+
+    def __init__(self):
+        super(CA_WBN, self).__init__()
+
+        # --- Visual Branch ---
+        # Stage 1: Input 3ch -> Conv(128) -> CBAM -> DualPool(256)
+        # Note: DualPooling doubles channels.
+        self.stage1_conv = WideConvBlock(3, 128)
+        self.stage1_cbam = CBAM(128)
+        self.stage1_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 2: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        # Delayed Integration: 256 -> 128
+        self.stage2_conv = WideConvBlock(256, 128)
+        self.stage2_cbam = CBAM(128)
+        self.stage2_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 3: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        self.stage3_conv = WideConvBlock(256, 128)
+        self.stage3_cbam = CBAM(128)
+        self.stage3_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 4: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        self.stage4_conv = WideConvBlock(256, 128)
+        self.stage4_cbam = CBAM(128)
+        self.stage4_pool = DualPooling(kernel_size=2, stride=2)
+
+        # --- Tri-Path Readout ---
+        # Stage 4 output is 256 channels (128 Peak, 128 Shadow), 4x4 spatial
+
+        # Path A: Spatial Context
+        # Conv 256 -> 64, 3x3, pad 1. Flatten. BN.
+        self.path_a_conv = nn.Conv2d(256, 64, kernel_size=3, padding=1, bias=False)
+        self.path_a_bn = nn.BatchNorm1d(64 * 4 * 4)  # 1024
+
+        # Path B: Global Intensity
+        # GAP 256 -> BN.
+        self.path_b_bn = nn.BatchNorm1d(256)
+
+        # Path C: Global Contrast
+        # Diff (128) -> GAP -> BN.
+        self.path_c_bn = nn.BatchNorm1d(128)
+
+        # --- Metadata Branch ---
+        self.meta_branch = MetadataBranch(hidden_dim=32, out_dim=32)
+
+        # --- Fusion Head ---
+        # Input: 1024 (A) + 256 (B) + 128 (C) + 32 (Meta) = 1440
+        self.fusion_fc = nn.Linear(1440, 512)
+        self.fusion_bn = nn.BatchNorm1d(512)
+        self.fusion_relu = nn.ReLU(inplace=True)
+        self.fusion_dropout = nn.Dropout(0.5)
+        self.classifier = nn.Linear(512, 1)
+
+    def forward(self, x_img, x_meta):
+        # --- Visual Forward ---
+        # Stage 1
+        x = self.stage1_conv(x_img)
+        x = self.stage1_cbam(x)
+        x = self.stage1_pool(x)
+
+        # Stage 2
+        x = self.stage2_conv(x)
+        x = self.stage2_cbam(x)
+        x = self.stage2_pool(x)
+
+        # Stage 3
+        x = self.stage3_conv(x)
+        x = self.stage3_cbam(x)
+        x = self.stage3_pool(x)
+
+        # Stage 4
+        x = self.stage4_conv(x)
+        x = self.stage4_cbam(x)
+        x = self.stage4_pool(x)  # (B, 256, 4, 4)
+
+        # --- Readout ---
+
+        # Path A: Spatial
+        feat_a = self.path_a_conv(x)  # (B, 64, 4, 4)
+        feat_a = feat_a.view(feat_a.size(0), -1)  # (B, 1024)
+        feat_a = self.path_a_bn(feat_a)
+
+        # Path B: Global Intensity
+        feat_b = F.adaptive_avg_pool2d(x, 1).view(x.size(0), -1)  # (B, 256)
+        feat_b = self.path_b_bn(feat_b)
+
+        # Path C: Global Contrast
+        # x is (B, 256, 4, 4). First 128 are Max (Peak), Last 128 are Min (Shadow)
+        peak = x[:, :128, :, :]
+        shadow = x[:, 128:, :, :]
+        diff = peak - shadow  # (B, 128, 4, 4)
+        feat_c = F.adaptive_avg_pool2d(diff, 1).view(diff.size(0), -1)  # (B, 128)
+        feat_c = self.path_c_bn(feat_c)
+
+        # --- Metadata Forward ---
+        feat_meta = self.meta_branch(x_meta)  # (B, 32)
+
+        # --- Fusion ---
+        fused = torch.cat([feat_a, feat_b, feat_c, feat_meta], dim=1)  # (B, 1440)
+
+        out = self.fusion_fc(fused)
+        out = self.fusion_bn(out)
+        out = self.fusion_relu(out)
+        out = self.fusion_dropout(out)
+        logits = self.classifier(out)
+
+        return torch.sigmoid(logits)
+=======
+class RDP_WBN(nn.Module):
+    """
+    Robust Dual-Path Wide-Body Network.
+    Cite {solution_lesson_node_00123}: Dual-Path Readout (Spatial + GAP).
+    Cite {solution_lesson_node_00162}: No pre-fusion BN on branches.
+    """
+
+    def __init__(self):
+        super(RDP_WBN, self).__init__()
+
+        # --- Visual Branch ---
+        # Stage 1: Input 3ch -> Conv(128) -> CBAM -> DualPool(256)
+        # Note: DualPooling doubles channels.
+        self.stage1_conv = WideConvBlock(3, 128)
+        self.stage1_cbam = CBAM(128)
+        self.stage1_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 2: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        # Delayed Integration: 256 -> 128
+        self.stage2_conv = WideConvBlock(256, 128)
+        self.stage2_cbam = CBAM(128)
+        self.stage2_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 3: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        self.stage3_conv = WideConvBlock(256, 128)
+        self.stage3_cbam = CBAM(128)
+        self.stage3_pool = DualPooling(kernel_size=2, stride=2)
+
+        # Stage 4: Input 256ch -> Conv(128) -> CBAM -> DualPool(256)
+        self.stage4_conv = WideConvBlock(256, 128)
+        self.stage4_cbam = CBAM(128)
+        self.stage4_pool = DualPooling(kernel_size=2, stride=2)
+
+        # --- Dual-Path Readout ---
+        # Stage 4 output is 256 channels (128 Peak, 128 Shadow), 4x4 spatial
+
+        # Path A: Spatial Context
+        # Conv 256 -> 64, 3x3, pad 1. Flatten.
+        # Cite {solution_lesson_node_00162}: No BN here.
+        self.path_a_conv = nn.Conv2d(256, 64, kernel_size=3, padding=1, bias=False)
+        # Output: 64 * 4 * 4 = 1024
+
+        # Path B: Global Intensity
+        # GAP 256.
+        # Cite {solution_lesson_node_00162}: No BN here.
+
+        # --- Metadata Branch ---
+        # Cite {solution_lesson_node_00158}: MLP with hidden layer.
+        self.meta_branch = MetadataBranch(hidden_dim=32, out_dim=32)
+
+        # --- Fusion Head ---
+        # Input: 1024 (A) + 256 (B) + 32 (Meta) = 1312
+        self.fusion_fc = nn.Linear(1312, 512)
+        self.fusion_bn = nn.BatchNorm1d(512)
+        self.fusion_relu = nn.ReLU(inplace=True)
+        self.fusion_dropout = nn.Dropout(0.5)
+        self.classifier = nn.Linear(512, 1)
+
+    def forward(self, x_img, x_meta):
+        # --- Visual Forward ---
+        # Stage 1
+        x = self.stage1_conv(x_img)
+        x = self.stage1_cbam(x)
+        x = self.stage1_pool(x)
+
+        # Stage 2
+        x = self.stage2_conv(x)
+        x = self.stage2_cbam(x)
+        x = self.stage2_pool(x)
+
+        # Stage 3
+        x = self.stage3_conv(x)
+        x = self.stage3_cbam(x)
+        x = self.stage3_pool(x)
+
+        # Stage 4
+        x = self.stage4_conv(x)
+        x = self.stage4_cbam(x)
+        x = self.stage4_pool(x)  # (B, 256, 4, 4)
+
+        # --- Readout ---
+
+        # Path A: Spatial
+        feat_a = self.path_a_conv(x)  # (B, 64, 4, 4)
+        feat_a = feat_a.view(feat_a.size(0), -1)  # (B, 1024)
+
+        # Path B: Global Intensity
+        feat_b = F.adaptive_avg_pool2d(x, 1).view(x.size(0), -1)  # (B, 256)
+
+        # --- Metadata Forward ---
+        feat_meta = self.meta_branch(x_meta)  # (B, 32)
+
+        # --- Fusion ---
+        # Cite {solution_lesson_node_00162}: Concatenate raw features.
+        fused = torch.cat([feat_a, feat_b, feat_meta], dim=1)  # (B, 1312)
+
+        out = self.fusion_fc(fused)
+        out = self.fusion_bn(out)
+        out = self.fusion_relu(out)
+        out = self.fusion_dropout(out)
+        logits = self.classifier(out)
+
+        return torch.sigmoid(logits)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Model Setup
+        model = CA_WBN().to(DEVICE)
+        optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
+=======
+        # Model Setup
+        model = RDP_WBN().to(DEVICE)
+        optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    for fold in range(NUM_FOLDS):
+        path = os.path.join(MODEL_DIR, f"model_fold_{fold}.pth")
+        if os.path.exists(path):
+            model = CA_WBN().to(DEVICE)
+            model.load_state_dict(torch.load(path, map_location=DEVICE))
+            model.eval()
+            models.append(model)
+=======
+    for fold in range(NUM_FOLDS):
+        path = os.path.join(MODEL_DIR, f"model_fold_{fold}.pth")
+        if os.path.exists(path):
+            model = RDP_WBN().to(DEVICE)
+            model.load_state_dict(torch.load(path, map_location=DEVICE))
+            model.eval()
+            models.append(model)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import CA_WBN
+from library.data_loader import get_loaders
+=======
+from library.model import RDP_WBN
+from library.data_loader import get_loaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Initialize Model, Optimizer, Criterion
+        model = CA_WBN().to(DEVICE)
+
+        # Revert from AdamW to Adam as per idea description ("Low and Slow" strategy)
+=======
+        # Initialize Model, Optimizer, Criterion
+        model = RDP_WBN().to(DEVICE)
+
+        # Revert from AdamW to Adam as per idea description ("Low and Slow" strategy)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    if os.path.exists(path):
+        m = model_lib.CA_WBN().to(config.DEVICE)
+        m.load_state_dict(torch.load(path, map_location=config.DEVICE))
+        m.eval()
+=======
+    if os.path.exists(path):
+        m = model_lib.RDP_WBN().to(config.DEVICE)
+        m.load_state_dict(torch.load(path, map_location=config.DEVICE))
+        m.eval()
+>>>>>>> REPLACE
+```

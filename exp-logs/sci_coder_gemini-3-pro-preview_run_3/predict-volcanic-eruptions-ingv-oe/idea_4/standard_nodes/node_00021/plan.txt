@@ -1,0 +1,287 @@
+To optimize the solution and address the severe overfitting observed in the previous run (Validation MAE ~3.45M vs Target ~2.74M), I will implement a targeted simplification of the feature engineering pipeline.
+
+**Strategy:**
+1.  **Remove Kinematic and Complexity Features:** Based on **Lesson 6** and **Lesson 12**, derivative features (velocity, acceleration) and complexity metrics (entropy, kurtosis) are primary sources of noise amplification and overfitting in this dataset. I will completely remove the computation of `velocity`, `acceleration`, `skewness`, `kurtosis`, `spectral_entropy`, and `spectral_centroid`.
+2.  **Focus on Robust Statistical Aggregates:** I will retain and rely on the feature sets that have historically performed well (as per **Lesson 2** and **Lesson 7**):
+    *   **Global Statistics:** Mean, Std, Min, Max, and Quantiles (1%, 5%, 95%, 99%).
+    *   **Windowed Statistics:** Explicit temporal flattening of Mean and Std across 10 windows (**Lesson 10**).
+    *   **Spectral Band Power:** Total power and energy in Low/Mid/High frequency bands (**Lesson 7**).
+3.  **Cache Invalidation:** I will update the working directory path in the configuration to ensure the model does not load the previously computed (noisy) features from the cache (**Lesson 13**).
+
+This approach reduces the feature space from ~570 to ~320 highly informative features, minimizing the risk of the model memorizing high-frequency noise.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+WORKING_DIR = "./working/idea_5"
+=======
+WORKING_DIR = "./working/idea_optimized"
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+def apply_savitzky_golay(data):
+    """
+    Applies Savitzky-Golay filter to smooth the data.
+    """
+    # axis=0 ensures we filter along the time dimension for all sensors
+    return signal.savgol_filter(
+        data, window_length=SG_WINDOW_LENGTH, polyorder=SG_POLYORDER, axis=0
+    )
+
+
+def compute_kinematics(smoothed_data):
+    """
+    Computes first (velocity) and second (acceleration) derivatives.
+    """
+    velocity = np.gradient(smoothed_data, axis=0)
+    acceleration = np.gradient(velocity, axis=0)
+    return velocity, acceleration
+
+
+def calculate_stats(array, prefix):
+    """
+    Calculates basic statistics for a given array.
+    Returns a dictionary.
+    """
+    # Handle potential empty or all-NaN arrays
+    if array.size == 0:
+        return {}
+
+    # We assume array is 1D here (one sensor's data)
+    res = {}
+    res[f"{prefix}_mean"] = np.mean(array)
+    std_val = np.std(array)
+    res[f"{prefix}_std"] = std_val
+    res[f"{prefix}_min"] = np.min(array)
+    res[f"{prefix}_max"] = np.max(array)
+
+    if std_val == 0:
+        res[f"{prefix}_skew"] = 0.0
+        res[f"{prefix}_kurt"] = 0.0
+    else:
+        res[f"{prefix}_skew"] = stats.skew(array, nan_policy="propagate")
+        res[f"{prefix}_kurt"] = stats.kurtosis(array, nan_policy="propagate")
+
+    # Quantiles
+    q = np.quantile(array, [0.01, 0.05, 0.95, 0.99])
+    res[f"{prefix}_q01"] = q[0]
+    res[f"{prefix}_q05"] = q[1]
+    res[f"{prefix}_q95"] = q[2]
+    res[f"{prefix}_q99"] = q[3]
+
+    return res
+
+
+def compute_spectral_features(x, fs=100.0):
+    """
+    Computes spectral features using Welch's method.
+    """
+    f, Pxx = signal.welch(x, fs=fs, nperseg=256)
+
+    # Total Power
+    total_power = np.sum(Pxx)
+
+    # Spectral Centroid & Entropy
+    if total_power == 0:
+        centroid = 0
+        spec_entropy = 0
+    else:
+        centroid = np.sum(f * Pxx) / total_power
+        # Cite Lesson 5: Spectral entropy captures signal complexity/texture
+        spec_entropy = stats.entropy(Pxx)
+
+    # Dominant Frequency
+    dominant_freq = f[np.argmax(Pxx)]
+
+    # Band Powers (Simplified relative bins)
+    # Low: Bottom 20%, Mid: Middle 60%, High: Top 20%
+    # Cite Lesson 7: Capturing energy in specific bands is more effective than generic stats
+    n_bins = len(Pxx)
+    low_idx = int(n_bins * 0.2)
+    high_idx = int(n_bins * 0.8)
+
+    power_low = np.sum(Pxx[:low_idx])
+    power_mid = np.sum(Pxx[low_idx:high_idx])
+    power_high = np.sum(Pxx[high_idx:])
+
+    return {
+        "spec_centroid": centroid,
+        "spec_dom_freq": dominant_freq,
+        "spec_power_total": total_power,
+        "spec_power_low": power_low,
+        "spec_power_mid": power_mid,
+        "spec_power_high": power_high,
+        "spec_entropy": spec_entropy,
+    }
+
+
+def process_segment(row):
+    """
+    Processes a single data segment: loads file, cleans, extracts features.
+    """
+    segment_id = int(row["segment_id"])
+    file_path = os.path.join(INPUT_DIR, row["file_path"])
+
+    try:
+        # Load Data
+        df = pd.read_csv(file_path, dtype="float32")
+
+        # Imputation
+        if FILL_NA_STRATEGY == "mean":
+            df = df.fillna(df.mean()).fillna(0)
+        else:
+            df = df.fillna(0)
+
+        # Extract raw numpy array for processing
+        sensor_data = df[SENSOR_COLS].values
+
+        # 1. Smoothing
+        smoothed_data = apply_savitzky_golay(sensor_data)
+
+        # 2. Kinematics
+        velocity, acceleration = compute_kinematics(smoothed_data)
+
+        features = {}
+        features["segment_id"] = segment_id
+
+        # Iterate over each sensor
+        for i, col in enumerate(SENSOR_COLS):
+            raw_sig = sensor_data[:, i]
+            smooth_sig = smoothed_data[:, i]
+            vel_sig = velocity[:, i]
+            acc_sig = acceleration[:, i]
+
+            # --- A. Global Stats (Raw) ---
+            features.update(calculate_stats(raw_sig, f"{col}_raw"))
+
+            # --- B. Kinematic Stats (Smoothed Derivatives) ---
+            features.update(calculate_stats(vel_sig, f"{col}_vel"))
+            features.update(calculate_stats(acc_sig, f"{col}_acc"))
+
+            # --- C. Windowed Stats (Raw) ---
+            # Split signal into windows
+            windows = np.array_split(raw_sig, NUM_WINDOWS)
+            for w_idx, window in enumerate(windows):
+                features[f"{col}_win{w_idx}_mean"] = np.mean(window)
+                features[f"{col}_win{w_idx}_std"] = np.std(window)
+
+            # --- D. Spectral Features (Raw) ---
+            spec_feats = compute_spectral_features(raw_sig)
+            for k, v in spec_feats.items():
+                features[f"{col}_{k}"] = v
+
+        # Add target if available
+        if "time_to_eruption" in row:
+            features["time_to_eruption"] = row["time_to_eruption"]
+
+        return features
+=======
+def calculate_stats(array, prefix):
+    """
+    Calculates basic statistics for a given array.
+    Returns a dictionary.
+    """
+    # Handle potential empty or all-NaN arrays
+    if array.size == 0:
+        return {}
+
+    # We assume array is 1D here (one sensor's data)
+    res = {}
+    res[f"{prefix}_mean"] = np.mean(array)
+    res[f"{prefix}_std"] = np.std(array)
+    res[f"{prefix}_min"] = np.min(array)
+    res[f"{prefix}_max"] = np.max(array)
+
+    # Quantiles
+    q = np.quantile(array, [0.01, 0.05, 0.95, 0.99])
+    res[f"{prefix}_q01"] = q[0]
+    res[f"{prefix}_q05"] = q[1]
+    res[f"{prefix}_q95"] = q[2]
+    res[f"{prefix}_q99"] = q[3]
+
+    return res
+
+
+def compute_spectral_features(x, fs=100.0):
+    """
+    Computes spectral features using Welch's method.
+    """
+    f, Pxx = signal.welch(x, fs=fs, nperseg=256)
+
+    # Total Power
+    total_power = np.sum(Pxx)
+
+    # Band Powers (Simplified relative bins)
+    # Low: Bottom 20%, Mid: Middle 60%, High: Top 20%
+    # Cite Lesson 7: Capturing energy in specific bands is more effective than generic stats
+    n_bins = len(Pxx)
+    low_idx = int(n_bins * 0.2)
+    high_idx = int(n_bins * 0.8)
+
+    power_low = np.sum(Pxx[:low_idx])
+    power_mid = np.sum(Pxx[low_idx:high_idx])
+    power_high = np.sum(Pxx[high_idx:])
+
+    return {
+        "spec_power_total": total_power,
+        "spec_power_low": power_low,
+        "spec_power_mid": power_mid,
+        "spec_power_high": power_high,
+    }
+
+
+def process_segment(row):
+    """
+    Processes a single data segment: loads file, cleans, extracts features.
+    """
+    segment_id = int(row["segment_id"])
+    file_path = os.path.join(INPUT_DIR, row["file_path"])
+
+    try:
+        # Load Data
+        df = pd.read_csv(file_path, dtype="float32")
+
+        # Imputation
+        if FILL_NA_STRATEGY == "mean":
+            df = df.fillna(df.mean()).fillna(0)
+        else:
+            df = df.fillna(0)
+
+        # Extract raw numpy array for processing
+        sensor_data = df[SENSOR_COLS].values
+
+        features = {}
+        features["segment_id"] = segment_id
+
+        # Iterate over each sensor
+        for i, col in enumerate(SENSOR_COLS):
+            raw_sig = sensor_data[:, i]
+
+            # --- A. Global Stats (Raw) ---
+            # Cite Lesson 2: Statistical feature extraction (moments/quantiles)
+            features.update(calculate_stats(raw_sig, f"{col}_raw"))
+
+            # --- B. Windowed Stats (Raw) ---
+            # Cite Lesson 10: Explicit Temporal Flattening (preserving window order)
+            # Split signal into windows
+            windows = np.array_split(raw_sig, NUM_WINDOWS)
+            for w_idx, window in enumerate(windows):
+                features[f"{col}_win{w_idx}_mean"] = np.mean(window)
+                features[f"{col}_win{w_idx}_std"] = np.std(window)
+
+            # --- C. Spectral Features (Raw) ---
+            # Cite Lesson 7: Domain-Specific Band Power
+            spec_feats = compute_spectral_features(raw_sig)
+            for k, v in spec_feats.items():
+                features[f"{col}_{k}"] = v
+
+        # Add target if available
+        if "time_to_eruption" in row:
+            features["time_to_eruption"] = row["time_to_eruption"]
+
+        return features
+>>>>>>> REPLACE
+```

@@ -1,0 +1,513 @@
+Based on the lessons learned, specifically **Lesson 00012** (avoid high-capacity models for coarse masks), **Lesson 00010** (prioritize dense tasks and use simple heads), and **Lesson 00008** (constrain global head capacity), I will optimize the solution by reverting to a **ResNet18** backbone. This lighter backbone acts as a structural regularizer, preventing overfitting to the coarse bounding-box-derived segmentation masks. I will also increase the **Batch Size to 32** to stabilize batch normalization statistics, disable **Deep Supervision** and **Dice Loss** to simplify the objective function (Cite solution_lesson_node_00012), and ensure the segmentation loss is heavily weighted (10:1) against the classification loss (Cite solution_lesson_node_00010).
+
+Here are the changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for Idea 4 (Intermediate files & Checkpoints)
+    WORKING_DIR = "./working/idea_4"
+    os.makedirs(WORKING_DIR, exist_ok=True)
+=======
+    # Working directory for Optimized Solution (Intermediate files & Checkpoints)
+    WORKING_DIR = "./working/optimized"
+    os.makedirs(WORKING_DIR, exist_ok=True)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    BACKBONE = "efficientnet_b4"
+    DEEP_SUPERVISION = True  # Enable auxiliary heads at 1/2 and 1/4 resolution
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    # Batch size adjusted for EfficientNet-B4 @ 512x512 on A100
+    BATCH_SIZE = 8
+    EPOCHS = 20
+=======
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    BACKBONE = "resnet18"
+    DEEP_SUPERVISION = False  # Disable auxiliary heads for simpler objective
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    # Batch size increased for ResNet18 @ 512x512 on A100 (Cite solution_lesson_node_00012)
+    BATCH_SIZE = 32
+    EPOCHS = 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class DiceLoss(nn.Module):
+    """
+    Dice Coefficient Loss for binary segmentation.
+    Computes 1 - Dice Score.
+    """
+
+    def __init__(self, smooth=1e-6):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        # Apply sigmoid to logits to get probabilities
+        probs = torch.sigmoid(logits)
+
+        # Flatten label and prediction tensors
+        probs = probs.view(-1)
+        targets = targets.view(-1)
+
+        intersection = (probs * targets).sum()
+        dice = (2.0 * intersection + self.smooth) / (
+            probs.sum() + targets.sum() + self.smooth
+        )
+
+        return 1 - dice
+
+
+class HybridLoss(nn.Module):
+    """
+    Hybrid Loss function combining Study-level CrossEntropy and
+    Image-level BCE + Dice Loss with Deep Supervision support.
+    """
+
+    def __init__(self):
+        super(HybridLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.dice_loss = DiceLoss()
+
+        self.cls_weight = Config.LOSS_WEIGHT_CLS
+        self.seg_weight = Config.LOSS_WEIGHT_SEG
+        self.deep_supervision = Config.DEEP_SUPERVISION
+
+    def forward(self, study_logits, mask_logits, study_targets, mask_targets):
+        """
+        Args:
+            study_logits (torch.Tensor): (B, 4) Raw logits for study classification.
+            mask_logits (torch.Tensor or list): (B, 1, H, W) or list of tensors for deep supervision.
+            study_targets (torch.Tensor): (B, 4) One-hot encoded targets or (B,) indices.
+            mask_targets (torch.Tensor): (B, 1, H, W) Binary segmentation masks.
+
+        Returns:
+            dict: Dictionary containing 'loss' (total) and components for logging.
+        """
+
+        # ===========================
+        # 1. Study-Level Loss
+        # ===========================
+        # Ensure targets are class indices for CrossEntropyLoss
+        if study_targets.dim() == 2 and study_targets.shape[1] == Config.NUM_CLASSES:
+            # Convert one-hot to indices
+            study_targets_indices = torch.argmax(study_targets, dim=1)
+        else:
+            study_targets_indices = study_targets.long()
+
+        study_loss = self.ce_loss(study_logits, study_targets_indices)
+
+        # ===========================
+        # 2. Image-Level Loss
+        # ===========================
+        seg_loss = 0.0
+        bce_loss_val = 0.0
+        dice_loss_val = 0.0
+
+        # Ensure mask targets are float for BCE/Dice
+        mask_targets = mask_targets.float()
+
+        if self.deep_supervision and isinstance(mask_logits, (list, tuple)):
+            # Deep Supervision: mask_logits is [output_final, output_half, output_quarter, ...]
+            # Standard weights for U-Net deep supervision
+            weights = [1.0, 0.5, 0.25, 0.125]
+
+            for i, pred in enumerate(mask_logits):
+                # Use default small weight if we exceed defined weights
+                weight = weights[i] if i < len(weights) else 0.1
+
+                # Resize target to match prediction resolution
+                if pred.shape[-2:] != mask_targets.shape[-2:]:
+                    target_resized = F.interpolate(
+                        mask_targets, size=pred.shape[-2:], mode="nearest"
+                    )
+                else:
+                    target_resized = mask_targets
+
+                bce = self.bce_loss(pred, target_resized)
+                dice = self.dice_loss(pred, target_resized)
+
+                # Sum components
+                loss_component = bce + dice
+                seg_loss += weight * loss_component
+
+                # Log metrics for the primary head (full resolution)
+                if i == 0:
+                    bce_loss_val = bce
+                    dice_loss_val = dice
+        else:
+            # Single Output
+            # Handle case where deep supervision is off but model returns a list (e.g. just one element)
+            if isinstance(mask_logits, (list, tuple)):
+                mask_logits = mask_logits[0]
+
+            bce_loss_val = self.bce_loss(mask_logits, mask_targets)
+            dice_loss_val = self.dice_loss(mask_logits, mask_targets)
+            seg_loss = bce_loss_val + dice_loss_val
+
+        # ===========================
+        # 3. Total Loss Aggregation
+        # ===========================
+        # Apply strict 1:10 weighting ratio as per strategy
+        total_loss = (self.cls_weight * study_loss) + (self.seg_weight * seg_loss)
+
+        return {
+            "loss": total_loss,
+            "study_loss": study_loss,
+            "seg_loss": seg_loss,
+            "bce_loss": bce_loss_val,
+            "dice_loss": dice_loss_val,
+        }
+=======
+class HybridLoss(nn.Module):
+    """
+    Hybrid Loss function combining Study-level CrossEntropy and
+    Image-level BCE Loss.
+    Removed DiceLoss to avoid overfitting to coarse annotations (Cite solution_lesson_node_00012).
+    """
+
+    def __init__(self):
+        super(HybridLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+        self.cls_weight = Config.LOSS_WEIGHT_CLS
+        self.seg_weight = Config.LOSS_WEIGHT_SEG
+
+    def forward(self, study_logits, mask_logits, study_targets, mask_targets):
+        """
+        Args:
+            study_logits (torch.Tensor): (B, 4) Raw logits for study classification.
+            mask_logits (torch.Tensor): (B, 1, H, W) Logits for segmentation.
+            study_targets (torch.Tensor): (B, 4) One-hot encoded targets or (B,) indices.
+            mask_targets (torch.Tensor): (B, 1, H, W) Binary segmentation masks.
+        """
+
+        # ===========================
+        # 1. Study-Level Loss
+        # ===========================
+        if study_targets.dim() == 2 and study_targets.shape[1] == Config.NUM_CLASSES:
+            study_targets_indices = torch.argmax(study_targets, dim=1)
+        else:
+            study_targets_indices = study_targets.long()
+
+        study_loss = self.ce_loss(study_logits, study_targets_indices)
+
+        # ===========================
+        # 2. Image-Level Loss
+        # ===========================
+        mask_targets = mask_targets.float()
+        
+        # Handle list input if model returns list (legacy support)
+        if isinstance(mask_logits, (list, tuple)):
+            mask_logits = mask_logits[0]
+
+        seg_loss = self.bce_loss(mask_logits, mask_targets)
+
+        # ===========================
+        # 3. Total Loss Aggregation
+        # ===========================
+        # Prioritize dense task (Cite solution_lesson_node_00010)
+        total_loss = (self.cls_weight * study_loss) + (self.seg_weight * seg_loss)
+
+        return {
+            "loss": total_loss,
+            "study_loss": study_loss,
+            "seg_loss": seg_loss,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class EfficientNetB4Unet(nn.Module):
+    """
+    EfficientNet-B4 U-Net with Deep Supervision and Constrained Classification Head.
+    """
+
+    def __init__(self):
+        super(EfficientNetB4Unet, self).__init__()
+
+        # 1. Encoder (Backbone)
+        # Load pre-trained EfficientNet-B4
+        # features_only=True returns the feature maps at different strides
+        self.encoder = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),  # Strides: 2, 4, 8, 16, 32
+        )
+
+        # Get channel counts from the backbone
+        # Typical B4 channels: [24, 32, 56, 160, 448]
+        enc_channels = self.encoder.feature_info.channels()
+        c0, c1, c2, c3, c4 = enc_channels
+
+        # 2. Constrained Classification Head
+        # Single Linear layer on top of Global Average Pooling of the bottleneck (c4)
+        self.cls_head = nn.Linear(c4, Config.NUM_CLASSES)
+
+        # 3. Decoder Path
+        # We start from the bottleneck (c4, stride 32)
+
+        # Block 1: Up 32 -> 16
+        self.dec1 = DecoderBlock(c4, c3, 256)
+
+        # Block 2: Up 16 -> 8
+        self.dec2 = DecoderBlock(256, c2, 128)
+
+        # Block 3: Up 8 -> 4
+        self.dec3 = DecoderBlock(128, c1, 64)
+
+        # Block 4: Up 4 -> 2
+        self.dec4 = DecoderBlock(64, c0, 32)
+
+        # Block 5: Up 2 -> 1 (Final Resolution)
+        # No skip connection from raw input typically used here in this design
+        self.dec5 = DecoderBlock(32, 0, 16)
+
+        # 4. Segmentation Heads
+        self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
+
+        self.deep_supervision = Config.DEEP_SUPERVISION
+        if self.deep_supervision:
+            # Auxiliary heads for Deep Supervision
+            # Attached at Stride 2 (Output of dec4)
+            self.aux_head_s2 = nn.Conv2d(32, 1, kernel_size=1)
+            # Attached at Stride 4 (Output of dec3)
+            self.aux_head_s4 = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        features = self.encoder(x)
+        # f0: stride 2
+        # f1: stride 4
+        # f2: stride 8
+        # f3: stride 16
+        # f4: stride 32 (Bottleneck)
+        f0, f1, f2, f3, f4 = features
+
+        # --- Classification Path ---
+        # Global Average Pooling
+        x_cls = F.adaptive_avg_pool2d(f4, (1, 1)).flatten(1)
+        study_logits = self.cls_head(x_cls)
+
+        # --- Decoder Path ---
+        d1 = self.dec1(f4, f3)  # -> Stride 16
+        d2 = self.dec2(d1, f2)  # -> Stride 8
+        d3 = self.dec3(d2, f1)  # -> Stride 4
+        d4 = self.dec4(d3, f0)  # -> Stride 2
+        d5 = self.dec5(d4)  # -> Stride 1
+
+        # --- Segmentation Heads ---
+        mask_logits_s1 = self.final_conv(d5)
+
+        if self.deep_supervision and self.training:
+            # Compute aux outputs
+            mask_logits_s2 = self.aux_head_s2(d4)
+            mask_logits_s4 = self.aux_head_s4(d3)
+
+            # Return list for HybridLoss to handle
+            return study_logits, [mask_logits_s1, mask_logits_s2, mask_logits_s4]
+        else:
+            # Inference or Val: Return only final resolution mask
+            return study_logits, mask_logits_s1
+=======
+class ResNet18Unet(nn.Module):
+    """
+    ResNet18 U-Net with simple linear classification head.
+    Lightweight backbone chosen to prevent overfitting to coarse masks (Cite solution_lesson_node_00012).
+    """
+
+    def __init__(self):
+        super(ResNet18Unet, self).__init__()
+
+        # 1. Encoder (Backbone)
+        # Load pre-trained ResNet18
+        self.encoder = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),
+        )
+
+        # ResNet18 channels: [64, 64, 128, 256, 512]
+        enc_channels = self.encoder.feature_info.channels()
+        c0, c1, c2, c3, c4 = enc_channels
+
+        # 2. Constrained Classification Head (Cite solution_lesson_node_00008)
+        self.cls_head = nn.Linear(c4, Config.NUM_CLASSES)
+
+        # 3. Decoder Path
+        # Block 1: Up 32 (512) -> 16 (256)
+        self.dec1 = DecoderBlock(c4, c3, 256)
+
+        # Block 2: Up 16 (256) -> 8 (128)
+        self.dec2 = DecoderBlock(256, c2, 128)
+
+        # Block 3: Up 8 (128) -> 4 (64)
+        self.dec3 = DecoderBlock(128, c1, 64)
+
+        # Block 4: Up 4 (64) -> 2 (64)
+        self.dec4 = DecoderBlock(64, c0, 32)
+
+        # Block 5: Up 2 (32) -> 1 (Original)
+        self.dec5 = DecoderBlock(32, 0, 16)
+
+        # 4. Segmentation Head
+        self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        features = self.encoder(x)
+        f0, f1, f2, f3, f4 = features
+
+        # --- Classification Path ---
+        x_cls = F.adaptive_avg_pool2d(f4, (1, 1)).flatten(1)
+        study_logits = self.cls_head(x_cls)
+
+        # --- Decoder Path ---
+        d1 = self.dec1(f4, f3)
+        d2 = self.dec2(d1, f2)
+        d3 = self.dec3(d2, f1)
+        d4 = self.dec4(d3, f0)
+        d5 = self.dec5(d4)
+
+        # --- Segmentation Head ---
+        mask_logits = self.final_conv(d5)
+
+        return study_logits, mask_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import EfficientNetB4Unet
+from library.utils import read_dicom, mask2box, seed_everything
+=======
+from library.model import ResNet18Unet
+from library.utils import read_dicom, mask2box, seed_everything
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    def __init__(self, model_path=None):
+        self.device = Config.DEVICE
+        self.model = EfficientNetB4Unet()
+
+        if model_path is None:
+=======
+    def __init__(self, model_path=None):
+        self.device = Config.DEVICE
+        self.model = ResNet18Unet()
+
+        if model_path is None:
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import EfficientNetB4Unet
+from library.engine import train_one_epoch, evaluate
+=======
+from library.model import ResNet18Unet
+from library.engine import train_one_epoch, evaluate
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = EfficientNetB4Unet()
+    model.to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = ResNet18Unet()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Final Evaluation & Analysis
+    print("\nTraining complete. Loading best model for final evaluation...")
+    model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+=======
+    # 5. Final Evaluation & Analysis
+    print("\nTraining complete. Loading best model for final evaluation...")
+    # Re-initialize model to ensure clean state before loading weights
+    model = ResNet18Unet()
+    model.to(device)
+    model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        batch_size = images.size(0)
+        total_loss_meter += loss.item() * batch_size
+        study_loss_meter += loss_dict["study_loss"].item() * batch_size
+        seg_loss_meter += loss_dict["seg_loss"].item() * batch_size
+        count += batch_size
+
+    avg_loss = total_loss_meter / count
+    avg_study_loss = study_loss_meter / count
+    avg_seg_loss = seg_loss_meter / count
+=======
+        batch_size = images.size(0)
+        total_loss_meter += loss.item() * batch_size
+        study_loss_meter += loss_dict["study_loss"].item() * batch_size
+        seg_loss_meter += loss_dict["seg_loss"].item() * batch_size
+        count += batch_size
+
+    avg_loss = total_loss_meter / count
+    avg_study_loss = study_loss_meter / count
+    avg_seg_loss = seg_loss_meter / count
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Calculate validation loss for monitoring
+            # Note: HybridLoss expects a list for mask_logits if deep supervision is on,
+            # but our model returns a single tensor in eval. We wrap it in a list for the loss function compatibility
+            # or rely on HybridLoss handling single tensors (which it does).
+            loss_dict = criterion(study_logits, mask_logits, labels, masks)
+            total_loss_meter += loss_dict["loss"].item() * batch_size
+            count += batch_size
+=======
+            # Calculate validation loss for monitoring
+            loss_dict = criterion(study_logits, mask_logits, labels, masks)
+            total_loss_meter += loss_dict["loss"].item() * batch_size
+            count += batch_size
+>>>>>>> REPLACE
+```

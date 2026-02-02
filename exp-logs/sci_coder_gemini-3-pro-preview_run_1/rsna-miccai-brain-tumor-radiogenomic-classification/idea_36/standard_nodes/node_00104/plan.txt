@@ -1,0 +1,415 @@
+My optimization strategy focuses on simplifying the model architecture and data selection heuristics based on the provided lessons, specifically targeting the "Current Best" configuration which outperformed more complex volumetric approaches.
+
+1.  **Input Simplification (Cite Lesson 00002, 00009, 00036):** I will revert from the 9-channel volumetric input to a **3-channel input** consisting of the **middle slice** of the FLAIR, T1wCE, and T2w modalities. The lessons indicate that naive channel stacking of many slices (Lesson 00009) and complex ROI-based mappings (Lesson 00036) often degrade performance compared to independent median-slice heuristics due to signal dilution and FOV mismatches.
+2.  **Architecture Standardization (Cite Lesson 00025):** I will remove the custom `adapt_first_layer` logic and the Gaussian weight inflation. By using a standard 3-channel input, we can directly leverage the ImageNet-pretrained weights of the **EfficientNet-B0** backbone without modification, preserving the pretrained feature extractors (Lesson 00025).
+3.  **Regularization & Training (Cite Lesson 00010, 00011):** I will maintain the aggressive regularization (Weight Decay 1e-2, Elastic Transforms) which was identified as critical for small datasets (Lesson 00010). I will also increase the training epochs from 5 to 10 to allow sufficient convergence, as previous logs showed the model was still learning (Lesson 00011).
+4.  **Normalization (Cite Lesson 00023):** I will ensure that normalization remains independent per channel, which is crucial for multi-modal MRI data.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+IMG_SIZE = 224
+IN_CHANNELS = 9  # 3 modalities (FLAIR, T1wCE, T2w) * 3 depths (CoM-10%, CoM, CoM+10%)
+BACKBONE = "tf_efficientnet_b0_ns"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.3
+
+# ==========================================
+# Data Processing Configuration
+# ==========================================
+# Relative offset from Center of Mass (CoM) for volumetric sampling
+# 0.1 means +/- 10% of the brain ROI depth
+DEPTH_OFFSET = 0.1
+=======
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+IMG_SIZE = 224
+IN_CHANNELS = 3  # 3 modalities (FLAIR, T1wCE, T2w) - Middle Slice Only Cite solution_lesson_node_00002
+BACKBONE = "tf_efficientnet_b0_ns"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.3
+
+# ==========================================
+# Data Processing Configuration
+# ==========================================
+# No depth offset needed for single slice approach
+DEPTH_OFFSET = 0.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def compute_brain_roi(file_paths):
+    """
+    Computes the Z-axis Center of Mass (CoM) and Depth of the brain tissue.
+    Iterates through the volume to identify slices containing brain tissue (pixels > 0).
+
+    Returns:
+        com_z (float): The mean index of slices containing brain signal.
+        depth (int): The number of slices between the first and last brain signal.
+        count (int): Total number of files in the sequence.
+    """
+    if not file_paths:
+        return 0, 0, 0
+
+    z_indices = []
+
+    # Iterate through all files to find brain presence
+    for i, path in enumerate(file_paths):
+        img = read_image_file(path)
+        # Check for signal (max > 0)
+        if img is not None and np.max(img) > 0:
+            z_indices.append(i)
+
+    if not z_indices:
+        # Fallback if no signal found: return middle index
+        count = len(file_paths)
+        return count // 2, 0, count
+
+    z_indices = np.array(z_indices)
+    min_z = z_indices[0]
+    max_z = z_indices[-1]
+    depth = max_z - min_z
+
+    # Center of Mass of the indices (geometric center of the occupied slices)
+    com_z = np.mean(z_indices)
+
+    return com_z, depth, len(file_paths)
+
+
+def _generate_stats_cache(metadata_df):
+    """
+    Internal function to compute stats for all subjects in the dataframe.
+    This is the heavy-lifting function passed to load_or_process_cache.
+    """
+    stats = []
+    modalities = ["flair", "t1wce", "t2w"]
+
+    print(f"Computing volumetric stats for {len(metadata_df)} subjects...")
+
+    for idx, row in metadata_df.iterrows():
+        sid = row["BraTS21ID"]
+        subject_stats = {"BraTS21ID": sid}
+
+        for mod in modalities:
+            # Metadata paths are relative to input dir
+            rel_path = row[f"{mod}_path"]
+            full_path = os.path.join(INPUT_DIR, rel_path)
+
+            paths = read_dicom_sequence(full_path)
+            com, depth, count = compute_brain_roi(paths)
+
+            subject_stats[f"{mod}_com"] = com
+            subject_stats[f"{mod}_depth"] = depth
+            subject_stats[f"{mod}_count"] = count
+
+        stats.append(subject_stats)
+
+    return pd.DataFrame(stats)
+=======
+def _generate_stats_cache(metadata_df):
+    """
+    Internal function to compute stats for all subjects in the dataframe.
+    Simplified to just count files as we use naive middle slice selection.
+    Cite solution_lesson_node_00036
+    """
+    stats = []
+    modalities = ["flair", "t1wce", "t2w"]
+
+    print(f"Computing basic stats for {len(metadata_df)} subjects...")
+
+    for idx, row in metadata_df.iterrows():
+        sid = row["BraTS21ID"]
+        subject_stats = {"BraTS21ID": sid}
+
+        for mod in modalities:
+            rel_path = row[f"{mod}_path"]
+            full_path = os.path.join(INPUT_DIR, rel_path)
+            
+            # Just counting files is fast
+            if os.path.exists(full_path):
+                files = [f for f in os.listdir(full_path) if f.endswith(".dcm")]
+                count = len(files)
+            else:
+                count = 0
+                
+            subject_stats[f"{mod}_count"] = count
+
+        stats.append(subject_stats)
+
+    return pd.DataFrame(stats)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def select_slice_indices(com, depth, count, offset_factor=DEPTH_OFFSET):
+    """
+    Calculates indices for -Offset, Center, and +Offset relative to the CoM.
+    Ensures indices are within bounds [0, count-1].
+    """
+    if count == 0:
+        return 0, 0, 0
+
+    indices = []
+    # Offsets: -10%, 0%, +10% (controlled by offset_factor)
+    multipliers = [-1.0, 0.0, 1.0]
+
+    for m in multipliers:
+        idx = com + (m * offset_factor * depth)
+        # Round to nearest integer and clamp
+        idx = int(np.round(idx))
+        idx = max(0, min(idx, count - 1))
+        indices.append(idx)
+
+    return indices
+
+
+def process_image(img):
+=======
+def process_image(img):
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def load_subject_volume(subject_row, stats_row):
+    """
+    Loads the 9-channel volume for a subject based on precomputed stats.
+
+    Channel Architecture:
+      0-2: [FLAIR, T1wCE, T2w] at -10% depth
+      3-5: [FLAIR, T1wCE, T2w] at CoM
+      6-8: [FLAIR, T1wCE, T2w] at +10% depth
+
+    Returns:
+        torch.Tensor: Shape (9, IMG_SIZE, IMG_SIZE)
+    """
+    modalities = ["flair", "t1wce", "t2w"]
+
+    # Container for all slices: slices_by_modality[mod] = [img_low, img_mid, img_high]
+    slices_by_modality = {}
+
+    for mod in modalities:
+        # Get paths
+        rel_path = subject_row[f"{mod}_path"]
+        full_path = os.path.join(INPUT_DIR, rel_path)
+        paths = read_dicom_sequence(full_path)
+
+        # Get stats
+        com = stats_row[f"{mod}_com"]
+        depth = stats_row[f"{mod}_depth"]
+        count = stats_row[f"{mod}_count"]
+
+        # Determine indices
+        indices = select_slice_indices(com, depth, count)
+
+        mod_imgs = []
+        for idx in indices:
+            if idx < len(paths):
+                img_raw = read_image_file(paths[idx])
+                img_proc = process_image(img_raw)
+            else:
+                img_proc = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+            mod_imgs.append(img_proc)
+
+        slices_by_modality[mod] = mod_imgs
+
+    # Stack into final tensor (Channels, H, W)
+    final_channels = []
+
+    # Low (-10%)
+    final_channels.append(slices_by_modality["flair"][0])
+    final_channels.append(slices_by_modality["t1wce"][0])
+    final_channels.append(slices_by_modality["t2w"][0])
+
+    # Mid (CoM)
+    final_channels.append(slices_by_modality["flair"][1])
+    final_channels.append(slices_by_modality["t1wce"][1])
+    final_channels.append(slices_by_modality["t2w"][1])
+
+    # High (+10%)
+    final_channels.append(slices_by_modality["flair"][2])
+    final_channels.append(slices_by_modality["t1wce"][2])
+    final_channels.append(slices_by_modality["t2w"][2])
+
+    # Stack
+    tensor_np = np.stack(final_channels, axis=0)
+
+    return torch.tensor(tensor_np, dtype=torch.float32)
+=======
+def load_subject_volume(subject_row, stats_row):
+    """
+    Loads the 3-channel volume (Middle Slice) for a subject.
+    Cite solution_lesson_node_00002: Naive middle slice selection.
+    Cite solution_lesson_node_00036: Independent heuristics per modality.
+    Cite solution_lesson_node_00031: Early Fusion (Channel Stacking).
+
+    Channel Architecture:
+      0: FLAIR (Middle)
+      1: T1wCE (Middle)
+      2: T2w (Middle)
+
+    Returns:
+        torch.Tensor: Shape (3, IMG_SIZE, IMG_SIZE)
+    """
+    modalities = ["flair", "t1wce", "t2w"]
+    final_channels = []
+
+    for mod in modalities:
+        # Get paths
+        rel_path = subject_row[f"{mod}_path"]
+        full_path = os.path.join(INPUT_DIR, rel_path)
+        paths = read_dicom_sequence(full_path)
+
+        count = len(paths)
+        if count > 0:
+            # Naive Middle Slice
+            idx = count // 2
+            img_raw = read_image_file(paths[idx])
+            # Independent normalization per channel (Cite solution_lesson_node_00023)
+            img_proc = process_image(img_raw)
+        else:
+            img_proc = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+        
+        final_channels.append(img_proc)
+
+    # Stack into final tensor (Channels, H, W)
+    tensor_np = np.stack(final_channels, axis=0)
+
+    return torch.tensor(tensor_np, dtype=torch.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CASIVNet(nn.Module):
+    """
+    Centroid-Aligned Scale-Invariant Volumetric (CASIV) Network.
+
+    This model adapts a 2D EfficientNet backbone to process 9-channel volumetric inputs
+    (3 modalities x 3 depths) by inflating the pretrained weights using a Gaussian-like
+    prior.
+    """
+
+    def __init__(self):
+        super(CASIVNet, self).__init__()
+
+        # 1. Initialize Backbone
+        # We use timm to load the EfficientNet-B0 with Noisy Student weights (ns)
+        # drop_rate sets the dropout probability before the final classifier
+        self.backbone = timm.create_model(
+            BACKBONE,
+            pretrained=True,
+            num_classes=NUM_CLASSES,
+            drop_rate=DROPOUT_RATE,
+        )
+
+        # 2. Adapt First Layer for 9-Channel Input
+        self.adapt_first_layer()
+
+    def adapt_first_layer(self):
+        """
+        Modifies the first convolutional layer to accept 9 channels instead of 3.
+        Applies 'Gaussian Weight Inflation' to preserve ImageNet priors.
+        """
+        # In timm's EfficientNet implementation, the first layer is named 'conv_stem'
+        old_conv = self.backbone.conv_stem
+
+        # Extract parameters from the existing layer
+        out_channels = old_conv.out_channels
+        kernel_size = old_conv.kernel_size
+        stride = old_conv.stride
+        padding = old_conv.padding
+        bias = old_conv.bias  # Usually None for conv_stem in EfficientNet
+
+        # Create the new layer with IN_CHANNELS (9)
+        new_conv = nn.Conv2d(
+            in_channels=IN_CHANNELS,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias is not None,
+        )
+
+        # 3. Gaussian Weight Inflation
+        # Original weights shape: (out_channels, 3, kernel_size, kernel_size)
+        old_weights = old_conv.weight.data
+
+        # New weights shape: (out_channels, 9, kernel_size, kernel_size)
+        # We initialize with zeros first
+        new_weights = torch.zeros_like(new_conv.weight.data)
+
+        # Logic:
+        # Channels 0-2: Peripheral (-10%) -> 25% energy
+        # Channels 3-5: Center (CoM)     -> 50% energy
+        # Channels 6-8: Peripheral (+10%) -> 25% energy
+
+        # We assume the input is stacked as [Modality1_Low, Modality2_Low, Modality3_Low,
+        #                                  Modality1_Mid, Modality2_Mid, Modality3_Mid, ...]
+        # The original weights expect [R, G, B]. We map the 3 modalities to these 3 channels.
+
+        # Peripheral Low (Channels 0-2)
+        new_weights[:, 0:3, :, :] = old_weights * 0.25
+
+        # Center (Channels 3-5)
+        new_weights[:, 3:6, :, :] = old_weights * 0.50
+
+        # Peripheral High (Channels 6-8)
+        new_weights[:, 6:9, :, :] = old_weights * 0.25
+
+        # Assign the new weights to the layer
+        new_conv.weight.data = new_weights
+
+        # If bias existed (unlikely for EfficientNet stem), copy it
+        if bias is not None:
+            new_conv.bias.data = bias
+
+        # Replace the layer in the backbone
+        self.backbone.conv_stem = new_conv
+
+    def forward(self, x):
+=======
+class CASIVNet(nn.Module):
+    """
+    Standard EfficientNet-B0 for 3-channel input (FLAIR, T1wCE, T2w).
+    Reverts to standard transfer learning as per Lesson 00009 (Avoid naive channel stacking)
+    and Lesson 00025 (Avoid learnable projections/complex adaptations).
+    """
+
+    def __init__(self):
+        super(CASIVNet, self).__init__()
+
+        # 1. Initialize Backbone
+        # We use timm to load the EfficientNet-B0 with Noisy Student weights (ns)
+        # drop_rate sets the dropout probability before the final classifier
+        # IN_CHANNELS is 3, which matches the pretrained weights (RGB)
+        self.backbone = timm.create_model(
+            BACKBONE,
+            pretrained=True,
+            num_classes=NUM_CLASSES,
+            drop_rate=DROPOUT_RATE,
+            in_chans=IN_CHANNELS 
+        )
+
+    def forward(self, x):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+library.config.EPOCHS = 5  # Reduce epochs for fast execution
+=======
+library.config.EPOCHS = 10  # Increase epochs to allow convergence (Cite solution_lesson_node_00011)
+>>>>>>> REPLACE
+```

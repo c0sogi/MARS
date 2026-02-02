@@ -1,0 +1,67 @@
+The `torch.OutOfMemoryError` is caused by expanding the feature map `(1, C, H, W)` to match the number of proposals `(K, C, H, W)` in `RoIHead.get_roi_features`. While PyTorch's `expand` is memory-efficient in the forward pass, the backward pass for `F.grid_sample` computes gradients for the expanded batch size, resulting in massive memory consumption (approx. 70GB for 64 proposals).
+
+To fix this, I will modify `library/model_blocks.py` to reshape the sampling grid instead of expanding the feature map. By treating the $K$ proposals as a single "tall" grid applied to the original feature map (batch size 1), we ensure the backward pass only allocates gradients for a single image, significantly reducing memory usage.
+
+```diff
+library/model_blocks.py
+<<<<<<< SEARCH
+        for b in range(B):
+            # feat: (1, C, H_f, W_f)
+            feat_b = features[b : b + 1]
+            # grid_b: (K, H_r, W_r, 2) -> Treat K as batch for grid_sample
+            grid_b = grid[b]
+
+            # Expand feat to match K? No, grid_sample supports broadcasting?
+            # grid_sample(input, grid): input (N, C, Hin, Win), grid (N, Hout, Wout, 2)
+            # We have 1 input image, K grids.
+            # We must expand input to (K, C, Hin, Win).
+            # This is memory heavy if K is large (e.g. 500).
+            # 500 * 384 * 800 * 800 * 4 bytes is huge.
+            # Efficient way: crop from (1, C, H, W) using (K, H, W, 2) grid?
+            # PyTorch `grid_sample` does not support broadcasting input against grid batch.
+            # We must loop or chunk.
+
+            # Chunking to save memory
+            chunk_size = 64
+            for i in range(0, K, chunk_size):
+                sub_grid = grid_b[i : i + chunk_size]  # (k, h, w, 2)
+                k_curr = sub_grid.shape[0]
+                sub_feat = feat_b.expand(
+                    k_curr, -1, -1, -1
+                )  # Virtual expansion (stride 0)
+
+                # Sampling
+                out = F.grid_sample(
+                    sub_feat, sub_grid, align_corners=True
+                )  # (k, C, h, w)
+                roi_features_list.append(out)
+=======
+        for b in range(B):
+            # feat: (1, C, H_f, W_f)
+            feat_b = features[b : b + 1]
+            # grid_b: (K, H_r, W_r, 2)
+            grid_b = grid[b]
+            K_curr = grid_b.shape[0]
+
+            if K_curr == 0:
+                continue
+
+            # Reshape grid to avoid expanding feature map (which causes OOM on backward)
+            # Treat K proposals as a single "tall" grid for the one image
+            # New grid shape: (1, K * H_r, W_r, 2)
+            grid_b_reshaped = grid_b.view(1, K_curr * self.roi_size, self.roi_size, 2)
+
+            # Sample from the single feature map
+            # out: (1, C, K * H_r, W_r)
+            out = F.grid_sample(feat_b, grid_b_reshaped, align_corners=True)
+
+            # Reshape back to (K, C, H_r, W_r)
+            # 1. View as (1, C, K, H_r, W_r)
+            # 2. Permute to (1, K, C, H_r, W_r)
+            # 3. Squeeze batch dim
+            out = out.view(1, features.shape[1], K_curr, self.roi_size, self.roi_size)
+            out = out.permute(0, 2, 1, 3, 4).contiguous().squeeze(0)
+
+            roi_features_list.append(out)
+>>>>>>> REPLACE
+```

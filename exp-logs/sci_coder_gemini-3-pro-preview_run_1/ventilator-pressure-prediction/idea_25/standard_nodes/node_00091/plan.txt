@@ -1,0 +1,356 @@
+My strategy is to optimize the model architecture by applying lessons learned from previous iterations, specifically targeting the degradation caused by "Uniform-Capacity" constraints and "Learned Context Projections".
+
+1.  **Architecture Upgrade (Wide-State Physics-Composite)**:
+    *   I will replace the `Uniform-Capacity` Bi-LSTM (which bottlenecked the hidden state to 512) with a **Wide-State Bi-LSTM** backbone (expanding to 1024 dimensions). This aligns with Lesson `solution_lesson_node_00055`, which emphasizes allowing the Bidirectional LSTM to naturally expand the state space (`2 * hidden_size`) to capture complex dynamics.
+    *   I will implement **Bottleneck Initialization** (Lesson `solution_lesson_node_00073`), where the CNN stem outputs a compressed representation (512 dim) that is expanded by the first LSTM block to the full backbone dimension (1024 dim). This improves convergence stability.
+
+2.  **Explicit Context Injection**:
+    *   I will remove the `context_proj` layer (Learned Context) and instead implement **Explicit Context Injection** of raw physical attributes (`R`, `C`) and derived interaction terms (`R_u_in`, `vol_C`). Lesson `solution_lesson_node_00090` and `solution_lesson_node_00076` demonstrate that explicit injection of these constants at every layer is superior to learned embeddings for physics-informed regression.
+
+3.  **Training Optimization**:
+    *   I will increase the training duration from 15 to **30 epochs** to ensure full convergence, as the previous 15-epoch run showed the model was still improving. The A100 GPU allows for this within the 3-hour limit.
+
+4.  **Code Changes**:
+    *   Modify `library/config.py` to update dimensions and epochs.
+    *   Modify `library/model.py` to refactor `CompositeBlock` for dimension expansion and explicit injection.
+    *   Modify `runfile.py` to reflect the updated configuration.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    EXPERIMENT_ID = "idea_25"
+
+    # =========================================================================
+    # File Paths & Directories
+=======
+    EXPERIMENT_ID = "idea_26"
+
+    # =========================================================================
+    # File Paths & Directories
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Architecture (Uniform-Capacity Physics-Composite)
+    # =========================================================================
+    # Uniform width backbone to maintain representational capacity
+    HIDDEN_DIM = 512
+
+    # Stem configuration
+    STEM_KERNEL_SIZES = [3, 5, 7]
+
+    # Backbone configuration
+    NUM_LAYERS = 4
+    FFN_EXPANSION_FACTOR = 2  # Expands to 1024 internally
+    DROPOUT = 0.1
+
+    # Residuals
+    USE_STRICT_IDENTITY = True  # No weights on skip connections where dims match
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 35  # Extended horizon for convergence
+=======
+    # =========================================================================
+    # Model Architecture (Wide-State Physics-Composite)
+    # =========================================================================
+    # Stem output dimension (Bottleneck)
+    STEM_DIM = 512
+    # Backbone dimension (Wide State)
+    BACKBONE_DIM = 1024
+
+    # Stem configuration
+    STEM_KERNEL_SIZES = [3, 5, 7]
+
+    # Backbone configuration
+    NUM_LAYERS = 4
+    FFN_EXPANSION_FACTOR = 2
+    DROPOUT = 0.1
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 30  # Optimized for 3h runtime
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CompositeBlock(nn.Module):
+    """
+    Uniform Composite Block with Curated Context Injection and Strict Identity Residuals.
+    Maintains uniform capacity (Hidden Dim 512) throughout.
+    """
+
+    def __init__(self, hidden_dim, context_dim, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Aligned Bi-LSTM
+        # Input is hidden_state + context
+        # Hidden dim is hidden_dim // 2 per direction -> output is hidden_dim
+        # This prevents the information bottleneck seen in standard Bi-LSTMs
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim + context_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Pointwise FFN (Expansion 2x)
+        # We avoid 4x expansion to maintain stability without normalization
+        ffn_dim = hidden_dim * Config.FFN_EXPANSION_FACTOR
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context):
+        # x: (Batch, Seq, Hidden)
+        # context: (Batch, Seq, Context)
+
+        # 1. Curated Context Injection
+        # We re-inject the static/physics context at every block
+        lstm_input = torch.cat([x, context], dim=-1)
+
+        # 2. Aligned Bi-LSTM
+        lstm_out, _ = self.lstm(lstm_input)
+
+        # 3. Strict Identity Residual 1
+        # Dimensions match (512 -> 512), no linear projection on skip
+        # Dropout applied to residual branch only
+        x = x + self.dropout(lstm_out)
+
+        # 4. Pointwise FFN
+        ffn_out = self.ffn(x)
+
+        # 5. Strict Identity Residual 2
+        # No LayerNorm, preserving absolute pressure magnitude
+        x = x + self.dropout(ffn_out)
+
+        return x
+
+
+class VentilatorModel(nn.Module):
+    """
+    Feature-Complete Uniform-Capacity Physics-Composite Network.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.hidden_dim = Config.HIDDEN_DIM
+
+        # Context Projection
+        # Learns a compact representation of the input (physics & static features)
+        # to serve as the "Curated Context" injected into each block.
+        self.context_dim = 64
+        self.context_proj = nn.Linear(input_dim, self.context_dim)
+
+        # Stem
+        self.stem = MultiScaleStem(
+            input_dim=input_dim,
+            hidden_dim=self.hidden_dim,
+            kernel_sizes=Config.STEM_KERNEL_SIZES,
+        )
+
+        # Backbone
+        self.blocks = nn.ModuleList(
+            [
+                CompositeBlock(self.hidden_dim, self.context_dim, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # Heads
+        self.head = nn.Linear(self.hidden_dim, 1)
+        self.aux_head = nn.Linear(self.hidden_dim, 1)
+
+        # Weight Initialization
+        self._init_weights()
+=======
+class CompositeBlock(nn.Module):
+    """
+    Wide-State Composite Block with Explicit Context Injection.
+    Supports dimension expansion (Bottleneck -> Wide) via residual projection.
+    Cite solution_lesson_node_00055: Projection Shortcuts for Dimension-Mismatched Residuals.
+    Cite solution_lesson_node_00044: Unnormalized Residual Connections.
+    """
+
+    def __init__(self, input_dim, hidden_dim, context_dim, dropout=0.1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
+        # Bi-LSTM
+        # Input: input_dim + context
+        # Output: hidden_dim (hidden_dim // 2 * 2)
+        # Cite solution_lesson_node_00055: Allow layer output to be 2*hidden_size (Wide State)
+        self.lstm = nn.LSTM(
+            input_size=input_dim + context_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Residual Projection
+        # If input_dim != hidden_dim, project residual path
+        self.use_projection = input_dim != hidden_dim
+        if self.use_projection:
+            self.res_proj = nn.Linear(input_dim, hidden_dim)
+
+        # Pointwise FFN (Expansion 2x)
+        # Cite solution_lesson_node_00052: Keep FFN expansion modest (2x) in unnormalized blocks
+        ffn_dim = hidden_dim * Config.FFN_EXPANSION_FACTOR
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_dim)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context):
+        # x: (Batch, Seq, input_dim)
+        # context: (Batch, Seq, context_dim)
+
+        # 1. Explicit Context Injection
+        # Cite solution_lesson_node_00090: Deep Context Injection of raw features
+        lstm_input = torch.cat([x, context], dim=-1)
+
+        # 2. Bi-LSTM
+        lstm_out, _ = self.lstm(lstm_input)  # (Batch, Seq, hidden_dim)
+
+        # 3. Residual Connection 1 (Temporal)
+        # Cite solution_lesson_node_00033: Additive Residuals
+        res = x
+        if self.use_projection:
+            res = self.res_proj(res)
+        
+        x = res + self.dropout(lstm_out)
+
+        # 4. Pointwise FFN + Residual 2 (Channel)
+        # Cite solution_lesson_node_00040: Interleave FFNs
+        x = x + self.dropout(self.ffn(x))
+
+        return x
+
+
+class VentilatorModel(nn.Module):
+    """
+    Deeply Supervised Physics-Injected Hybrid CNN-LSTM-FFN.
+    Cite solution_lesson_node_00073: Bottleneck Initialization (Stem 512 -> Backbone 1024).
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.stem_dim = Config.STEM_DIM
+        self.backbone_dim = Config.BACKBONE_DIM
+
+        # Context Indices for Explicit Injection
+        # R(0), C(1), R_u_in(6), vol_C(7)
+        # Cite solution_lesson_node_00076: Explicit Injection of Derived Physical Interactions
+        self.context_indices = [0, 1, 6, 7]
+        self.context_dim = len(self.context_indices)
+
+        # Stem
+        self.stem = MultiScaleStem(
+            input_dim=input_dim,
+            hidden_dim=self.stem_dim,
+            kernel_sizes=Config.STEM_KERNEL_SIZES,
+        )
+
+        # Backbone
+        # Layer 0: Stem Dim (512) -> Backbone Dim (1024)
+        # Layer 1..N: Backbone Dim (1024) -> Backbone Dim (1024)
+        self.blocks = nn.ModuleList()
+        
+        # Block 0 (Expansion)
+        self.blocks.append(
+            CompositeBlock(self.stem_dim, self.backbone_dim, self.context_dim, Config.DROPOUT)
+        )
+        
+        # Subsequent Blocks (Wide State)
+        for _ in range(Config.NUM_LAYERS - 1):
+            self.blocks.append(
+                CompositeBlock(self.backbone_dim, self.backbone_dim, self.context_dim, Config.DROPOUT)
+            )
+
+        # Heads
+        self.head = nn.Linear(self.backbone_dim, 1)
+        self.aux_head = nn.Linear(self.backbone_dim, 1)
+
+        # Weight Initialization
+        self._init_weights()
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def forward(self, x):
+        # x: (Batch, Seq, Feat)
+
+        # Generate Context Vector
+        context = self.context_proj(x)
+
+        # Stem
+        h = self.stem(x)
+
+        aux_out = None
+
+        # Backbone
+        for i, block in enumerate(self.blocks):
+            h = block(h, context)
+
+            # Deep Supervision after Block 2 (index 1)
+            # Provides gradient short-circuit
+            if i == 1:
+                aux_out = self.aux_head(h)
+
+        # Final Head
+        final_out = self.head(h)
+
+        return final_out, aux_out
+=======
+    def forward(self, x):
+        # x: (Batch, Seq, Feat)
+
+        # Extract Explicit Context
+        # Cite solution_lesson_node_00090: Explicit Injection
+        context = x[:, :, self.context_indices]
+
+        # Stem
+        h = self.stem(x)
+
+        aux_out = None
+
+        # Backbone
+        for i, block in enumerate(self.blocks):
+            h = block(h, context)
+
+            # Deep Supervision after Block 2 (index 1)
+            # Cite solution_lesson_node_00039: Deep Supervision
+            if i == 1:
+                aux_out = self.aux_head(h)
+
+        # Final Head
+        final_out = self.head(h)
+
+        return final_out, aux_out
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- Configuration ---
+    # Override defaults for a fast baseline execution that fits within time limits
+    Config.EPOCHS = 15  # Reduced from 35 to ensure completion < 2 hours
+    Config.BATCH_SIZE = 512  # Keep high for stable updates and speed on A100
+    Config.DEBUG = False  # Use full data to ensure we meet the accuracy threshold
+=======
+    # --- Configuration ---
+    # Override defaults for a fast baseline execution that fits within time limits
+    Config.EPOCHS = 30  # Optimized for 3h runtime and convergence
+    Config.BATCH_SIZE = 512  # Keep high for stable updates and speed on A100
+    Config.DEBUG = False  # Use full data to ensure we meet the accuracy threshold
+>>>>>>> REPLACE
+```

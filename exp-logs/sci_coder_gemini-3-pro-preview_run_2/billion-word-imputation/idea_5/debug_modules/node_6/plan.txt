@@ -1,0 +1,186 @@
+The analysis identified that the `TimeoutError` is caused by an inefficient inference pipeline. Specifically, the "Hypothesis Expansion" stage performs a round-trip to the CPU to convert tensors to text, manipulate strings, and re-tokenize them for the Infiller model. This process creates a bottleneck that prevents the GPU from being fully utilized, leading to a runtime that exceeds the 1-hour limit.
+
+To fix this, I will implement the following changes:
+1.  **Update Config:** Change the `INFILLER_MODEL_NAME` from `roberta-large` to `microsoft/deberta-v3-base`. This aligns the Infiller's tokenizer with the Locator's tokenizer, enabling direct tensor manipulation (splicing) without re-tokenization. This also reduces the computational cost of the Infiller model itself.
+2.  **Optimize Inference:** Rewrite the `predict` method in `library/inference.py` to perform hypothesis expansion by splicing the `[MASK]` token ID directly into the input tensors. This removes the costly string decoding/encoding loop and allows the pipeline to run efficiently on the GPU.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Stage 2: In-Filler
+    # RoBERTa-Large provides high capacity for semantic reconstruction (MLM)
+    INFILLER_MODEL_NAME = "roberta-large"
+=======
+    # Stage 2: In-Filler
+    # RoBERTa-Large provides high capacity for semantic reconstruction (MLM)
+    # Changed to DeBERTa-v3-base to share tokenizer with Locator for efficient inference (tensor splicing)
+    INFILLER_MODEL_NAME = "microsoft/deberta-v3-base"
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                # -------------------------------------------------------
+                # Stage 2: Hypothesis Expansion & Infiller Scoring
+                # -------------------------------------------------------
+
+                # Prepare batch for Infiller
+                # We will flatten the beam: Batch_Size * Beam_Width samples
+                infiller_texts = []
+                metadata_map = (
+                    []
+                )  # To map back to (batch_idx, beam_idx, insertion_char_idx)
+
+                for b_idx in range(len(raw_texts)):
+                    text = raw_texts[b_idx]
+                    offsets = loc_offsets[b_idx]
+
+                    for k in range(Config.BEAM_WIDTH):
+                        token_idx = topk_indices[b_idx, k]
+                        loc_score = topk_probs[b_idx, k]
+
+                        # Find character insertion point
+                        # The Locator predicts the token *after* which the gap exists.
+                        # So we look at the end offset of the predicted token.
+                        # Handle truncation/padding edge cases safely
+                        if token_idx >= len(offsets):
+                            token_idx = len(offsets) - 1
+
+                        start, end = offsets[token_idx]
+
+                        # If [SEP] or padding selected (should be rare due to masking), fallback to end of string
+                        if end == 0 and start == 0:
+                            insertion_idx = len(text)
+                        else:
+                            insertion_idx = end
+
+                        # Construct candidate: Insert " <mask>"
+                        # Note: Infiller (RoBERTa) expects <mask>. We add a space for natural separation.
+                        # If insertion is at end, " <mask>". If middle, " <mask>".
+                        # We reconstruct: text[:idx] + " " + mask + text[idx:]
+                        # But we must be careful about existing spaces.
+                        # The task removed a word. Usually implies spaces around it were merged or one remains.
+                        # Standard approach: Insert " <mask>" (space + mask).
+
+                        candidate_text = (
+                            text[:insertion_idx]
+                            + " "
+                            + self.tokenizer_inf.mask_token
+                            + text[insertion_idx:]
+                        )
+
+                        infiller_texts.append(candidate_text)
+                        metadata_map.append(
+                            {
+                                "batch_idx": b_idx,
+                                "loc_score": loc_score,
+                                "insertion_idx": insertion_idx,
+                                "original_text": text,
+                                "sample_id": sample_ids[b_idx].item(),
+                            }
+                        )
+
+                # Tokenize for Infiller
+                inf_encoding = self.tokenizer_inf(
+                    infiller_texts,
+                    max_length=Config.MAX_LEN,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                inf_input_ids = inf_encoding["input_ids"].to(self.device)
+                inf_attention_mask = inf_encoding["attention_mask"].to(self.device)
+=======
+                # -------------------------------------------------------
+                # Stage 2: Hypothesis Expansion & Infiller Scoring
+                # -------------------------------------------------------
+
+                # Optimization: Use tensor splicing to avoid costly CPU string manipulation and re-tokenization.
+                # This requires Locator and Infiller to share the same tokenizer (DeBERTa-v3).
+                
+                mask_token_id = self.tokenizer_inf.mask_token_id
+                pad_token_id = self.tokenizer_inf.pad_token_id
+                
+                inf_input_ids_list = []
+                inf_attention_mask_list = []
+                metadata_map = []
+
+                # We iterate to construct the spliced tensors
+                # While still a loop, tensor operations are faster than string decoding/encoding
+                for b_idx in range(len(raw_texts)):
+                    # Get original token IDs and mask
+                    ids = loc_input_ids[b_idx]
+                    mask = loc_attention_mask[b_idx]
+                    offsets = loc_offsets[b_idx]
+                    text = raw_texts[b_idx]
+
+                    for k in range(Config.BEAM_WIDTH):
+                        token_idx = int(topk_indices[b_idx, k])
+                        loc_score = topk_probs[b_idx, k]
+
+                        # Calculate character insertion index for final reconstruction
+                        if token_idx >= len(offsets):
+                             t_idx_safe = len(offsets) - 1
+                        else:
+                             t_idx_safe = token_idx
+                        
+                        start, end = offsets[t_idx_safe]
+                        insertion_char_idx = end if end != 0 else len(text)
+
+                        # Tensor Splicing: Insert [MASK] after token_idx
+                        # The gap is *after* token_idx, so we insert at token_idx + 1
+                        split_idx = token_idx + 1
+                        
+                        # Handle bounds
+                        if split_idx > len(ids):
+                            split_idx = len(ids)
+
+                        # Create new tensors
+                        # [0...split_idx] + [MASK] + [split_idx...]
+                        # We perform this on device to avoid transfers, though list append happens on CPU
+                        
+                        # Slices
+                        part1 = ids[:split_idx]
+                        part2 = ids[split_idx:]
+                        
+                        mask_tensor = torch.tensor([mask_token_id], device=self.device)
+                        new_ids = torch.cat([part1, mask_tensor, part2])
+                        
+                        # Attention mask: Insert 1
+                        mask_part1 = mask[:split_idx]
+                        mask_part2 = mask[split_idx:]
+                        one_tensor = torch.tensor([1], device=self.device)
+                        new_mask = torch.cat([mask_part1, one_tensor, mask_part2])
+                        
+                        # Truncate or Pad to Config.MAX_LEN
+                        curr_len = new_ids.size(0)
+                        if curr_len > Config.MAX_LEN:
+                            new_ids = new_ids[:Config.MAX_LEN]
+                            new_mask = new_mask[:Config.MAX_LEN]
+                        elif curr_len < Config.MAX_LEN:
+                            pad_len = Config.MAX_LEN - curr_len
+                            pad_ids = torch.full((pad_len,), pad_token_id, device=self.device)
+                            pad_zeros = torch.zeros((pad_len,), device=self.device)
+                            new_ids = torch.cat([new_ids, pad_ids])
+                            new_mask = torch.cat([new_mask, pad_zeros])
+
+                        inf_input_ids_list.append(new_ids)
+                        inf_attention_mask_list.append(new_mask)
+
+                        metadata_map.append(
+                            {
+                                "batch_idx": b_idx,
+                                "loc_score": loc_score,
+                                "insertion_idx": insertion_char_idx,
+                                "original_text": text,
+                                "sample_id": sample_ids[b_idx].item(),
+                            }
+                        )
+
+                # Stack tensors
+                inf_input_ids = torch.stack(inf_input_ids_list)
+                inf_attention_mask = torch.stack(inf_attention_mask_list)
+>>>>>>> REPLACE
+```

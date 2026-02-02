@@ -1,0 +1,312 @@
+To improve the model's performance, I will implement three targeted optimizations based on the empirical findings and lessons learned:
+
+1.  **Head+Tail Truncation for Long Sequences**: The failure analysis revealed a correlation between prediction error and question length (`Error vs q_len_char: 0.1448`). The current standard truncation likely discards the end of long question bodies, which often contains the core inquiry or summary. I will modify `process_data` to implement a "Head+Tail" truncation strategy (keeping the first 256 and last 256 tokens roughly) instead of simple tail truncation. This ensures the model sees both the context setup and the final question.
+
+2.  **Gradient Accumulation**: To stabilize training and improve generalization, I will increase the effective batch size from 4 to 16 using Gradient Accumulation (`ACCUMULATION_STEPS = 4`). This simulates a larger batch size on the limited GPU memory, reducing gradient noise.
+
+3.  **Cosine Learning Rate Schedule**: Citing **Lesson 00015** regarding convergence latency in Siamese networks, I will replace the linear scheduler with a Cosine schedule. This typically yields better convergence for fine-tuning transformers by maintaining a higher learning rate for longer before decaying.
+
+I will also update the `WORKING_DIR` to ensure the data is re-processed with the new truncation logic.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_7"
+    SUBMISSION_PATH = "./submission/submission.csv"
+
+    # Metadata file paths
+    TRAIN_PATH = os.path.join(METADATA_DIR, "train.csv")
+    VAL_PATH = os.path.join(METADATA_DIR, "val.csv")
+    TEST_PATH = os.path.join(METADATA_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Ensure working directory exists
+    os.makedirs(WORKING_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(SUBMISSION_PATH), exist_ok=True)
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "microsoft/deberta-v3-base"
+    MAX_LEN = 512  # Max sequence length for both Question and Answer streams
+    HIDDEN_SIZE = 768
+    DROPOUT = 0.1
+    NUM_LAYERS_TO_AGGREGATE = 4  # For Layer-Wise Dynamic Weighting
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    EPOCHS = 8
+    TRAIN_BATCH_SIZE = 4  # Adjusted for A100 40GB with Siamese 512+512 context
+    VALID_BATCH_SIZE = 8
+=======
+    WORKING_DIR = "./working/idea_8"
+    SUBMISSION_PATH = "./submission/submission.csv"
+
+    # Metadata file paths
+    TRAIN_PATH = os.path.join(METADATA_DIR, "train.csv")
+    VAL_PATH = os.path.join(METADATA_DIR, "val.csv")
+    TEST_PATH = os.path.join(METADATA_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Ensure working directory exists
+    os.makedirs(WORKING_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(SUBMISSION_PATH), exist_ok=True)
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "microsoft/deberta-v3-base"
+    MAX_LEN = 512  # Max sequence length for both Question and Answer streams
+    HIDDEN_SIZE = 768
+    DROPOUT = 0.1
+    NUM_LAYERS_TO_AGGREGATE = 4  # For Layer-Wise Dynamic Weighting
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    EPOCHS = 8
+    TRAIN_BATCH_SIZE = 4  # Adjusted for A100 40GB with Siamese 512+512 context
+    ACCUMULATION_STEPS = 4  # Effective Batch Size = 16
+    VALID_BATCH_SIZE = 8
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def process_data(df, tokenizer, fit_encoders=None):
+    # --- Stream 1: Question (Title + Body) ---
+    titles = df["question_title"].fillna("").astype(str).tolist()
+    bodies = df["question_body"].fillna("").astype(str).tolist()
+
+    q_enc = tokenizer(
+        titles,
+        bodies,
+        max_length=Config.MAX_LEN,
+        padding="max_length",
+        truncation=True,
+        return_tensors="np",
+        return_token_type_ids=False,
+    )
+
+    q_input_ids = q_enc["input_ids"]
+    q_attention_mask = q_enc["attention_mask"]
+    q_segment_ids = generate_segment_ids(q_input_ids, tokenizer.sep_token_id)
+
+    # --- Stream 2: Answer ---
+    answers = df["answer"].fillna("").astype(str).tolist()
+    a_enc = tokenizer(
+        answers,
+        max_length=Config.MAX_LEN,
+        padding="max_length",
+        truncation=True,
+        return_tensors="np",
+        return_token_type_ids=False,
+    )
+    a_input_ids = a_enc["input_ids"]
+    a_attention_mask = a_enc["attention_mask"]
+
+    # --- Categorical Features ---
+=======
+def process_data(df, tokenizer, fit_encoders=None):
+    # Helper for Head+Tail Truncation
+    def encode_head_tail(text_list_a, text_list_b=None, max_len=Config.MAX_LEN):
+        # Tokenize without special tokens first
+        enc_a = tokenizer(text_list_a, add_special_tokens=False)
+        enc_b = tokenizer(text_list_b, add_special_tokens=False) if text_list_b else None
+        
+        input_ids_out = []
+        attention_mask_out = []
+        
+        cls_id = tokenizer.cls_token_id
+        sep_id = tokenizer.sep_token_id
+        pad_id = tokenizer.pad_token_id
+        
+        count = len(text_list_a)
+        
+        for i in range(count):
+            ids_a = enc_a['input_ids'][i]
+            ids_b = enc_b['input_ids'][i] if enc_b else []
+            
+            # Construct: [CLS] A [SEP] B [SEP] or [CLS] A [SEP]
+            # Overhead: 3 if B exists, else 2
+            overhead = 3 if enc_b else 2
+            
+            total_tokens = len(ids_a) + len(ids_b) + overhead
+            
+            if total_tokens > max_len:
+                # Truncation Strategy
+                if enc_b:
+                    # Priority: Keep A (Title), Truncate B (Body)
+                    avail_b = max_len - len(ids_a) - overhead
+                    if avail_b < 0:
+                        # A is too big, truncate A, drop B
+                        ids_a = ids_a[:max_len-overhead] # Simple tail cut for Title
+                        ids_b = []
+                    else:
+                        # Head+Tail for B
+                        half = avail_b // 2
+                        ids_b = ids_b[:half] + ids_b[-half:] if half > 0 else []
+                else:
+                    # Single sequence: Head+Tail
+                    avail_a = max_len - overhead
+                    half = avail_a // 2
+                    ids_a = ids_a[:half] + ids_a[-half:] if half > 0 else []
+            
+            # Reconstruct
+            if enc_b:
+                seq = [cls_id] + ids_a + [sep_id] + ids_b + [sep_id]
+            else:
+                seq = [cls_id] + ids_a + [sep_id]
+                
+            # Padding
+            mask = [1] * len(seq)
+            pad_len = max_len - len(seq)
+            if pad_len > 0:
+                seq += [pad_id] * pad_len
+                mask += [0] * pad_len
+                
+            input_ids_out.append(seq)
+            attention_mask_out.append(mask)
+            
+        return np.array(input_ids_out), np.array(attention_mask_out)
+
+    # --- Stream 1: Question (Title + Body) ---
+    titles = df["question_title"].fillna("").astype(str).tolist()
+    bodies = df["question_body"].fillna("").astype(str).tolist()
+    
+    q_input_ids, q_attention_mask = encode_head_tail(titles, bodies)
+    q_segment_ids = generate_segment_ids(q_input_ids, tokenizer.sep_token_id)
+
+    # --- Stream 2: Answer ---
+    answers = df["answer"].fillna("").astype(str).tolist()
+    a_input_ids, a_attention_mask = encode_head_tail(answers, None)
+
+    # --- Categorical Features ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from transformers import get_linear_schedule_with_warmup
+
+from library.config import Config
+=======
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    for batch_idx, batch in enumerate(train_loader):
+        # Move batch data to device
+        q_input_ids = batch["q_input_ids"].to(device)
+        q_attention_mask = batch["q_attention_mask"].to(device)
+        q_segment_ids = batch["q_segment_ids"].to(device)
+        a_input_ids = batch["a_input_ids"].to(device)
+        a_attention_mask = batch["a_attention_mask"].to(device)
+        cats = batch["cats"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        preds = model(
+            q_input_ids=q_input_ids,
+            q_attention_mask=q_attention_mask,
+            q_segment_ids=q_segment_ids,
+            a_input_ids=a_input_ids,
+            a_attention_mask=a_attention_mask,
+            cats=cats,
+        )
+
+        # Compute loss
+        loss = loss_fn(preds, labels)
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / num_batches
+    return avg_loss
+=======
+    for batch_idx, batch in enumerate(train_loader):
+        # Move batch data to device
+        q_input_ids = batch["q_input_ids"].to(device)
+        q_attention_mask = batch["q_attention_mask"].to(device)
+        q_segment_ids = batch["q_segment_ids"].to(device)
+        a_input_ids = batch["a_input_ids"].to(device)
+        a_attention_mask = batch["a_attention_mask"].to(device)
+        cats = batch["cats"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Forward pass
+        preds = model(
+            q_input_ids=q_input_ids,
+            q_attention_mask=q_attention_mask,
+            q_segment_ids=q_segment_ids,
+            a_input_ids=a_input_ids,
+            a_attention_mask=a_attention_mask,
+            cats=cats,
+        )
+
+        # Compute loss
+        loss = loss_fn(preds, labels)
+        
+        # Scale loss for gradient accumulation
+        loss = loss / Config.ACCUMULATION_STEPS
+        loss.backward()
+
+        if (batch_idx + 1) % Config.ACCUMULATION_STEPS == 0 or (batch_idx + 1) == num_batches:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * Config.ACCUMULATION_STEPS
+
+    avg_loss = total_loss / num_batches
+    return avg_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Scheduler
+    num_training_steps = len(train_loader) * epochs
+    num_warmup_steps = int(0.1 * num_training_steps)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+=======
+    # Scheduler
+    # Adjust steps for gradient accumulation
+    num_update_steps_per_epoch = (len(train_loader) + Config.ACCUMULATION_STEPS - 1) // Config.ACCUMULATION_STEPS
+    num_training_steps = num_update_steps_per_epoch * epochs
+    num_warmup_steps = int(0.1 * num_training_steps)
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+>>>>>>> REPLACE
+```

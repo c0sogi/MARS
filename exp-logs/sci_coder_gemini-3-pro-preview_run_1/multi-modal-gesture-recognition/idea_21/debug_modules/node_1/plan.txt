@@ -1,0 +1,357 @@
+The issue is that the `GestureDataset` is failing to load any samples, resulting in an empty dataset and triggering an `AssertionError`. This is caused by broad `try...except` blocks in `_prepare_data`, `_process_mat`, and `_process_audio` that silently suppress all errors, masking the root cause. The underlying problem is likely a schema mismatch in `_process_mat`: the code strictly expects `WorldPosition` to be an array of structs (accessing `.X`, `.Y`, `.Z`), but in the provided dataset, this data is likely stored as a dense numeric matrix (e.g., shape `20x3`), which causes the existing logic to fail or skip the data.
+
+To fix this, I will:
+1.  Remove the broad `try...except` blocks in `_prepare_data`, `_process_mat`, and `_process_audio` to allow exceptions to propagate, as advised in **Debug Lesson 4**.
+2.  Update `_process_mat` to robustly handle `WorldPosition` data in both formats: as a struct array (via attribute access) and as a dense numeric matrix (via array indexing).
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+            # Process from scratch
+            try:
+                # 1. Load Skeleton & Labels
+                skeleton, labels_seq, num_frames = self._process_mat(row["data_path"])
+                if skeleton is None:
+                    continue
+
+                # 2. Load Audio
+                audio = self._process_audio(row["audio_path"], num_frames)
+                if audio is None:
+                    continue
+
+                # 3. Save to Cache
+                np.savez_compressed(
+                    cache_path, skeleton=skeleton, audio=audio, labels=labels_seq
+                )
+                valid_ids.append(sample_id)
+
+                # Accumulate for stats
+                if recompute_stats:
+                    # Subsample to save memory if needed, or accumulate sum/sq_sum
+                    # Here we take a random subset of frames to estimate stats
+                    if len(skeleton) > 0:
+                        indices = np.linspace(
+                            0, len(skeleton) - 1, min(len(skeleton), 10)
+                        ).astype(int)
+                        skel_accumulator.append(skeleton[indices])
+                        audio_accumulator.append(audio[indices])
+
+            except Exception as e:
+                # print(f"Error processing {sample_id}: {e}")
+                continue
+=======
+            # Process from scratch
+            # 1. Load Skeleton & Labels
+            skeleton, labels_seq, num_frames = self._process_mat(row["data_path"])
+            if skeleton is None:
+                continue
+
+            # 2. Load Audio
+            audio = self._process_audio(row["audio_path"], num_frames)
+            if audio is None:
+                continue
+
+            # 3. Save to Cache
+            np.savez_compressed(
+                cache_path, skeleton=skeleton, audio=audio, labels=labels_seq
+            )
+            valid_ids.append(sample_id)
+
+            # Accumulate for stats
+            if recompute_stats:
+                # Subsample to save memory if needed, or accumulate sum/sq_sum
+                # Here we take a random subset of frames to estimate stats
+                if len(skeleton) > 0:
+                    indices = np.linspace(
+                        0, len(skeleton) - 1, min(len(skeleton), 10)
+                    ).astype(int)
+                    skel_accumulator.append(skeleton[indices])
+                    audio_accumulator.append(audio[indices])
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def _process_mat(self, mat_rel_path):
+        """
+        Parses MAT file for Skeleton and Labels.
+        Returns:
+            skeleton (np.ndarray): (T, Joints*3)
+            labels_seq (np.ndarray): (T,) frame-wise labels
+            num_frames (int)
+        """
+        full_path = os.path.join(Config.INPUT_DIR, mat_rel_path)
+        try:
+            mat = scipy.io.loadmat(full_path, squeeze_me=True, struct_as_record=False)
+            video = mat["Video"]
+            num_frames = getattr(video, "NumFrames", 0)
+
+            if num_frames == 0:
+                return None, None, 0
+
+            # --- Extract Skeleton ---
+            # Frames -> Skeleton -> WorldPosition
+            frames_data = video.Frames
+            if (
+                not isinstance(frames_data, np.ndarray)
+                or len(frames_data) != num_frames
+            ):
+                # Fallback or strict check
+                return None, None, 0
+
+            # Pre-allocate
+            # 20 joints, 3 coords
+            skeleton_data = np.zeros(
+                (num_frames, Config.NUM_JOINTS, 3), dtype=np.float32
+            )
+
+            # Joint mapping: Prompt lists 20 joints.
+            # We assume the order in 'JointsType' matches the storage order in WorldPosition arrays.
+            # Usually WorldPosition is (20,) struct array or similar.
+            # Optimization: Check first frame to determine structure
+
+            for i in range(num_frames):
+                frame_obj = frames_data[i]
+                if hasattr(frame_obj, "Skeleton"):
+                    skel_obj = frame_obj.Skeleton
+                    # Handle multiple users: take first
+                    if isinstance(skel_obj, np.ndarray) and skel_obj.size > 0:
+                        skel_obj = skel_obj[0]
+
+                    if hasattr(skel_obj, "WorldPosition"):
+                        wp = skel_obj.WorldPosition
+                        # wp might be (20,) struct array with X,Y,Z fields
+                        # or a 20x3 matrix depending on export version.
+                        # Based on prompt "WorldPosition... X value... Y value...", likely struct array.
+
+                        if isinstance(wp, np.ndarray) and wp.size == Config.NUM_JOINTS:
+                            # Iterate joints
+                            for j in range(Config.NUM_JOINTS):
+                                joint = wp[j]
+                                skeleton_data[i, j, 0] = joint.X
+                                skeleton_data[i, j, 1] = joint.Y
+                                skeleton_data[i, j, 2] = joint.Z
+
+            # --- Root Relative ---
+            # HipCenter is usually index 0. Prompt lists it first.
+            hip_center = skeleton_data[:, 0:1, :]  # (T, 1, 3)
+            skeleton_data = skeleton_data - hip_center
+
+            # Flatten: (T, 60)
+            skeleton_flat = skeleton_data.reshape(num_frames, -1)
+
+            # --- Extract Labels (Frame-wise) ---
+            labels_seq = np.zeros(num_frames, dtype=np.int64)  # Default 0 (background)
+
+            if hasattr(video, "Labels"):
+                raw_labels = video.Labels
+                if not isinstance(raw_labels, np.ndarray):
+                    raw_labels = [raw_labels]
+                elif raw_labels.size == 1:
+                    raw_labels = [raw_labels.item()]
+
+                for l in raw_labels:
+                    if hasattr(l, "Name") and hasattr(l, "Begin") and hasattr(l, "End"):
+                        name = l.Name
+                        # Matlab 1-based indexing -> Python 0-based
+                        start_f = int(l.Begin) - 1
+                        end_f = int(l.End) - 1
+
+                        if name in Config.LABEL_MAP:
+                            lid = Config.LABEL_MAP[name]
+                            # Clip to valid range
+                            start_f = max(0, start_f)
+                            end_f = min(num_frames - 1, end_f)
+                            if end_f >= start_f:
+                                labels_seq[start_f : end_f + 1] = lid
+
+            return skeleton_flat, labels_seq, num_frames
+
+        except Exception as e:
+            # print(f"Mat parse error: {e}")
+            return None, None, 0
+=======
+    def _process_mat(self, mat_rel_path):
+        """
+        Parses MAT file for Skeleton and Labels.
+        Returns:
+            skeleton (np.ndarray): (T, Joints*3)
+            labels_seq (np.ndarray): (T,) frame-wise labels
+            num_frames (int)
+        """
+        full_path = os.path.join(Config.INPUT_DIR, mat_rel_path)
+        # Removed broad try-except to allow debugging (Cite debug_lesson_4)
+        mat = scipy.io.loadmat(full_path, squeeze_me=True, struct_as_record=False)
+        video = mat["Video"]
+        num_frames = getattr(video, "NumFrames", 0)
+
+        if num_frames == 0:
+            return None, None, 0
+
+        # --- Extract Skeleton ---
+        # Frames -> Skeleton -> WorldPosition
+        frames_data = video.Frames
+        if (
+            not isinstance(frames_data, np.ndarray)
+            or len(frames_data) != num_frames
+        ):
+            return None, None, 0
+
+        # Pre-allocate
+        # 20 joints, 3 coords
+        skeleton_data = np.zeros(
+            (num_frames, Config.NUM_JOINTS, 3), dtype=np.float32
+        )
+
+        for i in range(num_frames):
+            frame_obj = frames_data[i]
+            if hasattr(frame_obj, "Skeleton"):
+                skel_obj = frame_obj.Skeleton
+                # Handle multiple users: take first
+                if isinstance(skel_obj, np.ndarray) and skel_obj.size > 0:
+                    skel_obj = skel_obj[0]
+
+                if hasattr(skel_obj, "WorldPosition"):
+                    wp = skel_obj.WorldPosition
+                    
+                    # Handle Struct Array (array of objects with X, Y, Z)
+                    if isinstance(wp, np.ndarray) and wp.size >= Config.NUM_JOINTS and hasattr(wp.flat[0], 'X'):
+                        for j in range(Config.NUM_JOINTS):
+                            joint = wp.flat[j]
+                            skeleton_data[i, j, 0] = joint.X
+                            skeleton_data[i, j, 1] = joint.Y
+                            skeleton_data[i, j, 2] = joint.Z
+                    
+                    # Handle Dense Matrix (N x 3 or N x 4)
+                    elif isinstance(wp, np.ndarray) and wp.ndim == 2 and wp.shape[0] == Config.NUM_JOINTS and wp.shape[1] >= 3:
+                        skeleton_data[i, :, 0] = wp[:, 0]
+                        skeleton_data[i, :, 1] = wp[:, 1]
+                        skeleton_data[i, :, 2] = wp[:, 2]
+
+        # --- Root Relative ---
+        # HipCenter is usually index 0. Prompt lists it first.
+        hip_center = skeleton_data[:, 0:1, :]  # (T, 1, 3)
+        skeleton_data = skeleton_data - hip_center
+
+        # Flatten: (T, 60)
+        skeleton_flat = skeleton_data.reshape(num_frames, -1)
+
+        # --- Extract Labels (Frame-wise) ---
+        labels_seq = np.zeros(num_frames, dtype=np.int64)  # Default 0 (background)
+
+        if hasattr(video, "Labels"):
+            raw_labels = video.Labels
+            if not isinstance(raw_labels, np.ndarray):
+                raw_labels = [raw_labels]
+            elif raw_labels.size == 1:
+                raw_labels = [raw_labels.item()]
+
+            for l in raw_labels:
+                if hasattr(l, "Name") and hasattr(l, "Begin") and hasattr(l, "End"):
+                    name = l.Name
+                    # Matlab 1-based indexing -> Python 0-based
+                    start_f = int(l.Begin) - 1
+                    end_f = int(l.End) - 1
+
+                    if name in Config.LABEL_MAP:
+                        lid = Config.LABEL_MAP[name]
+                        # Clip to valid range
+                        start_f = max(0, start_f)
+                        end_f = min(num_frames - 1, end_f)
+                        if end_f >= start_f:
+                            labels_seq[start_f : end_f + 1] = lid
+
+        return skeleton_flat, labels_seq, num_frames
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def _process_audio(self, audio_rel_path, target_frames):
+        """
+        Loads audio, computes MFCC, aligns to target_frames.
+        Returns: (T, n_mfcc)
+        """
+        full_path = os.path.join(Config.INPUT_DIR, audio_rel_path)
+        try:
+            # Load with torchaudio
+            waveform, sample_rate = torchaudio.load(full_path)
+
+            # Resample if necessary
+            if sample_rate != Config.AUDIO_SAMPLERATE:
+                resampler = torchaudio.transforms.Resample(
+                    sample_rate, Config.AUDIO_SAMPLERATE
+                )
+                waveform = resampler(waveform)
+
+            # Mix to mono
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+            # Compute MFCC
+            # (1, n_mfcc, time)
+            mfcc = self.mfcc_transform(waveform)
+
+            # Transpose to (Time, Features) -> (T_aud, 13)
+            mfcc = mfcc.squeeze(0).transpose(0, 1).numpy()
+
+            # Align to Video Frames
+            # Simple truncation or padding
+            curr_len = mfcc.shape[0]
+            if curr_len > target_frames:
+                mfcc = mfcc[:target_frames]
+            elif curr_len < target_frames:
+                pad_amt = target_frames - curr_len
+                # Pad with zeros
+                mfcc = np.pad(mfcc, ((0, pad_amt), (0, 0)), mode="constant")
+
+            return mfcc
+
+        except Exception as e:
+            # print(f"Audio parse error: {e}")
+            return None
+=======
+    def _process_audio(self, audio_rel_path, target_frames):
+        """
+        Loads audio, computes MFCC, aligns to target_frames.
+        Returns: (T, n_mfcc)
+        """
+        full_path = os.path.join(Config.INPUT_DIR, audio_rel_path)
+        # Removed broad try-except (Cite debug_lesson_4)
+        
+        # Load with torchaudio
+        waveform, sample_rate = torchaudio.load(full_path)
+
+        # Resample if necessary
+        if sample_rate != Config.AUDIO_SAMPLERATE:
+            resampler = torchaudio.transforms.Resample(
+                sample_rate, Config.AUDIO_SAMPLERATE
+            )
+            waveform = resampler(waveform)
+
+        # Mix to mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Compute MFCC
+        # (1, n_mfcc, time)
+        mfcc = self.mfcc_transform(waveform)
+
+        # Transpose to (Time, Features) -> (T_aud, 13)
+        mfcc = mfcc.squeeze(0).transpose(0, 1).numpy()
+
+        # Align to Video Frames
+        # Simple truncation or padding
+        curr_len = mfcc.shape[0]
+        if curr_len > target_frames:
+            mfcc = mfcc[:target_frames]
+        elif curr_len < target_frames:
+            pad_amt = target_frames - curr_len
+            # Pad with zeros
+            mfcc = np.pad(mfcc, ((0, pad_amt), (0, 0)), mode="constant")
+
+        return mfcc
+>>>>>>> REPLACE
+```

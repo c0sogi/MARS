@@ -1,0 +1,333 @@
+To optimize the model's performance, I will implement the following changes based on the provided lessons:
+
+1.  **Revert to Standard ArcFace**: I will replace the `ElasticFace` head with a standard `ArcFace` head. Lesson 00038 highlights that `ElasticFace` combined with aggressive hyperparameters caused training instability and collapse in the previous attempt.
+2.  **Optimize Learning Rate**: I will reduce the learning rate from `1e-3` to `3e-4`. Lesson 00038 identifies high learning rates as a primary cause of failure for margin-based losses in this task.
+3.  **Disable Label Smoothing**: I will set label smoothing to `0.0`. Lesson 00013 indicates that label smoothing degrades performance when used with ArcFace on singleton-heavy datasets by diluting the gradient signal required to separate rare classes.
+4.  **Conservative Augmentation**: I will reduce the rotation augmentation from `20.0` to `15.0` degrees. Lesson 00014 suggests that aggressive rotation harms performance in fine-grained identification tasks.
+
+These changes are targeted at stabilizing the training process and maximizing the discriminative power of the metric learning head.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Loss Function: ElasticFace
+    # -------------------------------------------------------------------------
+    LOSS_MODULE = "ElasticFace"
+    S = 30.0  # Scale factor
+    M = 0.50  # Margin
+    SIGMA = 0.05  # Standard deviation for the elastic margin randomization
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    MAX_EPOCHS = 30
+    PATIENCE = 5  # Early stopping patience
+
+    # Optimizer: AdamW
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+    MIN_LR = 1e-6
+
+    # Scheduler: Cosine Annealing
+    SCHEDULER_T_MAX = MAX_EPOCHS
+
+    # Regularization
+    LABEL_SMOOTHING = 0.1
+
+    # -------------------------------------------------------------------------
+    # Augmentation Pipeline
+    # -------------------------------------------------------------------------
+    # Geometric (Conservative)
+    AUG_ROTATION = 20.0  # +/- degrees
+=======
+    # Loss Function: ArcFace
+    # -------------------------------------------------------------------------
+    LOSS_MODULE = "ArcFace"
+    S = 30.0  # Scale factor
+    M = 0.50  # Margin
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    MAX_EPOCHS = 25
+    PATIENCE = 5  # Early stopping patience
+
+    # Optimizer: AdamW
+    # Cite solution_lesson_node_00038: Margin-based losses are hypersensitive to LR.
+    # Reducing from 1e-3 to 3e-4 to prevent embedding collapse.
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-2
+    MIN_LR = 1e-6
+
+    # Scheduler: Cosine Annealing
+    SCHEDULER_T_MAX = MAX_EPOCHS
+
+    # Regularization
+    # Cite solution_lesson_node_00013: Avoid Label Smoothing with ArcFace on singleton-heavy datasets.
+    LABEL_SMOOTHING = 0.0
+
+    # -------------------------------------------------------------------------
+    # Augmentation Pipeline
+    # -------------------------------------------------------------------------
+    # Geometric (Conservative)
+    # Cite solution_lesson_node_00014: Conservative rotation is critical.
+    AUG_ROTATION = 15.0  # +/- degrees
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ElasticArcFace(nn.Module):
+    """
+    ElasticFace: Elastic Angular Margin Loss.
+
+    This module implements the ElasticFace loss head, which replaces the fixed margin
+    of ArcFace with a stochastic margin sampled from a Gaussian distribution N(m, sigma).
+    This flexibility allows the model to better accommodate class overlap and singleton
+    classes by relaxing the strict geometric constraints during training.
+
+    Reference: "ElasticFace: Elastic Margin Loss for Deep Face Recognition"
+    """
+
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, std=0.05):
+        """
+        Args:
+            in_features (int): Dimension of input embeddings.
+            out_features (int): Number of classes.
+            s (float): Scale factor.
+            m (float): Mean margin.
+            std (float): Standard deviation for the random margin.
+        """
+        super(ElasticArcFace, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.std = std
+
+        # Weight matrix (Class centers)
+        # Shape: (out_features, in_features) to match F.linear behavior
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embeddings, labels=None):
+        """
+        Args:
+            embeddings (torch.Tensor): Input features of shape (Batch, in_features).
+            labels (torch.Tensor, optional): Ground truth labels of shape (Batch,).
+
+        Returns:
+            torch.Tensor: Logits (scaled cosine similarities) of shape (Batch, out_features).
+        """
+        # 1. Normalize weights and input embeddings (L2 Norm)
+        # F.normalize defaults to p=2, dim=1
+        W = F.normalize(self.weight, p=2, dim=1)
+        X = F.normalize(embeddings, p=2, dim=1)
+
+        # 2. Compute Cosine Similarity
+        # Result: (Batch, Out_Features)
+        cosine = F.linear(X, W)
+
+        # 3. Inference / Validation Mode
+        # If no labels are provided or we are not training, return scaled cosine logits.
+        if labels is None or not self.training:
+            return cosine * self.s
+
+        # 4. Training Mode: Apply Elastic Margin
+
+        # Clamp cosine for numerical stability in acos
+        cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+        # Sample random margin from N(0, 1) * std + m
+        # We sample a single random margin for the batch for efficiency,
+        # or we could sample per instance. Per-batch is standard for efficiency.
+        eps = torch.randn(1, device=cosine.device) * self.std
+        m_random = self.m + eps
+
+        # Get the cosine value corresponding to the ground truth class
+        # labels: (Batch,) -> index: (Batch, 1)
+        index = labels.view(-1, 1).long()
+        cosine_target = cosine.gather(1, index)
+
+        # Compute theta = arccos(cos_theta)
+        theta = cosine_target.acos()
+
+        # Apply elastic margin: cos(theta + m_random)
+        cosine_target_margin = torch.cos(theta + m_random)
+
+        # Create one-hot mask to replace only the target class logits
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, index, 1.0)
+
+        # Combine: Use modified cosine for target class, original cosine for others
+        logits = cosine * (1 - one_hot) + cosine_target_margin * one_hot
+
+        # Scale logits
+        logits = logits * self.s
+
+        return logits
+=======
+class ArcFace(nn.Module):
+    """
+    ArcFace: Additive Angular Margin Loss.
+    
+    Standard implementation replacing ElasticFace to improve training stability.
+    Cite solution_lesson_node_00038: Reverting to standard ArcFace to fix instability.
+    """
+
+    def __init__(self, in_features, out_features, s=30.0, m=0.50):
+        """
+        Args:
+            in_features (int): Dimension of input embeddings.
+            out_features (int): Number of classes.
+            s (float): Scale factor.
+            m (float): Margin.
+        """
+        super(ArcFace, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+
+        # Weight matrix (Class centers)
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embeddings, labels=None):
+        # 1. Normalize weights and input embeddings
+        W = F.normalize(self.weight, p=2, dim=1)
+        X = F.normalize(embeddings, p=2, dim=1)
+
+        # 2. Compute Cosine Similarity
+        cosine = F.linear(X, W)
+
+        # 3. Inference / Validation Mode
+        if labels is None or not self.training:
+            return cosine * self.s
+
+        # 4. Training Mode: Apply Margin
+        cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        
+        # Get target cosine
+        index = labels.view(-1, 1).long()
+        cosine_target = cosine.gather(1, index)
+
+        # theta + m
+        theta = cosine_target.acos()
+        cosine_target_margin = torch.cos(theta + self.m)
+
+        # Replace target logits
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, index, 1.0)
+        
+        logits = cosine * (1 - one_hot) + cosine_target_margin * one_hot
+        logits = logits * self.s
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class WhaleDenseNet(nn.Module):
+    """
+    Ensemble Component Model: DenseNet121 with ElasticArcFace.
+
+    Architecture:
+    1. Backbone: DenseNet121 (pre-trained).
+    2. Pooling: Global Average Pooling (GAP).
+    3. Neck: BN -> Linear(512) -> BN (No Dropout).
+    4. Head: ElasticArcFace.
+    """
+
+    def __init__(
+        self,
+        num_classes=Config.NUM_CLASSES,
+        embedding_dim=Config.EMBEDDING_DIM,
+        pretrained=True,
+    ):
+        super(WhaleDenseNet, self).__init__()
+
+        # 1. Backbone
+        weights = "DEFAULT" if pretrained else None
+        self.backbone = models.densenet121(weights=weights)
+
+        # Capture input features of the original classifier (1024 for DenseNet121)
+        in_features = self.backbone.classifier.in_features
+
+        # Remove original classifier to save memory/parameters
+        del self.backbone.classifier
+
+        # 2. Neck
+        # Learnable bottleneck to adapt semantic features to geometric metric space
+        # We explicitly exclude Dropout as it conflicts with margin-based losses
+        self.neck = nn.Sequential(
+            nn.BatchNorm1d(in_features),
+            nn.Linear(in_features, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+        )
+
+        # 3. Head
+        self.head = ElasticArcFace(
+            in_features=embedding_dim,
+            out_features=num_classes,
+            s=Config.S,
+            m=Config.M,
+            std=Config.SIGMA,
+        )
+
+    def forward(self, x, labels=None):
+=======
+class WhaleDenseNet(nn.Module):
+    """
+    Ensemble Component Model: DenseNet121 with ArcFace.
+
+    Architecture:
+    1. Backbone: DenseNet121 (pre-trained).
+    2. Pooling: Global Average Pooling (GAP).
+    3. Neck: BN -> Linear(512) -> BN (No Dropout).
+    4. Head: ArcFace.
+    """
+
+    def __init__(
+        self,
+        num_classes=Config.NUM_CLASSES,
+        embedding_dim=Config.EMBEDDING_DIM,
+        pretrained=True,
+    ):
+        super(WhaleDenseNet, self).__init__()
+
+        # 1. Backbone
+        weights = "DEFAULT" if pretrained else None
+        self.backbone = models.densenet121(weights=weights)
+
+        # Capture input features of the original classifier (1024 for DenseNet121)
+        in_features = self.backbone.classifier.in_features
+
+        # Remove original classifier to save memory/parameters
+        del self.backbone.classifier
+
+        # 2. Neck
+        # Learnable bottleneck to adapt semantic features to geometric metric space
+        # We explicitly exclude Dropout as it conflicts with margin-based losses
+        self.neck = nn.Sequential(
+            nn.BatchNorm1d(in_features),
+            nn.Linear(in_features, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+        )
+
+        # 3. Head
+        self.head = ArcFace(
+            in_features=embedding_dim,
+            out_features=num_classes,
+            s=Config.S,
+            m=Config.M,
+        )
+
+    def forward(self, x, labels=None):
+>>>>>>> REPLACE
+```

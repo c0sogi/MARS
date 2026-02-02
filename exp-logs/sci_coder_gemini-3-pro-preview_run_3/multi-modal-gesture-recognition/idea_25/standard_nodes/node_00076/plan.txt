@@ -1,0 +1,710 @@
+My implementation strategy focuses on rectifying the architectural and methodological flaws identified in the previous solution by applying lessons learned from earlier iterations.
+
+1.  **Architectural Correction (Cite Lesson 00072)**: I will replace the `NRGSNet` (which used additive residual correction on logits) with `KC_IRN` (Kinematically-Consistent Iterative Refinement Network). This new architecture implements **Independent Probability Refinement**, where each refinement stage consumes the softmax probabilities of the previous stage and outputs fresh logits. This decouples the noise correction process and prevents the propagation of "jitter" seen in the residual approach. I will also reduce the TCN hidden channel size to 64 to avoid over-parameterization (Cite Lesson 00053).
+
+2.  **Model Selection Optimization (Cite Lesson 00075)**: I will modify the training loop in `library/trainer.py` to perform **full-sequence validation** at the end of every epoch. Instead of relying on frame-wise validation loss (which correlates poorly with the task metric), early stopping and model checkpointing will now be driven directly by the **Levenshtein Error Rate**.
+
+3.  **Regularization (Cite Lesson 00055)**: I will introduce `WEIGHT_DECAY = 1e-4` to the optimizer configuration to improve generalization on this small dataset.
+
+4.  **Refactoring**: I will move the Levenshtein calculation logic to `library/inference.py` to share it between the trainer (for early stopping) and the final evaluation script.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-3  # Adam default
+EPOCHS = 50
+EARLY_STOPPING_PATIENCE = 10
+
+# Loss Function Weights
+=======
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-3  # Adam default
+WEIGHT_DECAY = 1e-4  # L2 Regularization (Cite Lesson 00055)
+EPOCHS = 50
+EARLY_STOPPING_PATIENCE = 10
+
+# Model Capacity
+TCN_HIDDEN_CHANNELS = 64  # (Cite Lesson 00053)
+
+# Loss Function Weights
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import NRGSNet
+
+# Ensure deterministic behavior
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+def post_process_predictions(frame_indices):
+=======
+from library.model import KC_IRN
+
+# Ensure deterministic behavior
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+def calculate_levenshtein(seq1, seq2):
+    """
+    Calculates the Levenshtein distance between two sequences.
+    """
+    size_x = len(seq1) + 1
+    size_y = len(seq2) + 1
+    matrix = np.zeros((size_x, size_y))
+    for x in range(size_x):
+        matrix[x, 0] = x
+    for y in range(size_y):
+        matrix[0, y] = y
+
+    for x in range(1, size_x):
+        for y in range(1, size_y):
+            if seq1[x - 1] == seq2[y - 1]:
+                matrix[x, y] = min(
+                    matrix[x - 1, y] + 1, matrix[x - 1, y - 1], matrix[x, y - 1] + 1
+                )
+            else:
+                matrix[x, y] = min(
+                    matrix[x - 1, y] + 1, matrix[x - 1, y - 1] + 1, matrix[x, y - 1] + 1
+                )
+    return matrix[size_x - 1, size_y - 1]
+
+
+def post_process_predictions(frame_indices):
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 1. Load Model
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    model = NRGSNet().to(device)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+=======
+    # 1. Load Model
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    model = KC_IRN().to(device)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    DROPOUT,
+    NUM_CLASSES,
+)
+
+
+class Chomp1d(nn.Module):
+=======
+    DROPOUT,
+    NUM_CLASSES,
+    TCN_HIDDEN_CHANNELS,
+)
+
+
+class Chomp1d(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class NRGSNet(nn.Module):
+    """
+    Normalized Residual Gated-Sawtooth Network.
+    3-Stage Cascade:
+    1. Gated Bi-GRU Encoder -> L1
+    2. Normalized Residual TCN -> L2 = LogSoftmax(L1 + TCN(L1))
+    3. Normalized Residual TCN -> L3 = LogSoftmax(L2 + TCN(L2))
+    """
+
+    def __init__(self):
+        super(NRGSNet, self).__init__()
+
+        # Calculate Input Dimension
+        # Kinematics: 20 joints * 3 (Pos, Vel, Acc) * 3 coords = 180
+        # Audio: 13 MFCC
+        self.input_dim = (NUM_JOINTS * 3 * JOINTS_DIM) + N_MFCC
+
+        # --- Stage 1: Gated High-Capacity Kinematic Encoder ---
+        self.gated_input = GatedInput(self.input_dim)
+
+        # Bi-GRU: Hidden size is per direction, so output is 2 * HIDDEN_SIZE
+        self.gru = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=DROPOUT,
+        )
+
+        # Projection to classes
+        self.stage1_fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
+
+        # --- Stage 2: Normalized Residual Sawtooth Refinement ---
+        # Input: Log-probs (NUM_CLASSES channels)
+        # Internal TCN width: 256 (same as GRU output capacity)
+        self.stage2_tcn = SawtoothTCN(
+            num_inputs=NUM_CLASSES,
+            num_channels=HIDDEN_SIZE * 2,
+            kernel_size=KERNEL_SIZE,
+            dropout=DROPOUT,
+        )
+
+        # --- Stage 3: Independent Normalized Residual Refinement ---
+        self.stage3_tcn = SawtoothTCN(
+            num_inputs=NUM_CLASSES,
+            num_channels=HIDDEN_SIZE * 2,
+            kernel_size=KERNEL_SIZE,
+            dropout=DROPOUT,
+        )
+
+    def forward(self, x):
+        # x: (Batch, Time, Input_Dim)
+
+        # --- Stage 1 ---
+        # Gating
+        x_gated = self.gated_input(x)
+
+        # GRU Backbone
+        gru_out, _ = self.gru(x_gated)
+
+        # Initial Prediction
+        logits_1 = self.stage1_fc(gru_out)  # (B, T, C)
+        log_probs_1 = F.log_softmax(logits_1, dim=2)
+
+        # --- Stage 2 ---
+        # Permute for TCN: (B, T, C) -> (B, C, T)
+        tcn_in_1 = log_probs_1.permute(0, 2, 1)
+
+        # Predict additive correction to logits
+        correction_1 = self.stage2_tcn(tcn_in_1)  # (B, C, T)
+
+        # Normalized Residual: LogSoftmax(L1 + Correction)
+        # We treat L1 as the base logits for the next stage
+        logits_2 = tcn_in_1 + correction_1
+        log_probs_2 = F.log_softmax(logits_2, dim=1)  # Softmax over channels
+
+        # --- Stage 3 ---
+        tcn_in_2 = log_probs_2  # (B, C, T)
+
+        correction_2 = self.stage3_tcn(tcn_in_2)
+
+        logits_3 = tcn_in_2 + correction_2
+        log_probs_3 = F.log_softmax(logits_3, dim=1)
+
+        # Permute back to (B, T, C) for output
+        out_1 = log_probs_1
+        out_2 = log_probs_2.permute(0, 2, 1)
+        out_3 = log_probs_3.permute(0, 2, 1)
+
+        return out_1, out_2, out_3
+=======
+class KC_IRN(nn.Module):
+    """
+    Kinematically-Consistent Iterative Refinement Network.
+    Implements Independent Probability Refinement (Cite Lesson 00072).
+    3-Stage Cascade:
+    1. Gated Bi-GRU Encoder -> Logits1
+    2. TCN(Softmax(Logits1)) -> Logits2
+    3. TCN(Softmax(Logits2)) -> Logits3
+    """
+
+    def __init__(self):
+        super(KC_IRN, self).__init__()
+
+        # Calculate Input Dimension
+        self.input_dim = (NUM_JOINTS * 3 * JOINTS_DIM) + N_MFCC
+
+        # --- Stage 1: Gated High-Capacity Kinematic Encoder ---
+        self.gated_input = GatedInput(self.input_dim)
+
+        self.gru = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=DROPOUT,
+        )
+
+        self.stage1_fc = nn.Linear(HIDDEN_SIZE * 2, NUM_CLASSES)
+
+        # --- Stage 2: Independent Refinement ---
+        # Input: Probabilities (NUM_CLASSES channels)
+        # Output: New Logits (NUM_CLASSES channels)
+        self.stage2_tcn = SawtoothTCN(
+            num_inputs=NUM_CLASSES,
+            num_channels=TCN_HIDDEN_CHANNELS,
+            kernel_size=KERNEL_SIZE,
+            dropout=DROPOUT,
+        )
+
+        # --- Stage 3: Independent Refinement ---
+        self.stage3_tcn = SawtoothTCN(
+            num_inputs=NUM_CLASSES,
+            num_channels=TCN_HIDDEN_CHANNELS,
+            kernel_size=KERNEL_SIZE,
+            dropout=DROPOUT,
+        )
+
+    def forward(self, x):
+        # x: (Batch, Time, Input_Dim)
+
+        # --- Stage 1 ---
+        x_gated = self.gated_input(x)
+        gru_out, _ = self.gru(x_gated)
+        logits_1 = self.stage1_fc(gru_out)  # (B, T, C)
+
+        # --- Stage 2 ---
+        # Pass Softmax Probabilities (Cite Lesson 00072)
+        probs_1 = F.softmax(logits_1, dim=2)
+        tcn_in_1 = probs_1.permute(0, 2, 1)  # (B, C, T)
+        
+        logits_2_tcn = self.stage2_tcn(tcn_in_1) # (B, C, T)
+        logits_2 = logits_2_tcn.permute(0, 2, 1) # (B, T, C)
+
+        # --- Stage 3 ---
+        probs_2 = F.softmax(logits_2, dim=2)
+        tcn_in_2 = probs_2.permute(0, 2, 1)
+        
+        logits_3_tcn = self.stage3_tcn(tcn_in_2)
+        logits_3 = logits_3_tcn.permute(0, 2, 1)
+
+        # Return LogSoftmax for NLLLoss
+        return (
+            F.log_softmax(logits_1, dim=2),
+            F.log_softmax(logits_2, dim=2),
+            F.log_softmax(logits_3, dim=2)
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+
+from library.config import (
+    WORKING_DIR,
+    TRAIN_METADATA_PATH,
+    VAL_METADATA_PATH,
+    BATCH_SIZE,
+    LEARNING_RATE,
+    EPOCHS,
+    EARLY_STOPPING_PATIENCE,
+    BACKGROUND_CLASS_WEIGHT,
+    SMOOTHING_THRESHOLD,
+    SMOOTHING_LOSS_WEIGHT,
+    NUM_CLASSES,
+    SEED,
+)
+from library.dataset import GestureDataset
+from library.model import NRGSNet
+
+# Ensure deterministic behavior
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+=======
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+import pandas as pd
+import json
+import os
+
+from library.config import (
+    WORKING_DIR,
+    TRAIN_METADATA_PATH,
+    VAL_METADATA_PATH,
+    INPUT_DIR,
+    BATCH_SIZE,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    EPOCHS,
+    EARLY_STOPPING_PATIENCE,
+    BACKGROUND_CLASS_WEIGHT,
+    SMOOTHING_THRESHOLD,
+    SMOOTHING_LOSS_WEIGHT,
+    NUM_CLASSES,
+    SEED,
+)
+from library.dataset import GestureDataset
+from library.model import KC_IRN
+import library.inference as inference
+import library.data_utils as data_utils
+
+# Ensure deterministic behavior
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def validate_epoch(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct_preds = 0
+    total_preds = 0
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+
+            final_output = outputs[-1]
+            _, predicted = torch.max(final_output, 2)
+
+            correct_preds += (predicted == labels).sum().item()
+            total_preds += labels.numel()
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    epoch_acc = correct_preds / total_preds
+    return epoch_loss, epoch_acc
+
+
+def train_model(limit_data=None, load_cached_data=True):
+    """
+    Main training function.
+    Args:
+        limit_data (int): Optional limit for debugging.
+        load_cached_data (bool): Whether to use cached features.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Load Datasets
+    print("Loading Training Data...")
+    train_dataset = GestureDataset(
+        TRAIN_METADATA_PATH,
+        is_train=True,
+        load_cached_data=load_cached_data,
+        limit=limit_data,
+    )
+
+    print("Loading Validation Data...")
+    val_dataset = GestureDataset(
+        VAL_METADATA_PATH,
+        is_train=False,
+        load_cached_data=load_cached_data,
+        limit=limit_data,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # 2. Initialize Model
+    model = NRGSNet().to(device)
+
+    # 3. Setup Optimizer and Loss
+    # Using Adam as per plan (no AdamW)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = CustomLoss(device)
+
+    # 4. Training Loop
+    best_val_loss = float("inf")
+    patience_counter = 0
+    best_model_path = os.path.join(WORKING_DIR, "best_model.pth")
+
+    print("Starting training...")
+    start_time = time.time()
+
+    for epoch in range(EPOCHS):
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
+
+        print(
+            f"Epoch {epoch+1}/{EPOCHS} | "
+            f"Train Loss: {train_loss} | Train Acc: {train_acc} | "
+            f"Val Loss: {val_loss} | Val Acc: {val_acc}"
+        )
+
+        # Early Stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print("  Validation loss improved. Saved model.")
+        else:
+            patience_counter += 1
+            print(
+                f"  EarlyStopping counter: {patience_counter} out of {EARLY_STOPPING_PATIENCE}"
+            )
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
+                break
+
+    total_time = time.time() - start_time
+    print(f"Training complete in {total_time // 60:.0f}m {total_time % 60:.0f}s")
+    print(f"Best Validation Loss: {best_val_loss}")
+
+    return best_model_path
+=======
+def validate_full_sequences(model, device):
+    """
+    Performs validation on full sequences and computes Levenshtein Error Rate.
+    Cite Lesson 00075: Model Selection based on Sequence Metric.
+    """
+    model.eval()
+    df_val = pd.read_csv(VAL_METADATA_PATH)
+    
+    total_distance = 0
+    total_gestures = 0
+    
+    for _, row in df_val.iterrows():
+        data_path = os.path.join(INPUT_DIR, row["data_path"])
+        audio_path = os.path.join(INPUT_DIR, row["audio_path"])
+        
+        # Ground Truth
+        gt_labels = []
+        if pd.notna(row["labels"]):
+            try:
+                label_list = json.loads(row["labels"])
+                label_list.sort(key=lambda x: x["begin"])
+                gt_labels = [int(l["id"]) for l in label_list]
+            except:
+                pass
+        
+        # Inference
+        skeleton = data_utils.load_robust_mat(data_path, load_cached_data=True)
+        if skeleton is None or skeleton.shape[0] == 0:
+            total_distance += len(gt_labels)
+            total_gestures += len(gt_labels)
+            continue
+            
+        num_frames = skeleton.shape[0]
+        audio = data_utils.extract_audio_mfcc(audio_path, num_frames, load_cached_data=True)
+        
+        kinematics = data_utils.compute_kinematics(skeleton)
+        T, J, D = kinematics.shape
+        kinematics_flat = kinematics.reshape(T, J*D)
+        
+        features = np.concatenate([kinematics_flat, audio], axis=-1)
+        
+        avg_probs = inference.predict_sliding_window(model, features, device)
+        frame_preds = np.argmax(avg_probs, axis=1)
+        predicted_gestures = inference.post_process_predictions(frame_preds)
+        
+        dist = inference.calculate_levenshtein(predicted_gestures, gt_labels)
+        total_distance += dist
+        total_gestures += len(gt_labels)
+        
+    error_rate = total_distance / total_gestures if total_gestures > 0 else 1.0
+    return error_rate
+
+
+def train_model(limit_data=None, load_cached_data=True):
+    """
+    Main training function.
+    Args:
+        limit_data (int): Optional limit for debugging.
+        load_cached_data (bool): Whether to use cached features.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Load Datasets
+    print("Loading Training Data...")
+    train_dataset = GestureDataset(
+        TRAIN_METADATA_PATH,
+        is_train=True,
+        load_cached_data=load_cached_data,
+        limit=limit_data,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # 2. Initialize Model
+    model = KC_IRN().to(device)
+
+    # 3. Setup Optimizer and Loss
+    # Cite Lesson 00055: Use Weight Decay
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    criterion = CustomLoss(device)
+
+    # 4. Training Loop
+    best_val_metric = float("inf")
+    patience_counter = 0
+    best_model_path = os.path.join(WORKING_DIR, "best_model.pth")
+
+    print("Starting training...")
+    start_time = time.time()
+
+    for epoch in range(EPOCHS):
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        
+        # Validation on full sequences (Cite Lesson 00075)
+        val_metric = validate_full_sequences(model, device)
+
+        print(
+            f"Epoch {epoch+1}/{EPOCHS} | "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+            f"Val Error Rate: {val_metric:.4f}"
+        )
+
+        # Early Stopping based on Levenshtein Error Rate
+        if val_metric < best_val_metric:
+            best_val_metric = val_metric
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print("  Validation metric improved. Saved model.")
+        else:
+            patience_counter += 1
+            print(
+                f"  EarlyStopping counter: {patience_counter} out of {EARLY_STOPPING_PATIENCE}"
+            )
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
+                break
+
+    total_time = time.time() - start_time
+    print(f"Training complete in {total_time // 60:.0f}m {total_time % 60:.0f}s")
+    print(f"Best Validation Error Rate: {best_val_metric}")
+
+    return best_model_path
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import library.data_utils as data_utils
+from library.model import NRGSNet
+from library.config import (
+    VAL_METADATA_PATH,
+=======
+import library.data_utils as data_utils
+from library.model import KC_IRN
+from library.config import (
+    VAL_METADATA_PATH,
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Model
+    model = NRGSNet().to(device)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+=======
+    # Load Model
+    model = KC_IRN().to(device)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def calculate_levenshtein(seq1, seq2):
+    """
+    Calculates the Levenshtein distance between two sequences.
+    """
+    size_x = len(seq1) + 1
+    size_y = len(seq2) + 1
+    matrix = np.zeros((size_x, size_y))
+    for x in range(size_x):
+        matrix[x, 0] = x
+    for y in range(size_y):
+        matrix[0, y] = y
+
+    for x in range(1, size_x):
+        for y in range(1, size_y):
+            if seq1[x - 1] == seq2[y - 1]:
+                matrix[x, y] = min(
+                    matrix[x - 1, y] + 1, matrix[x - 1, y - 1], matrix[x, y - 1] + 1
+                )
+            else:
+                matrix[x, y] = min(
+                    matrix[x - 1, y] + 1, matrix[x - 1, y - 1] + 1, matrix[x, y - 1] + 1
+                )
+    return matrix[size_x - 1, size_y - 1]
+
+
+def run_validation_inference(model_path):
+=======
+def run_validation_inference(model_path):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # --- Metric Calculation ---
+        dist = calculate_levenshtein(predicted_gestures, gt_labels)
+
+        total_distance += dist
+=======
+        # --- Metric Calculation ---
+        dist = inference.calculate_levenshtein(predicted_gestures, gt_labels)
+
+        total_distance += dist
+>>>>>>> REPLACE
+```

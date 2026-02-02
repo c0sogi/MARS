@@ -1,0 +1,1402 @@
+I will optimize the solution by reverting the unstable semi-supervised pipeline to a robust supervised baseline, incorporating explicit depth injection and optimizing the evaluation protocol.
+
+**Strategy:**
+1.  **Architecture**: Replace the ineffective Auxiliary Depth Regression with **Explicit Depth Injection** (Concatenation) at the bottleneck. This aligns with **Lesson 00024** and **Lesson 00037**, which suggest that direct feature injection allows the decoder to better utilize conditional metadata than auxiliary tasks.
+2.  **Loss Function**: Remove the MSE loss component and strictly use **BCE + Lovasz Hinge Loss**. This addresses **Lesson 00021**, which highlights Lovasz as the superior objective for IoU metrics, and avoids the "silent disconnection" bug of the auxiliary head.
+3.  **Training**: Increase training duration to **50 epochs** (Cite **Lesson 00035**) to ensure full convergence, as the previous 10-epoch run was insufficient.
+4.  **Evaluation**: Implement **Adaptive Thresholding** during validation (Cite **Lesson 00033**) to maximize the mAP score by decoupling the decision boundary from the prediction probability.
+5.  **Pipeline**: Remove the "Student" training stage (which failed with `NaN`s due to soft-target incompatibility, **Lesson 00071**) and focus on a high-quality **5-Fold Ensemble** trained on ground truth data.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    EPOCHS = 50
+    NUM_FOLDS = 5
+
+    # Debugging / Development
+    DEBUG = False
+    DEBUG_SIZE = 100  # Number of samples to use when DEBUG is True
+
+    # =========================================================================
+    # Model Configuration
+    # =========================================================================
+    BACKBONE = "resnet34"
+    PRETRAINED = True
+
+    # Multi-Task Loss Weights
+    # Loss = Lovasz + BCE + (DEPTH_LOSS_WEIGHT * MSE)
+    DEPTH_LOSS_WEIGHT = 0.1
+
+    # Gating for Stage 2 (Noisy Student)
+    # Models with validation mAP < MAP_THRESHOLD are discarded from the ensemble
+    MAP_THRESHOLD = 0.75
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    EPOCHS = 50
+    NUM_FOLDS = 5
+
+    # Debugging / Development
+    DEBUG = False
+    DEBUG_SIZE = 100  # Number of samples to use when DEBUG is True
+
+    # =========================================================================
+    # Model Configuration
+    # =========================================================================
+    BACKBONE = "resnet34"
+    PRETRAINED = True
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class AuxDepthHead(nn.Module):
+    """
+    Auxiliary Depth Regression Head.
+
+    Attached to the bottleneck feature map to predict the normalized depth of the image.
+    This forces the encoder to learn depth-correlated texture features.
+
+    Structure: GlobalAveragePooling -> MLP -> Scalar.
+    """
+
+    def __init__(self, in_channels):
+        super(AuxDepthHead, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, 128), nn.ReLU(inplace=True), nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.mlp(x)
+        return x
+
+
+class SaltNet(nn.Module):
+    """
+    Corrected Multi-Task Wide-LinkNet Architecture.
+
+    Backbone: ResNet34 (Pretrained).
+    Decoder: Wide-LinkNet with Additive Skip Connections.
+    Auxiliary Task: Depth Regression (Not injected into decoder).
+    """
+
+    def __init__(self):
+        super(SaltNet, self).__init__()
+
+        # Load Pretrained ResNet34
+        weights = ResNet34_Weights.DEFAULT
+        resnet = models.resnet34(weights=weights)
+
+        # ---------------------------------------------------------------------
+        # Encoder (ResNet34)
+        # ---------------------------------------------------------------------
+
+        # Input Adaptation: Modify first conv to accept 1-channel input
+        # We sum the weights of the original 3 channels to preserve feature detectors
+        original_conv1 = resnet.conv1
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            self.conv1.weight[:] = original_conv1.weight.sum(dim=1, keepdim=True)
+
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        self.layer1 = resnet.layer1  # 64 channels, Stride 4 (effective)
+        self.layer2 = resnet.layer2  # 128 channels, Stride 8
+        self.layer3 = resnet.layer3  # 256 channels, Stride 16
+        self.layer4 = resnet.layer4  # 512 channels, Stride 32
+
+        # ---------------------------------------------------------------------
+        # Bottleneck & Aux Head
+        # ---------------------------------------------------------------------
+
+        # No explicit compression layer; pass full 512 channels to decoder.
+        self.aux_head = AuxDepthHead(512)
+
+        # ---------------------------------------------------------------------
+        # Decoder (Wide-LinkNet)
+        # ---------------------------------------------------------------------
+
+        # Decoder 4: 512 -> 256. Skip: layer3 (256)
+        self.decoder4 = DecoderBlock(512, 256)
+
+        # Decoder 3: 256 -> 128. Skip: layer2 (128)
+        self.decoder3 = DecoderBlock(256, 128)
+
+        # Decoder 2: 128 -> 64. Skip: layer1 (64)
+        self.decoder2 = DecoderBlock(128, 64)
+
+        # Decoder 1: 64 -> 64. Skip: conv1 output (64)
+        # Note: layer1 output (input to d2) has same spatial dim as maxpool output.
+        # conv1 output (skip for d1) is 2x larger (Stride 2).
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # ---------------------------------------------------------------------
+        # Final Head
+        # ---------------------------------------------------------------------
+
+        # Upsample from Stride 2 (64x64) to Stride 1 (128x128)
+        # Then map to 1 output channel (logits)
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        # ---------------------------------------------------------------------
+        # Encoder Path
+        # ---------------------------------------------------------------------
+        # x: (B, 1, H, W)
+
+        # Stride 2
+        x = self.conv1(x)
+        x = self.bn1(x)
+        e0 = self.relu(x)  # Save for Decoder 1 (64 ch)
+
+        # Stride 4
+        x = self.maxpool(e0)
+        e1 = self.layer1(x)  # Save for Decoder 2 (64 ch)
+
+        # Stride 8
+        e2 = self.layer2(e1)  # Save for Decoder 3 (128 ch)
+
+        # Stride 16
+        e3 = self.layer3(e2)  # Save for Decoder 4 (256 ch)
+
+        # Stride 32
+        e4 = self.layer4(e3)  # Bottleneck (512 ch)
+
+        # ---------------------------------------------------------------------
+        # Aux Task
+        # ---------------------------------------------------------------------
+        # Predict depth from bottleneck features
+        depth_pred = self.aux_head(e4)
+
+        # ---------------------------------------------------------------------
+        # Decoder Path
+        # ---------------------------------------------------------------------
+        # Depth is NOT injected into decoder to ensure test-time compatibility
+
+        d4 = self.decoder4(e4, e3)
+        d3 = self.decoder3(d4, e2)
+        d2 = self.decoder2(d3, e1)
+        d1 = self.decoder1(d2, e0)
+
+        # ---------------------------------------------------------------------
+        # Final Prediction
+        # ---------------------------------------------------------------------
+        mask_logits = self.final(d1)
+
+        return mask_logits, depth_pred
+=======
+class SaltNet(nn.Module):
+    """
+    Wide-LinkNet Architecture with Explicit Depth Injection.
+
+    Backbone: ResNet34 (Pretrained).
+    Decoder: Wide-LinkNet with Additive Skip Connections.
+    Depth Injection: Concatenation at Bottleneck (Cite solution_lesson_node_00024, solution_lesson_node_00037).
+    """
+
+    def __init__(self):
+        super(SaltNet, self).__init__()
+
+        # Load Pretrained ResNet34
+        weights = ResNet34_Weights.DEFAULT
+        resnet = models.resnet34(weights=weights)
+
+        # ---------------------------------------------------------------------
+        # Encoder (ResNet34)
+        # ---------------------------------------------------------------------
+
+        # Input Adaptation: Modify first conv to accept 1-channel input (Cite solution_lesson_node_00028)
+        original_conv1 = resnet.conv1
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        with torch.no_grad():
+            self.conv1.weight[:] = original_conv1.weight.sum(dim=1, keepdim=True)
+
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        self.layer1 = resnet.layer1  # 64 channels, Stride 4 (effective)
+        self.layer2 = resnet.layer2  # 128 channels, Stride 8
+        self.layer3 = resnet.layer3  # 256 channels, Stride 16
+        self.layer4 = resnet.layer4  # 512 channels, Stride 32
+
+        # ---------------------------------------------------------------------
+        # Depth Injection Module
+        # ---------------------------------------------------------------------
+        # MLP to project scalar depth to embedding (Cite solution_lesson_node_00029)
+        self.depth_projector = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 32)
+        )
+        
+        # Bottleneck channels: 512 (ResNet) + 32 (Depth) = 544
+        
+        # ---------------------------------------------------------------------
+        # Decoder (Wide-LinkNet)
+        # ---------------------------------------------------------------------
+
+        # Decoder 4: 544 -> 256. Skip: layer3 (256)
+        # Internal width will be 544 // 4 = 136 (Cite solution_lesson_node_00023)
+        self.decoder4 = DecoderBlock(544, 256)
+
+        # Decoder 3: 256 -> 128. Skip: layer2 (128)
+        self.decoder3 = DecoderBlock(256, 128)
+
+        # Decoder 2: 128 -> 64. Skip: layer1 (64)
+        self.decoder2 = DecoderBlock(128, 64)
+
+        # Decoder 1: 64 -> 64. Skip: conv1 output (64)
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # ---------------------------------------------------------------------
+        # Final Head
+        # ---------------------------------------------------------------------
+
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x, depth):
+        # ---------------------------------------------------------------------
+        # Encoder Path
+        # ---------------------------------------------------------------------
+        # x: (B, 1, H, W)
+        # depth: (B, 1)
+
+        # Stride 2
+        x = self.conv1(x)
+        x = self.bn1(x)
+        e0 = self.relu(x)  # Save for Decoder 1 (64 ch)
+
+        # Stride 4
+        x = self.maxpool(e0)
+        e1 = self.layer1(x)  # Save for Decoder 2 (64 ch)
+
+        # Stride 8
+        e2 = self.layer2(e1)  # Save for Decoder 3 (128 ch)
+
+        # Stride 16
+        e3 = self.layer3(e2)  # Save for Decoder 4 (256 ch)
+
+        # Stride 32
+        e4 = self.layer4(e3)  # Bottleneck (512 ch)
+
+        # ---------------------------------------------------------------------
+        # Depth Injection
+        # ---------------------------------------------------------------------
+        # Project depth
+        d_emb = self.depth_projector(depth) # (B, 32)
+        d_emb = d_emb.unsqueeze(2).unsqueeze(3) # (B, 32, 1, 1)
+        
+        # Tile to match feature map spatial dims (H/32, W/32)
+        # e4 is (B, 512, 4, 4) for 128x128 input
+        d_emb = d_emb.expand(-1, -1, e4.size(2), e4.size(3))
+        
+        # Concatenate (Cite solution_lesson_node_00037, solution_lesson_node_00041)
+        e4_cat = torch.cat([e4, d_emb], dim=1) # (B, 544, 4, 4)
+
+        # ---------------------------------------------------------------------
+        # Decoder Path
+        # ---------------------------------------------------------------------
+
+        d4 = self.decoder4(e4_cat, e3)
+        d3 = self.decoder3(d4, e2)
+        d2 = self.decoder2(d3, e1)
+        d1 = self.decoder1(d2, e0)
+
+        # ---------------------------------------------------------------------
+        # Final Prediction
+        # ---------------------------------------------------------------------
+        mask_logits = self.final(d1)
+
+        return mask_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+class MultiTaskLoss(nn.Module):
+    """
+    Combined loss function for the Corrected Multi-Task Wide-LinkNet strategy.
+    Combines BCE, Lovasz Hinge Loss, and MSE for auxiliary depth regression.
+    """
+
+    def __init__(self, depth_weight=0.1):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss(per_image=True)
+        self.mse = nn.MSELoss()
+        self.depth_weight = depth_weight
+
+    def forward(self, pred_mask, pred_depth, true_mask, true_depth):
+        """
+        Args:
+            pred_mask: (B, 1, H, W) Logits from the segmentation head.
+            pred_depth: (B, 1) Predicted depth values.
+            true_mask: (B, H, W) or (B, 1, H, W) Ground truth masks.
+            true_depth: (B,) Ground truth depth values.
+
+        Returns:
+            total_loss: The weighted sum of losses.
+            metrics: Dictionary containing individual loss components.
+        """
+        # 1. Prepare Masks
+        # Ensure true_mask matches pred_mask shape for BCE (B, 1, H, W)
+        if true_mask.dim() == 3:
+            true_mask_bce = true_mask.unsqueeze(1)
+        else:
+            true_mask_bce = true_mask
+
+        # Ensure inputs are squeezed for Lovasz (B, H, W)
+        if pred_mask.dim() == 4:
+            pred_mask_lovasz = pred_mask.squeeze(1)
+        else:
+            pred_mask_lovasz = pred_mask
+
+        if true_mask.dim() == 4:
+            true_mask_lovasz = true_mask.squeeze(1)
+        else:
+            true_mask_lovasz = true_mask
+
+        # 2. Compute Segmentation Losses
+        # BCEWithLogitsLoss
+        loss_bce = self.bce(pred_mask, true_mask_bce.float())
+
+        # Lovasz Hinge Loss (Per Image)
+        loss_lovasz = self.lovasz(pred_mask_lovasz, true_mask_lovasz)
+
+        # 3. Compute Depth Regression Loss
+        # Ensure shapes are compatible (B,) or (B, 1)
+        loss_depth = self.mse(pred_depth.view(-1), true_depth.float().view(-1))
+
+        # 4. Combine
+        # Summing terms to maintain gradient magnitude as per strategy
+        total_loss = loss_bce + loss_lovasz + (self.depth_weight * loss_depth)
+
+        return total_loss, {
+            "loss_bce": loss_bce.item(),
+            "loss_lovasz": loss_lovasz.item(),
+            "loss_depth": loss_depth.item(),
+            "loss_total": total_loss.item(),
+        }
+=======
+class SegmentationLoss(nn.Module):
+    """
+    Combined loss function: BCE + Lovasz Hinge.
+    Cite solution_lesson_node_00021: Lovasz-Hinge is superior for IoU metrics.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss(per_image=True)
+
+    def forward(self, pred_mask, true_mask):
+        """
+        Args:
+            pred_mask: (B, 1, H, W) Logits from the segmentation head.
+            true_mask: (B, H, W) or (B, 1, H, W) Ground truth masks.
+
+        Returns:
+            total_loss: Sum of BCE and Lovasz.
+            metrics: Dictionary containing individual loss components.
+        """
+        # 1. Prepare Masks
+        # Ensure true_mask matches pred_mask shape for BCE (B, 1, H, W)
+        if true_mask.dim() == 3:
+            true_mask_bce = true_mask.unsqueeze(1)
+        else:
+            true_mask_bce = true_mask
+
+        # Ensure inputs are squeezed for Lovasz (B, H, W)
+        if pred_mask.dim() == 4:
+            pred_mask_lovasz = pred_mask.squeeze(1)
+        else:
+            pred_mask_lovasz = pred_mask
+
+        if true_mask.dim() == 4:
+            true_mask_lovasz = true_mask.squeeze(1)
+        else:
+            true_mask_lovasz = true_mask
+
+        # 2. Compute Segmentation Losses
+        # BCEWithLogitsLoss
+        loss_bce = self.bce(pred_mask, true_mask_bce.float())
+
+        # Lovasz Hinge Loss (Per Image)
+        loss_lovasz = self.lovasz(pred_mask_lovasz, true_mask_lovasz)
+
+        # 3. Combine
+        # Summing terms (Cite solution_lesson_node_00036: Summing vs Averaging affects LR)
+        total_loss = loss_bce + loss_lovasz
+
+        return total_loss, {
+            "loss_bce": loss_bce.item(),
+            "loss_lovasz": loss_lovasz.item(),
+            "loss_total": total_loss.item(),
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.losses import MultiTaskLoss
+
+
+def set_seed(seed=42):
+    """Sets the random seed for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
+    """
+    Trains the model for one epoch.
+
+    Args:
+        model: The PyTorch model.
+        dataloader: Training dataloader.
+        criterion: The MultiTaskLoss function.
+        optimizer: The optimizer.
+        device: 'cuda' or 'cpu'.
+        epoch: Current epoch number (for logging).
+
+    Returns:
+        dict: Average losses for the epoch.
+    """
+    model.train()
+
+    running_loss = 0.0
+    running_bce = 0.0
+    running_lovasz = 0.0
+    running_depth = 0.0
+
+    dataset_size = 0
+
+    for batch_idx, batch in enumerate(dataloader):
+        # Unpack batch: image, mask, depth, id
+        if len(batch) == 4:
+            images, masks, depths, ids = batch
+        else:
+            continue
+
+        images = images.to(device)
+        masks = masks.to(device)
+        depths = depths.to(device)
+        batch_size = images.size(0)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        mask_logits, depth_pred = model(images)
+
+        # ---------------------------------------------------------------------
+        # CRITICAL: Runtime Assertion for Depth Head Connection
+        # ---------------------------------------------------------------------
+        # We must verify that the auxiliary depth head is connected to the
+        # computational graph to prevent the "silent disconnection" bug.
+        # Since we cannot access the internal 'loss_depth' tensor from the
+        # criterion (which returns it as a float in the metrics dict),
+        # we verify that the prediction tensor itself requires gradients.
+        if not depth_pred.requires_grad:
+            raise RuntimeError(
+                "Critical Error: Depth prediction head is disconnected from the "
+                "computational graph! 'depth_pred.requires_grad' is False."
+            )
+
+        # Compute Loss
+        loss, metrics = criterion(mask_logits, depth_pred, masks, depths)
+
+        # Verify total loss requires grad
+        if not loss.requires_grad:
+            raise RuntimeError("Critical Error: Total loss does not require gradients.")
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate metrics
+        running_loss += loss.item() * batch_size
+        running_bce += metrics["loss_bce"] * batch_size
+        running_lovasz += metrics["loss_lovasz"] * batch_size
+        running_depth += metrics["loss_depth"] * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    epoch_bce = running_bce / dataset_size
+    epoch_lovasz = running_lovasz / dataset_size
+    epoch_depth = running_depth / dataset_size
+
+    print(
+        f"Train Epoch {epoch}: Loss={epoch_loss:.5f} (BCE={epoch_bce:.5f}, Lovasz={epoch_lovasz:.5f}, Depth={epoch_depth:.5f})"
+    )
+
+    return {
+        "loss": epoch_loss,
+        "bce": epoch_bce,
+        "lovasz": epoch_lovasz,
+        "depth": epoch_depth,
+    }
+
+
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+
+    Args:
+        model: The PyTorch model.
+        dataloader: Validation dataloader.
+        criterion: The MultiTaskLoss function.
+        device: 'cuda' or 'cpu'.
+
+    Returns:
+        dict: Validation metrics (loss, map).
+    """
+    model.eval()
+
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 4:
+                images, masks, depths, ids = batch
+            else:
+                continue
+
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+            batch_size = images.size(0)
+
+            mask_logits, depth_pred = model(images)
+
+            loss, metrics = criterion(mask_logits, depth_pred, masks, depths)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid for probabilities
+            preds = torch.sigmoid(mask_logits)
+
+            # Store for mAP calculation (move to CPU)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(masks.cpu().numpy())
+
+    epoch_loss = running_loss / dataset_size
+
+    # Concatenate predictions
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Remove channel dimension if present: (N, 1, H, W) -> (N, H, W)
+    if all_preds.ndim == 4:
+        all_preds = all_preds[:, 0, :, :]
+    if all_targets.ndim == 4:
+        all_targets = all_targets[:, 0, :, :]
+
+    # Crop back to original 101x101 size for accurate metric calculation
+    # The model outputs 128x128 (padded).
+    start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+    end = start + Config.ORIG_SIZE
+
+    preds_crop = all_preds[:, start:end, start:end]
+    targets_crop = all_targets[:, start:end, start:end]
+
+    # Calculate mAP at threshold 0.5
+    bin_preds = (preds_crop > 0.5).astype(np.uint8)
+    map_score = get_score(bin_preds, targets_crop)
+
+    print(f"Val: Loss={epoch_loss:.5f}, mAP={map_score:.5f}")
+
+    return {"val_loss": epoch_loss, "map": map_score}
+
+
+def predict_tta(model, dataloader, device):
+    """
+    Generates predictions using Test-Time Augmentation (Horizontal Flip).
+
+    Args:
+        model: The PyTorch model.
+        dataloader: Test dataloader.
+        device: 'cuda' or 'cpu'.
+
+    Returns:
+        tuple: (predictions_array, ids_list)
+               predictions_array is (N, 1, 101, 101) probabilities.
+    """
+    model.eval()
+
+    all_preds = []
+    all_ids = []
+
+    # Crop indices
+    start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+    end = start + Config.ORIG_SIZE
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # Test loader returns: image, depth, id
+            images, depths, ids = batch
+            images = images.to(device)
+
+            # 1. Original Prediction
+            logits, _ = model(images)
+            probs = torch.sigmoid(logits)
+
+            # 2. Horizontal Flip TTA
+            images_flip = torch.flip(images, dims=[3])  # Flip width (dim 3)
+            logits_flip, _ = model(images_flip)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])  # Flip back
+
+            # Average predictions
+            avg_probs = (probs + probs_flip) / 2.0
+
+            # Crop to original size 101x101
+            avg_probs_crop = avg_probs[:, :, start:end, start:end]
+
+            all_preds.append(avg_probs_crop.cpu().numpy())
+            all_ids.extend(ids)
+
+    return np.concatenate(all_preds, axis=0), all_ids
+=======
+from library.losses import SegmentationLoss
+from library.utils import optimize_threshold
+
+
+def set_seed(seed=42):
+    """Sets the random seed for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+
+    running_loss = 0.0
+    running_bce = 0.0
+    running_lovasz = 0.0
+
+    dataset_size = 0
+
+    for batch_idx, batch in enumerate(dataloader):
+        # Unpack batch: image, mask, depth, id
+        if len(batch) == 4:
+            images, masks, depths, ids = batch
+        else:
+            continue
+
+        images = images.to(device)
+        masks = masks.to(device)
+        depths = depths.to(device)
+        batch_size = images.size(0)
+
+        optimizer.zero_grad()
+
+        # Forward pass (Pass depth!)
+        mask_logits = model(images, depths)
+
+        # Compute Loss
+        loss, metrics = criterion(mask_logits, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate metrics
+        running_loss += loss.item() * batch_size
+        running_bce += metrics["loss_bce"] * batch_size
+        running_lovasz += metrics["loss_lovasz"] * batch_size
+        dataset_size += batch_size
+
+    epoch_loss = running_loss / dataset_size
+    epoch_bce = running_bce / dataset_size
+    epoch_lovasz = running_lovasz / dataset_size
+
+    print(
+        f"Train Epoch {epoch}: Loss={epoch_loss:.5f} (BCE={epoch_bce:.5f}, Lovasz={epoch_lovasz:.5f})"
+    )
+
+    return {
+        "loss": epoch_loss,
+        "bce": epoch_bce,
+        "lovasz": epoch_lovasz,
+    }
+
+
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if len(batch) == 4:
+                images, masks, depths, ids = batch
+            else:
+                continue
+
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+            batch_size = images.size(0)
+
+            mask_logits = model(images, depths)
+
+            loss, metrics = criterion(mask_logits, masks)
+
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            # Apply sigmoid for probabilities
+            preds = torch.sigmoid(mask_logits)
+
+            # Store for mAP calculation (move to CPU)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(masks.cpu().numpy())
+
+    epoch_loss = running_loss / dataset_size
+
+    # Concatenate predictions
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Remove channel dimension if present: (N, 1, H, W) -> (N, H, W)
+    if all_preds.ndim == 4:
+        all_preds = all_preds[:, 0, :, :]
+    if all_targets.ndim == 4:
+        all_targets = all_targets[:, 0, :, :]
+
+    # Crop back to original 101x101 size for accurate metric calculation
+    start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+    end = start + Config.ORIG_SIZE
+
+    preds_crop = all_preds[:, start:end, start:end]
+    targets_crop = all_targets[:, start:end, start:end]
+
+    # Calculate mAP at OPTIMAL threshold (Cite solution_lesson_node_00033)
+    best_th, map_score = optimize_threshold(preds_crop, targets_crop)
+
+    print(f"Val: Loss={epoch_loss:.5f}, Best mAP={map_score:.5f} at Th={best_th:.3f}")
+
+    return {"val_loss": epoch_loss, "map": map_score, "threshold": best_th}
+
+
+def predict_tta(model, dataloader, device):
+    """
+    Generates predictions using Test-Time Augmentation (Horizontal Flip).
+    """
+    model.eval()
+
+    all_preds = []
+    all_ids = []
+
+    # Crop indices
+    start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+    end = start + Config.ORIG_SIZE
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # Test loader returns: image, depth, id
+            images, depths, ids = batch
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # 1. Original Prediction
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # 2. Horizontal Flip TTA
+            images_flip = torch.flip(images, dims=[3])  # Flip width (dim 3)
+            logits_flip = model(images_flip, depths) # Depth invariant to hflip
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])  # Flip back
+
+            # Average predictions
+            avg_probs = (probs + probs_flip) / 2.0
+
+            # Crop to original size 101x101
+            avg_probs_crop = avg_probs[:, :, start:end, start:end]
+
+            all_preds.append(avg_probs_crop.cpu().numpy())
+            all_ids.extend(ids)
+
+    return np.concatenate(all_preds, axis=0), all_ids
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.losses import MultiTaskLoss
+from library.engine import (
+    set_seed,
+    train_one_epoch,
+    evaluate,
+    predict_tta,
+    generate_submission,
+)
+from library.utils import optimize_threshold, calc_iou, get_score
+
+
+def main():
+    # -------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # -------------------------------------------------------------------------
+    # Set fast baseline parameters
+    Config.EPOCHS = 10
+    Config.BATCH_SIZE = 32
+
+    set_seed(Config.SEED)
+    device = Config.DEVICE
+
+    print(f"Starting Run. Device: {device}, Epochs per stage: {Config.EPOCHS}")
+
+    # Ensure data is prepared and cached
+    # This generates 'train_data_processed.parquet' with fold info
+    train_meta_df = prepare_train_data(load_cached_data=True)
+    test_meta_df = prepare_test_data(load_cached_data=True)
+
+    # Create directories for artifacts
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+    model_dir = os.path.join(Config.WORKING_DIR, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # 2. Stage 1: Train 5-Fold Ensemble
+    # -------------------------------------------------------------------------
+    print("\n=== Stage 1: Training 5-Fold Ensemble ===")
+
+    fold_models = []
+    fold_metrics = []
+
+    for fold in range(Config.NUM_FOLDS):
+        print(f"\nTraining Fold {fold}/{Config.NUM_FOLDS - 1}")
+
+        # Get dataloaders for this fold
+        train_loader, val_loader = get_dataloaders(fold=fold, load_cached_data=True)
+
+        # Initialize Model, Loss, Optimizer
+        model = SaltNet().to(device)
+        criterion = MultiTaskLoss(depth_weight=Config.DEPTH_LOSS_WEIGHT)
+        optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+        scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+
+        best_map = 0.0
+        best_model_path = os.path.join(model_dir, f"model_fold_{fold}.pth")
+
+        # Training Loop
+        for epoch in range(1, Config.EPOCHS + 1):
+            train_metrics = train_one_epoch(
+                model, train_loader, criterion, optimizer, device, epoch
+            )
+            val_metrics = evaluate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            # Save best model
+            if val_metrics["map"] > best_map:
+                best_map = val_metrics["map"]
+                torch.save(model.state_dict(), best_model_path)
+
+        print(f"Fold {fold} Best mAP: {best_map:.4f}")
+        fold_metrics.append(best_map)
+        fold_models.append(best_model_path)
+
+        # Cleanup to free memory
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # 3. Stage 2: Quality Gating & Pseudo-Label Generation
+    # -------------------------------------------------------------------------
+    print("\n=== Stage 2: Quality Gating & Pseudo-Labeling ===")
+
+    # Filter models based on validation performance
+    valid_model_paths = []
+    for fold, score in enumerate(fold_metrics):
+        if score >= Config.MAP_THRESHOLD:
+            valid_model_paths.append(fold_models[fold])
+            print(f"Fold {fold} accepted (mAP {score:.4f} >= {Config.MAP_THRESHOLD})")
+        else:
+            print(f"Fold {fold} discarded (mAP {score:.4f} < {Config.MAP_THRESHOLD})")
+
+    # Fallback if all models fail threshold
+    if not valid_model_paths:
+        print(
+            "Warning: No models passed the threshold. Using the best performing model."
+        )
+        best_idx = np.argmax(fold_metrics)
+        valid_model_paths.append(fold_models[best_idx])
+
+    # Generate Pseudo-Labels on Test Set
+    print("Generating pseudo-labels on Test set...")
+    test_loader = get_test_dataloader(load_cached_data=True)
+
+    avg_preds = None
+    test_ids = []
+
+    # Ensemble prediction
+    for model_path in valid_model_paths:
+        model = SaltNet().to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+        # Predict with TTA
+        preds, ids = predict_tta(model, test_loader, device)
+
+        if avg_preds is None:
+            avg_preds = preds
+            test_ids = ids
+        else:
+            avg_preds += preds
+
+        del model
+        torch.cuda.empty_cache()
+
+    # Average probabilities
+    avg_preds /= len(valid_model_paths)
+
+    # Create dictionary mapping ID to Soft Mask (H, W)
+    # avg_preds is (N, 1, H, W), we need (H, W)
+    pseudo_labels = {}
+    avg_preds_sq = avg_preds[:, 0, :, :]
+
+    for idx, img_id in enumerate(test_ids):
+        pseudo_labels[img_id] = avg_preds_sq[idx]
+
+    print(f"Generated {len(pseudo_labels)} pseudo-labels.")
+
+    # -------------------------------------------------------------------------
+    # 4. Stage 3: Student Training
+    # -------------------------------------------------------------------------
+    print("\n=== Stage 3: Student Training ===")
+
+    # Identify Hold-Out Validation Set
+    val_csv_df = pd.read_csv(Config.VAL_CSV)
+    val_ids = set(val_csv_df["id"].values)
+
+    # Split processed train data into Student Train and Student Val
+    # Student Train = All Labeled Data - HoldOut Val
+    student_train_df = train_meta_df[~train_meta_df["id"].isin(val_ids)].reset_index(
+        drop=True
+    )
+    student_val_df = train_meta_df[train_meta_df["id"].isin(val_ids)].reset_index(
+        drop=True
+    )
+
+    print(
+        f"Student Training Data: {len(student_train_df)} labeled + {len(test_meta_df)} pseudo"
+    )
+    print(f"Student Validation Data: {len(student_val_df)} (Hold-out)")
+
+    # Construct Datasets
+    ds_labeled = SaltDataset(student_train_df, mode="train")
+    ds_pseudo = SaltDataset(
+        test_meta_df, mode="pseudo_train", pseudo_labels=pseudo_labels
+    )
+    ds_train_combined = ConcatDataset([ds_labeled, ds_pseudo])
+
+    ds_val = SaltDataset(student_val_df, mode="val")
+
+    # Construct Loaders
+    student_train_loader = DataLoader(
+        ds_train_combined,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    student_val_loader = DataLoader(
+        ds_val,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Initialize Student Model
+    student_model = SaltNet().to(device)
+    criterion = MultiTaskLoss(depth_weight=Config.DEPTH_LOSS_WEIGHT)
+    optimizer = optim.AdamW(student_model.parameters(), lr=Config.LEARNING_RATE)
+    scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+
+    best_student_map = 0.0
+    best_student_path = os.path.join(model_dir, "student_best.pth")
+
+    # Student Training Loop
+    for epoch in range(1, Config.EPOCHS + 1):
+        train_metrics = train_one_epoch(
+            student_model, student_train_loader, criterion, optimizer, device, epoch
+        )
+        val_metrics = evaluate(student_model, student_val_loader, criterion, device)
+        scheduler.step()
+
+        if val_metrics["map"] > best_student_map:
+            best_student_map = val_metrics["map"]
+            torch.save(student_model.state_dict(), best_student_path)
+
+    print(f"Student Best mAP: {best_student_map:.4f}")
+
+    # Load best student model for final evaluation
+    student_model.load_state_dict(torch.load(best_student_path, map_location=device))
+    student_model.eval()
+
+    # -------------------------------------------------------------------------
+    # 5. Final Validation & Failure Analysis
+    # -------------------------------------------------------------------------
+    print("\n=== Final Validation & Failure Analysis ===")
+
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    # Crop indices for metric calculation (128 -> 101)
+    start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+    end = start + Config.ORIG_SIZE
+
+    # Inference on Hold-Out Set with TTA
+    with torch.no_grad():
+        for batch in student_val_loader:
+            if len(batch) == 4:
+                images, masks, depths, ids = batch
+            else:
+                continue
+
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Original
+            logits, _ = student_model(images)
+            probs = torch.sigmoid(logits)
+
+            # Flip TTA
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip, _ = student_model(images_flip)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+
+            # Average
+            avg_probs = (probs + probs_flip) / 2.0
+
+            all_preds.append(avg_probs.cpu().numpy())
+            all_targets.append(masks.cpu().numpy())
+            all_ids.extend(ids)
+
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Squeeze channel dimension
+    if all_preds.ndim == 4:
+        all_preds = all_preds[:, 0, :, :]
+    if all_targets.ndim == 4:
+        all_targets = all_targets[:, 0, :, :]
+
+    # Crop to original size
+    preds_crop = all_preds[:, start:end, start:end]
+    targets_crop = all_targets[:, start:end, start:end]
+
+    # Optimize Threshold
+    best_th, best_score = optimize_threshold(preds_crop, targets_crop)
+    print(f"Optimal Threshold: {best_th}, Score: {best_score:.5f}")
+
+    # Print Final Metric
+    final_metric = best_score
+    print(f"Final Validation Metric: {final_metric:.10f}")
+
+    # Failure Analysis
+    # Calculate error per image (1 - IoU)
+    errors = []
+    for i in range(len(preds_crop)):
+        p = (preds_crop[i] > best_th).astype(np.uint8)
+        t = targets_crop[i].astype(np.uint8)
+        iou = calc_iou(p, t)
+        errors.append(1.0 - iou)
+
+    # Map errors back to metadata
+    id_to_error = dict(zip(all_ids, errors))
+    analysis_df = student_val_df.copy()
+    analysis_df["error"] = analysis_df["id"].map(id_to_error)
+    analysis_df = analysis_df.dropna(subset=["error"])
+
+    # Correlations
+    corr_depth = analysis_df["z"].corr(analysis_df["error"])
+    corr_salt = analysis_df["salt_coverage"].corr(analysis_df["error"])
+
+    print("\nFailure Analysis:")
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_salt:.4f}")
+
+    # -------------------------------------------------------------------------
+    # 6. Submission
+    # -------------------------------------------------------------------------
+    if final_metric > 0.7985:
+        print("\nMetric condition met. Generating submission...")
+        generate_submission(
+            student_model,
+            test_loader,
+            device,
+            output_path=os.path.join(Config.SUBMISSION_DIR, "submission.csv"),
+            threshold=best_th,
+        )
+    else:
+        print(f"\nMetric {final_metric:.4f} <= 0.7985. Skipping submission.")
+=======
+from library.losses import SegmentationLoss
+from library.engine import (
+    set_seed,
+    train_one_epoch,
+    evaluate,
+    predict_tta,
+    generate_submission,
+)
+from library.utils import optimize_threshold, calc_iou
+
+
+def main():
+    # -------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # -------------------------------------------------------------------------
+    set_seed(Config.SEED)
+    device = Config.DEVICE
+
+    print(f"Starting Run. Device: {device}, Epochs: {Config.EPOCHS}")
+
+    # Ensure data is prepared and cached
+    train_meta_df = prepare_train_data(load_cached_data=True)
+    
+    # Create directories for artifacts
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+    model_dir = os.path.join(Config.WORKING_DIR, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # 2. Train 5-Fold Ensemble (Supervised Only)
+    # -------------------------------------------------------------------------
+    print("\n=== Training 5-Fold Ensemble ===")
+
+    fold_models = []
+    fold_metrics = []
+    fold_thresholds = []
+    
+    # Validation data for final analysis (using Fold 0 as proxy or aggregate)
+    # We will aggregate OOF predictions for final metric
+    oof_preds = []
+    oof_targets = []
+    oof_ids = []
+
+    for fold in range(Config.NUM_FOLDS):
+        print(f"\nTraining Fold {fold}/{Config.NUM_FOLDS - 1}")
+
+        # Get dataloaders for this fold
+        train_loader, val_loader = get_dataloaders(fold=fold, load_cached_data=True)
+
+        # Initialize Model, Loss, Optimizer
+        model = SaltNet().to(device)
+        criterion = SegmentationLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+        scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+
+        best_map = 0.0
+        best_th = 0.5
+        best_model_path = os.path.join(model_dir, f"model_fold_{fold}.pth")
+
+        # Training Loop
+        for epoch in range(1, Config.EPOCHS + 1):
+            train_metrics = train_one_epoch(
+                model, train_loader, criterion, optimizer, device, epoch
+            )
+            val_metrics = evaluate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            # Save best model based on optimized mAP (Cite solution_lesson_node_00033)
+            if val_metrics["map"] > best_map:
+                best_map = val_metrics["map"]
+                best_th = val_metrics["threshold"]
+                torch.save(model.state_dict(), best_model_path)
+
+        print(f"Fold {fold} Best mAP: {best_map:.4f} at Threshold {best_th:.3f}")
+        fold_metrics.append(best_map)
+        fold_thresholds.append(best_th)
+        fold_models.append(best_model_path)
+        
+        # Generate OOF predictions for this fold using best model
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        
+        # We need to collect OOF data for final analysis
+        # Using predict_tta logic but for validation loader
+        # Crop indices
+        start = (Config.IMG_SIZE - Config.ORIG_SIZE) // 2
+        end = start + Config.ORIG_SIZE
+        
+        model.eval()
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 4:
+                    images, masks, depths, ids = batch
+                else:
+                    continue
+                images = images.to(device)
+                depths = depths.to(device)
+                masks = masks.to(device)
+                
+                # TTA Prediction
+                logits = model(images, depths)
+                probs = torch.sigmoid(logits)
+                
+                images_flip = torch.flip(images, dims=[3])
+                logits_flip = model(images_flip, depths)
+                probs_flip = torch.sigmoid(logits_flip)
+                probs_flip = torch.flip(probs_flip, dims=[3])
+                
+                avg_probs = (probs + probs_flip) / 2.0
+                
+                # Crop
+                avg_probs_crop = avg_probs[:, 0, start:end, start:end]
+                masks_cpu = masks.cpu().numpy()[:, start:end, start:end]
+                
+                oof_preds.append(avg_probs_crop.cpu().numpy())
+                oof_targets.append(masks_cpu)
+                oof_ids.extend(ids)
+
+        # Cleanup
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # 3. Final Analysis on OOF Data
+    # -------------------------------------------------------------------------
+    print("\n=== Final Validation & Failure Analysis ===")
+    
+    all_preds = np.concatenate(oof_preds, axis=0)
+    all_targets = np.concatenate(oof_targets, axis=0)
+    
+    # Optimize Global Threshold
+    best_th, best_score = optimize_threshold(all_preds, all_targets)
+    print(f"Global Optimal Threshold: {best_th}, Score: {best_score:.5f}")
+    
+    final_metric = best_score
+    print(f"Final Validation Metric: {final_metric:.10f}")
+
+    # Failure Analysis
+    errors = []
+    for i in range(len(all_preds)):
+        p = (all_preds[i] > best_th).astype(np.uint8)
+        t = all_targets[i].astype(np.uint8)
+        iou = calc_iou(p, t)
+        errors.append(1.0 - iou)
+
+    id_to_error = dict(zip(oof_ids, errors))
+    
+    # Reconstruct dataframe for analysis
+    analysis_df = train_meta_df[train_meta_df["id"].isin(oof_ids)].copy()
+    analysis_df["error"] = analysis_df["id"].map(id_to_error)
+    analysis_df = analysis_df.dropna(subset=["error"])
+
+    corr_depth = analysis_df["z"].corr(analysis_df["error"])
+    corr_salt = analysis_df["salt_coverage"].corr(analysis_df["error"])
+
+    print("\nFailure Analysis:")
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_salt:.4f}")
+
+    # -------------------------------------------------------------------------
+    # 4. Submission
+    # -------------------------------------------------------------------------
+    if final_metric > 0.7985:
+        print("\nMetric condition met. Generating submission...")
+        
+        test_loader = get_test_dataloader(load_cached_data=True)
+        avg_preds = None
+        
+        # Ensemble Inference
+        for idx, model_path in enumerate(fold_models):
+            print(f"Predicting with model {idx}...")
+            model = SaltNet().to(device)
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            
+            preds, ids = predict_tta(model, test_loader, device)
+            
+            if avg_preds is None:
+                avg_preds = preds
+            else:
+                avg_preds += preds
+            
+            del model
+            torch.cuda.empty_cache()
+            
+        avg_preds /= len(fold_models)
+        
+        # Binarize with global threshold
+        if avg_preds.ndim == 4:
+            avg_preds = avg_preds[:, 0, :, :]
+            
+        binary_preds = (avg_preds > best_th).astype(np.uint8)
+        
+        # Encode
+        from library.utils import rle_encode
+        rle_masks = []
+        for i in range(len(ids)):
+            rle = rle_encode(binary_preds[i])
+            rle_masks.append(rle)
+            
+        submission_df = pd.DataFrame({"id": ids, "rle_mask": rle_masks})
+        output_path = os.path.join(Config.SUBMISSION_DIR, "submission.csv")
+        submission_df.to_csv(output_path, index=False)
+        print(f"Submission saved to {output_path}")
+
+    else:
+        print(f"\nMetric {final_metric:.4f} <= 0.7985. Skipping submission.")
+>>>>>>> REPLACE
+```

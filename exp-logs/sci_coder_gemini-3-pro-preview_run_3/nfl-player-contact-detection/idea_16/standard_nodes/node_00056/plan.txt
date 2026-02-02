@@ -1,0 +1,253 @@
+To improve the model's performance, I will implement a strategy based on **Lesson 00055 (Augmentation vs. Replacement)**. The previous solution's failure in Stream B (Player-Ground impact) was due to the strict removal of raw kinematic data (speed, acceleration magnitude) in favor of derived ego-centric features (surge/sway). While ego-centric features are theoretically sound, they rely on orientation sensors which can be noisy during impacts. By removing the raw data, the model lost its stable baseline signal.
+
+My strategy is to **augment** the Stream B feature set rather than replacing it. I will modify the feature engineering pipeline to include both the derived ego-centric features (surge, sway, jerk) and the robust raw kinematic magnitudes (speed, acceleration, jerk) and angular components (sine/cosine of orientation). Additionally, I will fix a bug in the failure analysis routine that caused a crash when loading object arrays (IDs) and increase the number of boosting estimators to allow the model to fully converge.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- Stream B: Impact Model (Player-Ground) ---
+    # Focus: Loss of control and force transients.
+    # Input: Ego-Centric Kinematics ONLY.
+    # Innovation: Project motion into body frame (Surge/Sway).
+    STREAM_B_CONFIG = {
+        "stream_name": "impact",
+        "use_tracking": False,  # Raw field coords disabled
+        "use_relational": False,  # No second player to relate to
+        "use_visual": False,  # Visuals often occluded or noisy for ground
+        "use_ego": True,
+        # Derived Ego-Centric features
+        "ego_cols": ["surge_speed", "sway_speed", "surge_accel", "sway_accel"],
+    }
+=======
+    # --- Stream B: Impact Model (Player-Ground) ---
+    # Focus: Loss of control and force transients.
+    # Input: Ego-Centric Kinematics + Raw Kinematics (Augmented).
+    # Innovation: Project motion into body frame (Surge/Sway) while keeping raw magnitude signals.
+    STREAM_B_CONFIG = {
+        "stream_name": "impact",
+        "use_tracking": True,  # Enable raw tracking (Cite solution_lesson_node_00055)
+        "use_relational": False,  # No second player to relate to
+        "use_visual": False,  # Visuals often occluded or noisy for ground
+        "use_ego": True,
+        # Derived Ego-Centric features
+        "ego_cols": ["surge_v", "sway_v", "surge_a", "sway_a", "surge_j", "sway_j"],
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+        # 2. Try Loading from Cache
+        if (
+            load_cached_data
+            and os.path.exists(cache_path_X)
+            and os.path.exists(cache_path_y)
+        ):
+            print(f"[{stream}] Loading features from cache: {cache_path_X}")
+            X = pd.read_parquet(cache_path_X)
+            y = np.load(cache_path_y)
+            ids = np.load(cache_path_ids)
+            return X, y, ids
+=======
+        # 2. Try Loading from Cache
+        if (
+            load_cached_data
+            and os.path.exists(cache_path_X)
+            and os.path.exists(cache_path_y)
+        ):
+            print(f"[{stream}] Loading features from cache: {cache_path_X}")
+            X = pd.read_parquet(cache_path_X)
+            y = np.load(cache_path_y)
+            ids = np.load(cache_path_ids, allow_pickle=True)
+            return X, y, ids
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+    def _process_stream_b(self, df):
+        """
+        Generates features for Stream B: Impact Model (Player-Ground).
+        Focus: Ego-Centric Kinematics (Surge/Sway).
+        """
+        # We only care about Player 1 (Player 2 is Ground)
+
+        # --- 1. Derive Kinematics ---
+        # Convert Speed/Direction to Cartesian Velocity
+        vx, vy = self._get_velocity_vectors(df["speed_p1"], df["direction_p1"])
+
+        # Assign to DataFrame for robust grouping
+        df["vx"] = vx
+        df["vy"] = vy
+
+        # Derive Acceleration (Discrete Diff)
+        # Group by game_play to avoid boundary issues
+        # Note: We assume data is sorted by game_play, step
+        groups = df.groupby("game_play")
+
+        # Use transform to maintain index alignment
+        ax = groups["vx"].transform(lambda x: x.diff().fillna(0))
+        ay = groups["vy"].transform(lambda x: x.diff().fillna(0))
+
+        # Derive Jerk
+        df["ax"] = ax
+        df["ay"] = ay
+
+        jx = groups["ax"].transform(lambda x: x.diff().fillna(0))
+        jy = groups["ay"].transform(lambda x: x.diff().fillna(0))
+
+        # --- 2. Ego-Centric Projection ---
+        # We project motion onto the player's CURRENT orientation (t=0 for the window)
+        # Orientation is in degrees. NFL: 0=North(Y), 90=East(X).
+        # Unit vector for orientation: (sin(theta), cos(theta))
+
+        theta_rad = np.radians(df["orientation_p1"])
+        cos_theta = np.cos(theta_rad)
+        sin_theta = np.sin(theta_rad)
+
+        # Surge: Parallel to orientation (v dot u)
+        # u = (sin, cos) for 0=North
+        # v = (vx, vy)
+        # surge = vx * sin + vy * cos
+        surge_v = vx * sin_theta + vy * cos_theta
+        surge_a = ax * sin_theta + ay * cos_theta
+        surge_j = jx * sin_theta + jy * cos_theta
+
+        # Sway: Perpendicular to orientation (v dot u_perp)
+        # u_perp = (cos, -sin)  (Right hand rule / 90 deg rotation)
+        # sway = vx * cos - vy * sin
+        sway_v = vx * cos_theta - vy * sin_theta
+        sway_a = ax * cos_theta - ay * sin_theta
+        sway_j = jx * cos_theta - jy * sin_theta
+
+        features = pd.DataFrame(
+            {
+                "surge_v": surge_v,
+                "sway_v": sway_v,
+                "surge_a": surge_a,
+                "sway_a": sway_a,
+                "surge_j": surge_j,
+                "sway_j": sway_j,
+            },
+            index=df.index,
+        )
+
+        # --- 3. Temporal Pyramids ---
+        # For Stream B, we want the history of these ego-features.
+        # Note: The projection above uses CURRENT orientation.
+        # Ideally, for a lag t-k, we should project v_(t-k) onto orientation_t.
+        # The current implementation calculates v_t projected on o_t.
+        # When we shift this feature, we get (v_(t-k) projected on o_(t-k)).
+        # This is "Ego-motion at that time". This is a valid feature: "Was I moving sideways 1 sec ago?"
+        # The prompt mentions "Project ... into ... Coordinate System... invariant".
+        # Using historical ego-motion is the standard interpretation of "Ego-Centric Features".
+
+        cols_to_lag = ["surge_v", "sway_v", "surge_a", "sway_a", "surge_j", "sway_j"]
+        X_final = self._apply_temporal_pyramids(features, df["game_play"], cols_to_lag)
+
+        return X_final.astype(np.float32)
+=======
+    def _process_stream_b(self, df):
+        """
+        Generates features for Stream B: Impact Model (Player-Ground).
+        Focus: Ego-Centric Kinematics (Surge/Sway) AUGMENTED with Raw Kinematics.
+        Cite solution_lesson_node_00055: Augmentation vs Replacement.
+        """
+        # We only care about Player 1 (Player 2 is Ground)
+
+        # --- 1. Derive Kinematics ---
+        # Convert Speed/Direction to Cartesian Velocity
+        vx, vy = self._get_velocity_vectors(df["speed_p1"], df["direction_p1"])
+
+        # Assign to DataFrame for robust grouping
+        df["vx"] = vx
+        df["vy"] = vy
+
+        # Derive Acceleration (Discrete Diff)
+        # Group by game_play to avoid boundary issues
+        groups = df.groupby("game_play")
+
+        # Use transform to maintain index alignment
+        ax = groups["vx"].transform(lambda x: x.diff().fillna(0))
+        ay = groups["vy"].transform(lambda x: x.diff().fillna(0))
+
+        # Derive Jerk
+        df["ax"] = ax
+        df["ay"] = ay
+
+        jx = groups["ax"].transform(lambda x: x.diff().fillna(0))
+        jy = groups["ay"].transform(lambda x: x.diff().fillna(0))
+
+        # --- 2. Ego-Centric Projection ---
+        # Orientation is in degrees. NFL: 0=North(Y), 90=East(X).
+        theta_rad = np.radians(df["orientation_p1"])
+        cos_theta = np.cos(theta_rad)
+        sin_theta = np.sin(theta_rad)
+
+        # Surge: Parallel to orientation
+        surge_v = vx * sin_theta + vy * cos_theta
+        surge_a = ax * sin_theta + ay * cos_theta
+        surge_j = jx * sin_theta + jy * cos_theta
+
+        # Sway: Perpendicular to orientation
+        sway_v = vx * cos_theta - vy * sin_theta
+        sway_a = ax * cos_theta - ay * sin_theta
+        sway_j = jx * cos_theta - jy * sin_theta
+
+        # --- 3. Raw Kinematic Augmentation ---
+        # Calculate magnitudes and angular components
+        accel_mag = np.sqrt(ax**2 + ay**2)
+        jerk_mag = np.sqrt(jx**2 + jy**2)
+        
+        # Decompose Orientation (Cite solution_lesson_node_00005)
+        orient_sin = sin_theta
+        orient_cos = cos_theta
+
+        features = pd.DataFrame(
+            {
+                # Ego Features
+                "surge_v": surge_v,
+                "sway_v": sway_v,
+                "surge_a": surge_a,
+                "sway_a": sway_a,
+                "surge_j": surge_j,
+                "sway_j": sway_j,
+                # Raw Augmentation (Robust Baseline)
+                "speed": df["speed_p1"],
+                "accel_mag": accel_mag,
+                "jerk_mag": jerk_mag,
+                "orient_sin": orient_sin,
+                "orient_cos": orient_cos,
+            },
+            index=df.index,
+        )
+
+        cols_to_lag = [
+            "surge_v", "sway_v", "surge_a", "sway_a", "surge_j", "sway_j",
+            "speed", "accel_mag", "jerk_mag", "orient_sin", "orient_cos"
+        ]
+        X_final = self._apply_temporal_pyramids(features, df["game_play"], cols_to_lag)
+
+        return X_final.astype(np.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Configure for Fast Baseline
+    # Override n_estimators to ensure the script completes within the time limit
+    Config.XGB_PARAMS_STREAM_A["n_estimators"] = 500
+    Config.XGB_PARAMS_STREAM_B["n_estimators"] = 500
+=======
+    # 2. Configure for Fast Baseline
+    # Override n_estimators to ensure the script completes within the time limit
+    # Increased to 2500 to allow convergence (Early Stopping will handle termination)
+    Config.XGB_PARAMS_STREAM_A["n_estimators"] = 2500
+    Config.XGB_PARAMS_STREAM_B["n_estimators"] = 2500
+>>>>>>> REPLACE
+```

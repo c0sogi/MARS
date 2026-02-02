@@ -1,0 +1,954 @@
+To improve the model's performance, I will transition the solution from a computationally expensive, data-starved Directional MPNN to a highly efficient, node-centric GNN (SchNet-variant) capable of training on the full dataset. This strategy directly addresses **Lesson 00014** (Data Volume > Architecture Complexity) and **Lesson 00016** (Efficient Data Pipelines). Additionally, I will replace the disjoint prediction heads with a shared architecture conditioned on coupling type embeddings, as recommended by **Lesson 00022**, to improve data efficiency and transfer learning across coupling types.
+
+Here are the specific modifications:
+1.  **`library/config.py`**: Disable `DEBUG` mode to train on the full dataset, increase `BATCH_SIZE` to 1024 for throughput, and adjust `MAX_EPOCHS` to 20.
+2.  **`library/data_factory.py`**: Remove the computationally expensive triplet generation loops ($O(N \times \text{degree}^2)$), reverting to a pure distance-based graph construction ($O(N \times \text{degree})$).
+3.  **`library/loader.py`**: Remove triplet-related logic from the dataset and collator to match the simplified data structure.
+4.  **`library/layers.py`**:
+    *   Replace `InteractionBlock` (directional) with a node-centric Continuous Filter Convolution block (SchNet-style).
+    *   Replace `TypeSpecificHeads` with `SharedCouplingHead` to utilize type embeddings.
+5.  **`library/model.py`**: Update `DirectionalMPNN` to use the new node-centric layers and flow.
+6.  **`runfile.py`**: Remove the debug overrides to enable full-scale training.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 128  # Number of molecules per batch
+    LEARNING_RATE = 5e-4
+    WEIGHT_DECAY = 1e-5
+    MAX_EPOCHS = 30
+    PATIENCE = 5  # Early stopping patience
+
+    # Scheduler
+    SCHEDULER_T_0 = 10  # Cosine Annealing restart interval
+    SCHEDULER_T_MULT = 2
+
+    # Loss Weights
+    # Total Loss = L_coupling + AUX_WEIGHT * (L_shielding + L_charge)
+    AUX_LOSS_WEIGHT = 0.1
+
+    # Debugging
+    DEBUG = False  # Set to True to run on a small subset
+    DEBUG_SAMPLE_SIZE = 2000
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 1024  # Increased for throughput (Cite Lesson 00016)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-5
+    MAX_EPOCHS = 20
+    PATIENCE = 5  # Early stopping patience
+
+    # Scheduler
+    SCHEDULER_T_0 = 20  # Cosine Annealing restart interval
+    SCHEDULER_T_MULT = 1
+
+    # Loss Weights
+    # Total Loss = L_coupling + AUX_WEIGHT * (L_shielding + L_charge)
+    AUX_LOSS_WEIGHT = 0.1
+
+    # Debugging
+    DEBUG = False  # Train on full dataset (Cite Lesson 00014)
+    DEBUG_SAMPLE_SIZE = 2000
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_factory.py
+<<<<<<< SEARCH
+        # Triplets
+        all_triplet_index = []  # (2, K) -> indices into edge array
+        all_triplet_attr = []  # (K, 1) -> cos theta
+
+        # Targets (Couplings)
+=======
+        # Targets (Couplings)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_factory.py
+<<<<<<< SEARCH
+            # --- Triplet Processing (Directional) ---
+            # We need to map local (u, v) pairs to the index in the current molecule's edge list
+            # Create a sparse map or dictionary: (u_local, v_local) -> local_edge_index
+            # Since N is small (<30), a dense matrix is fine for lookup
+            edge_lookup = np.full((n_atoms, n_atoms), -1, dtype=np.int64)
+            edge_lookup[src_local, dst_local] = np.arange(n_edges)
+
+            # Find triplets k -> j -> i
+            # We iterate over the center atom j
+            triplet_in = []
+            triplet_out = []
+            triplet_angles = []
+
+            # Group edges by center node (j)
+            # Incoming to j: edges where dst == j
+            # Outgoing from j: edges where src == j
+            # Since graph is undirected (symmetric), neighbors are same.
+            # But we treat edges as directed in DMPNN.
+
+            for j in range(n_atoms):
+                # Indices of neighbors
+                neighbors = dst_local[src_local == j]
+
+                if len(neighbors) < 2:
+                    continue
+
+                # All pairs of neighbors (k, i) where k != i
+                # We want path k -> j -> i
+                # Incoming edge index: (k, j)
+                # Outgoing edge index: (j, i)
+
+                for k in neighbors:
+                    for i in neighbors:
+                        if k == i:
+                            continue
+
+                        idx_kj = edge_lookup[k, j]  # Incoming
+                        idx_ji = edge_lookup[j, i]  # Outgoing
+
+                        if idx_kj == -1 or idx_ji == -1:
+                            continue
+
+                        # Calculate Angle
+                        # vec_jk = r_k - r_j
+                        # vec_ji = r_i - r_j
+                        v_jk = coords[k] - coords[j]
+                        v_ji = coords[i] - coords[j]
+
+                        # Cosine similarity
+                        norm_jk = np.linalg.norm(v_jk)
+                        norm_ji = np.linalg.norm(v_ji)
+                        dot = np.dot(v_jk, v_ji)
+                        cos_theta = dot / (norm_jk * norm_ji + 1e-9)
+                        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+
+                        triplet_in.append(idx_kj + edge_offset)
+                        triplet_out.append(idx_ji + edge_offset)
+                        triplet_angles.append(cos_theta)
+
+            if triplet_in:
+                all_triplet_index.append(np.stack([triplet_in, triplet_out], axis=0))
+                all_triplet_attr.append(np.array(triplet_angles, dtype=np.float32))
+
+            # --- Target Mapping ---
+=======
+            # --- Target Mapping ---
+            # Create edge lookup for coupling mapping
+            edge_lookup = np.full((n_atoms, n_atoms), -1, dtype=np.int64)
+            edge_lookup[src_local, dst_local] = np.arange(n_edges)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_factory.py
+<<<<<<< SEARCH
+            "edge_batch": np.concatenate(all_edge_batch),
+            "triplet_index": (
+                np.concatenate(all_triplet_index, axis=1)
+                if all_triplet_index
+                else np.empty((2, 0), dtype=np.int64)
+            ),
+            "triplet_attr": (
+                np.concatenate(all_triplet_attr)
+                if all_triplet_attr
+                else np.empty((0,), dtype=np.float32)
+            ),
+            "coupling_edge_index": (
+=======
+            "edge_batch": np.concatenate(all_edge_batch),
+            "coupling_edge_index": (
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+        # Triplet Pointers
+        # Triplets are defined by indices into the edge array.
+        # We determine which molecule a triplet belongs to by looking up the molecule of its first edge.
+        triplet_index = self.data["triplet_index"]
+        if triplet_index.shape[1] > 0:
+            # triplet_index[0] is the index of the first edge in the triplet (global edge index)
+            # edge_batch maps global edge index -> molecule index
+            triplet_mol_idx = edge_batch[triplet_index[0]]
+            triplet_counts = np.bincount(triplet_mol_idx, minlength=self.num_mols)
+            self.triplet_ptr = np.zeros(self.num_mols + 1, dtype=np.int64)
+            self.triplet_ptr[1:] = np.cumsum(triplet_counts)
+        else:
+            self.triplet_ptr = np.zeros(self.num_mols + 1, dtype=np.int64)
+
+        # Coupling Pointers
+=======
+        # Coupling Pointers
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+        # Get start and end pointers
+        n_start, n_end = self.node_ptr[idx], self.node_ptr[idx + 1]
+        e_start, e_end = self.edge_ptr[idx], self.edge_ptr[idx + 1]
+        t_start, t_end = self.triplet_ptr[idx], self.triplet_ptr[idx + 1]
+        c_start, c_end = self.coupling_ptr[idx], self.coupling_ptr[idx + 1]
+
+        # --- Extract Nodes ---
+        node_x = self.data["node_x"][n_start:n_end]
+        node_pos = self.data["node_pos"][n_start:n_end]
+        aux_shield = self.data["aux_shielding"][n_start:n_end]
+        aux_charge = self.data["aux_charge"][n_start:n_end]
+
+        # --- Extract Edges ---
+        # edge_index is (2, M). Global indices.
+        # Subtract n_start to make them local (0 to num_nodes-1)
+        if e_end > e_start:
+            edge_index = self.data["edge_index"][:, e_start:e_end] - n_start
+            edge_attr = self.data["edge_attr"][e_start:e_end]
+        else:
+            edge_index = np.empty((2, 0), dtype=np.int64)
+            edge_attr = np.empty((0,), dtype=np.float32)
+
+        # --- Extract Triplets ---
+        # triplet_index is (2, K). Global edge indices.
+        # Subtract e_start to make them local (0 to num_edges-1)
+        if t_end > t_start:
+            triplet_index = self.data["triplet_index"][:, t_start:t_end] - e_start
+            triplet_attr = self.data["triplet_attr"][t_start:t_end]
+        else:
+            triplet_index = np.empty((2, 0), dtype=np.int64)
+            triplet_attr = np.empty((0,), dtype=np.float32)
+
+        # --- Extract Couplings ---
+=======
+        # Get start and end pointers
+        n_start, n_end = self.node_ptr[idx], self.node_ptr[idx + 1]
+        e_start, e_end = self.edge_ptr[idx], self.edge_ptr[idx + 1]
+        c_start, c_end = self.coupling_ptr[idx], self.coupling_ptr[idx + 1]
+
+        # --- Extract Nodes ---
+        node_x = self.data["node_x"][n_start:n_end]
+        node_pos = self.data["node_pos"][n_start:n_end]
+        aux_shield = self.data["aux_shielding"][n_start:n_end]
+        aux_charge = self.data["aux_charge"][n_start:n_end]
+
+        # --- Extract Edges ---
+        # edge_index is (2, M). Global indices.
+        # Subtract n_start to make them local (0 to num_nodes-1)
+        if e_end > e_start:
+            edge_index = self.data["edge_index"][:, e_start:e_end] - n_start
+            edge_attr = self.data["edge_attr"][e_start:e_end]
+        else:
+            edge_index = np.empty((2, 0), dtype=np.int64)
+            edge_attr = np.empty((0,), dtype=np.float32)
+
+        # --- Extract Couplings ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+        return {
+            "node_x": node_x,
+            "node_pos": node_pos,
+            "aux_shield": aux_shield,
+            "aux_charge": aux_charge,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "triplet_index": triplet_index,
+            "triplet_attr": triplet_attr,
+            "coupling_edge_index": coupling_edge_index,
+            "coupling_type": coupling_type,
+            "coupling_value": coupling_value,
+            "coupling_id": coupling_id,
+            "num_nodes": n_end - n_start,
+            "num_edges": e_end - e_start,
+        }
+=======
+        return {
+            "node_x": node_x,
+            "node_pos": node_pos,
+            "aux_shield": aux_shield,
+            "aux_charge": aux_charge,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "coupling_edge_index": coupling_edge_index,
+            "coupling_type": coupling_type,
+            "coupling_value": coupling_value,
+            "coupling_id": coupling_id,
+            "num_nodes": n_end - n_start,
+            "num_edges": e_end - e_start,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+        # Initialize containers
+        node_x_list, node_pos_list = [], []
+        aux_shield_list, aux_charge_list = [], []
+        edge_index_list, edge_attr_list = [], []
+        triplet_index_list, triplet_attr_list = [], []
+        c_edge_idx_list, c_type_list, c_val_list, c_id_list = [], [], [], []
+
+        batch_node_batch = []
+=======
+        # Initialize containers
+        node_x_list, node_pos_list = [], []
+        aux_shield_list, aux_charge_list = [], []
+        edge_index_list, edge_attr_list = [], []
+        c_edge_idx_list, c_type_list, c_val_list, c_id_list = [], [], [], []
+
+        batch_node_batch = []
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+            # --- Edges ---
+            if n_edges > 0:
+                # Re-index edges: local_node_idx + node_offset
+                e_idx = torch.from_numpy(sample["edge_index"]).long() + node_offset
+                edge_index_list.append(e_idx)
+                edge_attr_list.append(torch.from_numpy(sample["edge_attr"]).float())
+                batch_edge_batch.append(torch.full((n_edges,), i, dtype=torch.long))
+
+                # --- Triplets ---
+                if sample["triplet_index"].shape[1] > 0:
+                    # Re-index triplets: local_edge_idx + edge_offset
+                    t_idx = (
+                        torch.from_numpy(sample["triplet_index"]).long() + edge_offset
+                    )
+                    triplet_index_list.append(t_idx)
+                    triplet_attr_list.append(
+                        torch.from_numpy(sample["triplet_attr"]).float()
+                    )
+
+                # --- Couplings ---
+                if sample["coupling_edge_index"].shape[0] > 0:
+                    # Re-index couplings: local_edge_idx + edge_offset
+                    c_idx = (
+                        torch.from_numpy(sample["coupling_edge_index"]).long()
+                        + edge_offset
+                    )
+=======
+            # --- Edges ---
+            if n_edges > 0:
+                # Re-index edges: local_node_idx + node_offset
+                e_idx = torch.from_numpy(sample["edge_index"]).long() + node_offset
+                edge_index_list.append(e_idx)
+                edge_attr_list.append(torch.from_numpy(sample["edge_attr"]).float())
+                batch_edge_batch.append(torch.full((n_edges,), i, dtype=torch.long))
+
+                # --- Couplings ---
+                if sample["coupling_edge_index"].shape[0] > 0:
+                    # Re-index couplings: local_edge_idx + edge_offset
+                    c_idx = (
+                        torch.from_numpy(sample["coupling_edge_index"]).long()
+                        + edge_offset
+                    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/loader.py
+<<<<<<< SEARCH
+        if triplet_index_list:
+            batch_data["triplet_index"] = torch.cat(triplet_index_list, dim=1)
+            batch_data["triplet_attr"] = torch.cat(triplet_attr_list)
+        else:
+            batch_data["triplet_index"] = torch.empty((2, 0), dtype=torch.long)
+            batch_data["triplet_attr"] = torch.empty((0,), dtype=torch.float)
+
+        if c_edge_idx_list:
+=======
+        if c_edge_idx_list:
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+class InteractionBlock(nn.Module):
+    """
+    Performs directional message passing.
+    Aggregates messages from 'preceding' edges (k->j) to 'current' edges (j->i)
+    weighted by angular information derived from the triplet (k, j, i).
+    """
+
+    def __init__(self, hidden_dim, num_angle_rbf, activation=nn.SiLU()):
+        super(InteractionBlock, self).__init__()
+        self.hidden_dim = hidden_dim
+
+        # Angular RBF expansion for cosine theta (range -1 to 1)
+        self.angle_rbf = GaussianSmearing(
+            start=-1.0,
+            stop=1.0,
+            num_gaussians=num_angle_rbf,
+            centered=True,
+            learnable=False,
+        )
+
+        # MLP to transform angular features
+        self.angle_mlp = nn.Sequential(
+            nn.Linear(num_angle_rbf, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Linear transform for source edge features (k->j)
+        self.source_lin = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        # MLP to update target edge features (j->i) using aggregated messages
+        self.update_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, edge_embeddings, triplet_index, triplet_attr):
+        """
+        Args:
+            edge_embeddings: (num_edges, hidden_dim)
+            triplet_index: (2, num_triplets). Row 0: source edge indices (k->j),
+                           Row 1: target edge indices (j->i).
+            triplet_attr: (num_triplets,) cosine of bond angles theta_{kji}.
+        Returns:
+            Updated edge_embeddings: (num_edges, hidden_dim)
+        """
+        # 1. Process Angular Features
+        angle_emb = self.angle_rbf(triplet_attr)  # (num_triplets, num_angle_rbf)
+        angle_w = self.angle_mlp(angle_emb)  # (num_triplets, hidden_dim)
+
+        # 2. Process Source Edges
+        source_idx = triplet_index[0]
+        target_idx = triplet_index[1]
+
+        source_h = edge_embeddings[source_idx]  # (num_triplets, hidden_dim)
+        source_h = self.source_lin(source_h)  # (num_triplets, hidden_dim)
+
+        # 3. Compute Messages (Hadamard product of source edge and angle weight)
+        messages = source_h * angle_w  # (num_triplets, hidden_dim)
+
+        # 4. Aggregate Messages to Target Edges
+        # Sum messages for each target edge index
+        num_edges = edge_embeddings.size(0)
+        aggregated_messages = scatter(
+            messages, target_idx, dim=0, dim_size=num_edges, reduce="sum"
+        )
+
+        # 5. Update Target Edges
+        # Concatenate original features with aggregated messages (Residual-like structure)
+        combined = torch.cat([edge_embeddings, aggregated_messages], dim=-1)
+        update = self.update_mlp(combined)
+
+        # Residual connection
+        return edge_embeddings + update
+=======
+class InteractionBlock(nn.Module):
+    """
+    Performs node-centric continuous filter convolution (cf. SchNet).
+    Aggregates messages from neighbors weighted by RBF distance filters.
+    Optimized for speed to enable training on full dataset (Cite Lesson 00014).
+    """
+
+    def __init__(self, hidden_dim, num_rbf, activation=nn.SiLU()):
+        super(InteractionBlock, self).__init__()
+        self.hidden_dim = hidden_dim
+
+        # Filter Network: Generates weights from edge embeddings
+        self.filter_network = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # MLP to process node features
+        self.node_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            activation,
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, h, edge_index, edge_embeddings):
+        """
+        Args:
+            h: (num_nodes, hidden_dim)
+            edge_index: (2, num_edges)
+            edge_embeddings: (num_edges, hidden_dim) - Derived from RBF distances
+        Returns:
+            Updated h: (num_nodes, hidden_dim)
+        """
+        # 1. Compute Filters
+        W = self.filter_network(edge_embeddings)  # (M, hidden_dim)
+
+        # 2. Gather neighbor features
+        src, dst = edge_index
+        h_neighbors = h[src]  # (M, hidden_dim)
+
+        # 3. Interaction
+        messages = h_neighbors * W  # (M, hidden_dim)
+
+        # 4. Aggregate
+        aggregated = scatter(messages, dst, dim=0, dim_size=h.size(0), reduce="sum")
+
+        # 5. Update Nodes (Residual)
+        update = self.node_mlp(aggregated)
+        return h + update
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+class TypeSpecificHeads(nn.Module):
+    """
+    Readout module with specific heads for each coupling type.
+    Injects edge embeddings and node embeddings into the final prediction to ensure
+    high-frequency geometric information is available at the output.
+    """
+
+    def __init__(
+        self,
+        node_dim,
+        edge_dim,
+        num_types=Config.NUM_COUPLING_TYPES,
+        hidden_dim=128,
+        output_dim=1,
+    ):
+        super(TypeSpecificHeads, self).__init__()
+        self.num_types = num_types
+
+        # Input: Node_i + Node_j + Edge_ij
+        input_dim = node_dim * 2 + edge_dim
+
+        self.heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, output_dim),
+                )
+                for _ in range(num_types)
+            ]
+        )
+
+    def forward(
+        self,
+        node_embeddings,
+        edge_embeddings,
+        edge_index,
+        coupling_edge_index,
+        coupling_type,
+    ):
+        """
+        Args:
+            node_embeddings: (num_nodes, node_dim)
+            edge_embeddings: (num_edges, edge_dim)
+            edge_index: (2, num_edges) - Global connectivity
+            coupling_edge_index: (num_couplings,) indices of edges corresponding to the target pairs
+            coupling_type: (num_couplings,) integer type indices
+        Returns:
+            predictions: (num_couplings, output_dim)
+        """
+        # 1. Gather features for the specific couplings
+
+        # Edge features for the coupling pair (e_ij)
+        e_ij = edge_embeddings[coupling_edge_index]  # (num_couplings, edge_dim)
+
+        # Identify source and target nodes for these edges
+        # edge_index[0] is source, edge_index[1] is target
+        src_idx = edge_index[0, coupling_edge_index]
+        dst_idx = edge_index[1, coupling_edge_index]
+
+        # Gather node features (h_i, h_j)
+        h_src = node_embeddings[src_idx]  # (num_couplings, node_dim)
+        h_dst = node_embeddings[dst_idx]  # (num_couplings, node_dim)
+
+        # Combine all features
+        combined = torch.cat([h_src, h_dst, e_ij], dim=-1)  # (num_couplings, input_dim)
+
+        # 2. Apply Type-Specific Heads
+        # Initialize output tensor
+        output = torch.zeros(combined.size(0), 1, device=combined.device)
+
+        # Iterate over types and apply the corresponding MLP head
+        for t in range(self.num_types):
+            mask = coupling_type == t
+            if mask.any():
+                # Process subset of couplings belonging to type t
+                subset_input = combined[mask]
+                subset_out = self.heads[t](subset_input)
+                output[mask] = subset_out
+
+        return output
+=======
+class SharedCouplingHead(nn.Module):
+    """
+    Shared readout module conditioned on coupling type embeddings.
+    More data-efficient than disjoint heads (Cite Lesson 00022).
+    Explicitly injects edge features (Cite Lesson 00011).
+    """
+
+    def __init__(
+        self,
+        node_dim,
+        edge_dim,
+        num_types=Config.NUM_COUPLING_TYPES,
+        hidden_dim=128,
+        output_dim=1,
+    ):
+        super(SharedCouplingHead, self).__init__()
+        
+        # Type embedding
+        self.type_embedding = nn.Embedding(num_types, hidden_dim)
+
+        # Input: Node_i + Node_j + Edge_ij + Type_Emb
+        input_dim = node_dim * 2 + edge_dim + hidden_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(
+        self,
+        node_embeddings,
+        edge_embeddings,
+        edge_index,
+        coupling_edge_index,
+        coupling_type,
+    ):
+        # 1. Gather features
+        e_ij = edge_embeddings[coupling_edge_index]  # (C, edge_dim)
+        
+        src_idx = edge_index[0, coupling_edge_index]
+        dst_idx = edge_index[1, coupling_edge_index]
+        
+        h_src = node_embeddings[src_idx]  # (C, node_dim)
+        h_dst = node_embeddings[dst_idx]  # (C, node_dim)
+        
+        # Type embedding
+        t_emb = self.type_embedding(coupling_type) # (C, hidden_dim)
+
+        # Combine
+        combined = torch.cat([h_src, h_dst, e_ij, t_emb], dim=-1)
+
+        # 2. Predict
+        return self.mlp(combined)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.layers import EdgeEmbedding, InteractionBlock, TypeSpecificHeads
+
+
+class DirectionalMPNN(nn.Module):
+    """
+    Directional Message Passing Neural Network (DMPNN) for Scalar Coupling Prediction.
+
+    This model operates on directed edges (bonds) to explicitly model bond angles
+    via triplet interactions. It updates edge embeddings through several message
+    passing layers and then aggregates information back to nodes for auxiliary
+    predictions and the final edge-conditioned readout.
+    """
+
+    def __init__(self):
+        super(DirectionalMPNN, self).__init__()
+        self.config = Config()
+
+        # Hyperparameters
+        hidden_dim = self.config.HIDDEN_DIM
+        num_layers = self.config.NUM_LAYERS
+        num_rbf = self.config.NUM_RBF
+        num_angle_rbf = self.config.NUM_ANGLE_RBF
+        num_atom_types = self.config.NUM_ATOM_TYPES
+
+        # 1. Initial Embeddings
+        # Node embedding: Maps atom type index to hidden vector
+        self.node_embedding = nn.Embedding(num_atom_types, hidden_dim)
+
+        # Edge embedding: Maps scalar distance to hidden vector via RBF + MLP
+        self.edge_embedding = EdgeEmbedding(
+            num_rbf=num_rbf,
+            hidden_dim=hidden_dim,
+            cutoff_lower=0.0,
+            cutoff_upper=self.config.CUTOFF_RADIUS,
+        )
+
+        # 2. Message Passing Blocks
+        # Stack of InteractionBlocks that update edge features based on angular context
+        self.blocks = nn.ModuleList(
+            [
+                InteractionBlock(hidden_dim=hidden_dim, num_angle_rbf=num_angle_rbf)
+                for _ in range(num_layers)
+            ]
+        )
+
+        # 3. Node Update / Aggregation
+        # After edge updates, we aggregate incoming edges to update node features
+        # This is crucial for the auxiliary tasks and the node-component of the readout
+        self.node_update_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 4. Primary Readout (Coupling Constant)
+        # Predicts coupling constant using updated node features and specific edge features
+        self.readout = TypeSpecificHeads(
+            node_dim=hidden_dim,
+            edge_dim=hidden_dim,
+            num_types=self.config.NUM_COUPLING_TYPES,
+            hidden_dim=hidden_dim,
+            output_dim=1,
+        )
+
+        # 5. Auxiliary Heads
+        # Predict Magnetic Shielding and Mulliken Charges from updated node features
+        # These act as regularizers during training
+        self.shielding_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+
+        self.charge_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, batch):
+        """
+        Forward pass of the model.
+
+        Args:
+            batch (dict): Dictionary containing collated graph data tensors.
+                          Keys: node_x, edge_index, edge_attr, triplet_index, triplet_attr, etc.
+
+        Returns:
+            dict: Dictionary containing predictions:
+                  - 'coupling': (num_couplings, 1)
+                  - 'shielding': (num_nodes, 1)
+                  - 'charge': (num_nodes, 1)
+        """
+        # Unpack necessary data
+        node_x = batch["node_x"]  # (N,)
+        edge_index = batch["edge_index"]  # (2, M)
+        edge_attr = batch["edge_attr"]  # (M,)
+        triplet_index = batch["triplet_index"]  # (2, K)
+        triplet_attr = batch["triplet_attr"]  # (K,)
+
+        # Coupling specific indices
+        coupling_edge_index = batch["coupling_edge_index"]  # (C,)
+        coupling_type = batch["coupling_type"]  # (C,)
+
+        # 1. Initialize Embeddings
+        h = self.node_embedding(node_x)  # (N, hidden_dim)
+
+        # Handle case with no edges (e.g., single atom molecules if any, though unlikely in this dataset)
+        if edge_index.shape[1] > 0:
+            e = self.edge_embedding(edge_attr)  # (M, hidden_dim)
+
+            # 2. Directional Message Passing
+            # Iteratively update edge embeddings
+            for block in self.blocks:
+                if triplet_index.shape[1] > 0:
+                    e = block(e, triplet_index, triplet_attr)
+                else:
+                    # If no triplets (no angles), skip interaction or just pass through
+                    # In this architecture, InteractionBlock is residual, so e remains e
+                    pass
+
+            # 3. Aggregate Messages to Nodes
+            # Sum incoming edge features to update node features
+            # edge_index[1] is the target node index for directed edges
+            # e contains info about the edge and its incoming neighbors
+            dst_idx = edge_index[1]
+            aggregated_messages = scatter(
+                e, dst_idx, dim=0, dim_size=h.size(0), reduce="sum"
+            )
+
+            # Update node features with aggregated messages (Residual connection)
+            h = h + self.node_update_mlp(aggregated_messages)
+        else:
+            # If no edges, create dummy edge embeddings for readout consistency if needed
+            # (Though coupling_edge_index would be empty, so readout won't be called on them)
+            e = torch.zeros(0, self.config.HIDDEN_DIM, device=h.device)
+
+        # 4. Generate Predictions
+
+        # A. Auxiliary Tasks (Node-level)
+        pred_shielding = self.shielding_head(h)
+        pred_charge = self.charge_head(h)
+
+        # B. Primary Task (Edge-level / Pair-level)
+        if coupling_edge_index.shape[0] > 0:
+            pred_coupling = self.readout(
+                node_embeddings=h,
+                edge_embeddings=e,
+                edge_index=edge_index,
+                coupling_edge_index=coupling_edge_index,
+                coupling_type=coupling_type,
+            )
+        else:
+            pred_coupling = torch.zeros(0, 1, device=h.device)
+
+        return {
+            "coupling": pred_coupling,
+            "shielding": pred_shielding,
+            "charge": pred_charge,
+        }
+=======
+from library.layers import EdgeEmbedding, InteractionBlock, SharedCouplingHead
+
+
+class DirectionalMPNN(nn.Module):
+    """
+    Optimized Node-Centric GNN (SchNet-variant).
+    Replaces heavy Directional MPNN to enable training on full dataset (Cite Lesson 00014).
+    Uses shared heads for data efficiency (Cite Lesson 00022).
+    """
+
+    def __init__(self):
+        super(DirectionalMPNN, self).__init__()
+        self.config = Config()
+
+        # Hyperparameters
+        hidden_dim = self.config.HIDDEN_DIM
+        num_layers = self.config.NUM_LAYERS
+        num_rbf = self.config.NUM_RBF
+        num_atom_types = self.config.NUM_ATOM_TYPES
+
+        # 1. Initial Embeddings
+        self.node_embedding = nn.Embedding(num_atom_types, hidden_dim)
+
+        self.edge_embedding = EdgeEmbedding(
+            num_rbf=num_rbf,
+            hidden_dim=hidden_dim,
+            cutoff_lower=0.0,
+            cutoff_upper=self.config.CUTOFF_RADIUS,
+        )
+
+        # 2. Message Passing Blocks (Node-Centric)
+        self.blocks = nn.ModuleList(
+            [
+                InteractionBlock(hidden_dim=hidden_dim, num_rbf=num_rbf)
+                for _ in range(num_layers)
+            ]
+        )
+
+        # 3. Readout
+        self.readout = SharedCouplingHead(
+            node_dim=hidden_dim,
+            edge_dim=hidden_dim,
+            num_types=self.config.NUM_COUPLING_TYPES,
+            hidden_dim=hidden_dim,
+            output_dim=1,
+        )
+
+        # 4. Auxiliary Heads
+        self.shielding_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+
+        self.charge_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, batch):
+        # Unpack
+        node_x = batch["node_x"]
+        edge_index = batch["edge_index"]
+        edge_attr = batch["edge_attr"]
+        
+        coupling_edge_index = batch["coupling_edge_index"]
+        coupling_type = batch["coupling_type"]
+
+        # 1. Embeddings
+        h = self.node_embedding(node_x)
+        
+        if edge_index.shape[1] > 0:
+            e = self.edge_embedding(edge_attr)
+
+            # 2. Message Passing (Node Updates)
+            for block in self.blocks:
+                h = block(h, edge_index, e)
+        else:
+            e = torch.zeros(0, self.config.HIDDEN_DIM, device=h.device)
+
+        # 3. Predictions
+        pred_shielding = self.shielding_head(h)
+        pred_charge = self.charge_head(h)
+
+        if coupling_edge_index.shape[0] > 0:
+            pred_coupling = self.readout(
+                node_embeddings=h,
+                edge_embeddings=e,
+                edge_index=edge_index,
+                coupling_edge_index=coupling_edge_index,
+                coupling_type=coupling_type,
+            )
+        else:
+            pred_coupling = torch.zeros(0, 1, device=h.device)
+
+        return {
+            "coupling": pred_coupling,
+            "shielding": pred_shielding,
+            "charge": pred_charge,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # ==========================================
+    # 1. Configuration for Fast Baseline
+    # ==========================================
+    # Override Config defaults to ensure execution within time limits
+    Config.DEBUG = True
+    Config.DEBUG_SAMPLE_SIZE = 50000  # Train on ~50k molecules (approx 15% of data)
+    Config.MAX_EPOCHS = 5  # Limit epochs for speed
+    Config.BATCH_SIZE = 128
+    Config.NUM_WORKERS = 4
+
+    # Ensure fully reproducible results
+    seed_everything(Config.SEED)
+
+    print("Starting Fast Baseline Run...")
+    print(f"Debug Mode: {Config.DEBUG} (Sample Size: {Config.DEBUG_SAMPLE_SIZE})")
+    print(f"Max Epochs: {Config.MAX_EPOCHS}")
+
+    # ==========================================
+    # 2. Training
+=======
+def main():
+    # ==========================================
+    # 1. Configuration
+    # ==========================================
+    # Ensure fully reproducible results
+    seed_everything(Config.SEED)
+
+    print("Starting Full Training Run...")
+    print(f"Debug Mode: {Config.DEBUG}")
+    print(f"Max Epochs: {Config.MAX_EPOCHS}")
+    print(f"Batch Size: {Config.BATCH_SIZE}")
+
+    # ==========================================
+    # 2. Training
+>>>>>>> REPLACE
+```

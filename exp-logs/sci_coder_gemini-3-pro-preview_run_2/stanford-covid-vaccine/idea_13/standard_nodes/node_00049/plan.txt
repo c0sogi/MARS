@@ -1,0 +1,386 @@
+I will implement the `DensePartnerAwareNet` architecture which corresponds to the "Current Best Solution" (Idea 8) referenced in the lessons. This architecture utilizes a Dense Dilated TCN backbone with a growth rate of 64 and dropout of 0.1 (Cite solution_lesson_node_00037, solution_lesson_node_00038). Crucially, it replaces the complex parallel refinement branch of the previous solution with a direct `LatentStructuralGather` mechanism that concatenates the full dense feature history of a base with that of its paired partner (Cite solution_lesson_node_00031, solution_lesson_node_00047). This "Dense Feature Aggregation" provides the global context required for RNA folding without the optimization difficulties of staged residuals. I will also ensure cache invalidation (Cite solution_lesson_node_00032) and extend training to 35 epochs (Cite solution_lesson_node_00003) to allow full convergence.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working Directory (Explicitly requested idea_13)
+    WORKING_DIR = "./working/idea_13/"
+
+    # Cache Filenames
+    # Unique identifiers to ensure cache invalidation for the new architecture
+    TRAIN_CACHE_FILE = "train_data_bridged_v1.npz"
+    VAL_CACHE_FILE = "val_data_bridged_v1.npz"
+    TEST_CACHE_FILE = "test_data_bridged_v1.npz"
+=======
+    # Working Directory
+    WORKING_DIR = "./working/idea_opt/"
+
+    # Cache Filenames
+    # Unique identifiers to ensure cache invalidation for the new architecture
+    TRAIN_CACHE_FILE = "train_data_opt_v1.npz"
+    VAL_CACHE_FILE = "val_data_opt_v1.npz"
+    TEST_CACHE_FILE = "test_data_opt_v1.npz"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StackingRefinementBlock(nn.Module):
+    """
+    Processes paired states to model base-pair stacking interactions.
+    """
+
+    def __init__(
+        self, in_channels, hidden_channels, kernel_size=3, layers=2, dropout=0.1
+    ):
+        super(StackingRefinementBlock, self).__init__()
+        self.layers = nn.ModuleList()
+
+        # First layer
+        padding = kernel_size // 2
+        self.layers.append(
+            nn.Sequential(
+                nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=padding),
+                nn.BatchNorm1d(hidden_channels),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+        )
+
+        # Subsequent layers
+        for _ in range(layers - 1):
+            self.layers.append(
+                nn.Sequential(
+                    nn.Conv1d(
+                        hidden_channels, hidden_channels, kernel_size, padding=padding
+                    ),
+                    nn.BatchNorm1d(hidden_channels),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+            )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class BridgedHybridNet(nn.Module):
+    """
+    Bridged Dense-Refined Hybrid Network (Idea 14).
+    Combines a Dense Dilated TCN backbone with a Parallel Stacking Refinement branch.
+    """
+
+    def __init__(self):
+        super(BridgedHybridNet, self).__init__()
+
+        # ==========================================
+        # 1. Dense Backbone (Dilated TCN)
+        # ==========================================
+        self.dense_blocks = nn.ModuleList()
+        current_channels = Config.IN_CHANNELS
+        growth_rate = Config.GROWTH_RATE
+
+        # Build blocks with increasing dilation
+        for dilation in Config.DILATIONS:
+            block = DenseTCNBlock(
+                in_channels=current_channels,
+                out_channels=growth_rate,
+                kernel_size=Config.KERNEL_SIZE,
+                dilation=dilation,
+                dropout=Config.DROPOUT,
+            )
+            self.dense_blocks.append(block)
+            # In DenseNet, we concatenate output to input for the next layer
+            current_channels += growth_rate
+
+        self.backbone_out_channels = current_channels
+
+        # ==========================================
+        # 2. Parallel Stacking Refinement Branch
+        # ==========================================
+        # Compression 1x1 Conv
+        self.compress_conv = nn.Conv1d(
+            self.backbone_out_channels, growth_rate, kernel_size=1
+        )
+
+        # Structural Gather
+        self.gather = LatentStructuralGather()
+
+        # Stacking Module
+        # Input to stacking is (Compressed_Self + Compressed_Partner)
+        stacking_in_channels = growth_rate * 2
+        self.stacking_module = StackingRefinementBlock(
+            in_channels=stacking_in_channels,
+            hidden_channels=growth_rate,
+            kernel_size=Config.STACKING_KERNEL_SIZE,
+            layers=Config.STACKING_LAYERS,
+            dropout=Config.DROPOUT,
+        )
+
+        # ==========================================
+        # 3. Bridged Fusion & Global Aggregation
+        # ==========================================
+        # Bridge: Concatenate Backbone Output + Stacking Output
+        fusion_channels = self.backbone_out_channels + growth_rate
+
+        # BiGRU
+        gru_hidden_size = fusion_channels // 2
+        self.gru = nn.GRU(
+            input_size=fusion_channels,
+            hidden_size=gru_hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # ==========================================
+        # 4. Output Head
+        # ==========================================
+        self.out_proj = nn.Linear(gru_hidden_size * 2, 5)
+
+    def forward(self, inputs, partner_indices):
+        """
+        Args:
+            inputs: (Batch, In_Channels, Seq_Len)
+            partner_indices: (Batch, Seq_Len)
+        """
+        # 1. Dense Backbone Forward Pass
+        # We maintain a list of all features to facilitate dense concatenation
+        features = [inputs]
+
+        for block in self.dense_blocks:
+            # Concatenate all previous features
+            dense_in = torch.cat(features, dim=1)
+            # Compute block output
+            out = block(dense_in)
+            # Store output
+            features.append(out)
+
+        # Final Backbone Representation (Concatenation of all)
+        h_dense = torch.cat(features, dim=1)  # (Batch, backbone_out_channels, Seq_Len)
+
+        # 2. Stacking Refinement Branch
+        # Compress
+        h_compressed = self.compress_conv(h_dense)  # (Batch, growth_rate, Seq_Len)
+
+        # Gather Partner Features
+        h_partner = self.gather(h_compressed, partner_indices)
+
+        # Form Pair State
+        h_pair = torch.cat(
+            [h_compressed, h_partner], dim=1
+        )  # (Batch, growth_rate*2, Seq_Len)
+
+        # Process Stacking Physics
+        h_stack = self.stacking_module(h_pair)  # (Batch, growth_rate, Seq_Len)
+
+        # 3. Bridged Fusion
+        h_fused = torch.cat(
+            [h_dense, h_stack], dim=1
+        )  # (Batch, fusion_channels, Seq_Len)
+
+        # 4. Global Aggregation (BiGRU)
+        # Permute for RNN: (Batch, Seq_Len, Channels)
+        h_fused_perm = h_fused.permute(0, 2, 1)
+
+        gru_out, _ = self.gru(h_fused_perm)
+
+        # 5. Output Projection
+        logits = self.out_proj(gru_out)  # (Batch, Seq_Len, 5)
+
+        # Permute back to (Batch, 5, Seq_Len) if needed, or keep as is.
+        # The metric calculation expects (N, Seq, 5) or flattened.
+        # Usually PyTorch Loss expects (N, C, L) or (N, L, C).
+        # We return (N, Seq_Len, 5) to match common usage.
+
+        return logits
+=======
+class DensePartnerAwareNet(nn.Module):
+    """
+    Dense Partner-Aware Network (Idea 8).
+    Uses a Dense Dilated TCN backbone and Latent Structural Gathering.
+    """
+
+    def __init__(self):
+        super(DensePartnerAwareNet, self).__init__()
+
+        # ==========================================
+        # 1. Dense Backbone (Dilated TCN)
+        # ==========================================
+        self.dense_blocks = nn.ModuleList()
+        current_channels = Config.IN_CHANNELS
+        growth_rate = Config.GROWTH_RATE
+
+        # Build blocks with increasing dilation
+        for dilation in Config.DILATIONS:
+            block = DenseTCNBlock(
+                in_channels=current_channels,
+                out_channels=growth_rate,
+                kernel_size=Config.KERNEL_SIZE,
+                dilation=dilation,
+                dropout=Config.DROPOUT,
+            )
+            self.dense_blocks.append(block)
+            # In DenseNet, we concatenate output to input for the next layer
+            current_channels += growth_rate
+
+        self.backbone_out_channels = current_channels
+
+        # ==========================================
+        # 2. Structural Interaction
+        # ==========================================
+        self.gather = LatentStructuralGather()
+
+        # ==========================================
+        # 3. Global Aggregation (BiGRU)
+        # ==========================================
+        # Input: Self Features + Partner Features
+        fusion_channels = self.backbone_out_channels * 2
+
+        # BiGRU
+        # Hidden size = Half of input to maintain dimension consistency
+        gru_hidden_size = fusion_channels // 2
+        self.gru = nn.GRU(
+            input_size=fusion_channels,
+            hidden_size=gru_hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # ==========================================
+        # 4. Output Head
+        # ==========================================
+        self.out_proj = nn.Linear(gru_hidden_size * 2, 5)
+
+    def forward(self, inputs, partner_indices):
+        """
+        Args:
+            inputs: (Batch, In_Channels, Seq_Len)
+            partner_indices: (Batch, Seq_Len)
+        """
+        # 1. Dense Backbone Forward Pass
+        features = [inputs]
+
+        for block in self.dense_blocks:
+            # Concatenate all previous features
+            dense_in = torch.cat(features, dim=1)
+            out = block(dense_in)
+            features.append(out)
+
+        # Final Backbone Representation (Concatenation of all)
+        h_dense = torch.cat(features, dim=1)  # (Batch, backbone_out_channels, Seq_Len)
+
+        # 2. Structural Gathering
+        # Gather the full dense history of the partner
+        h_partner = self.gather(h_dense, partner_indices)
+
+        # 3. Fusion
+        h_fused = torch.cat([h_dense, h_partner], dim=1)
+
+        # 4. Global Aggregation (BiGRU)
+        h_fused_perm = h_fused.permute(0, 2, 1)
+        gru_out, _ = self.gru(h_fused_perm)
+
+        # 5. Output Projection
+        logits = self.out_proj(gru_out)  # (Batch, Seq_Len, 5)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import BridgedHybridNet
+
+
+class Trainer:
+    def __init__(self):
+        self.device = Config.DEVICE
+        self.scored_indices = [
+            i for i, col in enumerate(Config.TARGET_COLS) if col in Config.SCORED_COLS
+        ]
+
+        # Initialize Model
+        self.model = BridgedHybridNet().to(self.device)
+=======
+from library.model import DensePartnerAwareNet
+
+
+class Trainer:
+    def __init__(self):
+        self.device = Config.DEVICE
+        self.scored_indices = [
+            i for i, col in enumerate(Config.TARGET_COLS) if col in Config.SCORED_COLS
+        ]
+
+        # Initialize Model
+        self.model = DensePartnerAwareNet().to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import BridgedHybridNet
+
+
+def main():
+    # ==========================================
+    # 1. Configuration & Setup
+    # ==========================================
+    # Override Config for fast execution and isolation
+    Config.EPOCHS = 20  # Limit epochs for a fast baseline (default was 50)
+    Config.WORKING_DIR = "./working/idea_14/"  # Isolate working directory
+=======
+from library.model import DensePartnerAwareNet
+
+
+def main():
+    # ==========================================
+    # 1. Configuration & Setup
+    # ==========================================
+    # Override Config for fast execution and isolation
+    Config.EPOCHS = 35  # Extended epochs for better convergence (Cite Lesson 00003)
+    Config.WORKING_DIR = Config.WORKING_DIR  # Use Config default (idea_opt)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 3. Final Validation Evaluation
+    # ==========================================
+    print("\nPerforming Final Validation...")
+
+    # Load the best model saved during training
+    model_path = Config.get_model_path()
+    if not os.path.exists(model_path):
+        print(f"Error: Model file not found at {model_path}")
+        return
+
+    trainer.model.load_state_dict(torch.load(model_path, map_location=Config.DEVICE))
+    trainer.model.eval()
+=======
+    # ==========================================
+    # 3. Final Validation Evaluation
+    # ==========================================
+    print("\nPerforming Final Validation...")
+
+    # Load the best model saved during training
+    model_path = Config.get_model_path()
+    if not os.path.exists(model_path):
+        print(f"Error: Model file not found at {model_path}")
+        return
+
+    # Re-initialize model class to ensure architecture matches weights if class changed dynamically
+    trainer.model = DensePartnerAwareNet().to(Config.DEVICE)
+    trainer.model.load_state_dict(torch.load(model_path, map_location=Config.DEVICE))
+    trainer.model.eval()
+>>>>>>> REPLACE
+```

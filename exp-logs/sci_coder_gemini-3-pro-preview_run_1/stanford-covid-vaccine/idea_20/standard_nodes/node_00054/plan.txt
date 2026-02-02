@@ -1,0 +1,270 @@
+Based on **Lesson 00053**, I will revert the detrimental "Target-Specific Aggregator" introduced in the previous solution and replace it with a **Shared Scalar Mixture Aggregator**. The lesson highlights that for highly correlated targets (like RNA degradation under different conditions), hard parameter sharing in the aggregation and projection layers is critical to learn robust common features and prevent overfitting. Additionally, based on **Lesson 00049**, I will reduce the sequence embedding dimension from 64 to 32, as compact embeddings with layer-wise aggregation have been shown to perform efficiently on this dataset.
+
+Here are the changes:
+1.  **`library/config.py`**: Update `working_dir` to `idea_21` and reduce `seq_embed_dim` to 32.
+2.  **`library/model.py`**: Replace `TargetSpecificAggregator` with `ScalarMixture` (shared weights) and simplify `Net` to use a single shared output head.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    working_dir = "./working/idea_20"
+    model_save_path = os.path.join(working_dir, "best_model.pth")
+=======
+    working_dir = "./working/idea_21"
+    model_save_path = os.path.join(working_dir, "best_model.pth")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Input Embeddings
+    seq_embed_dim = 64  # Embedding size for nucleotide identity
+    loop_embed_dim = 32  # Embedding size for loop type
+=======
+    # Input Embeddings
+    seq_embed_dim = 32  # Embedding size for nucleotide identity Cite solution_lesson_node_00049
+    loop_embed_dim = 32  # Embedding size for loop type
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TargetSpecificAggregator(nn.Module):
+    """
+    Aggregates layer outputs using learned scalar weights specific to each target.
+    """
+
+    def __init__(self, n_layers, n_targets, hidden_dim):
+        super().__init__()
+        self.n_layers = n_layers
+        self.n_targets = n_targets
+
+        # Learnable weights: (n_targets, n_layers)
+        # Initialized to 0 to start with uniform weighting (after softmax)
+        self.weights = nn.Parameter(torch.zeros(n_targets, n_layers))
+
+    def forward(self, layers_output):
+        """
+        Args:
+            layers_output (list): List of tensors (B, L, W) from each layer.
+        Returns:
+            list: List of tensors (B, L, W), one per target.
+        """
+        # Stack layers: (B, L, n_layers, W)
+        stacked = torch.stack(layers_output, dim=2)
+
+        # Compute mixing weights: (n_targets, n_layers)
+        alphas = torch.softmax(self.weights, dim=1)
+
+        outputs = []
+        for k in range(self.n_targets):
+            # Get weights for target k: (n_layers)
+            # Reshape for broadcasting: (1, 1, n_layers, 1)
+            w = alphas[k].view(1, 1, self.n_layers, 1)
+
+            # Weighted sum over layers
+            # (B, L, n_layers, W) * (1, 1, n_layers, 1) -> sum dim 2 -> (B, L, W)
+            agg = (stacked * w).sum(dim=2)
+            outputs.append(agg)
+
+        return outputs
+
+
+class Net(nn.Module):
+    """
+    Target-Aware Layer-Aggregated Wide-Stream BiGRU.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Input Embeddings
+        self.seq_embed = nn.Embedding(Config.vocab_size, Config.seq_embed_dim)
+        self.loop_embed = nn.Embedding(Config.loop_vocab_size, Config.loop_embed_dim)
+        self.dist_embed = SinusoidalPositionalEmbedding(Config.distance_dim)
+
+        # 2. Recurrent Stem
+        # Projects concatenated inputs to the residual stream width (hidden_dim)
+        self.stem = nn.GRU(
+            input_size=Config.input_dim,
+            hidden_size=Config.hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.stem_dropout = nn.Dropout(Config.dropout)
+
+        # 3. Backbone (Wide-Stream Residual Blocks)
+        self.layers = nn.ModuleList(
+            [
+                WideBiGRUBlock(Config.hidden_dim, Config.dropout)
+                for _ in range(Config.n_layers)
+            ]
+        )
+
+        # 4. Target-Specific Aggregator
+        # We aggregate the Stem output + outputs from all N blocks
+        total_layers = 1 + Config.n_layers
+        self.aggregator = TargetSpecificAggregator(
+            n_layers=total_layers,
+            n_targets=Config.n_targets,
+            hidden_dim=Config.hidden_dim,
+        )
+
+        # 5. Output Heads
+        # Independent linear projection for each target
+        self.heads = nn.ModuleList(
+            [nn.Linear(Config.hidden_dim, 1) for _ in range(Config.n_targets)]
+        )
+
+    def forward(self, sequence, loop_type, distance, mask=None):
+        # sequence: (B, L)
+        # loop_type: (B, L)
+        # distance: (B, L)
+
+        # --- Embeddings ---
+        emb_seq = self.seq_embed(sequence)  # (B, L, seq_dim)
+        emb_loop = self.loop_embed(loop_type)  # (B, L, loop_dim)
+        emb_dist = self.dist_embed(distance)  # (B, L, dist_dim)
+
+        # Concatenate features
+        x = torch.cat([emb_seq, emb_loop, emb_dist], dim=-1)  # (B, L, input_dim)
+
+        # --- Stem ---
+        x, _ = self.stem(x)
+        x = self.stem_dropout(x)
+
+        # Collect outputs (Stem is layer 0)
+        layer_outputs = [x]
+
+        # --- Backbone ---
+        for layer in self.layers:
+            x = layer(x)
+            layer_outputs.append(x)
+
+        # --- Aggregation ---
+        # Returns a list of contexts, one for each target
+        target_contexts = self.aggregator(layer_outputs)
+
+        # --- Heads ---
+        preds = []
+        for k, head in enumerate(self.heads):
+            # Project context to scalar: (B, L, W) -> (B, L, 1)
+            out = head(target_contexts[k])
+            preds.append(out)
+
+        # Concatenate to (B, L, n_targets)
+        final_pred = torch.cat(preds, dim=-1)
+
+        return final_pred
+=======
+class ScalarMixture(nn.Module):
+    """
+    Aggregates layer outputs using a single set of learned scalar weights shared across targets.
+    Cite solution_lesson_node_00053
+    """
+
+    def __init__(self, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        # Learnable weights: (n_layers)
+        self.weights = nn.Parameter(torch.zeros(n_layers))
+
+    def forward(self, layers_output):
+        """
+        Args:
+            layers_output (list): List of tensors (B, L, W) from each layer.
+        Returns:
+            torch.Tensor: Aggregated tensor (B, L, W).
+        """
+        # Stack layers: (B, L, n_layers, W)
+        stacked = torch.stack(layers_output, dim=2)
+
+        # Compute mixing weights: (n_layers)
+        probs = torch.softmax(self.weights, dim=0)
+
+        # Reshape for broadcasting: (1, 1, n_layers, 1)
+        w = probs.view(1, 1, self.n_layers, 1)
+
+        # Weighted sum over layers
+        # (B, L, n_layers, W) * (1, 1, n_layers, 1) -> sum dim 2 -> (B, L, W)
+        out = (stacked * w).sum(dim=2)
+
+        return out
+
+
+class Net(nn.Module):
+    """
+    Scalar-Aggregated Wide-Stream BiGRU.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Input Embeddings
+        self.seq_embed = nn.Embedding(Config.vocab_size, Config.seq_embed_dim)
+        self.loop_embed = nn.Embedding(Config.loop_vocab_size, Config.loop_embed_dim)
+        self.dist_embed = SinusoidalPositionalEmbedding(Config.distance_dim)
+
+        # 2. Recurrent Stem
+        # Projects concatenated inputs to the residual stream width (hidden_dim)
+        self.stem = nn.GRU(
+            input_size=Config.input_dim,
+            hidden_size=Config.hidden_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.stem_dropout = nn.Dropout(Config.dropout)
+
+        # 3. Backbone (Wide-Stream Residual Blocks)
+        self.layers = nn.ModuleList(
+            [
+                WideBiGRUBlock(Config.hidden_dim, Config.dropout)
+                for _ in range(Config.n_layers)
+            ]
+        )
+
+        # 4. Shared Scalar Aggregator
+        # We aggregate the Stem output + outputs from all N blocks
+        total_layers = 1 + Config.n_layers
+        self.aggregator = ScalarMixture(n_layers=total_layers)
+
+        # 5. Output Head
+        # Shared linear projection for all targets (Hard Parameter Sharing)
+        self.head = nn.Linear(Config.hidden_dim, Config.n_targets)
+
+    def forward(self, sequence, loop_type, distance, mask=None):
+        # sequence: (B, L)
+        # loop_type: (B, L)
+        # distance: (B, L)
+
+        # --- Embeddings ---
+        emb_seq = self.seq_embed(sequence)  # (B, L, seq_dim)
+        emb_loop = self.loop_embed(loop_type)  # (B, L, loop_dim)
+        emb_dist = self.dist_embed(distance)  # (B, L, dist_dim)
+
+        # Concatenate features
+        x = torch.cat([emb_seq, emb_loop, emb_dist], dim=-1)  # (B, L, input_dim)
+
+        # --- Stem ---
+        x, _ = self.stem(x)
+        x = self.stem_dropout(x)
+
+        # Collect outputs (Stem is layer 0)
+        layer_outputs = [x]
+
+        # --- Backbone ---
+        for layer in self.layers:
+            x = layer(x)
+            layer_outputs.append(x)
+
+        # --- Aggregation ---
+        # Returns a single shared context (B, L, W)
+        context = self.aggregator(layer_outputs)
+
+        # --- Head ---
+        # Project context to targets: (B, L, W) -> (B, L, n_targets)
+        final_pred = self.head(context)
+
+        return final_pred
+>>>>>>> REPLACE
+```

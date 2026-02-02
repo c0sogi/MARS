@@ -1,0 +1,330 @@
+To optimize the solution, I will implement a **Late Fusion** architecture, directly addressing the structural bias identified in Lesson `solution_lesson_node_00012`. The previous Early Fusion approach (broadcasting scalar metadata as image channels) caused the model to over-rely on the "clean" age signal (correlation 0.85) at the expense of visual features. By processing the image and metadata (Age, Implant) in separate streams and fusing them at the feature level, we force the backbone to learn visual representations before they are influenced by demographic priors.
+
+Key changes:
+1.  **Architecture (Cite solution_lesson_node_00012):** Modify `MultiTaskEfficientNet` to accept a tuple of inputs `(image, metadata)`. The image passes through the EfficientNet backbone, and the metadata passes through a small MLP. The resulting feature vectors are concatenated before the classification heads.
+2.  **Data Pipeline:** Update `MammogramDataset` to return `(image, metadata)` tuples. The image is now a standard 3-channel RGB tensor (grayscale repeated) to leverage pretrained weights effectively, while metadata is a distinct vector.
+3.  **Hyperparameters:** Increase `EPOCHS` to 5 in `runfile.py` to allow the new architecture sufficient convergence time (previous run took ~17 mins for 3 epochs, so 5 is well within limits).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # 3 Channels: 1 Image + 1 Age (Broadcasted) + 1 Implant (Broadcasted)
+    IN_CHANNELS = 3
+
+    # Mapping for Auxiliary Task (Density)
+=======
+    # 3 Channels: RGB (Image repeated)
+    IN_CHANNELS = 3
+    # Metadata: Age, Implant
+    META_DIM = 2
+
+    # Mapping for Auxiliary Task (Density)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Optimization
+    LR = 1e-4
+    MIN_LR = 1e-6
+    WEIGHT_DECAY = 1e-5
+
+    # Loss Weights
+=======
+    # Optimization
+    LR = 1e-4
+    MIN_LR = 1e-6
+    WEIGHT_DECAY = 1e-4
+
+    # Loss Weights
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # 4. Prepare Metadata Channels
+        h, w = img.shape
+
+        # Age Channel: Standard Scaled -> Broadcast
+        age_val = self.ages[idx]
+        age_norm = (age_val - self.age_mean) / (self.age_std + 1e-6)
+        age_channel = np.full((h, w), age_norm, dtype=np.float32)
+
+        # Implant Channel: Binary -> Broadcast
+        implant_val = self.implants[idx]
+        implant_channel = np.full((h, w), implant_val, dtype=np.float32)
+
+        # 5. Stack Channels (3, H, W)
+        # Channel 0: Image
+        # Channel 1: Age
+        # Channel 2: Implant
+        input_tensor = np.stack([img, age_channel, implant_channel], axis=0)
+        input_tensor = torch.from_numpy(input_tensor)
+
+        # 6. Prepare Targets
+        cancer_target = torch.tensor(self.cancer_labels[idx], dtype=torch.float)
+        density_target = torch.tensor(self.density_labels[idx], dtype=torch.long)
+
+        if self.mode == "test":
+            return input_tensor, self.prediction_ids[idx]
+        else:
+            return input_tensor, cancer_target, density_target
+=======
+        # 4. Prepare Image Tensor (3, H, W) - Repeat grayscale to RGB
+        img = np.stack([img, img, img], axis=0)
+        image_tensor = torch.from_numpy(img)
+
+        # 5. Prepare Metadata Vector
+        age_val = self.ages[idx]
+        age_norm = (age_val - self.age_mean) / (self.age_std + 1e-6)
+        implant_val = self.implants[idx]
+        
+        meta_tensor = torch.tensor([age_norm, implant_val], dtype=torch.float32)
+
+        # 6. Prepare Targets
+        cancer_target = torch.tensor(self.cancer_labels[idx], dtype=torch.float)
+        density_target = torch.tensor(self.density_labels[idx], dtype=torch.long)
+
+        if self.mode == "test":
+            return (image_tensor, meta_tensor), self.prediction_ids[idx]
+        else:
+            return (image_tensor, meta_tensor), cancer_target, density_target
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiTaskEfficientNet(nn.Module):
+    def __init__(self, backbone_name=Config.BACKBONE, pretrained=True):
+        super(MultiTaskEfficientNet, self).__init__()
+
+        # Initialize backbone as feature extractor
+        # in_chans=3 matches our input (Image, Age, Implant)
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+        )
+
+        # Get the number of features output by the backbone
+        n_features = self.backbone.num_features
+
+        # Primary Head: Cancer Detection (Binary)
+        self.cancer_head = nn.Linear(n_features, 1)
+
+        # Auxiliary Head: Density Classification (4 classes)
+        self.density_head = nn.Linear(n_features, Config.NUM_AUX_CLASSES)
+
+    def forward(self, x):
+        # Extract features
+        features = self.backbone(x)
+
+        # Multi-task outputs
+        cancer_logits = self.cancer_head(features)
+        density_logits = self.density_head(features)
+
+        return cancer_logits, density_logits
+=======
+class MultiTaskEfficientNet(nn.Module):
+    def __init__(self, backbone_name=Config.BACKBONE, pretrained=True):
+        super(MultiTaskEfficientNet, self).__init__()
+
+        # Initialize backbone as feature extractor
+        # in_chans=3 (RGB)
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+        )
+
+        # Metadata processing
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(Config.META_DIM, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        # Combined features
+        n_features = self.backbone.num_features + 32
+
+        # Primary Head: Cancer Detection (Binary)
+        self.cancer_head = nn.Linear(n_features, 1)
+
+        # Auxiliary Head: Density Classification (4 classes)
+        self.density_head = nn.Linear(n_features, Config.NUM_AUX_CLASSES)
+
+    def forward(self, inputs):
+        x, meta = inputs
+        
+        # Extract image features
+        img_features = self.backbone(x)
+        
+        # Extract metadata features
+        meta_features = self.meta_mlp(meta)
+        
+        # Late Fusion
+        combined = torch.cat([img_features, meta_features], dim=1)
+
+        # Multi-task outputs
+        cancer_logits = self.cancer_head(combined)
+        density_logits = self.density_head(combined)
+
+        return cancer_logits, density_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    for batch_idx, (inputs, cancer_targets, density_targets) in enumerate(loader):
+        inputs = inputs.to(device)
+        cancer_targets = cancer_targets.to(device).unsqueeze(1)  # [B, 1]
+        density_targets = density_targets.to(device)  # [B]
+
+        optimizer.zero_grad()
+
+        # Forward
+        cancer_logits, density_logits = model(inputs)
+=======
+    for batch_idx, ((images, metas), cancer_targets, density_targets) in enumerate(loader):
+        images = images.to(device)
+        metas = metas.to(device)
+        cancer_targets = cancer_targets.to(device).unsqueeze(1)  # [B, 1]
+        density_targets = density_targets.to(device)  # [B]
+
+        optimizer.zero_grad()
+
+        # Forward
+        cancer_logits, density_logits = model((images, metas))
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for inputs, cancer_targets, density_targets in loader:
+            inputs = inputs.to(device)
+
+            cancer_logits, density_logits = model(inputs)
+
+            # Cancer Probs
+=======
+    with torch.no_grad():
+        for (images, metas), cancer_targets, density_targets in loader:
+            images = images.to(device)
+            metas = metas.to(device)
+
+            cancer_logits, density_logits = model((images, metas))
+
+            # Cancer Probs
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for inputs, batch_ids in loader:
+            inputs = inputs.to(device)
+
+            cancer_logits, _ = model(inputs)
+            probs = torch.sigmoid(cancer_logits).cpu().numpy().flatten()
+=======
+    with torch.no_grad():
+        for (images, metas), batch_ids in loader:
+            images = images.to(device)
+            metas = metas.to(device)
+
+            cancer_logits, _ = model((images, metas))
+            probs = torch.sigmoid(cancer_logits).cpu().numpy().flatten()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    for batch_idx, (inputs, cancer_targets, density_targets) in enumerate(loader):
+        inputs = inputs.to(device)
+        cancer_targets = cancer_targets.to(device).unsqueeze(1)  # [B, 1]
+        density_targets = density_targets.to(device)  # [B]
+
+        optimizer.zero_grad()
+
+        # Forward
+        with autocast():
+            cancer_logits, density_logits = model(inputs)
+=======
+    for batch_idx, ((images, metas), cancer_targets, density_targets) in enumerate(loader):
+        images = images.to(device)
+        metas = metas.to(device)
+        cancer_targets = cancer_targets.to(device).unsqueeze(1)  # [B, 1]
+        density_targets = density_targets.to(device)  # [B]
+
+        optimizer.zero_grad()
+
+        # Forward
+        with autocast():
+            cancer_logits, density_logits = model((images, metas))
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for inputs, cancer_targets, density_targets in loader:
+            inputs = inputs.to(device)
+
+            with autocast():
+                cancer_logits, density_logits = model(inputs)
+=======
+    with torch.no_grad():
+        for (images, metas), cancer_targets, density_targets in loader:
+            images = images.to(device)
+            metas = metas.to(device)
+
+            with autocast():
+                cancer_logits, density_logits = model((images, metas))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    EPOCHS = 3
+    THRESHOLD = 0.04436662048101425
+
+    print(f"Starting Fast Baseline Run (Epochs={EPOCHS})...")
+=======
+    EPOCHS = 5
+    THRESHOLD = 0.04437665641307831
+
+    print(f"Starting Optimized Late Fusion Run (Epochs={EPOCHS})...")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for inputs, cancer_targets, density_targets in val_loader:
+            inputs = inputs.to(device)
+            cancer_logits, _ = model(inputs)
+
+            probs = torch.sigmoid(cancer_logits).cpu().numpy().flatten()
+=======
+    with torch.no_grad():
+        for (images, metas), cancer_targets, density_targets in val_loader:
+            images = images.to(device)
+            metas = metas.to(device)
+            cancer_logits, _ = model((images, metas))
+
+            probs = torch.sigmoid(cancer_logits).cpu().numpy().flatten()
+>>>>>>> REPLACE
+```

@@ -1,0 +1,327 @@
+My implementation strategy focuses on reverting the ineffective input-level augmentation and replacing it with a structural **Dual-Stream Pooling** mechanism, as recommended by Lessons 70 and 76.
+
+1.  **Revert Input Augmentation**: I will modify `library/data_utils.py` to stop generating inverted images ($1-X$) and revert the `INPUT_CHANNELS` in `library/config.py` to 3. This adheres to Lesson 76, which states that complementary feature extraction (like shadows) should be embedded in the architecture, not the input.
+2.  **Implement Dual-Stream Pooling**: I will modify `library/model_utils.py` to introduce a `DualPooling` class. This layer computes both Max Pooling (peaks) and Min Pooling (shadows/voids) and concatenates them, effectively doubling the feature depth at each stage. This addresses Lesson 70 regarding the preservation of signal extremes in SAR imagery.
+3.  **Adjust Architecture Dimensions**: I will update the `CSNet` class (effectively converting it to the DPCNet architecture) to handle the channel doubling induced by Dual Pooling. To prevent parameter explosion and overfitting (Lesson 41), I will use a contracted filter progression (`32 -> 64 -> 64 -> 32`), which results in feature map depths of `64 -> 128 -> 128 -> 64` after pooling. This maintains a compact flattened vector size of 1024, striking a balance between capturing rich "shadow" features and maintaining a regularized model capacity.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Input channels: 3 Base (HH, HV, Avg) + 3 Complementary (1-HH, 1-HV, 1-Avg)
+    INPUT_CHANNELS = 6
+
+    # Architecture specific: Sustained width with terminal contraction
+    # Stage 1 -> Stage 2 -> Stage 3 -> Stage 4
+    FILTER_SIZES = [64, 128, 128, 64]
+=======
+    # Input channels: 3 Base (HH, HV, Avg)
+    INPUT_CHANNELS = 3
+
+    # Architecture specific: Dual Pooling results in effective doubling
+    # Defined here for reference, implemented in model
+    FILTER_SIZES = [32, 64, 64, 32]
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_utils.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        # 1. Retrieve 3-channel normalized image
+        img_3ch = self.images[idx]  # (3, 75, 75)
+
+        # 2. Construct Complementary Channels (1 - X)
+        # Since images are [0, 1], this inverts the signal (shadows -> peaks)
+        complement = 1.0 - img_3ch
+
+        # 3. Stack to form 6-channel input
+        # Channels: [HH, HV, Avg, 1-HH, 1-HV, 1-Avg]
+        img_6ch = np.concatenate([img_3ch, complement], axis=0)  # (6, 75, 75)
+
+        # 4. Convert to Tensor
+        tensor = torch.from_numpy(img_6ch).float()
+=======
+    def __getitem__(self, idx):
+        # 1. Retrieve 3-channel normalized image
+        img_3ch = self.images[idx]  # (3, 75, 75)
+
+        # 2. Convert to Tensor
+        tensor = torch.from_numpy(img_3ch).float()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_utils.py
+<<<<<<< SEARCH
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module.
+    Sequentially applies Channel and Spatial attention.
+    """
+
+    def __init__(self, planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        out = out * self.sa(out)
+        return out
+
+
+class CSNet(nn.Module):
+    """
+    Complementary Signal Network (CS-Net).
+
+    Features:
+    1. Input-Level Dual-Stream: Accepts 6 channels (Normal + Inverted).
+    2. Sustained Width CNN: 64 -> 128 -> 128 -> 64 filters.
+    3. CBAM Attention: Applied Pre-Pooling in every block.
+    4. Metadata Fusion: Concatenation of visual and angle features.
+    """
+
+    def __init__(self):
+        super(CSNet, self).__init__()
+
+        # --- Visual Branch ---
+        # Input: 6 channels (HH, HV, Avg, 1-HH, 1-HV, 1-Avg)
+
+        # Stage 1: 6 -> 64
+        # 75x75 -> 37x37
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.cbam1 = CBAM(64)
+
+        # Stage 2: 64 -> 128
+        # 37x37 -> 18x18
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.cbam2 = CBAM(128)
+
+        # Stage 3: 128 -> 128
+        # 18x18 -> 9x9
+        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.cbam3 = CBAM(128)
+
+        # Stage 4: 128 -> 64 (Terminal Contraction)
+        # 9x9 -> 4x4
+        self.conv4 = nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(64)
+        self.cbam4 = CBAM(64)
+
+        self.pool = nn.MaxPool2d(2, 2)
+        self.relu = nn.ReLU(inplace=True)
+
+        # --- Metadata Branch ---
+        # Processes scalar incidence angle
+        self.meta_fc1 = nn.Linear(1, 16)
+        self.meta_bn1 = nn.BatchNorm1d(16)
+        self.meta_fc2 = nn.Linear(16, 32)
+        self.meta_bn2 = nn.BatchNorm1d(32)
+
+        # --- Fusion Head ---
+        # Visual flat: 64 * 4 * 4 = 1024
+        # Meta flat: 32
+        # Total: 1056
+        self.fc1 = nn.Linear(1024 + 32, 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
+        self.dropout = nn.Dropout(0.2)
+
+        self.fc2 = nn.Linear(512, 256)
+        self.bn_fc2 = nn.BatchNorm1d(256)
+
+        self.out = nn.Linear(256, 1)
+
+        # Weight initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x_img, x_angle):
+        # --- Visual Branch Forward ---
+        # Stage 1
+        x = self.conv1(x_img)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.cbam1(x)
+        x = self.pool(x)
+
+        # Stage 2
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.cbam2(x)
+        x = self.pool(x)
+
+        # Stage 3
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x = self.cbam3(x)
+        x = self.pool(x)
+
+        # Stage 4
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = self.relu(x)
+        x = self.cbam4(x)
+        x = self.pool(x)
+
+        # Flatten: (N, 64, 4, 4) -> (N, 1024)
+        x_visual = x.view(x.size(0), -1)
+=======
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module.
+    Sequentially applies Channel and Spatial attention.
+    """
+
+    def __init__(self, planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        out = out * self.sa(out)
+        return out
+
+
+class DualPooling(nn.Module):
+    """
+    Dual-Stream Pooling Module.
+    Computes both Max and Min pooling and concatenates them.
+    Cite solution_lesson_node_00070: Preserving Signal Extremes.
+    """
+
+    def __init__(self, kernel_size=2, stride=2):
+        super(DualPooling, self).__init__()
+        self.max_pool = nn.MaxPool2d(kernel_size, stride)
+
+    def forward(self, x):
+        # Max Pooling (Peaks)
+        out_max = self.max_pool(x)
+        # Min Pooling (Shadows) - implemented as negative max of negative input
+        out_min = -self.max_pool(-x)
+        return torch.cat([out_max, out_min], dim=1)
+
+
+class CSNet(nn.Module):
+    """
+    Dual-Pooling Contracted Network (DPCNet).
+    Replaces input-level augmentation with architectural Dual Pooling.
+
+    Features:
+    1. Dual Pooling: Preserves both shadows and peaks (Cite Lesson 70, 76).
+    2. Contracted Architecture: 32 -> 64 -> 64 -> 32 filters (Cite Lesson 41).
+    3. CBAM Attention: Applied Pre-Pooling (Cite Lesson 61).
+    """
+
+    def __init__(self):
+        super(CSNet, self).__init__()
+
+        # --- Visual Branch ---
+        # Input: 3 channels (HH, HV, Avg)
+
+        # Stage 1: 3 -> 32 (Conv) -> 32 (CBAM) -> 64 (DualPool)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.cbam1 = CBAM(32)
+
+        # Stage 2: 64 -> 64 (Conv) -> 64 (CBAM) -> 128 (DualPool)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.cbam2 = CBAM(64)
+
+        # Stage 3: 128 -> 64 (Conv) -> 64 (CBAM) -> 128 (DualPool)
+        self.conv3 = nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.cbam3 = CBAM(64)
+
+        # Stage 4: 128 -> 32 (Conv) -> 32 (CBAM) -> 64 (DualPool)
+        self.conv4 = nn.Conv2d(128, 32, kernel_size=3, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(32)
+        self.cbam4 = CBAM(32)
+
+        self.pool = DualPooling(2, 2)
+        self.relu = nn.ReLU(inplace=True)
+
+        # --- Metadata Branch ---
+        # Processes scalar incidence angle
+        self.meta_fc1 = nn.Linear(1, 16)
+        self.meta_bn1 = nn.BatchNorm1d(16)
+        self.meta_fc2 = nn.Linear(16, 32)
+        self.meta_bn2 = nn.BatchNorm1d(32)
+
+        # --- Fusion Head ---
+        # Visual flat: 64 (channels) * 4 * 4 = 1024
+        # Meta flat: 32
+        # Total: 1056
+        self.fc1 = nn.Linear(1024 + 32, 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
+        self.dropout = nn.Dropout(0.2)
+
+        self.fc2 = nn.Linear(512, 256)
+        self.bn_fc2 = nn.BatchNorm1d(256)
+
+        self.out = nn.Linear(256, 1)
+
+        # Weight initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x_img, x_angle):
+        # --- Visual Branch Forward ---
+        # Stage 1
+        x = self.conv1(x_img)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.cbam1(x)
+        x = self.pool(x) # Output channels doubles here
+
+        # Stage 2
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.cbam2(x)
+        x = self.pool(x)
+
+        # Stage 3
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x = self.cbam3(x)
+        x = self.pool(x)
+
+        # Stage 4
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = self.relu(x)
+        x = self.cbam4(x)
+        x = self.pool(x)
+
+        # Flatten: (N, 64, 4, 4) -> (N, 1024)
+        x_visual = x.view(x.size(0), -1)
+>>>>>>> REPLACE
+```

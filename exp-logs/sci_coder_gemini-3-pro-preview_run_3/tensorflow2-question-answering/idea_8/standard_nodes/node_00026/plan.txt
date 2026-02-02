@@ -1,0 +1,590 @@
+The issue is that the validation process was truncating the dataset (`head(10000)`) and using an incorrect metric aggregation method (macro-averaged F1 per example instead of global Micro F1). The fix involves rewriting the `validate_and_analyze` function to iterate over the entire validation set and implement global counters (`micro_tp`, `micro_fp`, `micro_fn`) for calculating the Micro F1 score. This requires decoupling the logic for False Positives and False Negatives, ensuring that a mismatch penalizes both precision and recall, as per the debug lessons.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def validate_and_analyze():
+    print("\n--- Starting Validation and Failure Analysis ---")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vocab = get_vocabulary(load_cached_data=True)
+    embedding_matrix = load_glove_embeddings(
+        vocab.token_to_idx, Config.EMBEDDING_DIM, load_cached_data=True
+    )
+
+    # Load Models
+    ranker = ANBoWRanker(embedding_matrix=embedding_matrix).to(device)
+    reader = ConvBiDAFReader(embedding_matrix=embedding_matrix).to(device)
+
+    if os.path.exists(Config.RANKER_MODEL_PATH):
+        ranker.load_state_dict(
+            torch.load(Config.RANKER_MODEL_PATH, map_location=device)
+        )
+    if os.path.exists(Config.READER_MODEL_PATH):
+        reader.load_state_dict(
+            torch.load(Config.READER_MODEL_PATH, map_location=device)
+        )
+
+    ranker.eval()
+    reader.eval()
+
+    # Load Validation Metadata
+    val_meta = pd.read_csv(Config.VAL_METADATA_PATH)
+    # Use config limit
+    if Config.VAL_SAMPLE_SIZE:
+        val_meta = val_meta.head(Config.VAL_SAMPLE_SIZE)
+
+    print(f"Validating on {len(val_meta)} samples...")
+
+    # Metrics
+    total_f1 = 0.0
+    count = 0
+
+    # Analysis Data
+    analysis_records = []
+
+    # We process document by document to simulate the pipeline
+    # To speed up, we can batch candidates for the ranker
+
+    # Pre-read data to avoid IO bottleneck during inference loop
+    # We will process in chunks of documents
+
+    doc_chunk_size = 100
+
+    for i in range(0, len(val_meta), doc_chunk_size):
+        chunk = val_meta.iloc[i : i + doc_chunk_size]
+
+        # Prepare candidates for this chunk
+        chunk_candidates = []
+        ground_truths = {}  # doc_idx -> annotation
+
+        with open(Config.TRAIN_FILE, "rb") as f:
+            for idx, row in chunk.iterrows():
+                f.seek(row["byte_offset"])
+                line = f.readline()
+                if not line:
+                    continue
+
+                try:
+                    entry = json.loads(line)
+                    q_text = entry["question_text"]
+                    doc_text = entry["document_text"]
+                    doc_tokens = tokenize_text(doc_text)
+
+                    # Store GT
+                    ground_truths[idx] = {
+                        "annotations": entry["annotations"],
+                        "doc_tokens": doc_tokens,
+                        "q_tokens": tokenize_text(q_text),
+                    }
+
+                    candidates = parse_html_candidates(doc_tokens)
+                    for c_idx, (start, end) in enumerate(candidates):
+                        c_tokens = doc_tokens[start:end]
+                        if len(c_tokens) < 5:
+                            continue
+
+                        chunk_candidates.append(
+                            {
+                                "doc_idx": idx,
+                                "cand_idx": c_idx,
+                                "q_tokens": ground_truths[idx]["q_tokens"],
+                                "c_tokens": c_tokens,
+                                "token_start": start,
+                                "token_end": end,
+                            }
+                        )
+
+                except Exception:
+                    continue
+
+        if not chunk_candidates:
+            continue
+
+        # Ranker Inference
+        ranker_dataset = ValidationDataset(chunk_candidates, vocab)
+        ranker_loader = DataLoader(
+            ranker_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        ranker_scores = []
+        with torch.no_grad():
+            for batch in ranker_loader:
+                q_ids = batch["q_ids"].to(device)
+                c_ids = batch["c_ids"].to(device)
+                logits = ranker(q_ids, c_ids)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                ranker_scores.extend(probs)
+
+        # Assign scores back
+        for j, item in enumerate(chunk_candidates):
+            item["ranker_score"] = ranker_scores[j]
+
+        # Group by document and pick best
+        df_candidates = pd.DataFrame(chunk_candidates)
+        best_candidates_indices = df_candidates.groupby("doc_idx")[
+            "ranker_score"
+        ].idxmax()
+
+        # Reader Inference on best candidates
+        top_candidates = [chunk_candidates[idx] for idx in best_candidates_indices]
+
+        reader_dataset = ValidationDataset(top_candidates, vocab)
+        reader_loader = DataLoader(
+            reader_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        reader_results = []  # (start_logits, end_logits)
+
+        with torch.no_grad():
+            for batch in reader_loader:
+                q_ids = batch["q_ids"].to(device)
+                c_ids = batch["c_ids"].to(device)
+                start_logits, end_logits = reader(q_ids, c_ids)
+
+                s_probs = F.softmax(start_logits, dim=-1).cpu().numpy()
+                e_probs = F.softmax(end_logits, dim=-1).cpu().numpy()
+
+                for k in range(len(s_probs)):
+                    reader_results.append((s_probs[k], e_probs[k]))
+
+        # Final Evaluation
+        for k, item in enumerate(top_candidates):
+            doc_idx = item["doc_idx"]
+            gt = ground_truths[doc_idx]
+
+            s_probs, e_probs = reader_results[k]
+
+            # Get best span
+            s_idx, e_idx, span_score = get_best_span(s_probs, e_probs)
+
+            ranker_score = item["ranker_score"]
+            final_confidence = ranker_score * span_score
+
+            # Prediction
+            pred_long_span = (-1, -1)
+            pred_short_text = ""
+
+            if final_confidence >= Config.INFERENCE_THRESHOLD:
+                # Long
+                la_start = item["token_start"]
+                la_end = item["token_end"]
+                pred_long_span = (la_start, la_end)
+
+                # Short
+                # e_idx is inclusive in model output, exclusive in slicing logic usually
+                # The util get_best_span returns inclusive end index relative to candidate
+                sa_rel_start = s_idx
+                sa_rel_end = e_idx + 1  # exclusive
+
+                sa_global_start = la_start + sa_rel_start
+                sa_global_end = la_start + sa_rel_end
+
+                # Clip
+                sa_global_start = max(la_start, min(sa_global_start, la_end))
+                sa_global_end = max(sa_global_start, min(sa_global_end, la_end))
+
+                if sa_global_end > sa_global_start:
+                    pred_short_text = " ".join(
+                        gt["doc_tokens"][sa_global_start:sa_global_end]
+                    )
+
+            # Evaluate against GT
+            # NQ Metric: Micro F1 over Long and Short
+            # We treat Long and Short as separate instances for Micro F1
+            # But typically NQ evaluation is complex. Here we simplify to:
+            # Check if prediction matches ANY valid annotation.
+
+            # Check Long Answer Match
+            long_match = 0.0
+            short_match = 0.0
+
+            valid_long_exists = False
+            valid_short_exists = False
+
+            for ann in gt["annotations"]:
+                # Long
+                gt_la_start = ann["long_answer"]["start_token"]
+                gt_la_end = ann["long_answer"]["end_token"]
+
+                if gt_la_start != -1:
+                    valid_long_exists = True
+                    # Exact match for long answer indices
+                    if pred_long_span == (gt_la_start, gt_la_end):
+                        long_match = 1.0
+
+                # Short
+                if ann["short_answers"]:
+                    valid_short_exists = True
+                    for sa in ann["short_answers"]:
+                        gt_sa_text = " ".join(
+                            gt["doc_tokens"][sa["start_token"] : sa["end_token"]]
+                        )
+                        if f1_score(pred_short_text, gt_sa_text) > short_match:
+                            short_match = f1_score(pred_short_text, gt_sa_text)
+                elif ann["yes_no_answer"] != "NONE":
+                    valid_short_exists = True
+                    if normalize_answer(pred_short_text) == normalize_answer(
+                        ann["yes_no_answer"]
+                    ):
+                        short_match = 1.0
+
+            # Handle Null predictions
+            if not valid_long_exists:
+                # If no answer exists and we predicted nothing, that's a match (F1=1)
+                # If we predicted something, F1=0
+                if pred_long_span == (-1, -1):
+                    long_match = 1.0
+                else:
+                    long_match = 0.0
+            else:
+                # Valid answer exists, if we predicted nothing, F1=0
+                if pred_long_span == (-1, -1):
+                    long_match = 0.0
+
+            if not valid_short_exists:
+                if pred_short_text == "":
+                    short_match = 1.0
+                else:
+                    short_match = 0.0
+            else:
+                if pred_short_text == "":
+                    short_match = 0.0
+
+            # Average F1 for this example
+            example_f1 = (long_match + short_match) / 2.0
+            total_f1 += example_f1
+            count += 1
+
+            # Log for failure analysis
+            analysis_records.append(
+                {
+                    "q_len": len(gt["q_tokens"]),
+                    "doc_len": len(gt["doc_tokens"]),
+                    "cand_len": item["token_end"] - item["token_start"],
+                    "ranker_score": ranker_score,
+                    "reader_score": span_score,
+                    "f1": example_f1,
+                    "error": 1.0 - example_f1,
+                }
+            )
+
+    final_metric = total_f1 / count if count > 0 else 0.0
+    print(f"Final Validation Metric: {final_metric}")
+=======
+def validate_and_analyze():
+    print("\n--- Starting Validation and Failure Analysis ---")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vocab = get_vocabulary(load_cached_data=True)
+    embedding_matrix = load_glove_embeddings(
+        vocab.token_to_idx, Config.EMBEDDING_DIM, load_cached_data=True
+    )
+
+    # Load Models
+    ranker = ANBoWRanker(embedding_matrix=embedding_matrix).to(device)
+    reader = ConvBiDAFReader(embedding_matrix=embedding_matrix).to(device)
+
+    if os.path.exists(Config.RANKER_MODEL_PATH):
+        ranker.load_state_dict(
+            torch.load(Config.RANKER_MODEL_PATH, map_location=device)
+        )
+    if os.path.exists(Config.READER_MODEL_PATH):
+        reader.load_state_dict(
+            torch.load(Config.READER_MODEL_PATH, map_location=device)
+        )
+
+    ranker.eval()
+    reader.eval()
+
+    # Load Validation Metadata
+    val_meta = pd.read_csv(Config.VAL_METADATA_PATH)
+    # Cite debug_lesson_2: Validate on the Entire Dataset
+    print(f"Validating on {len(val_meta)} samples (Full Validation Set)...")
+
+    # Global Counters for Micro F1
+    micro_tp = 0
+    micro_fp = 0
+    micro_fn = 0
+
+    # Analysis Data
+    analysis_records = []
+
+    # We process document by document to simulate the pipeline
+    # To speed up, we can batch candidates for the ranker
+
+    # Pre-read data to avoid IO bottleneck during inference loop
+    # We will process in chunks of documents
+
+    doc_chunk_size = 100
+
+    for i in range(0, len(val_meta), doc_chunk_size):
+        chunk = val_meta.iloc[i : i + doc_chunk_size]
+
+        # Prepare candidates for this chunk
+        chunk_candidates = []
+        ground_truths = {}  # doc_idx -> annotation
+
+        with open(Config.TRAIN_FILE, "rb") as f:
+            for idx, row in chunk.iterrows():
+                f.seek(row["byte_offset"])
+                line = f.readline()
+                if not line:
+                    continue
+
+                try:
+                    entry = json.loads(line)
+                    q_text = entry["question_text"]
+                    doc_text = entry["document_text"]
+                    doc_tokens = tokenize_text(doc_text)
+
+                    # Store GT
+                    ground_truths[idx] = {
+                        "annotations": entry["annotations"],
+                        "doc_tokens": doc_tokens,
+                        "q_tokens": tokenize_text(q_text),
+                    }
+
+                    candidates = parse_html_candidates(doc_tokens)
+                    for c_idx, (start, end) in enumerate(candidates):
+                        c_tokens = doc_tokens[start:end]
+                        if len(c_tokens) < 5:
+                            continue
+
+                        chunk_candidates.append(
+                            {
+                                "doc_idx": idx,
+                                "cand_idx": c_idx,
+                                "q_tokens": ground_truths[idx]["q_tokens"],
+                                "c_tokens": c_tokens,
+                                "token_start": start,
+                                "token_end": end,
+                            }
+                        )
+
+                except Exception:
+                    continue
+
+        if not chunk_candidates:
+            continue
+
+        # Ranker Inference
+        ranker_dataset = ValidationDataset(chunk_candidates, vocab)
+        ranker_loader = DataLoader(
+            ranker_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        ranker_scores = []
+        with torch.no_grad():
+            for batch in ranker_loader:
+                q_ids = batch["q_ids"].to(device)
+                c_ids = batch["c_ids"].to(device)
+                logits = ranker(q_ids, c_ids)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                ranker_scores.extend(probs)
+
+        # Assign scores back
+        for j, item in enumerate(chunk_candidates):
+            item["ranker_score"] = ranker_scores[j]
+
+        # Group by document and pick best
+        df_candidates = pd.DataFrame(chunk_candidates)
+        best_candidates_indices = df_candidates.groupby("doc_idx")[
+            "ranker_score"
+        ].idxmax()
+
+        # Reader Inference on best candidates
+        top_candidates = [chunk_candidates[idx] for idx in best_candidates_indices]
+
+        reader_dataset = ValidationDataset(top_candidates, vocab)
+        reader_loader = DataLoader(
+            reader_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        reader_results = []  # (start_logits, end_logits)
+
+        with torch.no_grad():
+            for batch in reader_loader:
+                q_ids = batch["q_ids"].to(device)
+                c_ids = batch["c_ids"].to(device)
+                start_logits, end_logits = reader(q_ids, c_ids)
+
+                s_probs = F.softmax(start_logits, dim=-1).cpu().numpy()
+                e_probs = F.softmax(end_logits, dim=-1).cpu().numpy()
+
+                for k in range(len(s_probs)):
+                    reader_results.append((s_probs[k], e_probs[k]))
+
+        # Final Evaluation
+        for k, item in enumerate(top_candidates):
+            doc_idx = item["doc_idx"]
+            gt = ground_truths[doc_idx]
+
+            s_probs, e_probs = reader_results[k]
+
+            # Get best span
+            s_idx, e_idx, span_score = get_best_span(s_probs, e_probs)
+
+            ranker_score = item["ranker_score"]
+            final_confidence = ranker_score * span_score
+
+            # Prediction
+            has_pred_long = False
+            pred_long_span = (-1, -1)
+
+            has_pred_short = False
+            pred_short_span = (-1, -1)
+            pred_short_text = ""
+
+            if final_confidence >= Config.INFERENCE_THRESHOLD:
+                # Long
+                la_start = item["token_start"]
+                la_end = item["token_end"]
+                pred_long_span = (la_start, la_end)
+                has_pred_long = True
+
+                # Short
+                # e_idx is inclusive in model output, exclusive in slicing logic usually
+                # The util get_best_span returns inclusive end index relative to candidate
+                sa_rel_start = s_idx
+                sa_rel_end = e_idx + 1  # exclusive
+
+                sa_global_start = la_start + sa_rel_start
+                sa_global_end = la_start + sa_rel_end
+
+                # Clip
+                sa_global_start = max(la_start, min(sa_global_start, la_end))
+                sa_global_end = max(sa_global_start, min(sa_global_end, la_end))
+
+                if sa_global_end > sa_global_start:
+                    pred_short_span = (sa_global_start, sa_global_end)
+                    pred_short_text = " ".join(
+                        gt["doc_tokens"][sa_global_start:sa_global_end]
+                    )
+                    has_pred_short = True
+
+            # --- Evaluate against GT (Micro F1 Logic) ---
+            # Cite debug_lesson_5: Decouple False Positive and False Negative Logic
+
+            # 1. Long Answer Evaluation
+            has_gt_long = False
+            long_match = False
+
+            for ann in gt["annotations"]:
+                gt_la_start = ann["long_answer"]["start_token"]
+                gt_la_end = ann["long_answer"]["end_token"]
+                if gt_la_start != -1:
+                    has_gt_long = True
+                    if has_pred_long and pred_long_span == (gt_la_start, gt_la_end):
+                        long_match = True
+                        break  # Found a valid match
+
+            if has_pred_long:
+                if long_match:
+                    micro_tp += 1
+                else:
+                    micro_fp += 1
+
+            if has_gt_long:
+                if not long_match:
+                    micro_fn += 1
+
+            # 2. Short Answer Evaluation
+            has_gt_short = False
+            short_match = False
+
+            for ann in gt["annotations"]:
+                # Check Yes/No
+                if ann["yes_no_answer"] != "NONE":
+                    has_gt_short = True
+                    if has_pred_short and normalize_answer(
+                        pred_short_text
+                    ) == normalize_answer(ann["yes_no_answer"]):
+                        short_match = True
+                        break
+                # Check Short Spans
+                elif ann["short_answers"]:
+                    has_gt_short = True
+                    if has_pred_short:
+                        for sa in ann["short_answers"]:
+                            # Exact index match required
+                            if pred_short_span == (sa["start_token"], sa["end_token"]):
+                                short_match = True
+                                break
+                    if short_match:
+                        break
+
+            if has_pred_short:
+                if short_match:
+                    micro_tp += 1
+                else:
+                    micro_fp += 1
+
+            if has_gt_short:
+                if not short_match:
+                    micro_fn += 1
+
+            # Log for failure analysis (using a proxy F1 for this example)
+            # This is just for the analysis dataframe, not the final metric
+            example_tp = (1 if long_match else 0) + (1 if short_match else 0)
+            example_fp = (1 if has_pred_long and not long_match else 0) + (
+                1 if has_pred_short and not short_match else 0
+            )
+            example_fn = (1 if has_gt_long and not long_match else 0) + (
+                1 if has_gt_short and not short_match else 0
+            )
+
+            prec = (
+                example_tp / (example_tp + example_fp)
+                if (example_tp + example_fp) > 0
+                else 0.0
+            )
+            rec = (
+                example_tp / (example_tp + example_fn)
+                if (example_tp + example_fn) > 0
+                else 0.0
+            )
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+            analysis_records.append(
+                {
+                    "q_len": len(gt["q_tokens"]),
+                    "doc_len": len(gt["doc_tokens"]),
+                    "cand_len": item["token_end"] - item["token_start"],
+                    "ranker_score": ranker_score,
+                    "reader_score": span_score,
+                    "f1": f1,
+                    "error": 1.0 - f1,
+                }
+            )
+
+    # Compute Global Micro F1
+    precision = (
+        micro_tp / (micro_tp + micro_fp) if (micro_tp + micro_fp) > 0 else 0.0
+    )
+    recall = (
+        micro_tp / (micro_tp + micro_fn) if (micro_tp + micro_fn) > 0 else 0.0
+    )
+    final_metric = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    print(f"\nGlobal Micro Stats: TP={micro_tp}, FP={micro_fp}, FN={micro_fn}")
+    print(f"Precision: {precision:.4f}, Recall: {recall:.4f}")
+    print(f"Final Validation Metric (Micro F1): {final_metric:.4f}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,699 @@
+import os
+import time
+import math
+import numpy as np
+import pandas as pd
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Import required libraries
+from library.config import Config
+from library.utils import seed_everything, calculate_roc_auc
+
+# =========================================================================
+# Dataset
+# =========================================================================
+
+
+class CactusDataset(Dataset):
+    def __init__(self, metadata_path, transform=None, is_test=False):
+        """
+        Args:
+            metadata_path (str): Path to the metadata CSV file.
+            transform (callable, optional): Optional transform to be applied on a sample.
+            is_test (bool): If True, ignores the 'has_cactus' label (uses placeholder).
+        """
+        self.df = pd.read_csv(metadata_path)
+        self.transform = transform
+        self.is_test = is_test
+        self.input_dir = Config.INPUT_DIR
+
+    def __len__(self):
+        if Config.DEBUG:
+            return min(len(self.df), Config.DEBUG_SUBSET_SIZE)
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full path
+        img_path = os.path.join(self.input_dir, row["file_path"])
+
+        # Load Image
+        image = cv2.imread(img_path)
+        if image is None:
+            # Fallback for missing images (should not happen based on metadata check)
+            image = np.zeros((Config.IMAGE_SIZE, Config.IMAGE_SIZE, 3), dtype=np.uint8)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Resize if necessary (though dataset is 32x32)
+        if image.shape[0] != Config.IMAGE_SIZE or image.shape[1] != Config.IMAGE_SIZE:
+            image = cv2.resize(image, (Config.IMAGE_SIZE, Config.IMAGE_SIZE))
+
+        # Normalize to [0, 1] and then standardize
+        image = image.astype(np.float32) / 255.0
+
+        # Manual Standardization
+        mean = np.array(Config.MEAN, dtype=np.float32)
+        std = np.array(Config.STD, dtype=np.float32)
+        image = (image - mean) / std
+
+        # To Tensor (C, H, W)
+        image = np.transpose(image, (2, 0, 1))
+        image = torch.from_numpy(image)
+
+        # Apply augmentation if provided (usually handled outside or via albumentations)
+        if self.transform:
+            image = self.transform(image)
+
+        if self.is_test:
+            return image, row["id"]
+        else:
+            label = torch.tensor(row["has_cactus"], dtype=torch.float32)
+            return image, label
+
+
+# =========================================================================
+# Steerable Equivariant Layers (D4 Group)
+# =========================================================================
+
+
+class D4Indices:
+    """
+    Helper class to manage D4 group indices and actions.
+    Group elements: 0..3 (Rotations 0, 90, 180, 270), 4..7 (Reflections).
+    """
+
+    def __init__(self, device):
+        self.device = device
+        # Precompute permutation indices for group convolution
+        # For a filter connecting input orientation v to output u,
+        # we need the kernel corresponding to relative transformation u^-1 v.
+        # This is a simplified lookup table for the D4 Cayley table.
+        # We will implement the convolution by transforming the kernel explicitly.
+        pass
+
+    @staticmethod
+    def rotate_k(k, r):
+        """Rotates a kernel k by r * 90 degrees."""
+        if r == 0:
+            return k
+        return torch.rot90(k, k=r, dims=(-2, -1))
+
+    @staticmethod
+    def transform_kernel(kernel, group_idx):
+        """
+        Transforms a spatial kernel by the group element.
+        group_idx: 0..3 (rotations), 4..7 (flips + rotations)
+        """
+        if group_idx < 4:
+            return D4Indices.rotate_k(kernel, group_idx)
+        else:
+            # Flip first (Horizontal flip), then rotate
+            k_flip = torch.flip(kernel, dims=[-1])
+            return D4Indices.rotate_k(k_flip, group_idx - 4)
+
+
+class EquivariantConv2d(nn.Module):
+    """
+    Steerable Convolution Layer for D4 Group.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        type="group",
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.type = type  # 'lifting' or 'group'
+
+        # Define weights
+        # Lifting: Input is scalar (C_in), Output is regular field (C_out * 8)
+        # We store base kernel (C_out, C_in, K, K)
+        # Group: Input is regular (C_in * 8), Output is regular (C_out * 8)
+        # We store base kernel (C_out, C_in, 8, K, K) - technically (C_out, C_in, K, K) is enough for basis
+        # but to allow full freedom we use (C_out, C_in, 8, K, K) which represents the kernel on the group.
+
+        if type == "lifting":
+            self.weight = nn.Parameter(
+                torch.Tensor(out_channels, in_channels, kernel_size, kernel_size)
+            )
+        else:
+            # For group conv, we have 8 input orientations and 8 output orientations.
+            # We learn the kernel for the identity output orientation relative to all 8 input orientations.
+            # Shape: (Out, In, 8_orientations, K, K)
+            self.weight = nn.Parameter(
+                torch.Tensor(out_channels, in_channels, 8, kernel_size, kernel_size)
+            )
+
+        self.bias = nn.Parameter(
+            torch.Tensor(out_channels)
+        )  # One bias per logical channel (shared across orientations)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        # x shape:
+        # Lifting: (B, C_in, H, W)
+        # Group:   (B, C_in * 8, H, W)
+
+        if self.type == "lifting":
+            # Generate 8 filters from the base weights
+            # W_base: (Co, Ci, K, K)
+            # We want W_full: (Co * 8, Ci, K, K)
+
+            w_list = []
+            for g in range(8):
+                # Transform the spatial kernel
+                w_g = D4Indices.transform_kernel(self.weight, g)
+                w_list.append(w_g)
+
+            # Interleave is not needed for lifting, just stack.
+            # However, we want the output to be ordered [Co_0_rot0, Co_0_rot1... Co_1_rot0...]
+            # or [Co_0_rot0, Co_1_rot0... | Co_0_rot1...]
+            # Standard convention: Channels first, then orientations.
+            # Let's stick to: (B, Co * 8, H, W) where indices are [c * 8 + g]
+
+            # Stack along output dimension
+            # We need to reshape carefully.
+            # w_list is list of 8 tensors of shape (Co, Ci, K, K)
+            # We want to stack them such that output channel i corresponds to (logical_c, orientation_g)
+
+            # Let's arrange output as: logical channel varies slowest, orientation varies fastest.
+            # i.e., C_out blocks of 8 orientations.
+            w_full = torch.stack(w_list, dim=1)  # (Co, 8, Ci, K, K)
+            w_full = w_full.view(
+                self.out_channels * 8,
+                self.in_channels,
+                self.kernel_size,
+                self.kernel_size,
+            )
+
+            out = F.conv2d(x, w_full, stride=self.stride, padding=self.padding)
+
+        else:
+            # Group Convolution
+            # Input: (B, Ci * 8, H, W)
+            # Weight: (Co, Ci, 8, K, K) -> Kernel connecting output(e) to input(g)
+            # We need to construct (Co * 8, Ci * 8, K, K)
+
+            # For output orientation u and input orientation v:
+            # The kernel is T(u) [ K(u^-1 v) ]
+            # Let's map indices 0..7 to D4 elements.
+            # u^-1 v is the relative orientation.
+
+            # We can construct the full weight matrix.
+            # Target: (Co * 8, Ci * 8, K, K)
+            # We iterate u (0..7) and v (0..7).
+
+            # Pre-allocate list of lists
+            w_matrix = [[None for _ in range(8)] for _ in range(8)]
+
+            # D4 Multiplication Table (Indices)
+            # 0=e, 1=r, 2=r2, 3=r3, 4=f, 5=fr, 6=fr2, 7=fr3
+            # We need a helper to compute u^-1 v.
+            # Instead of implementing the full Cayley table, we can just transform the weights 8 times
+            # and permute them.
+
+            # Strategy:
+            # 1. Generate 8 transformed versions of the entire kernel bank.
+            #    Base Kernel K: (Co, Ci, 8, K, K). K[..., h, :, :] connects input orientation h to output e.
+            # 2. To get kernel for output u:
+            #    We rotate the spatial part of K by u.
+            #    We also permute the input orientation dimension h.
+            #    If we rotate output by u, the input that was at h is now effectively at u*h.
+            #    So we need to permute the '8' dimension of K.
+
+            # Let's do it explicitly for robustness.
+            # We want W_uv connecting input v to output u.
+            # W_uv = Transform(u) applied to W_{e, (u^-1 v)}
+            # But our stored weight is W_{e, h}.
+            # So W_uv = Transform(u) applied to W_{e, u^-1 v}.
+
+            # Define Cayley table lookup for u^-1 v
+            # Rows: u, Cols: v. Value: u^-1 v
+            # D4 Table (simplified):
+            # r^k * r^m = r^(k+m)
+            # f * r^k = f r^k
+            # r^k * f = f r^(-k) = f r^(4-k)
+            # f * f = e
+
+            # It's easier to just construct the 8x8 blocks.
+            blocks = []
+            for u in range(8):  # Output orientation
+                row_blocks = []
+                for v in range(8):  # Input orientation
+                    # Calculate relative g = u^-1 v
+                    # This is tricky to hardcode quickly without errors.
+                    # ALTERNATIVE: Use the property that Group Conv is a convolution on the group.
+                    # We can shift the weight tensor cyclically for rotations.
+
+                    # Let's use the explicit definition of the stored weight:
+                    # self.weight[co, ci, g] connects input_orientation=g to output_orientation=0.
+
+                    # To connect input=v to output=u:
+                    # We need the kernel that connects v to u.
+                    # This is the same as connecting v*u^-1 to 0? No.
+                    # By equivariance, connecting v to u is the same as connecting (u^-1 v) to 0,
+                    # but spatially rotated by u.
+
+                    # Wait, if input is rotated by u, output is rotated by u.
+                    # So W_{u, v} = \rho(u) W_{0, u^{-1}v}
+
+                    g = self._get_relative_idx(u, v)
+
+                    # Get kernel for relative orientation g
+                    k_g = self.weight[:, :, g, :, :]  # (Co, Ci, K, K)
+
+                    # Rotate spatially by u
+                    k_uv = D4Indices.transform_kernel(k_g, u)
+                    row_blocks.append(k_uv)
+
+                # Concatenate along input channels (dim 1)
+                # row_blocks is list of 8 tensors (Co, Ci, K, K)
+                # We want (Co, Ci*8, K, K)
+                w_u = torch.cat(row_blocks, dim=1)
+                blocks.append(w_u)
+
+            # Concatenate along output channels (dim 0)
+            w_full = torch.cat(blocks, dim=0)  # (Co*8, Ci*8, K, K)
+
+            out = F.conv2d(x, w_full, stride=self.stride, padding=self.padding)
+
+        # Add bias
+        # Bias is (Co). We need to broadcast to (Co * 8).
+        b = self.bias.repeat_interleave(8)
+        out = out + b.view(1, -1, 1, 1)
+
+        return out
+
+    def _get_relative_idx(self, u, v):
+        # Compute g = u^-1 * v in D4
+        # 0..3: r0..r3
+        # 4..7: f r0 .. f r3
+
+        # Inverse mapping
+        # inv(r^k) = r^(4-k)
+        # inv(f r^k) = f r^k (elements with f are self-inverse in D4? No. (fr)^2 = e)
+        # Check: f r f r = f f r^-1 r = e. Yes.
+
+        # Helper to decompose idx to (is_flip, rot)
+        def decompose(idx):
+            return (idx >= 4), (idx % 4)
+
+        u_flip, u_rot = decompose(u)
+        v_flip, v_rot = decompose(v)
+
+        # u^-1
+        # If u is rotation r^k: inv is r^(4-k)
+        # If u is flip f r^k: inv is f r^k
+
+        if not u_flip:
+            u_inv_flip = False
+            u_inv_rot = (4 - u_rot) % 4
+        else:
+            u_inv_flip = True
+            u_inv_rot = u_rot
+
+        # Multiply u_inv * v
+        # (f^a r^b) * (f^c r^d)
+        # If a=0, c=0: r^(b+d)
+        # If a=0, c=1: f r^(d-b) ?? No. r^b f = f r^-b.
+        # Let's do step by step.
+
+        # Result flip: a ^ c
+        res_flip = u_inv_flip ^ v_flip
+
+        # Result rot:
+        # If u_inv has no flip: r^b * f^c r^d
+        #   If c=0: r^(b+d)
+        #   If c=1: r^b f r^d = f r^(-b) r^d = f r^(d-b)
+        # If u_inv has flip: f r^b * f^c r^d
+        #   If c=0: f r^(b+d)
+        #   If c=1: f r^b f r^d = f f r^(-b) r^d = r^(d-b)
+
+        if not u_inv_flip:
+            if not v_flip:
+                res_rot = (u_inv_rot + v_rot) % 4
+            else:
+                res_rot = (v_rot - u_inv_rot) % 4
+        else:
+            if not v_flip:
+                res_rot = (u_inv_rot + v_rot) % 4
+            else:
+                res_rot = (v_rot - u_inv_rot) % 4
+
+        return (4 if res_flip else 0) + res_rot
+
+
+class EquivariantBN(nn.Module):
+    """
+    Group Batch Normalization.
+    Aggregates statistics over the orientation dimension to ensure equivariance.
+    """
+
+    def __init__(self, num_channels):
+        super().__init__()
+        self.num_channels = num_channels
+        self.bn = nn.BatchNorm2d(num_channels)  # Standard BN
+
+    def forward(self, x):
+        # x: (B, C * 8, H, W)
+        # We reshape to (B * 8, C, H, W) to share stats across orientations?
+        # No, strict equivariance requires sharing stats across the group orbit.
+        # i.e. Mean and Var should be computed over (B, 8, H, W).
+        # But standard BN computes over (B, H, W).
+        # If we reshape x to (B * 8, C, H, W) and apply BN(C), we compute stats over (B*8, H, W).
+        # This effectively averages over the group dimension. Correct.
+
+        B, C8, H, W = x.shape
+        C = C8 // 8
+
+        x_reshaped = x.view(B * 8, C, H, W)
+        out = self.bn(x_reshaped)
+        return out.view(B, C8, H, W)
+
+
+class EquivariantBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = EquivariantConv2d(
+            in_channels, out_channels, stride=stride, type="group"
+        )
+        self.bn1 = EquivariantBN(out_channels)
+        self.conv2 = EquivariantConv2d(
+            out_channels, out_channels, stride=1, type="group"
+        )
+        self.bn2 = EquivariantBN(out_channels)
+
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            # For shortcut, we need 1x1 group conv equivalent.
+            # Or just AveragePool + Pointwise Linear.
+            # Let's use a 1x1 Equivariant Conv for simplicity.
+            self.shortcut = nn.Sequential(
+                EquivariantConv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    padding=0,
+                    type="group",
+                ),
+                EquivariantBN(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+# =========================================================================
+# Model Architecture
+# =========================================================================
+
+
+class SteerableCactusNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Use cuequivariance to define irreps string (Documentation/Metadata purpose)
+        self.irreps_in = cuequivariance.Irreps(cuequivariance.O3, "3x0e")  # RGB
+
+        self.hidden_dim = Config.HIDDEN_DIM
+
+        # Stem: Lifting Layer
+        # Input: 3 channels. Output: hidden_dim * 8 channels.
+        self.stem = nn.Sequential(
+            EquivariantConv2d(
+                3, self.hidden_dim, kernel_size=3, padding=1, type="lifting"
+            ),
+            EquivariantBN(self.hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 1: 32x32
+        self.stage1 = EquivariantBlock(self.hidden_dim, self.hidden_dim)
+
+        # Stage 2: 16x16
+        self.stage2 = EquivariantBlock(self.hidden_dim, self.hidden_dim * 2, stride=2)
+
+        # Stage 3: 8x8
+        self.stage3 = EquivariantBlock(
+            self.hidden_dim * 2, self.hidden_dim * 4, stride=2
+        )
+
+        # Invariant Head
+        # Global Pooling over Group (Max or Mean) -> (B, C_final, H, W)
+        # Then GAP -> (B, C_final)
+        self.final_channels = self.hidden_dim * 4
+        self.fc = nn.Linear(self.final_channels, 1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+
+        # Group Pooling (Max over orientations)
+        # x: (B, C*8, H, W)
+        B, C8, H, W = x.shape
+        C = C8 // 8
+        x = x.view(B, C, 8, H, W)
+        x = torch.max(x, dim=2)[0]  # (B, C, H, W)
+
+        # Global Average Pooling
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.flatten(1)
+
+        # Linear
+        x = self.fc(x)
+        return x
+
+
+# =========================================================================
+# Training & Inference Logic
+# =========================================================================
+
+
+def mixup_data(x, y, alpha=0.2, device="cuda"):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device, use_mixup=True):
+    model.train()
+    total_loss = 0
+
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device).unsqueeze(1)
+
+        optimizer.zero_grad()
+
+        if use_mixup:
+            inputs, targets_a, targets_b, lam = mixup_data(
+                inputs, targets, Config.MIXUP_ALPHA, device
+            )
+            outputs = model(inputs)
+            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * inputs.size(0)
+
+    return total_loss / len(loader.dataset)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device).unsqueeze(1)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            total_loss += loss.item() * inputs.size(0)
+            all_preds.append(torch.sigmoid(outputs).cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+    auc = calculate_roc_auc(all_targets, all_preds)
+
+    return total_loss / len(loader.dataset), auc
+
+
+def train_model(model=None):
+    """
+    Main training routine.
+    """
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # Data
+    train_dataset = CactusDataset(Config.TRAIN_METADATA_PATH)
+    val_dataset = CactusDataset(Config.VAL_METADATA_PATH)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # Model
+    if model is None:
+        model = CactusResNet()
+    model = model.to(device)
+
+    # Optimizer & Scheduler
+    optimizer = AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=Config.EPOCHS, eta_min=Config.SCHEDULER_MIN_LR
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    best_auc = 0.0
+
+    print(f"Starting training for {Config.EPOCHS} epochs...")
+    for epoch in range(Config.EPOCHS):
+        start_time = time.time()
+
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            use_mixup=Config.USE_MIXUP,
+        )
+        val_loss, val_auc = validate(model, val_loader, criterion, device)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val AUC: {val_auc:.6f} | Time: {time.time() - start_time:.1f}s"
+        )
+
+        if val_auc > best_auc:
+            best_auc = val_auc
+            torch.save(model.state_dict(), Config.MODEL_SAVE_PATH)
+
+    print(f"Training Complete. Best Validation AUC: {best_auc}")
+    return model
+
+
+def predict(model, test_loader, device):
+    """
+    Inference with 4-view TTA.
+    """
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for inputs, ids in test_loader:
+            inputs = inputs.to(device)
+
+            # TTA: Original, HFlip, VFlip, Rot180
+            # Note: Rot180 is same as HFlip + VFlip
+
+            # 1. Original
+            out1 = torch.sigmoid(model(inputs))
+
+            # 2. Horizontal Flip
+            out2 = torch.sigmoid(model(torch.flip(inputs, [3])))
+
+            # 3. Vertical Flip
+            out3 = torch.sigmoid(model(torch.flip(inputs, [2])))
+
+            # 4. Rotate 180
+            out4 = torch.sigmoid(model(torch.rot90(inputs, k=2, dims=[2, 3])))
+
+            # Average
+            avg_preds = (out1 + out2 + out3 + out4) / 4.0
+
+            all_preds.append(avg_preds.cpu().numpy())
+            all_ids.extend(ids)
+
+    return np.concatenate(all_preds).flatten(), all_ids
+
+
+def generate_submission():
+    """
+    Loads best model and generates submission file.
+    """
+    device = torch.device(Config.DEVICE)
+
+    # Load Model
+    model = CactusResNet().to(device)
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+    else:
+        print("Warning: No trained model found. Using random initialization.")
+
+    # Data
+    test_dataset = CactusDataset(Config.TEST_METADATA_PATH, is_test=True)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # Predict
+    probs, ids = predict(model, test_loader, device)
+
+    # Save
+    df = pd.DataFrame({"id": ids, "has_cactus": probs})
+    df.to_csv(Config.SUBMISSION_PATH, index=False)
+    print(f"Submission saved to {Config.SUBMISSION_PATH}")

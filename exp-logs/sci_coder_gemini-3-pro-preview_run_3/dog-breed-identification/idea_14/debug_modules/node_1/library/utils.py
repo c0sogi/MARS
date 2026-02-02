@@ -1,0 +1,40 @@
+import os
+import random
+import numpy as np
+import torch
+from sklearn.metrics import log_loss
+
+
+def seed_everything(seed: int = 42):
+    """
+    Sets the random seed for reproducibility across Python, NumPy, and PyTorch.
+
+    Args:
+        seed (int): The seed value to use.
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Ensure deterministic behavior for cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def calculate_metric(y_true, y_pred):
+    """
+    Calculates the Multi Class Log Loss.
+
+    Args:
+        y_true (array-like): Ground truth labels. Can be class indices or one-hot encoded vectors.
+        y_pred (array-like): Predicted probabilities with shape (n_samples, n_classes).
+
+    Returns:
+        float: The calculated log loss.
+    """
+    # sklearn.metrics.log_loss handles various formats for y_true (labels or binary matrix)
+    # as long as y_pred contains probabilities.
+    return log_loss(y_true, y_pred)

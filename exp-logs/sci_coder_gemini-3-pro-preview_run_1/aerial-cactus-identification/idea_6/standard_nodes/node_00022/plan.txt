@@ -1,0 +1,564 @@
+I will optimize the solution by reverting the architecture to the **CactusResNet** (a custom shallow ResNet), which has been identified as the most reliable model for achieving a perfect ROC AUC of 1.0 (Cite solution_lesson_node_00006). While the RepVGG model is faster, the previous run's score of 0.999987 indicates it fell slightly short of perfection, possibly due to the added complexity of Deep Supervision or the re-parameterization dynamics. I will retain the **In-Memory Caching** strategy (Cite solution_lesson_node_00020) to ensure the training remains fast (removing I/O bottlenecks) and **Mixup Regularization** (Cite solution_lesson_node_00004) to close the generalization gap. I will remove the Deep Supervision logic as it is unnecessary for this shallow network and simplifies the training loop.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Deep Supervision
+    AUX_LOSS_WEIGHT = 0.4
+
+    # ==========================================
+=======
+    # ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups=1):
+    """
+    Helper to create a Conv2d followed by BatchNorm2d.
+    """
+    result = nn.Sequential()
+    result.add_module(
+        "conv",
+        nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=False,
+        ),
+    )
+    result.add_module("bn", nn.BatchNorm2d(num_features=out_channels))
+    return result
+
+
+class RepVGGBlock(nn.Module):
+    """
+    RepVGG Block that supports structural re-parameterization.
+    Training: Multi-branch (3x3, 1x1, Identity).
+    Inference: Fused 3x3 Conv.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        dilation=1,
+        groups=1,
+        padding_mode="zeros",
+        deploy=False,
+    ):
+        super(RepVGGBlock, self).__init__()
+        self.deploy = deploy
+        self.groups = groups
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.padding_mode = padding_mode
+
+        # Activation
+        self.nonlinearity = nn.ReLU()
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=True,
+                padding_mode=padding_mode,
+            )
+        else:
+            self.rbr_identity = (
+                nn.BatchNorm2d(num_features=in_channels)
+                if out_channels == in_channels and stride == 1
+                else None
+            )
+            self.rbr_dense = conv_bn(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+            )
+            self.rbr_1x1 = conv_bn(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=stride,
+                padding=padding - kernel_size // 2,
+                groups=groups,
+            )
+
+    def forward(self, inputs):
+        if hasattr(self, "rbr_reparam"):
+            return self.nonlinearity(self.rbr_reparam(inputs))
+
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+
+        return self.nonlinearity(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+
+    def get_equivalent_kernel_bias(self):
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
+        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        return (
+            kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid,
+            bias3x3 + bias1x1 + biasid,
+        )
+
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        else:
+            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return 0, 0
+        if isinstance(branch, nn.Sequential):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+        else:
+            # Identity branch is just BN
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, "id_tensor"):
+                input_dim = self.in_channels // self.groups
+                kernel_value = np.zeros(
+                    (self.in_channels, input_dim, 3, 3), dtype=np.float32
+                )
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def switch_to_deploy(self):
+        if hasattr(self, "rbr_reparam"):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(
+            in_channels=self.rbr_dense.conv.in_channels,
+            out_channels=self.rbr_dense.conv.out_channels,
+            kernel_size=self.rbr_dense.conv.kernel_size,
+            stride=self.rbr_dense.conv.stride,
+            padding=self.rbr_dense.conv.padding,
+            dilation=self.rbr_dense.conv.dilation,
+            groups=self.rbr_dense.conv.groups,
+            bias=True,
+        )
+        self.rbr_reparam.weight.data = kernel
+        self.rbr_reparam.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__("rbr_dense")
+        self.__delattr__("rbr_1x1")
+        if hasattr(self, "rbr_identity"):
+            self.__delattr__("rbr_identity")
+        if hasattr(self, "id_tensor"):
+            self.__delattr__("id_tensor")
+        self.deploy = True
+
+
+class RepVGGDeepSup(nn.Module):
+    """
+    Shallow RepVGG architecture with Deep Supervision.
+    Structure: Stem -> Stage1 -> Stage2 -> AuxHead -> Stage3 -> MainHead.
+    """
+
+    def __init__(self, num_classes=1, width_multiplier=1.0, deploy=False):
+        super(RepVGGDeepSup, self).__init__()
+        self.deploy = deploy
+        self.num_classes = num_classes
+
+        # Channel configurations
+        # Widths tailored for 32x32 input to maintain capacity without over-parameterization
+        self.stage_planes = [
+            int(64 * width_multiplier),
+            int(64 * width_multiplier),
+            int(128 * width_multiplier),
+            int(256 * width_multiplier),
+        ]
+
+        # Stem: 3x3 Conv, Stride 1 (Preserves 32x32 resolution)
+        self.stem = RepVGGBlock(
+            in_channels=3,
+            out_channels=self.stage_planes[0],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            deploy=deploy,
+        )
+
+        # Stages
+        # Stage 1: 32x32 -> 16x16
+        self.stage1 = self._make_stage(
+            self.stage_planes[0],
+            self.stage_planes[1],
+            num_blocks=2,
+            stride=2,
+            deploy=deploy,
+        )
+
+        # Stage 2: 16x16 -> 8x8
+        self.stage2 = self._make_stage(
+            self.stage_planes[1],
+            self.stage_planes[2],
+            num_blocks=2,
+            stride=2,
+            deploy=deploy,
+        )
+
+        # Stage 3: 8x8 -> 4x4
+        self.stage3 = self._make_stage(
+            self.stage_planes[2],
+            self.stage_planes[3],
+            num_blocks=2,
+            stride=2,
+            deploy=deploy,
+        )
+
+        # Heads
+        # Auxiliary Head attached after Stage 2
+        self.aux_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(self.stage_planes[2], num_classes),
+        )
+
+        # Main Head attached after Stage 3
+        self.main_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(self.stage_planes[3], num_classes),
+        )
+
+    def _make_stage(self, in_planes, out_planes, num_blocks, stride, deploy):
+        layers = []
+        # First block handles stride and channel expansion
+        layers.append(
+            RepVGGBlock(
+                in_channels=in_planes,
+                out_channels=out_planes,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                deploy=deploy,
+            )
+        )
+        # Subsequent blocks are stride 1
+        for _ in range(1, num_blocks):
+            layers.append(
+                RepVGGBlock(
+                    in_channels=out_planes,
+                    out_channels=out_planes,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    deploy=deploy,
+                )
+            )
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.stem(x)
+        out = self.stage1(out)
+        out = self.stage2(out)
+
+        # Deep Supervision Hook
+        # Only compute aux output if training and not in deploy mode
+        if self.training and not self.deploy:
+            aux_out = self.aux_head(out)
+        else:
+            aux_out = None
+
+        out = self.stage3(out)
+        main_out = self.main_head(out)
+
+        if self.training and not self.deploy:
+            return main_out, aux_out
+        else:
+            return main_out
+
+    def switch_to_deploy(self):
+        """
+        Fuses all RepVGG blocks and removes the auxiliary head for efficient inference.
+        """
+        if self.deploy:
+            return
+
+        # Switch stem
+        self.stem.switch_to_deploy()
+
+        # Switch stages
+        for stage in [self.stage1, self.stage2, self.stage3]:
+            for layer in stage:
+                layer.switch_to_deploy()
+
+        # Remove Aux Head to save memory and ensure it's not used
+        if hasattr(self, "aux_head"):
+            self.__delattr__("aux_head")
+
+        self.deploy = True
+=======
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_planes,
+                    self.expansion * planes,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(self.expansion * planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class CactusResNet(nn.Module):
+    """
+    Custom Shallow ResNet optimized for 32x32 images (Cite solution_lesson_node_00001).
+    Uses conservative downsampling to preserve spatial resolution.
+    """
+
+    def __init__(self, num_blocks=[2, 2, 2], num_classes=1):
+        super(CactusResNet, self).__init__()
+        self.in_planes = 64
+
+        # Stem: 3x3 Conv, Stride 1 (Preserves 32x32 resolution)
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+
+        # 3 Stages
+        # Stage 1: 64 channels, stride 1 -> 32x32
+        self.layer1 = self._make_layer(BasicBlock, 64, num_blocks[0], stride=1)
+        # Stage 2: 128 channels, stride 2 -> 16x16
+        self.layer2 = self._make_layer(BasicBlock, 128, num_blocks[1], stride=2)
+        # Stage 3: 256 channels, stride 2 -> 8x8
+        self.layer3 = self._make_layer(BasicBlock, 256, num_blocks[2], stride=2)
+
+        self.linear = nn.Linear(256 * BasicBlock.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.adaptive_avg_pool2d(out, 1)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for i, (inputs, labels) in enumerate(dataloader):
+        inputs = inputs.to(device)
+        labels = labels.to(device).unsqueeze(1)  # Shape (N, 1)
+
+        # Apply Mixup
+        inputs, targets_a, targets_b, lam = mixup_data(
+            inputs, labels, Config.MIXUP_ALPHA, device
+        )
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        # RepVGGDeepSup returns (main_out, aux_out) in training mode
+        main_out, aux_out = model(inputs)
+
+        # Calculate Loss
+        # Main Head Loss
+        loss_main = mixup_criterion(criterion, main_out, targets_a, targets_b, lam)
+
+        # Aux Head Loss
+        loss_aux = mixup_criterion(criterion, aux_out, targets_a, targets_b, lam)
+
+        # Total Loss
+        loss = loss_main + (Config.AUX_LOSS_WEIGHT * loss_aux)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        dataset_size += inputs.size(0)
+=======
+    for i, (inputs, labels) in enumerate(dataloader):
+        inputs = inputs.to(device)
+        labels = labels.to(device).unsqueeze(1)  # Shape (N, 1)
+
+        # Apply Mixup
+        inputs, targets_a, targets_b, lam = mixup_data(
+            inputs, labels, Config.MIXUP_ALPHA, device
+        )
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(inputs)
+
+        # Calculate Loss
+        loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        dataset_size += inputs.size(0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def predict_tta(model, test_loader, device):
+    """
+    Performs inference using 4-view Test Time Augmentation (TTA).
+    Views: Original, H-Flip, V-Flip, Rot180.
+
+    Args:
+        model: The trained model (should be in deploy mode).
+        test_loader: DataLoader for test data (returns images, ids).
+        device: 'cuda' or 'cpu'.
+
+    Returns:
+        dict: Mapping of id -> probability
+    """
+    model.eval()
+    predictions = {}
+
+    # Ensure model is in deploy mode for efficiency
+    if hasattr(model, "switch_to_deploy"):
+        model.switch_to_deploy()
+
+    with torch.no_grad():
+=======
+def predict_tta(model, test_loader, device):
+    """
+    Performs inference using 4-view Test Time Augmentation (TTA).
+    Views: Original, H-Flip, V-Flip, Rot180.
+
+    Args:
+        model: The trained model.
+        test_loader: DataLoader for test data (returns images, ids).
+        device: 'cuda' or 'cpu'.
+
+    Returns:
+        dict: Mapping of id -> probability
+    """
+    model.eval()
+    predictions = {}
+
+    with torch.no_grad():
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RepVGGDeepSup
+from library.engine import train_model, validate, predict_tta, set_seed
+=======
+from library.model import CactusResNet
+from library.engine import train_model, validate, predict_tta, set_seed
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Training
+    print("\n[Model Training]")
+    model = RepVGGDeepSup(num_classes=Config.NUM_CLASSES, deploy=False)
+    model = model.to(device)
+
+    # Train the model (engine handles loop, scheduler, early stopping)
+=======
+    # 3. Model Training
+    print("\n[Model Training]")
+    model = CactusResNet(num_classes=Config.NUM_CLASSES)
+    model = model.to(device)
+
+    # Train the model (engine handles loop, scheduler, early stopping)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    if final_auc > 0.5:
+        print("\n[Submission Generation]")
+
+        # Switch model to deploy mode (fuses layers, removes aux head)
+        model.switch_to_deploy()
+
+        # Generate predictions with TTA
+        predictions_map = predict_tta(model, test_loader, device)
+=======
+    if final_auc > 0.5:
+        print("\n[Submission Generation]")
+
+        # Generate predictions with TTA
+        predictions_map = predict_tta(model, test_loader, device)
+>>>>>>> REPLACE
+```

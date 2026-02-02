@@ -1,0 +1,356 @@
+I will optimize the solution by reverting the "Multi-Band Pooling" strategy (Idea 12) to the superior "Hierarchical Feature Fusion with Global Pooling" strategy (Idea 11), which achieved a higher validation AUC of 0.9947 compared to 0.9854.
+
+**Implementation Strategy:**
+1.  **Refine Model Architecture**: Replace the `MultiBandResNetCRNN` with `HierarchicalResNetCRNN`. Instead of splitting the frequency dimension into bands (which increased dimensionality and risk of overfitting, Cite {solution_lesson_node_00060}), I will use Global Average Pooling across the frequency dimension for Layers 2, 3, and 4. I will then concatenate these features and apply a learnable 1x1 convolution projection to reduce the dimensionality before feeding the sequence to the Bi-GRU (Cite {solution_lesson_node_00057}).
+2.  **Configuration Updates**: Update `library/config.py` to set a new `WORKING_DIR` (to avoid cache conflicts), rename the model, and set `EPOCHS` to 15 to ensure sufficient training time (removing the debug override in `runfile.py`). I will retain `HOP_LENGTH=16` to maintain the temporal resolution that worked well for the Hierarchical approach.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for caching intermediate data (Idea 12)
+    WORKING_DIR = "./working/idea_12"
+
+    # Submission directory
+=======
+    # Working directory for caching intermediate data
+    WORKING_DIR = "./working/idea_hierarchical"
+
+    # Submission directory
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Architecture: Multi-Band Hierarchical Coordinate-Attention ResNet-18 CRNN
+    MODEL_NAME = "resnet18_ca_multiband"
+    IN_CHANNELS = 1
+    NUM_CLASSES = 1
+
+    # Feature extraction settings
+    USE_COORDINATE_ATTENTION = True
+    USE_MULTIBAND_POOLING = True
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    EPOCHS = 20
+=======
+    # Architecture: Hierarchical Coordinate-Attention ResNet-18 CRNN
+    MODEL_NAME = "resnet18_ca_hierarchical"
+    IN_CHANNELS = 1
+    NUM_CLASSES = 1
+
+    # Feature extraction settings
+    USE_COORDINATE_ATTENTION = True
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    EPOCHS = 15
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiBandResNetCRNN(nn.Module):
+    """
+    Multi-Band Hierarchical Coordinate-Attention ResNet-18 CRNN.
+    """
+
+    def __init__(self):
+        super(MultiBandResNetCRNN, self).__init__()
+
+        # 1. Backbone: ResNet18
+        # Load weights
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        self.resnet = models.resnet18(weights=weights)
+
+        # Modify first layer for 1 channel input
+        original_conv1 = self.resnet.conv1
+        self.resnet.conv1 = nn.Conv2d(
+            1,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=False,
+        )
+        # Initialize with average of RGB weights
+        with torch.no_grad():
+            self.resnet.conv1.weight.data = original_conv1.weight.data.mean(
+                dim=1, keepdim=True
+            )
+
+        # 2. Time-Preserving Strides
+        # Layer 2 keeps stride 2 (standard)
+        # Layer 3: Stride (2, 1)
+        self.resnet.layer3[0].conv1.stride = (2, 1)
+        self.resnet.layer3[0].downsample[0].stride = (2, 1)
+        # Layer 4: Stride (2, 1)
+        self.resnet.layer4[0].conv1.stride = (2, 1)
+        self.resnet.layer4[0].downsample[0].stride = (2, 1)
+
+        # 3. Coordinate Attention
+        # We wrap the layers with CA if configured
+        if Config.USE_COORDINATE_ATTENTION:
+            self.ca2 = CoordinateAttention(128, 128)
+            self.ca3 = CoordinateAttention(256, 256)
+            self.ca4 = CoordinateAttention(512, 512)
+
+        # 4. RNN Head
+        # Feature dimensions calculation
+        # Layer 2: 128 ch, 2 bands -> 256
+        # Layer 3: 256 ch, 2 bands -> 512
+        # Layer 4: 512 ch, 1 band  -> 512
+        # Total: 1280
+        self.rnn_input_dim = 128 * 2 + 256 * 2 + 512
+        self.rnn_hidden_dim = 128
+
+        self.gru = nn.GRU(
+            input_size=self.rnn_input_dim,
+            hidden_size=self.rnn_hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
+        )
+
+        self.attn_pool = AttentionPooling(self.rnn_hidden_dim * 2)
+        self.fc = nn.Linear(self.rnn_hidden_dim * 2, 1)
+
+    def _multiband_pool(self, x, num_bands):
+        # x: (B, C, F, T)
+        B, C, F, T = x.shape
+        assert F % num_bands == 0, f"Freq dim {F} not divisible by {num_bands}"
+
+        # Reshape to separate bands: (B, C, Bands, F_per_band, T)
+        x_reshaped = x.view(B, C, num_bands, F // num_bands, T)
+
+        # Average over frequency within each band: (B, C, Bands, T)
+        x_pooled = x_reshaped.mean(dim=3)
+
+        # Flatten bands into channels: (B, C * Bands, T)
+        x_out = x_pooled.view(B, C * num_bands, T)
+        return x_out
+
+    def forward(self, x):
+        # x: (B, 1, F, T)
+
+        # Stem
+        x = self.resnet.conv1(x)
+        x = self.resnet.bn1(x)
+        x = self.resnet.relu(x)
+        x = self.resnet.maxpool(x)
+
+        # Layer 1
+        x = self.resnet.layer1(x)
+
+        # Layer 2
+        l2 = self.resnet.layer2(x)
+        if Config.USE_COORDINATE_ATTENTION:
+            l2 = self.ca2(l2)
+        # Pool Layer 2: 2 Bands
+        f2 = self._multiband_pool(l2, num_bands=2)
+
+        # Layer 3
+        l3 = self.resnet.layer3(l2)
+        if Config.USE_COORDINATE_ATTENTION:
+            l3 = self.ca3(l3)
+        # Pool Layer 3: 2 Bands
+        f3 = self._multiband_pool(l3, num_bands=2)
+
+        # Layer 4
+        l4 = self.resnet.layer4(l3)
+        if Config.USE_COORDINATE_ATTENTION:
+            l4 = self.ca4(l4)
+        # Pool Layer 4: 1 Band (Global)
+        f4 = self._multiband_pool(l4, num_bands=1)
+
+        # Concatenate: (B, Total_Channels, T)
+        features = torch.cat([f2, f3, f4], dim=1)
+
+        # Prepare for RNN: (B, T, C)
+        features = features.permute(0, 2, 1)
+
+        # RNN
+        self.gru.flatten_parameters()
+        rnn_out, _ = self.gru(features)
+
+        # Pooling
+        pool_out = self.attn_pool(rnn_out)
+
+        # Classification
+        logits = self.fc(pool_out)
+
+        return logits
+=======
+class HierarchicalResNetCRNN(nn.Module):
+    """
+    Hierarchical Coordinate-Attention ResNet-18 CRNN with Global Frequency Pooling.
+    Aggregates features from Layers 2, 3, and 4.
+    """
+
+    def __init__(self):
+        super(HierarchicalResNetCRNN, self).__init__()
+
+        # 1. Backbone: ResNet18
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        self.resnet = models.resnet18(weights=weights)
+
+        # Modify first layer for 1 channel input
+        original_conv1 = self.resnet.conv1
+        self.resnet.conv1 = nn.Conv2d(
+            1,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=False,
+        )
+        with torch.no_grad():
+            self.resnet.conv1.weight.data = original_conv1.weight.data.mean(
+                dim=1, keepdim=True
+            )
+
+        # 2. Time-Preserving Strides (Layers 3 and 4 only)
+        # Cite {solution_lesson_node_00059}: Preserve Early Temporal Downsampling
+        self.resnet.layer3[0].conv1.stride = (2, 1)
+        self.resnet.layer3[0].downsample[0].stride = (2, 1)
+        self.resnet.layer4[0].conv1.stride = (2, 1)
+        self.resnet.layer4[0].downsample[0].stride = (2, 1)
+
+        # 3. Coordinate Attention
+        # Cite {solution_lesson_node_00047}
+        if Config.USE_COORDINATE_ATTENTION:
+            self.ca2 = CoordinateAttention(128, 128)
+            self.ca3 = CoordinateAttention(256, 256)
+            self.ca4 = CoordinateAttention(512, 512)
+
+        # 4. Hierarchical Projection & RNN Head
+        # Cite {solution_lesson_node_00057}, {solution_lesson_node_00060}
+        # Layer 2: 128 ch
+        # Layer 3: 256 ch
+        # Layer 4: 512 ch
+        # Total Raw: 896
+        self.concat_dim = 128 + 256 + 512
+        self.projected_dim = 512
+
+        self.projection = nn.Sequential(
+            nn.Conv1d(self.concat_dim, self.projected_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(self.projected_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        self.gru = nn.GRU(
+            input_size=self.projected_dim,
+            hidden_size=128,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
+        )
+
+        self.attn_pool = AttentionPooling(128 * 2)
+        self.fc = nn.Linear(128 * 2, 1)
+
+    def forward(self, x):
+        # x: (B, 1, F, T)
+
+        # Stem
+        x = self.resnet.conv1(x)
+        x = self.resnet.bn1(x)
+        x = self.resnet.relu(x)
+        x = self.resnet.maxpool(x)
+
+        # Layer 1
+        x = self.resnet.layer1(x)
+
+        # Layer 2
+        l2 = self.resnet.layer2(x)
+        if Config.USE_COORDINATE_ATTENTION:
+            l2 = self.ca2(l2)
+        
+        # Layer 3
+        l3 = self.resnet.layer3(l2)
+        if Config.USE_COORDINATE_ATTENTION:
+            l3 = self.ca3(l3)
+        
+        # Layer 4
+        l4 = self.resnet.layer4(l3)
+        if Config.USE_COORDINATE_ATTENTION:
+            l4 = self.ca4(l4)
+
+        # Global Frequency Pooling: Mean over dim 2 (Freq)
+        # Output: (B, C, T)
+        f2 = l2.mean(dim=2)
+        f3 = l3.mean(dim=2)
+        f4 = l4.mean(dim=2)
+
+        # Concatenate Hierarchical Features
+        # (B, 896, T)
+        features = torch.cat([f2, f3, f4], dim=1)
+
+        # Projection (Bottleneck)
+        features = self.projection(features)
+
+        # Prepare for RNN: (B, T, C)
+        features = features.permute(0, 2, 1)
+
+        # RNN
+        self.gru.flatten_parameters()
+        rnn_out, _ = self.gru(features)
+
+        # Pooling
+        pool_out = self.attn_pool(rnn_out)
+
+        # Classification
+        logits = self.fc(pool_out)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MultiBandResNetCRNN
+from library.trainer import Trainer
+
+
+def run_failure_analysis(model, val_loader, device):
+=======
+from library.model import HierarchicalResNetCRNN
+from library.trainer import Trainer
+
+
+def run_failure_analysis(model, val_loader, device):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration Overrides for Fast Baseline
+    # We limit epochs to ensure the script completes quickly while still learning.
+    Config.EPOCHS = 6
+
+    # 2. Setup
+    set_seed(Config.SEED)
+=======
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Model Initialization
+    print(f"Initializing Model: {Config.MODEL_NAME}")
+    model = MultiBandResNetCRNN().to(device)
+
+    # 5. Training
+=======
+    # 4. Model Initialization
+    print(f"Initializing Model: {Config.MODEL_NAME}")
+    model = HierarchicalResNetCRNN().to(device)
+
+    # 5. Training
+>>>>>>> REPLACE
+```

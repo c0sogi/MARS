@@ -1,0 +1,193 @@
+To address the `InvalidMetricValueError` caused by `NaN` values propagating through the training pipeline, I will implement the following fixes:
+
+1.  **Robust Data Loading (`library/data_loader.py`)**:
+    *   In `load_gnss_data`, I will add linear interpolation for missing WLS positions and fill any remaining gaps with 0.0 to ensure valid inputs for coordinate conversion.
+    *   In `process_trip`, I will add a check to filter out training samples where the target residuals are `NaN` or excessively large (outliers > 100km), which likely indicate corrupted WLS data.
+    *   In `CustomScaler`, I will sanitize inputs using `np.nan_to_num` in both `fit` and `transform` methods to handle any remaining `NaN`s or `Inf`s before scaling.
+
+2.  **Numerical Safety (`library/utils.py`)**:
+    *   In `ecef_to_llh`, I will clip the cosine of the latitude to a small epsilon to prevent division-by-zero errors when calculating altitude, which can occur near poles or with invalid data.
+
+3.  **Cache Management (`runfile.py`)**:
+    *   I will update the cache cleaning logic to explicitly remove `.npy` files in the working directory, ensuring that the corrupted dataset is fully regenerated.
+
+These changes directly address the root causes identified in the error analysis (Missing Data Propagation, Target Corruption, Input Corruption, and Singularity Risk).
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    N = WGS84_A / np.sqrt(1 - WGS84_E2 * np.sin(lat) ** 2)
+    alt = p / np.cos(lat) - N
+
+    # Handle poles where cos(lat) is close to 0
+    # For simplicity in this vectorized context, we assume standard operating ranges.
+    # A robust implementation would check for p < epsilon.
+
+    return np.degrees(lat), np.degrees(lon), alt
+=======
+    N = WGS84_A / np.sqrt(1 - WGS84_E2 * np.sin(lat) ** 2)
+    
+    # Safe division for altitude calculation
+    cos_lat = np.cos(lat)
+    # Clip cos_lat to avoid division by zero (e.g. at poles)
+    cos_lat = np.where(np.abs(cos_lat) < 1e-6, 1e-6, cos_lat)
+    
+    alt = p / cos_lat - N
+
+    return np.degrees(lat), np.degrees(lon), alt
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def fit(self, traj_data, sky_data):
+        # traj_data shape: (N, Window, Channels)
+        # Flatten window dimension for stats calculation
+        N, W, C_traj = traj_data.shape
+        traj_flat = traj_data.reshape(-1, C_traj)
+
+        self.means["traj"] = np.nanmean(traj_flat, axis=0).tolist()
+        self.stds["traj"] = np.nanstd(traj_flat, axis=0).tolist()
+
+        # sky_data shape: (N, Channels)
+        self.means["sky"] = np.nanmean(sky_data, axis=0).tolist()
+        self.stds["sky"] = np.nanstd(sky_data, axis=0).tolist()
+=======
+    def fit(self, traj_data, sky_data):
+        # traj_data shape: (N, Window, Channels)
+        # Flatten window dimension for stats calculation
+        N, W, C_traj = traj_data.shape
+        traj_flat = traj_data.reshape(-1, C_traj)
+
+        # Handle NaNs and Infs before stats calculation
+        traj_flat = np.nan_to_num(traj_flat, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        self.means["traj"] = np.nanmean(traj_flat, axis=0).tolist()
+        self.stds["traj"] = np.nanstd(traj_flat, axis=0).tolist()
+
+        # sky_data shape: (N, Channels)
+        sky_data = np.nan_to_num(sky_data, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        self.means["sky"] = np.nanmean(sky_data, axis=0).tolist()
+        self.stds["sky"] = np.nanstd(sky_data, axis=0).tolist()
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def transform(self, traj_data, sky_data):
+        traj_norm = (traj_data - np.array(self.means["traj"])) / np.array(
+            self.stds["traj"]
+        )
+        sky_norm = (sky_data - np.array(self.means["sky"])) / np.array(self.stds["sky"])
+
+        # Handle potential NaNs created during scaling or existing before
+        traj_norm = np.nan_to_num(traj_norm)
+        sky_norm = np.nan_to_num(sky_norm)
+
+        return traj_norm, sky_norm
+=======
+    def transform(self, traj_data, sky_data):
+        # Sanitize inputs first
+        traj_data = np.nan_to_num(traj_data, nan=0.0, posinf=0.0, neginf=0.0)
+        sky_data = np.nan_to_num(sky_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+        traj_norm = (traj_data - np.array(self.means["traj"])) / np.array(
+            self.stds["traj"]
+        )
+        sky_norm = (sky_data - np.array(self.means["sky"])) / np.array(self.stds["sky"])
+
+        # Handle potential NaNs created during scaling or existing before
+        traj_norm = np.nan_to_num(traj_norm)
+        sky_norm = np.nan_to_num(sky_norm)
+
+        return traj_norm, sky_norm
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    # Fill NaNs in std columns (single satellite case)
+    for col in df_agg.columns:
+        if "std" in col:
+            df_agg[col] = df_agg[col].fillna(0)
+
+    # Convert WLS ECEF to LLA
+    if "WlsPositionXEcefMeters_first" in df_agg.columns:
+=======
+    # Fill NaNs in std columns (single satellite case)
+    for col in df_agg.columns:
+        if "std" in col:
+            df_agg[col] = df_agg[col].fillna(0)
+
+    # Interpolate missing WLS positions to avoid NaNs
+    # Cite debug_lesson_4
+    wls_cols = ["WlsPositionXEcefMeters_first", "WlsPositionYEcefMeters_first", "WlsPositionZEcefMeters_first"]
+    if all(c in df_agg.columns for c in wls_cols):
+        # Linear interpolation for gaps
+        df_agg[wls_cols] = df_agg[wls_cols].interpolate(method='linear', limit_direction='both')
+        # Fill remaining NaNs (e.g. start/end or empty) with 0.0 to avoid NaNs in LLA
+        df_agg[wls_cols] = df_agg[wls_cols].fillna(0.0)
+
+    # Convert WLS ECEF to LLA
+    if "WlsPositionXEcefMeters_first" in df_agg.columns:
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+            t_lat_m, t_lon_m = degrees_to_meters_diff(
+                gt_lat - center_lat, gt_lon - center_lon, center_lat
+            )
+            target_sample = np.array([t_lat_m, t_lon_m])
+        else:
+=======
+            t_lat_m, t_lon_m = degrees_to_meters_diff(
+                gt_lat - center_lat, gt_lon - center_lon, center_lat
+            )
+            
+            # Filter out samples with NaN targets or extreme outliers (likely due to bad WLS)
+            # Cite debug_lesson_4
+            if np.isnan(t_lat_m) or np.isnan(t_lon_m) or np.abs(t_lat_m) > 100000 or np.abs(t_lon_m) > 100000:
+                continue
+                
+            target_sample = np.array([t_lat_m, t_lon_m])
+        else:
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Clean up cache to ensure NaN-free data generation
+    print("Cleaning up cache files...")
+    for cache_file in [TRAIN_CACHE_PATH, VAL_CACHE_PATH, TEST_CACHE_PATH]:
+        if os.path.exists(cache_file):
+            try:
+                os.remove(cache_file)
+            except OSError:
+                pass
+
+    # ---------------------------------------------------------
+=======
+    # Clean up cache to ensure NaN-free data generation
+    print("Cleaning up cache files...")
+    for cache_file in [TRAIN_CACHE_PATH, VAL_CACHE_PATH, TEST_CACHE_PATH]:
+        if os.path.exists(cache_file):
+            try:
+                os.remove(cache_file)
+            except OSError:
+                pass
+    
+    # Also remove numpy cache files
+    import glob
+    for f in glob.glob(os.path.join(library.config.WORKING_DIR, "*.npy")):
+        os.remove(f)
+
+    # ---------------------------------------------------------
+>>>>>>> REPLACE
+```

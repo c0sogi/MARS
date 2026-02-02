@@ -1,0 +1,405 @@
+Implementation strategy:
+1.  **Refine Feature Engineering (Lesson 00020)**: In `library/model.py`, replace the complex ECEF->ENU coordinate transformation for *input features* with robust, element-wise scaling of Latitude/Longitude degrees to meters. This avoids numerical instability (NaNs) caused by noisy altitude data in the geometric projection chain.
+2.  **Simplify Reconstruction**: Update the prediction reconstruction logic in both `library/model.py` (for submission) and `runfile.py` (for validation) to use the inverse of this simple scaling, ensuring consistency between training and inference.
+3.  **Stabilize Training**: In `library/trainer.py`, add gradient clipping (`clip_grad_norm_`) to prevent exploding gradients, which likely contributed to the `nan` loss in the previous run.
+4.  **Robust Data Preparation**: In `library/model.py`, ensure missing values in WLS positions are handled (forward/backward fill) before feature computation to prevent NaNs from propagating into the model inputs.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def create_windows(df, window_size):
+    """
+    Creates sliding windows for the dataset.
+    Returns a numpy array of shape (N, window_size, features).
+    """
+    # Features to window
+    feature_cols = [
+        "RelE",
+        "RelN",
+        "RelU",
+        "VelE",
+        "VelN",
+        "VelU",
+        "MeanCn0",
+        "MeanUncertainty",
+        "SatelliteCount",
+    ]
+
+    # Ensure data is sorted by trip and time
+    df = df.sort_values(["tripId", "UnixTimeMillis"]).reset_index(drop=True)
+
+    # We need to pad per trip to maintain output size = input size
+    # The center of the window corresponds to the prediction target
+    pad = window_size // 2
+
+    windows_list = []
+
+    for trip_id, group in df.groupby("tripId"):
+        data = group[feature_cols].values
+
+        # Pad the beginning and end of the trip sequence
+        # Replicate the first and last elements
+        pad_start = np.tile(data[0], (pad, 1))
+        pad_end = np.tile(data[-1], (pad, 1))
+        padded_data = np.vstack([pad_start, data, pad_end])
+
+        # Create sliding windows
+        # Shape: (num_samples, window_size, num_features)
+        # Using stride_tricks for efficiency
+        stride0, stride1 = padded_data.strides
+        num_windows = len(data)
+
+        windows = np.lib.stride_tricks.as_strided(
+            padded_data,
+            shape=(num_windows, window_size, len(feature_cols)),
+            strides=(stride0, stride0, stride1),
+        )
+
+        windows_list.append(windows)
+
+    return np.vstack(windows_list)
+
+
+def process_features(df):
+    """
+    Generates relative metric features (ENU) and velocities.
+    """
+    # Convert WLS ECEF to LLA
+    wls_lat, wls_lon, wls_alt = ecef_to_lla(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+    )
+
+    df["WlsLat"] = wls_lat
+    df["WlsLon"] = wls_lon
+    df["WlsAlt"] = wls_alt
+
+    # We construct "Relative" features.
+    # However, the windowing function logic above just slices existing columns.
+    # To make the window "Relative to Center", we need to do it AFTER windowing or
+    # use a clever trick.
+    # Trick: The network needs translation invariance.
+    # Instead of absolute ECEF or LLA, we can use the difference between
+    # current epoch WLS and previous epoch WLS (Velocity) as inputs,
+    # plus maybe a local shape relative to the window center.
+
+    # Implementing "Relative to Window Center" efficiently:
+    # It is computationally expensive to re-center every window in a loop.
+    # Approximation:
+    # 1. Calculate global ENU relative to the FIRST point of the trip.
+    # 2. Inside the window, subtract the center's ENU from neighbors.
+    # This preserves the metric shape perfectly locally.
+
+    # Calculate ENU relative to trip start
+    df["TripStartLat"] = df.groupby("tripId")["WlsLat"].transform("first")
+    df["TripStartLon"] = df.groupby("tripId")["WlsLon"].transform("first")
+    df["TripStartAlt"] = df.groupby("tripId")["WlsAlt"].transform("first")
+
+    # Vectorized ECEF to ENU relative to trip start
+    # Note: ecef_to_enu takes scalar ref lat/lon usually, but we can pass arrays if implementation supports it.
+    # The provided utils ecef_to_enu uses numpy, so passing arrays for ref should work if dimensions match.
+
+    e, n, u = ecef_to_enu(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+        df["TripStartLat"].values,
+        df["TripStartLon"].values,
+        df["TripStartAlt"].values,
+    )
+
+    df["GlobalE"] = e
+    df["GlobalN"] = n
+    df["GlobalU"] = u
+
+    # Calculate Velocities (First order difference)
+    # Fill NA for first element with 0
+    df["VelE"] = df.groupby("tripId")["GlobalE"].diff().fillna(0)
+    df["VelN"] = df.groupby("tripId")["GlobalN"].diff().fillna(0)
+    df["VelU"] = df.groupby("tripId")["GlobalU"].diff().fillna(0)
+
+    # Fill missing signal metrics
+    df["MeanCn0"] = df["MeanCn0"].fillna(0)
+    df["MeanUncertainty"] = df["MeanUncertainty"].fillna(
+        100
+    )  # High uncertainty default
+    df["SatelliteCount"] = df["SatelliteCount"].fillna(0)
+
+    return df
+
+
+def re_center_windows(windows):
+    """
+    Adjusts the position features (indices 0, 1, 2 corresponding to Global E, N, U)
+    to be relative to the center of the window.
+    """
+    # windows shape: (N, window_size, features)
+    # Feature indices: 0:GlobalE, 1:GlobalN, 2:GlobalU
+
+    center_idx = windows.shape[1] // 2
+
+    # Extract center positions: (N, 1, 3)
+    center_pos = windows[:, center_idx : center_idx + 1, 0:3]
+
+    # Subtract center from all positions in window
+    windows[:, :, 0:3] -= center_pos
+
+    # Now columns 0, 1, 2 are RelE, RelN, RelU
+    return windows
+=======
+def create_windows(df, window_size):
+    """
+    Creates sliding windows for the dataset.
+    Returns a numpy array of shape (N, window_size, features).
+    """
+    # Features to window
+    # We use Lat/Lon/Alt directly, plus velocities and signal metrics
+    feature_cols = [
+        "WlsLat",
+        "WlsLon",
+        "WlsAlt",
+        "VelLat",
+        "VelLon",
+        "VelAlt",
+        "MeanCn0",
+        "MeanUncertainty",
+        "SatelliteCount",
+    ]
+
+    # Ensure data is sorted by trip and time
+    df = df.sort_values(["tripId", "UnixTimeMillis"]).reset_index(drop=True)
+
+    # We need to pad per trip to maintain output size = input size
+    pad = window_size // 2
+
+    windows_list = []
+
+    for trip_id, group in df.groupby("tripId"):
+        data = group[feature_cols].values
+
+        # Pad the beginning and end of the trip sequence
+        pad_start = np.tile(data[0], (pad, 1))
+        pad_end = np.tile(data[-1], (pad, 1))
+        padded_data = np.vstack([pad_start, data, pad_end])
+
+        # Create sliding windows
+        stride0, stride1 = padded_data.strides
+        num_windows = len(data)
+
+        windows = np.lib.stride_tricks.as_strided(
+            padded_data,
+            shape=(num_windows, window_size, len(feature_cols)),
+            strides=(stride0, stride0, stride1),
+        )
+
+        windows_list.append(windows)
+
+    return np.vstack(windows_list)
+
+
+def process_features(df):
+    """
+    Generates relative metric features (ENU) and velocities.
+    Cite solution_lesson_node_00020: Minimize Coordinate Transformations.
+    We use simple scaling of Lat/Lon instead of ECEF->ENU to avoid instability.
+    """
+    # Ensure WLS columns are filled
+    cols = ["WlsPositionXEcefMeters", "WlsPositionYEcefMeters", "WlsPositionZEcefMeters"]
+    df[cols] = df[cols].fillna(0)
+
+    # Convert WLS ECEF to LLA
+    wls_lat, wls_lon, wls_alt = ecef_to_lla(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+    )
+
+    df["WlsLat"] = wls_lat
+    df["WlsLon"] = wls_lon
+    df["WlsAlt"] = wls_alt
+
+    # Calculate Velocities (First order difference) in meters approx
+    deg_to_m = 111320.0
+    
+    # Diffs
+    dLat = df.groupby("tripId")["WlsLat"].diff().fillna(0)
+    dLon = df.groupby("tripId")["WlsLon"].diff().fillna(0)
+    dAlt = df.groupby("tripId")["WlsAlt"].diff().fillna(0)
+    
+    # Scale velocities to meters
+    df["VelLat"] = dLat * deg_to_m
+    df["VelLon"] = dLon * deg_to_m * np.cos(np.radians(df["WlsLat"]))
+    df["VelAlt"] = dAlt
+
+    # Fill missing signal metrics
+    df["MeanCn0"] = df["MeanCn0"].fillna(0)
+    df["MeanUncertainty"] = df["MeanUncertainty"].fillna(100)
+    df["SatelliteCount"] = df["SatelliteCount"].fillna(0)
+
+    return df
+
+
+def re_center_windows(windows):
+    """
+    Adjusts the position features to be relative to the center of the window
+    and scales them to meters.
+    """
+    # windows shape: (N, W, F)
+    # Indices: 0:Lat, 1:Lon, 2:Alt
+    
+    center_idx = windows.shape[1] // 2
+    center_pos = windows[:, center_idx : center_idx + 1, 0:3]
+
+    # Subtract center from all positions in window
+    windows[:, :, 0:3] -= center_pos
+    
+    # Scale to meters
+    deg_to_m = 111320.0
+    
+    # RelLat (North)
+    windows[:, :, 0] *= deg_to_m
+    
+    # RelLon (East) - use center lat for cosine scaling
+    center_lats_rad = np.radians(center_pos[:, :, 0])
+    cos_lat = np.cos(center_lats_rad)
+    windows[:, :, 1] *= (deg_to_m * cos_lat)
+    
+    # RelAlt is already in meters (diff of meters)
+    
+    return windows
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Rename Global columns to Rel placeholders for window creation function
+    # The create_windows function expects specific names
+    merged.rename(
+        columns={"GlobalE": "RelE", "GlobalN": "RelN", "GlobalU": "RelU"}, inplace=True
+    )
+
+    # Create Windows
+    X = create_windows(merged, Config.WINDOW_SIZE)
+=======
+    # Create Windows
+    X = create_windows(merged, Config.WINDOW_SIZE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # 4. Reconstruct Absolute Coordinates
+    print("Reconstructing absolute coordinates...")
+
+    # Extract baseline WLS coordinates from metadata
+    wls_lat = df_test_meta["WlsLat"].values
+    wls_lon = df_test_meta["WlsLon"].values
+    wls_alt = df_test_meta["WlsAlt"].values
+
+    pred_e = predictions[:, 0]
+    pred_n = predictions[:, 1]
+    # We assume 0 vertical offset as we only predict horizontal residuals
+    pred_u = np.zeros_like(pred_e)
+
+    # Convert predicted ENU offsets back to ECEF relative to the WLS baseline
+    pred_x, pred_y, pred_z = enu_to_ecef(
+        pred_e, pred_n, pred_u, wls_lat, wls_lon, wls_alt
+    )
+
+    # Convert ECEF to Geodetic (Lat, Lon)
+    pred_lat, pred_lon, _ = ecef_to_lla(pred_x, pred_y, pred_z)
+=======
+    # 4. Reconstruct Absolute Coordinates
+    print("Reconstructing absolute coordinates...")
+
+    # Extract baseline WLS coordinates from metadata
+    wls_lat = df_test_meta["WlsLat"].values
+    wls_lon = df_test_meta["WlsLon"].values
+    
+    # Predictions are DeltaEast, DeltaNorth in meters
+    pred_e = predictions[:, 0]
+    pred_n = predictions[:, 1]
+    
+    deg_to_m = 111320.0
+    
+    # Reconstruct Lat/Lon using simple inverse scaling
+    # Lat = WlsLat + DeltaN / 111320
+    pred_lat = wls_lat + (pred_n / deg_to_m)
+    
+    # Lon = WlsLon + DeltaE / (111320 * cos(Lat))
+    # Use WlsLat for cosine approximation
+    cos_lat = np.cos(np.radians(wls_lat))
+    pred_lon = wls_lon + (pred_e / (deg_to_m * cos_lat))
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate loss weighted by batch size
+=======
+        loss.backward()
+        
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        optimizer.step()
+
+        # Accumulate loss weighted by batch size
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Reconstruct Absolute Coordinates
+    # The model predicts the offset from the WLS baseline in meters (East, North)
+    # We need to convert these offsets back to Lat/Lon
+
+    print("Reconstructing coordinates...")
+    # Extract baselines
+    wls_lat = df_val_meta["WlsLat"].values
+    wls_lon = df_val_meta["WlsLon"].values
+    wls_alt = df_val_meta["WlsAlt"].values
+
+    # Predicted local offsets
+    pred_e = preds[:, 0]
+    pred_n = preds[:, 1]
+    pred_u = np.zeros_like(pred_e)  # We only predict horizontal
+
+    # Convert ENU offsets to ECEF relative to WLS baseline
+    pred_x, pred_y, pred_z = enu_to_ecef(
+        pred_e, pred_n, pred_u, wls_lat, wls_lon, wls_alt
+    )
+
+    # Convert ECEF to Geodetic
+    pred_lat, pred_lon, _ = ecef_to_lla(pred_x, pred_y, pred_z)
+=======
+    # 3. Reconstruct Absolute Coordinates
+    # The model predicts the offset from the WLS baseline in meters (East, North)
+    # We need to convert these offsets back to Lat/Lon
+
+    print("Reconstructing coordinates...")
+    # Extract baselines
+    wls_lat = df_val_meta["WlsLat"].values
+    wls_lon = df_val_meta["WlsLon"].values
+
+    # Predicted local offsets (DeltaEast, DeltaNorth)
+    pred_e = preds[:, 0]
+    pred_n = preds[:, 1]
+    
+    deg_to_m = 111320.0
+    
+    # Inverse scaling
+    pred_lat = wls_lat + (pred_n / deg_to_m)
+    
+    cos_lat = np.cos(np.radians(wls_lat))
+    pred_lon = wls_lon + (pred_e / (deg_to_m * cos_lat))
+>>>>>>> REPLACE
+```

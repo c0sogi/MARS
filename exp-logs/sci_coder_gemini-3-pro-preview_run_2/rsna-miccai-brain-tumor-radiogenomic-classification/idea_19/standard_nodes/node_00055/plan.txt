@@ -1,0 +1,358 @@
+My strategy is to revert the complex "Hierarchical-Gated" and "Independent Anchor" ROI selection logic introduced in the previous solution (Idea 19) back to a robust, single-modality (FLAIR) approach, as suggested by the lessons learned. Specifically, I will implement **Sum of Intensity** selection (Lesson 38) on the FLAIR modality, with explicit **Boundary Exclusion** (Lesson 18) to avoid artifacts at the top and bottom of the scan. I will then enforce **Absolute Indexing** (Lesson 24) and **Global Anchoring** (Lesson 53) in the dataset class, ensuring that all modalities are aligned to the same anatomical depth derived from FLAIR. This restores spatial coherence and robustness. I will also ensure the learning rate remains low (1e-4) as per Lesson 40.
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+CACHE_DIR = "./working/idea_19"
+=======
+CACHE_DIR = "./working/idea_20"
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def compute_anchor_indices(metadata_df, load_cached_data=True):
+    """
+    Implements Hierarchical-Gated ROI Selection.
+    Stage 1: FLAIR Energy Gating (Central 80%)
+    Stage 2: T1wCE Max Intensity Targeting within Gate
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, "roi_cache.parquet")
+
+    # 1. Load Cache if requested
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            # Convert to dict: BraTS21ID -> anchor_index
+            return dict(zip(cache_df["BraTS21ID"], cache_df["anchor_index"]))
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    print("Computing ROI anchors (Hierarchical-Gated)...")
+    anchor_dict = {}
+
+    # Iterate over all subjects
+    # We need to process row by row
+    for idx, row in metadata_df.iterrows():
+        subject_id = row["BraTS21ID"]
+
+        # Paths
+        flair_dir = os.path.join(INPUT_DIR, row["path_FLAIR"])
+        t1wce_dir = os.path.join(INPUT_DIR, row["path_T1wCE"])
+
+        flair_files = get_sorted_files(flair_dir)
+        t1wce_files = get_sorted_files(t1wce_dir)
+
+        num_flair = len(flair_files)
+
+        if num_flair == 0:
+            anchor_dict[subject_id] = 0
+            continue
+
+        # --- Stage 1: Anatomical Gating (FLAIR) ---
+        # Calculate energy profile
+        energy_profile = []
+        # We can't read ALL files if time is tight, but for ROI we usually need to.
+        # To optimize, we read every 2nd or 3rd slice for the profile if N is large?
+        # Given the constraints and small dataset size (500 subjects), reading is feasible.
+        # We will read all to be accurate.
+
+        valid_flair_indices = []
+
+        # Pre-read FLAIR to find brain volume
+        flair_intensities = []
+        for f in flair_files:
+            p = os.path.join(flair_dir, f)
+            img = load_image_robust(p)
+            energy = np.sum(img)
+            flair_intensities.append(energy)
+
+        flair_intensities = np.array(flair_intensities)
+        total_energy = np.sum(flair_intensities)
+
+        start_idx = 0
+        end_idx = num_flair - 1
+
+        if total_energy > 0:
+            cumsum = np.cumsum(flair_intensities)
+            # Find indices for central 80% (10% to 90%)
+            try:
+                start_idx = np.where(cumsum >= 0.1 * total_energy)[0][0]
+                end_idx = np.where(cumsum >= 0.9 * total_energy)[0][0]
+            except IndexError:
+                start_idx = 0
+                end_idx = num_flair - 1
+
+        # Ensure indices are within bounds and logical
+        start_idx = max(0, start_idx)
+        end_idx = min(num_flair - 1, end_idx)
+        if start_idx >= end_idx:
+            start_idx = 0
+            end_idx = num_flair - 1
+
+        # --- Stage 2: Pathological Targeting (T1wCE) ---
+        # We search for max intensity in T1wCE within the valid window [start_idx, end_idx]
+        # Note: T1wCE files might not align 1:1 with FLAIR indices if counts differ.
+        # However, usually in BraTS datasets, slices are co-registered or we assume spatial correspondence
+        # by normalized depth. Here we assume file index correspondence or simply map the range.
+        # If file counts differ significantly, we map the relative depth.
+
+        num_t1wce = len(t1wce_files)
+
+        if num_t1wce > 0:
+            # Map start/end from FLAIR space to T1wCE space
+            ratio = num_t1wce / num_flair
+            t_start = int(start_idx * ratio)
+            t_end = int(end_idx * ratio)
+            t_end = max(t_start + 1, t_end)
+            t_end = min(num_t1wce, t_end)
+
+            max_intensity = -1
+            best_idx_local = -1
+
+            # Scan T1wCE
+            for i in range(t_start, t_end):
+                p = os.path.join(t1wce_dir, t1wce_files[i])
+                img = load_image_robust(p)
+                val = np.max(img)
+                if val > max_intensity:
+                    max_intensity = val
+                    best_idx_local = i
+
+            # Fallback check: if max intensity is very low (black image), revert to FLAIR
+            if max_intensity < 10:  # Arbitrary low threshold for "empty"
+                # Revert to FLAIR Max in the valid range
+                best_idx_local = -1
+        else:
+            best_idx_local = -1
+
+        # --- Fallback: FLAIR Max ---
+        if best_idx_local == -1:
+            # Find max intensity in FLAIR within the valid range
+            max_intensity = -1
+            best_flair_idx = start_idx
+            for i in range(start_idx, end_idx + 1):
+                # We already loaded these, but didn't store the max pixel, only sum.
+                # To save IO, we might just use the sum profile as a proxy for "most brain"
+                # or re-read. Re-reading is safer for "Max Pixel".
+                p = os.path.join(flair_dir, flair_files[i])
+                img = load_image_robust(p)
+                val = np.max(img)
+                if val > max_intensity:
+                    max_intensity = val
+                    best_flair_idx = i
+
+            # Map back to T1wCE space if we need a unified anchor index?
+            # The dataset loader assumes we use one integer index.
+            # If we use FLAIR index, we must ensure we pick the corresponding files in other modalities.
+            # We will store the relative depth (0.0 to 1.0) or just the index.
+            # Since MRIDataset uses the same integer index for all modalities,
+            # we should store the index relative to the modality we used,
+            # but this is problematic if slice counts differ.
+            # Strategy: Store the normalized position (0.0-1.0) and convert in Dataset?
+            # Or simpler: Just store the index assuming roughly equal slice counts (common in BraTS).
+            # Let's store the index. If we derived it from FLAIR, we use that index.
+            anchor_dict[subject_id] = best_flair_idx
+        else:
+            # We found a good T1wCE slice.
+            # If we used T1wCE index, we need to map it back to FLAIR/others if counts differ?
+            # Let's assume we use the index `best_idx_local` which is a T1wCE index.
+            # If we use this index to load FLAIR, and FLAIR has different count, we might be off.
+            # Robust approach: Store the Middle Slice of the ROI if counts differ,
+            # or just use the index and handle out-of-bounds in Dataset.
+            anchor_dict[subject_id] = best_idx_local
+
+    # Save to cache
+    cache_data = [{"BraTS21ID": k, "anchor_index": v} for k, v in anchor_dict.items()]
+    pd.DataFrame(cache_data).to_parquet(cache_path)
+
+    return anchor_dict
+=======
+def compute_anchor_indices(metadata_df, load_cached_data=True):
+    """
+    Computes ROI anchors using FLAIR Sum Intensity with Boundary Exclusion.
+    Cite solution_lesson_node_00038 (Integral vs Extremal)
+    Cite solution_lesson_node_00018 (Boundary Exclusion)
+    Cite solution_lesson_node_00053 (Single Dominant Modality)
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, "roi_cache.parquet")
+
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            return dict(zip(cache_df["BraTS21ID"], cache_df["anchor_index"]))
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    print("Computing ROI anchors (FLAIR Sum Intensity)...")
+    anchor_dict = {}
+
+    for idx, row in metadata_df.iterrows():
+        subject_id = row["BraTS21ID"]
+        flair_dir = os.path.join(INPUT_DIR, row["path_FLAIR"])
+        files = get_sorted_files(flair_dir)
+        num_files = len(files)
+
+        if num_files == 0:
+            anchor_dict[subject_id] = 0
+            continue
+
+        # Boundary Exclusion: Middle 70% (Exclude top/bottom 15%)
+        start_idx = int(num_files * 0.15)
+        end_idx = int(num_files * 0.85)
+        
+        # Ensure valid range
+        if start_idx >= end_idx:
+            start_idx = 0
+            end_idx = num_files
+
+        max_energy = -1
+        best_idx = num_files // 2
+
+        # Iterate through valid range
+        for i in range(start_idx, end_idx):
+            p = os.path.join(flair_dir, files[i])
+            img = load_image_robust(p)
+            energy = np.sum(img) # Integral statistic (Lesson 38)
+            
+            if energy > max_energy:
+                max_energy = energy
+                best_idx = i
+        
+        anchor_dict[subject_id] = best_idx
+
+    cache_data = [{"BraTS21ID": k, "anchor_index": v} for k, v in anchor_dict.items()]
+    pd.DataFrame(cache_data).to_parquet(cache_path)
+
+    return anchor_dict
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get anchor
+        anchor = self.anchor_dict.get(subject_id, 0)
+
+        # Define slice indices: anchor-5, anchor, anchor+5
+        indices = [anchor - STRIDE, anchor, anchor + STRIDE]
+
+        # Modalities
+        modalities = ["path_FLAIR", "path_T1w", "path_T1wCE", "path_T2w"]
+
+        channels = []
+
+        for mod_col in modalities:
+            dir_path = os.path.join(INPUT_DIR, row[mod_col])
+            files = get_sorted_files(dir_path)
+            num_files = len(files)
+
+            for slice_idx in indices:
+                # Handle out of bounds / missing files
+                # If slice counts differ between modalities, we map the index proportionally?
+                # Or we just clamp. Clamping is safer.
+                # If the anchor was derived from T1wCE (e.g. idx 100) and FLAIR has 20 slices, 100 is invalid.
+                # We need a robust way to map index.
+                # Simple robust strategy: Clamp to [0, num_files-1]
+
+                if num_files == 0:
+                    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+                else:
+                    # Clamp
+                    read_idx = max(0, min(slice_idx, num_files - 1))
+                    file_path = os.path.join(dir_path, files[read_idx])
+
+                    # Load
+                    img = load_image_robust(file_path)
+
+                    # Resize
+                    img = cv2.resize(
+                        img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
+                    )
+
+                    # Normalize (Min-Max)
+                    mi, ma = np.min(img), np.max(img)
+                    if ma > mi:
+                        img = (img - mi) / (ma - mi)
+                    else:
+                        img = np.zeros_like(img)
+
+                channels.append(img)
+
+        # Stack: (12, 224, 224) -> but Albumentations needs (H, W, C)
+        # channels is list of 12 (224, 224) arrays
+        img_stack = np.stack(channels, axis=-1)  # (224, 224, 12)
+=======
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get anchor (derived from FLAIR)
+        anchor = self.anchor_dict.get(subject_id, 0)
+
+        # Define slice indices: anchor-5, anchor, anchor+5
+        # Cite solution_lesson_node_00037 (Fixed Stride)
+        indices = [anchor - STRIDE, anchor, anchor + STRIDE]
+
+        # Modalities
+        modalities = ["path_FLAIR", "path_T1w", "path_T1wCE", "path_T2w"]
+
+        channels = []
+
+        for mod_col in modalities:
+            dir_path = os.path.join(INPUT_DIR, row[mod_col])
+            files = get_sorted_files(dir_path)
+            num_files = len(files)
+
+            for slice_idx in indices:
+                # Absolute Indexing with Clamping
+                # Cite solution_lesson_node_00024 (Absolute Indexing)
+                # Cite solution_lesson_node_00038 (Clamp/Repeat vs Zero-Pad)
+                
+                if num_files == 0:
+                    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+                else:
+                    # Clamp index to valid range for this modality
+                    read_idx = max(0, min(slice_idx, num_files - 1))
+                    file_path = os.path.join(dir_path, files[read_idx])
+
+                    # Load
+                    img = load_image_robust(file_path)
+
+                    # Resize (Area Interpolation)
+                    # Cite solution_lesson_node_00031
+                    img = cv2.resize(
+                        img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA
+                    )
+
+                    # Normalize (Min-Max)
+                    # Cite solution_lesson_node_00041
+                    mi, ma = np.min(img), np.max(img)
+                    if ma > mi:
+                        img = (img - mi) / (ma - mi)
+                    else:
+                        img = np.zeros_like(img)
+
+                channels.append(img)
+
+        # Stack: (12, 224, 224) -> but Albumentations needs (H, W, C)
+        img_stack = np.stack(channels, axis=-1)  # (224, 224, 12)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+=======
+    # Cite solution_lesson_node_00040 (Low LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,250 @@
+To optimize performance within the 4-hour time limit, I will implement the strategy outlined in **Lesson `solution_lesson_node_00019`**, which emphasizes prioritizing data coverage over model complexity. The previous solution failed because it used a heavy architecture (`EfficientNet-B3` + `Coordinate Injection`) that forced training on a small 25% subset of data, leading to severe underfitting (mAP 0.021).
+
+My changes will:
+1.  **Revert to a Lightweight Backbone**: Switch from `efficientnet_b3` to `efficientnet_b0` in `library/config.py` and `library/model.py`. This reduces computational cost significantly (Cite `solution_lesson_node_00019`).
+2.  **Remove Coordinate Injection**: Delete the `CoordinateInjector` in `library/model.py` to further reduce parameter count and memory usage, as the complexity trade-off was not worth the data reduction.
+3.  **Train on Full Dataset**: Modify `runfile.py` to remove the subsampling logic and train on the complete training set (~10k images) instead of 2,500 images.
+4.  **Optimize Hyperparameters**:
+    *   Increase `BATCH_SIZE` from 8 to 32 in `library/config.py` (feasible with the lighter B0 backbone on A100).
+    *   Reduce `IMG_SIZE` from 640 to 512 to accelerate training throughput.
+    *   Ensure training runs for the full 20 epochs defined in `Config` (modifying `runfile.py`), utilizing the `CosineAnnealingLR` scheduler effectively (Cite `solution_lesson_node_00011`).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Data Configuration
+    # =========================================================================
+    IMG_SIZE = 640  # Resolution for EfficientNet-B3
+    NUM_CLASSES = 14  # 0-13 are findings
+    NO_FINDING_CLASS_ID = 14
+=======
+    # =========================================================================
+    # Data Configuration
+    # =========================================================================
+    IMG_SIZE = 512  # Resolution for EfficientNet-B0
+    NUM_CLASSES = 14  # 0-13 are findings
+    NO_FINDING_CLASS_ID = 14
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # =========================================================================
+    # Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 8  # Reduced from 16 to fit in 16GB VRAM
+    EPOCHS = 20  # Extended schedule for convergence
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-4
+    NUM_WORKERS = 8  # Efficient data loading
+
+    # Model Architecture Settings
+    BACKBONE = "efficientnet_b3"
+=======
+    # =========================================================================
+    # Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32  # Increased for EfficientNet-B0 on A100
+    EPOCHS = 20  # Extended schedule for convergence
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-4
+    NUM_WORKERS = 8  # Efficient data loading
+
+    # Model Architecture Settings
+    BACKBONE = "efficientnet_b0"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CoordinateInjector(nn.Module):
+    """
+    Appends normalized x, y coordinates (meshgrid) to the feature map.
+    This allows the subsequent convolution layers (CoordinateConv) to learn spatial priors.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Create y coordinates: range [-1, 1] varying along height
+        y_coords = (
+            torch.linspace(-1, 1, H, device=x.device)
+            .view(1, 1, H, 1)
+            .repeat(B, 1, 1, W)
+        )
+
+        # Create x coordinates: range [-1, 1] varying along width
+        x_coords = (
+            torch.linspace(-1, 1, W, device=x.device)
+            .view(1, 1, 1, W)
+            .repeat(B, 1, H, 1)
+        )
+
+        # Concatenate along channel dimension
+        return torch.cat([x, x_coords, y_coords], dim=1)
+
+
+class SpatiallyAwareCenterNet(nn.Module):
+    def __init__(self, num_classes=Config.NUM_CLASSES):
+        super().__init__()
+
+        # 1. Backbone: EfficientNet-B3
+        # We extract features at strides 4, 8, 16, 32
+        # Indices: 1 (C2), 2 (C3), 3 (C4), 4 (C5)
+        self.backbone = timm.create_model(
+            "efficientnet_b3",
+            pretrained=True,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+        feature_channels = (
+            self.backbone.feature_info.channels()
+        )  # e.g., [32, 48, 136, 384]
+
+        # 2. Neck: Stacked BiFPN
+        self.fpn_channels = 128
+=======
+class SpatiallyAwareCenterNet(nn.Module):
+    def __init__(self, num_classes=Config.NUM_CLASSES):
+        super().__init__()
+
+        # 1. Backbone: EfficientNet-B0
+        # We extract features at strides 4, 8, 16, 32
+        # Indices: 1 (C2), 2 (C3), 3 (C4), 4 (C5)
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+        feature_channels = (
+            self.backbone.feature_info.channels()
+        )
+
+        # 2. Neck: Stacked BiFPN
+        self.fpn_channels = 128
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # 4. Coordinate Injection
+        self.coord_injector = CoordinateInjector()
+        # Input channels to heads = FPN channels + 2 (x, y)
+        head_in_channels = self.fpn_channels + 2
+
+        # 5. Heads
+        # Heatmap Head (Classification)
+        self.hm_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_classes, 1),
+        )
+
+        # Size Head (Width, Height)
+        self.wh_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, 1),
+        )
+
+        # Offset Head (Refinement)
+        self.reg_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, 1),
+        )
+=======
+        # 4. Heads
+        # Input channels to heads = FPN channels
+        head_in_channels = self.fpn_channels
+
+        # Heatmap Head (Classification)
+        self.hm_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_classes, 1),
+        )
+
+        # Size Head (Width, Height)
+        self.wh_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, 1),
+        )
+
+        # Offset Head (Refinement)
+        self.reg_head = nn.Sequential(
+            nn.Conv2d(head_in_channels, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, 1),
+        )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # 5. Coordinate Injection
+        fused_map_coords = self.coord_injector(fused_map)
+
+        # 6. Heads
+        hm = self.hm_head(fused_map_coords)
+        wh = self.wh_head(fused_map_coords)
+        reg = self.reg_head(fused_map_coords)
+=======
+        # 5. Heads
+        hm = self.hm_head(fused_map)
+        wh = self.wh_head(fused_map)
+        reg = self.reg_head(fused_map)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Data Preparation (Subsampling for Fast Baseline)
+    # To ensure the script completes within the time limit, we train on a subset.
+    full_train_df = pd.read_csv(Config.TRAIN_META_PATH)
+
+    # Sample ~2500 images (approx 25% of training data)
+    unique_img_ids = full_train_df["image_id"].unique()
+    sample_size = min(2500, len(unique_img_ids))
+
+    # Random sampling of image IDs
+    sampled_img_ids = np.random.choice(unique_img_ids, size=sample_size, replace=False)
+    train_subset_df = full_train_df[
+        full_train_df["image_id"].isin(sampled_img_ids)
+    ].copy()
+
+    # Save temporary subset metadata
+    subset_train_path = os.path.join(Config.WORK_DIR, "train_meta_subset.csv")
+    train_subset_df.to_csv(subset_train_path, index=False)
+    print(f"Training on subset of {len(sampled_img_ids)} images.")
+
+    # Create DataLoaders
+    # We use the FULL validation set to ensure the metric is comparable and valid
+    dataloaders = get_dataloaders(
+        train_meta=subset_train_path,
+        val_meta=Config.VAL_META_PATH,
+        test_meta=Config.TEST_META_PATH,
+    )
+=======
+    # 2. Data Preparation
+    # Training on the full dataset as per Lesson solution_lesson_node_00019
+    print("Training on full dataset...")
+
+    # Create DataLoaders
+    dataloaders = get_dataloaders(
+        train_meta=Config.TRAIN_META_PATH,
+        val_meta=Config.VAL_META_PATH,
+        test_meta=Config.TEST_META_PATH,
+    )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Training
+    # We limit to 5 epochs for the fast baseline check
+    n_epochs = 5
+    train_model(model, dataloaders, device, epochs=n_epochs)
+=======
+    # 4. Training
+    train_model(model, dataloaders, device, epochs=Config.EPOCHS)
+>>>>>>> REPLACE
+```

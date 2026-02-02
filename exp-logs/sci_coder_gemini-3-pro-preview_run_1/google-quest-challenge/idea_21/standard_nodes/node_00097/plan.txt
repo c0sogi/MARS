@@ -1,0 +1,407 @@
+I will optimize the solution by transitioning from a **Shared-Bottom RoBERTa** architecture to a fully independent **Dual-Encoder RoBERTa** architecture. This leverages **Lesson 00076** (Decouple encoders when targets are partitioned) and **Lesson 00077** (Capacity Scaling), which showed that independent `roberta-base` encoders outperformed shared or distilled variants. I will maintain the **Phantom Scheduling** (Cite 00078) and **Differential Learning Rates** (Cite 00053) strategies that proved effective. Additionally, I will update the head initialization to a **Normal distribution** to better align with the pre-trained backbone (Cite 00051).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_21"
+    SUBMISSION_DIR = "./submission"
+
+    # Metadata Paths (Generated in previous steps)
+=======
+    WORKING_DIR = "./working/idea_22"
+    SUBMISSION_DIR = "./submission"
+
+    # Metadata Paths (Generated in previous steps)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Shared-Bottom Split-Top Structure
+    # roberta-base has 12 layers (0-11).
+    # Layers 0-9 (10 layers) are shared.
+    # Layers 10-11 (2 layers) are split into independent branches.
+    SHARED_LAYERS = 10
+    SPLIT_LAYERS = 2
+
+    # ==========================================
+=======
+    # ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SharedBottomRoBERTa(nn.Module):
+    """
+    Shared-Bottom RoBERTa Dual-Encoder with Multi-Level Interaction Fusion.
+
+    Architecture:
+    - Backbone: roberta-base
+    - Shared Bottom: Layers 0-9 (10 layers)
+    - Split Top: Layers 10-11 (2 layers, independent for Q and A)
+    - Fusion:
+        - Layer 9 (Shared) Interactions (Avg Pool) -> Guaranteed Alignment
+        - Layer 11 (Split) Interactions (Avg Pool) -> Specialized High-Level
+        - Layer 11 (Split) Intrinsic Features (Max Pool) -> Salient Signals
+    - Head: Residual Projection
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+
+        # Load backbone
+        base_model = AutoModel.from_pretrained(config.BACKBONE)
+        self.embeddings = base_model.embeddings
+
+        # Extract encoder layers
+        # roberta-base has 12 layers
+        all_layers = base_model.encoder.layer
+
+        # Shared Layers (0 to 9)
+        self.shared_encoder = nn.ModuleList(
+            [all_layers[i] for i in range(config.SHARED_LAYERS)]
+        )
+
+        # Split Layers (10 to 11)
+        # We create independent copies for Q and A branches initialized from pretrained weights
+        split_source = [
+            all_layers[i]
+            for i in range(
+                config.SHARED_LAYERS, config.SHARED_LAYERS + config.SPLIT_LAYERS
+            )
+        ]
+        self.q_encoder = nn.ModuleList(copy.deepcopy(split_source))
+        self.a_encoder = nn.ModuleList(copy.deepcopy(split_source))
+
+        # Calculate Fusion Dimension
+        # 1. Split Output (Layer 11) Avg Pool: u_split, v_split -> 768 * 2
+        # 2. Split Output (Layer 11) Max Pool: u_max, v_max -> 768 * 2
+        # 3. Shared Output (Layer 9) Interactions: u_shared * v_shared, |u_shared - v_shared| -> 768 * 2
+        # 4. Split Output (Layer 11) Interactions: u_split * v_split, |u_split - v_split| -> 768 * 2
+        # Total = 8 * 768 = 6144
+        self.fusion_dim = config.HIDDEN_SIZE * 8
+
+        self.fusion_norm = nn.LayerNorm(self.fusion_dim)
+
+        self.head = ResidualProjectionHead(
+            input_dim=self.fusion_dim,
+            hidden_dim=config.HIDDEN_SIZE,
+            output_dim=config.NUM_TARGETS,
+        )
+
+        self._init_head_weights()
+
+    def _init_head_weights(self):
+        # Initialize head specific layers
+        for m in self.head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def get_extended_attention_mask(self, attention_mask, dtype):
+        """
+        Expands attention mask from [batch, seq] to [batch, 1, 1, seq]
+        and converts to additive mask (0.0 for keep, -10000.0 for mask).
+        """
+        if attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask[:, None, None, :]
+        else:
+            extended_attention_mask = attention_mask
+
+        extended_attention_mask = extended_attention_mask.to(dtype=dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return extended_attention_mask
+
+    def masked_avg_pool(self, hidden_states, mask):
+        mask_expanded = mask.unsqueeze(-1).expand(hidden_states.size()).float()
+        sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
+        sum_mask = mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        return sum_embeddings / sum_mask
+
+    def masked_max_pool(self, hidden_states, mask):
+        mask_expanded = mask.unsqueeze(-1).expand(hidden_states.size()).bool()
+        # Clone to avoid modifying original tensor in place
+        out = hidden_states.clone()
+        out[~mask_expanded] = -1e9
+        return torch.max(out, 1)[0]
+
+    def forward(self, input_ids_q, attention_mask_q, input_ids_a, attention_mask_a):
+        # Prepare masks
+        dtype = self.embeddings.word_embeddings.weight.dtype
+        ext_mask_q = self.get_extended_attention_mask(attention_mask_q, dtype)
+        ext_mask_a = self.get_extended_attention_mask(attention_mask_a, dtype)
+
+        # Embeddings
+        emb_q = self.embeddings(input_ids=input_ids_q)
+        emb_a = self.embeddings(input_ids=input_ids_a)
+
+        # Shared Bottom Pass (Layers 0-9)
+        hidden_q = emb_q
+        hidden_a = emb_a
+
+        for layer in self.shared_encoder:
+            hidden_q = layer(hidden_q, ext_mask_q)[0]
+            hidden_a = layer(hidden_a, ext_mask_a)[0]
+
+        # Capture Layer 9 Outputs (Shared)
+        shared_out_q = hidden_q
+        shared_out_a = hidden_a
+
+        # Split Top Pass (Layers 10-11)
+        # Q Branch
+        for layer in self.q_encoder:
+            hidden_q = layer(hidden_q, ext_mask_q)[0]
+
+        # A Branch
+        for layer in self.a_encoder:
+            hidden_a = layer(hidden_a, ext_mask_a)[0]
+
+        # Capture Layer 11 Outputs (Split)
+        split_out_q = hidden_q
+        split_out_a = hidden_a
+
+        # Pooling
+        # Shared Interactions (Layer 9) - Avg Pool
+        u_shared = self.masked_avg_pool(shared_out_q, attention_mask_q)
+        v_shared = self.masked_avg_pool(shared_out_a, attention_mask_a)
+
+        # Split Features (Layer 11) - Avg Pool
+        u_split = self.masked_avg_pool(split_out_q, attention_mask_q)
+        v_split = self.masked_avg_pool(split_out_a, attention_mask_a)
+
+        # Split Features (Layer 11) - Max Pool
+        u_max = self.masked_max_pool(split_out_q, attention_mask_q)
+        v_max = self.masked_max_pool(split_out_a, attention_mask_a)
+
+        # Compute Interactions
+        # Level 1: Shared (Guaranteed Alignment)
+        i_shared_prod = u_shared * v_shared
+        i_shared_diff = torch.abs(u_shared - v_shared)
+
+        # Level 2: Split (Specialized)
+        i_split_prod = u_split * v_split
+        i_split_diff = torch.abs(u_split - v_split)
+
+        # Fusion
+        # F = [u_split, v_split, u_max, v_max, I_shared, I_split]
+        features = torch.cat(
+            [
+                u_split,
+                v_split,
+                u_max,
+                v_max,
+                i_shared_prod,
+                i_shared_diff,
+                i_split_prod,
+                i_split_diff,
+            ],
+            dim=1,
+        )
+
+        features = self.fusion_norm(features)
+
+        # Prediction
+        logits = self.head(features)
+
+        return logits
+=======
+class DualRoBERTa(nn.Module):
+    """
+    Independent Dual-Encoder RoBERTa.
+    Uses two separate RoBERTa backbones for Question and Answer streams.
+    Implements Lesson 00076 (Decouple Encoders) and Lesson 00077 (Capacity Scaling).
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+
+        # Independent Backbones (Cite 00076)
+        self.q_backbone = AutoModel.from_pretrained(config.BACKBONE)
+        self.a_backbone = AutoModel.from_pretrained(config.BACKBONE)
+
+        # Fusion Dimension:
+        # u_avg, v_avg, u_max, v_max, u*v, |u-v|
+        # 6 * 768 = 4608
+        self.fusion_dim = config.HIDDEN_SIZE * 6
+
+        self.fusion_norm = nn.LayerNorm(self.fusion_dim)
+
+        self.head = ResidualProjectionHead(
+            input_dim=self.fusion_dim,
+            hidden_dim=config.HIDDEN_SIZE,
+            output_dim=config.NUM_TARGETS,
+        )
+
+        self._init_head_weights()
+
+    def _init_head_weights(self):
+        # Initialize head specific layers
+        # Use Normal initialization to match backbone (Cite 00051)
+        for m in self.head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def masked_avg_pool(self, hidden_states, mask):
+        mask_expanded = mask.unsqueeze(-1).expand(hidden_states.size()).float()
+        sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
+        sum_mask = mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        return sum_embeddings / sum_mask
+
+    def masked_max_pool(self, hidden_states, mask):
+        mask_expanded = mask.unsqueeze(-1).expand(hidden_states.size()).bool()
+        out = hidden_states.clone()
+        out[~mask_expanded] = -1e9
+        return torch.max(out, 1)[0]
+
+    def forward(self, input_ids_q, attention_mask_q, input_ids_a, attention_mask_a):
+        # Independent Forward Passes
+        out_q = self.q_backbone(input_ids=input_ids_q, attention_mask=attention_mask_q)
+        out_a = self.a_backbone(input_ids=input_ids_a, attention_mask=attention_mask_a)
+
+        # Last Hidden States
+        last_hidden_q = out_q.last_hidden_state
+        last_hidden_a = out_a.last_hidden_state
+
+        # Pooling
+        u_avg = self.masked_avg_pool(last_hidden_q, attention_mask_q)
+        v_avg = self.masked_avg_pool(last_hidden_a, attention_mask_a)
+        u_max = self.masked_max_pool(last_hidden_q, attention_mask_q)
+        v_max = self.masked_max_pool(last_hidden_a, attention_mask_a)
+
+        # Interactions (Cite 00057: Simple interactions preferred)
+        i_prod = u_avg * v_avg
+        i_diff = torch.abs(u_avg - v_avg)
+
+        # Fusion
+        features = torch.cat(
+            [u_avg, v_avg, u_max, v_max, i_prod, i_diff],
+            dim=1,
+        )
+
+        features = self.fusion_norm(features)
+        logits = self.head(features)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import SharedBottomRoBERTa
+
+
+def train_one_epoch(
+    model, loader, optimizer, scheduler, criterion, device, epoch, config
+):
+    """
+    Handles the training of one epoch.
+    Manages backbone freezing/unfreezing based on the epoch.
+    """
+    model.train()
+
+    # Head Warmup Strategy: Freeze backbone if needed
+    freeze_backbone = epoch < config.FREEZE_BACKBONE_EPOCHS
+
+    # We toggle requires_grad for backbone components
+    # Backbone includes: embeddings, shared_encoder, q_encoder, a_encoder
+    backbone_modules = [
+        model.embeddings,
+        model.shared_encoder,
+        model.q_encoder,
+        model.a_encoder,
+    ]
+
+    for module in backbone_modules:
+        for param in module.parameters():
+            param.requires_grad = not freeze_backbone
+
+    # The head should always be trainable
+=======
+from library.model import DualRoBERTa
+
+
+def train_one_epoch(
+    model, loader, optimizer, scheduler, criterion, device, epoch, config
+):
+    """
+    Handles the training of one epoch.
+    Manages backbone freezing/unfreezing based on the epoch.
+    """
+    model.train()
+
+    # Head Warmup Strategy: Freeze backbone if needed (Cite 00050)
+    freeze_backbone = epoch < config.FREEZE_BACKBONE_EPOCHS
+
+    # We toggle requires_grad for backbone components
+    backbone_modules = [model.q_backbone, model.a_backbone]
+
+    for module in backbone_modules:
+        for param in module.parameters():
+            param.requires_grad = not freeze_backbone
+
+    # The head should always be trainable
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 2. Model Initialization
+    model = SharedBottomRoBERTa(config)
+    model.to(config.device)
+
+    # 3. Optimizer Setup (Differential Learning Rates)
+    # Group parameters
+    backbone_params = (
+        list(model.embeddings.parameters())
+        + list(model.shared_encoder.parameters())
+        + list(model.q_encoder.parameters())
+        + list(model.a_encoder.parameters())
+    )
+
+    head_params = list(model.head.parameters()) + list(model.fusion_norm.parameters())
+=======
+    # 2. Model Initialization
+    model = DualRoBERTa(config)
+    model.to(config.device)
+
+    # 3. Optimizer Setup (Differential Learning Rates)
+    # Group parameters
+    backbone_params = list(model.q_backbone.parameters()) + list(
+        model.a_backbone.parameters()
+    )
+
+    head_params = list(model.head.parameters()) + list(model.fusion_norm.parameters())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SharedBottomRoBERTa
+from library.engine import run_training
+from library.dataset import get_dataloaders, load_data
+from library.utils import seed_everything, compute_spearmanr
+=======
+from library.model import DualRoBERTa
+from library.engine import run_training
+from library.dataset import get_dataloaders, load_data
+from library.utils import seed_everything, compute_spearmanr
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Load Best Model for Final Evaluation
+    print("\n--- Loading Best Model ---")
+    model = SharedBottomRoBERTa(config)
+    if not os.path.exists(config.MODEL_SAVE_PATH):
+        raise FileNotFoundError(f"Model file not found at {config.MODEL_SAVE_PATH}")
+=======
+    # 3. Load Best Model for Final Evaluation
+    print("\n--- Loading Best Model ---")
+    model = DualRoBERTa(config)
+    if not os.path.exists(config.MODEL_SAVE_PATH):
+        raise FileNotFoundError(f"Model file not found at {config.MODEL_SAVE_PATH}")
+>>>>>>> REPLACE
+```

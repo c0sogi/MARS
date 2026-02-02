@@ -1,0 +1,434 @@
+I will optimize the solution by transitioning from custom "scratch" architectures to adapted pre-trained ImageNet models, leveraging transfer learning while preserving spatial resolution for the 32x32 inputs.
+
+**Optimization Strategy:**
+1.  **Adopt Pre-trained Models with Stem Adaptation (Cite solution_lesson_node_00026, solution_lesson_node_00008, solution_lesson_node_00023):** I will replace the custom `WideSEResNet` and `DenseNetBC` with `resnet34` and `densenet121` from the `timm` library, initialized with pre-trained weights. To handle the 32x32 input size without destroying spatial information, I will replace the initial "stem" (aggressive downsampling layers) with a single 3x3 stride-1 convolution, randomly initialized as per Lesson 23. I will also include `efficientnet_b0` with the same adaptation.
+2.  **Extend Training Horizon (Cite solution_lesson_node_00016):** I will increase the training duration from the baseline's 10 epochs to 30 epochs. This ensures that the models, particularly the pre-trained ones with modified stems, have sufficient iterations to converge and refine their decision boundaries.
+3.  **Refine Learning Rate:** I will lower the learning rate to `5e-4` (from `1e-3`) to prevent destabilizing the pre-trained weights during the initial adaptation phase.
+4.  **Remove Baseline Constraints:** I will remove the hardcoded `Config.EPOCHS = 10` override in `runfile.py` to allow the full training schedule.
+
+```diff
+library/architectures.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import timm
+
+# ------------------------------------------------------------------------------
+# 1. Custom Wide SE-ResNet
+# ------------------------------------------------------------------------------
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class WideBasicBlock(nn.Module):
+    def __init__(self, in_planes, planes, dropout_rate, stride=1):
+        super(WideBasicBlock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, padding=1, bias=False)
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.se = SEBlock(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+            )
+
+    def forward(self, x):
+        out = self.dropout(self.conv1(F.relu(self.bn1(x))))
+        out = self.conv2(F.relu(self.bn2(out)))
+        out = self.se(out)
+        out += self.shortcut(x)
+        return out
+
+
+class WideSEResNet(nn.Module):
+    def __init__(self, depth=16, widen_factor=4, dropout_rate=0.3, num_classes=1):
+        super(WideSEResNet, self).__init__()
+        self.in_planes = 16
+
+        assert (depth - 4) % 6 == 0, "WideResNet depth should be 6n+4"
+        n = (depth - 4) // 6
+        k = widen_factor
+
+        nStages = [16, 16 * k, 32 * k, 64 * k]
+
+        self.conv1 = nn.Conv2d(
+            3, nStages[0], kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.layer1 = self._wide_layer(
+            WideBasicBlock, nStages[1], n, dropout_rate, stride=1
+        )
+        self.layer2 = self._wide_layer(
+            WideBasicBlock, nStages[2], n, dropout_rate, stride=2
+        )
+        self.layer3 = self._wide_layer(
+            WideBasicBlock, nStages[3], n, dropout_rate, stride=2
+        )
+        self.bn1 = nn.BatchNorm2d(nStages[3])
+        self.linear = nn.Linear(nStages[3], num_classes)
+
+        # Weight initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, dropout_rate, stride))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.relu(self.bn1(out))
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+# ------------------------------------------------------------------------------
+# 2. Custom DenseNet-BC (CIFAR Scale)
+# ------------------------------------------------------------------------------
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, in_planes, growth_rate):
+        super(Bottleneck, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, 4 * growth_rate, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
+        self.conv2 = nn.Conv2d(
+            4 * growth_rate, growth_rate, kernel_size=3, padding=1, bias=False
+        )
+
+    def forward(self, x):
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        out = torch.cat([out, x], 1)
+        return out
+
+
+class Transition(nn.Module):
+    def __init__(self, in_planes, out_planes):
+        super(Transition, self).__init__()
+        self.bn = nn.BatchNorm2d(in_planes)
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        out = self.conv(F.relu(self.bn(x)))
+        out = F.avg_pool2d(out, 2)
+        return out
+
+
+class DenseNetBC(nn.Module):
+    def __init__(self, depth=40, growth_rate=12, reduction=0.5, num_classes=1):
+        super(DenseNetBC, self).__init__()
+        n_blocks = (depth - 4) // 6
+
+        num_planes = 2 * growth_rate
+        self.conv1 = nn.Conv2d(3, num_planes, kernel_size=3, padding=1, bias=False)
+
+        self.dense1 = self._make_dense_layers(
+            Bottleneck, num_planes, n_blocks, growth_rate
+        )
+        num_planes += n_blocks * growth_rate
+        out_planes = int(math.floor(num_planes * reduction))
+        self.trans1 = Transition(num_planes, out_planes)
+        num_planes = out_planes
+
+        self.dense2 = self._make_dense_layers(
+            Bottleneck, num_planes, n_blocks, growth_rate
+        )
+        num_planes += n_blocks * growth_rate
+        out_planes = int(math.floor(num_planes * reduction))
+        self.trans2 = Transition(num_planes, out_planes)
+        num_planes = out_planes
+
+        self.dense3 = self._make_dense_layers(
+            Bottleneck, num_planes, n_blocks, growth_rate
+        )
+        num_planes += n_blocks * growth_rate
+
+        self.bn = nn.BatchNorm2d(num_planes)
+        self.linear = nn.Linear(num_planes, num_classes)
+
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias, 0)
+
+    def _make_dense_layers(self, block, in_planes, n_block, growth_rate):
+        layers = []
+        for i in range(n_block):
+            layers.append(block(in_planes, growth_rate))
+            in_planes += growth_rate
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.trans1(self.dense1(out))
+        out = self.trans2(self.dense2(out))
+        out = self.dense3(out)
+        out = F.relu(self.bn(out))
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+# ------------------------------------------------------------------------------
+# 3. Modified EfficientNet-B0
+# ------------------------------------------------------------------------------
+
+
+class ModifiedEfficientNet(nn.Module):
+    def __init__(self, num_classes=1, pretrained=True):
+        super(ModifiedEfficientNet, self).__init__()
+        # Load standard EfficientNet-B0
+        # We load with num_classes=0 to get the feature extractor, but timm handles
+        # classifier replacement nicely if we just specify num_classes.
+        # However, to modify the stem cleanly, we load the full model.
+        self.model = timm.create_model(
+            "efficientnet_b0", pretrained=pretrained, num_classes=num_classes
+        )
+
+        # Modify the stem (first convolution)
+        # Original: Conv2d(3, 32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        # Modified: Stride=1 to preserve 32x32 resolution
+        original_stem = self.model.conv_stem
+        self.model.conv_stem = nn.Conv2d(
+            in_channels=original_stem.in_channels,
+            out_channels=original_stem.out_channels,
+            kernel_size=original_stem.kernel_size,
+            stride=1,  # Change stride to 1
+            padding=original_stem.padding,
+            bias=original_stem.bias is not None,
+        )
+
+        # Initialize the new stem
+        nn.init.kaiming_normal_(
+            self.model.conv_stem.weight, mode="fan_out", nonlinearity="relu"
+        )
+        if self.model.conv_stem.bias is not None:
+            nn.init.constant_(self.model.conv_stem.bias, 0)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# ------------------------------------------------------------------------------
+# Factory Function
+# ------------------------------------------------------------------------------
+
+
+def get_model(model_name, num_classes=1, pretrained=False):
+    """
+    Factory function to instantiate models based on the configuration name.
+
+    Args:
+        model_name (str): The name of the model architecture.
+        num_classes (int): Number of output classes.
+        pretrained (bool): Whether to use pretrained weights (where applicable).
+                           Note: ModifiedEfficientNet will always re-init the stem.
+
+    Returns:
+        nn.Module: The requested model instance.
+    """
+    if model_name == "custom_wide_se_resnet":
+        # WideResNet-16-4 with SE
+        return WideSEResNet(
+            depth=16, widen_factor=4, dropout_rate=0.3, num_classes=num_classes
+        )
+
+    elif model_name == "custom_densenet_bc":
+        # DenseNet-BC-40-12
+        return DenseNetBC(
+            depth=40, growth_rate=12, reduction=0.5, num_classes=num_classes
+        )
+
+    elif model_name == "modified_efficientnet_b0":
+        # EfficientNet-B0 with stride-1 stem
+        return ModifiedEfficientNet(num_classes=num_classes, pretrained=pretrained)
+
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+=======
+import torch
+import torch.nn as nn
+import timm
+
+
+class AdaptedTimmModel(nn.Module):
+    """
+    Wrapper for timm models to adapt them for 32x32 input images.
+    It replaces the initial downsampling stem with a stride-1 convolution
+    and removes early pooling layers to preserve spatial resolution.
+    """
+
+    def __init__(self, model_name, num_classes=1, pretrained=True):
+        super(AdaptedTimmModel, self).__init__()
+        self.model = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=num_classes
+        )
+
+        # Adapt stem based on architecture type
+        if "resnet" in model_name:
+            # ResNet: conv1 (7x7 s2) -> bn1 -> act -> maxpool (3x3 s2)
+            # We replace conv1 with 3x3 s1 and remove maxpool
+            # This changes total downsampling from 4x to 1x at the stem
+            
+            # Check if conv1 exists (standard ResNet)
+            if hasattr(self.model, "conv1"):
+                in_c = self.model.conv1.in_channels
+                out_c = self.model.conv1.out_channels
+                self.model.conv1 = nn.Conv2d(
+                    in_c, out_c, kernel_size=3, stride=1, padding=1, bias=False
+                )
+                # Random initialization for the new layer (Cite Lesson 23)
+                nn.init.kaiming_normal_(
+                    self.model.conv1.weight, mode="fan_out", nonlinearity="relu"
+                )
+            
+            # Remove maxpool
+            if hasattr(self.model, "maxpool"):
+                self.model.maxpool = nn.Identity()
+
+        elif "densenet" in model_name:
+            # DenseNet: features.conv0 (7x7 s2) -> norm0 -> relu0 -> pool0 (3x3 s2)
+            # Replace conv0 with 3x3 s1, remove pool0
+            if hasattr(self.model.features, "conv0"):
+                in_c = self.model.features.conv0.in_channels
+                out_c = self.model.features.conv0.out_channels
+                self.model.features.conv0 = nn.Conv2d(
+                    in_c, out_c, kernel_size=3, stride=1, padding=1, bias=False
+                )
+                nn.init.kaiming_normal_(
+                    self.model.features.conv0.weight, mode="fan_out", nonlinearity="relu"
+                )
+            
+            if hasattr(self.model.features, "pool0"):
+                self.model.features.pool0 = nn.Identity()
+
+        elif "efficientnet" in model_name:
+            # EfficientNet: conv_stem (3x3 s2)
+            # Replace with 3x3 s1
+            if hasattr(self.model, "conv_stem"):
+                in_c = self.model.conv_stem.in_channels
+                out_c = self.model.conv_stem.out_channels
+                self.model.conv_stem = nn.Conv2d(
+                    in_c, out_c, kernel_size=3, stride=1, padding=1, bias=False
+                )
+                nn.init.kaiming_normal_(
+                    self.model.conv_stem.weight, mode="fan_out", nonlinearity="relu"
+                )
+                # EfficientNet typically does not have an explicit maxpool in the stem
+
+    def forward(self, x):
+        return self.model(x)
+
+
+def get_model(model_name, num_classes=1, pretrained=True):
+    """
+    Factory function to instantiate adapted timm models.
+    """
+    return AdaptedTimmModel(model_name, num_classes=num_classes, pretrained=pretrained)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Model Architectures (The Lightweight Triad)
+    # --------------------------------------------------------------------------
+    MODELS = [
+        "custom_wide_se_resnet",  # Shallow, wide ResNet with SE blocks
+        "custom_densenet_bc",  # Compact DenseNet
+        "modified_efficientnet_b0",  # EfficientNet with stride-1 stem
+    ]
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    EPOCHS = 50
+    BATCH_SIZE = 128
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2  # AdamW typically requires higher weight decay than SGD
+=======
+    # --------------------------------------------------------------------------
+    # Model Architectures (Pretrained & Adapted)
+    # --------------------------------------------------------------------------
+    MODELS = [
+        "resnet34",         # Pretrained ResNet34
+        "densenet121",      # Pretrained DenseNet121
+        "efficientnet_b0",  # Pretrained EfficientNet-B0
+    ]
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    EPOCHS = 30  # Extended horizon for convergence (Cite Lesson 16)
+    BATCH_SIZE = 128
+
+    # Optimization
+    LEARNING_RATE = 5e-4  # Lower LR for fine-tuning pretrained models
+    WEIGHT_DECAY = 1e-2
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline execution
+    Config.EPOCHS = 10  # Reduce epochs for speed
+    print(f"Running on device: {device}")
+    print(f"Fast Baseline Mode: Epochs set to {Config.EPOCHS}")
+=======
+    # Override Config for Fast Baseline execution
+    # Config.EPOCHS = 10  # Removed to allow full training (Cite Lesson 16)
+    print(f"Running on device: {device}")
+>>>>>>> REPLACE
+```

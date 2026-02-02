@@ -1,0 +1,1167 @@
+I will optimize the solution by reverting the detrimental Multi-Task Learning (Masked Language Modeling) components introduced in the previous iteration, as advised by **Cite solution_lesson_node_00020**. Instead, I will implement the high-performing "Distance-Aware Residual BiGRU" architecture described in **Cite solution_lesson_node_00016** and **Cite solution_lesson_node_00017**, which utilizes explicit geometric distance encoding and a Pre-LayerNorm backbone. I will also scale up the model capacity (Hidden Dim 384, Embedding Dim 192) and batch size (64) to match the successful configuration from **Cite solution_lesson_node_00017**.
+
+The changes involve:
+1.  **`library/config.py`**: Removing MLM-related configs, increasing model dimensions, and updating the batch size.
+2.  **`library/dataset.py`**: Removing the dynamic masking logic and the paired-base identity feature extraction.
+3.  **`library/model.py`**: Removing the reconstruction head and paired-base feature logic, focusing on a clean Residual BiGRU with distance embeddings.
+4.  **`library/loss.py`**: Replacing the joint loss with a standard MSE loss focused on scored columns.
+5.  **`library/train.py`** & **`runfile.py`**: Updating the training loop and configuration to reflect these architectural changes.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Vocabularies
+    # Sequence: A:0, G:1, C:2, U:3, MASK:4, PAD:5
+    TOKEN2ID = {"A": 0, "G": 1, "C": 2, "U": 3}
+    MASK_TOKEN_ID = 4
+    PAD_TOKEN_ID = 5
+    VOCAB_SIZE = 6
+
+    # Loop types: S, M, I, B, H, E, X
+    LOOP2ID = {"S": 0, "M": 1, "I": 2, "B": 3, "H": 4, "E": 5, "X": 6}
+    LOOP_VOCAB_SIZE = 7
+
+    # Model Architecture
+    EMBED_DIM = 128
+    HIDDEN_DIM = 256
+    NUM_LAYERS = 5
+    DROPOUT = 0.1
+
+    # Training Hyperparameters
+    BATCH_SIZE = 32
+    LR = 1e-3
+    EPOCHS = 25
+    MASK_PROB = 0.15
+    LAMBDA_RECON = 0.5
+    SEED = 42
+=======
+    # Vocabularies
+    # Sequence: A:0, G:1, C:2, U:3
+    TOKEN2ID = {"A": 0, "G": 1, "C": 2, "U": 3}
+    VOCAB_SIZE = 4
+
+    # Loop types: S, M, I, B, H, E, X
+    LOOP2ID = {"S": 0, "M": 1, "I": 2, "B": 3, "H": 4, "E": 5, "X": 6}
+    LOOP_VOCAB_SIZE = 7
+
+    # Model Architecture
+    # Scaled up based on Lesson 17
+    EMBED_DIM = 192
+    HIDDEN_DIM = 384
+    NUM_LAYERS = 5
+    DROPOUT = 0.1
+
+    # Training Hyperparameters
+    BATCH_SIZE = 64
+    LR = 1e-3
+    EPOCHS = 20
+    SEED = 42
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from library.features import get_distance_encoding, get_paired_index_map
+
+
+class RNADataset(Dataset):
+    def __init__(self, split="train", config=Config(), load_cached_data=True):
+        """
+        PyTorch Dataset for RNA degradation prediction.
+
+        Args:
+            split (str): One of 'train', 'val', 'test'.
+            config (Config): Configuration object containing paths and hyperparameters.
+            load_cached_data (bool): Whether to try loading from cache first.
+        """
+        self.config = config
+        self.split = split
+        self.rng = np.random.default_rng(config.SEED)
+
+        # Ensure working directory exists
+        os.makedirs(config.WORKING_DIR, exist_ok=True)
+        cache_path = os.path.join(config.WORKING_DIR, f"{split}_data.npz")
+
+        # 1. Load from Cache if available
+        if load_cached_data and os.path.exists(cache_path):
+            print(f"Loading cached {split} data from {cache_path}...")
+            data = np.load(cache_path, allow_pickle=True)
+            self.ids = data["ids"]
+            self.sequences = data["sequences"]
+            self.loop_types = data["loop_types"]
+            self.pair_indices = data["pair_indices"]
+            self.pair_distances = data["pair_distances"]
+
+            if split in ["train", "val"]:
+                self.targets = data["targets"]
+            else:
+                self.targets = None
+
+        # 2. Process from Scratch
+        else:
+            print(f"Processing {split} data from metadata...")
+            parquet_path = os.path.join(config.METADATA_DIR, f"{split}.parquet")
+
+            if not os.path.exists(parquet_path):
+                raise FileNotFoundError(f"Metadata file not found: {parquet_path}")
+
+            df = pd.read_parquet(parquet_path)
+
+            self.ids = df["id"].values
+
+            # Encode Sequences
+            self.sequences = []
+            for seq in df["sequence"]:
+                encoded = [config.TOKEN2ID.get(c, config.PAD_TOKEN_ID) for c in seq]
+                self.sequences.append(encoded)
+            self.sequences = np.array(self.sequences, dtype=np.int32)
+
+            # Encode Loop Types
+            self.loop_types = []
+            for lt in df["predicted_loop_type"]:
+                encoded = [config.LOOP2ID.get(c, 0) for c in lt]
+                self.loop_types.append(encoded)
+            self.loop_types = np.array(self.loop_types, dtype=np.int32)
+
+            # Process Structure Features using library.features
+            self.pair_indices = []
+            self.pair_distances = []
+
+            for struct in df["structure"]:
+                # Get Paired-Base Identity indices
+                p_idx = get_paired_index_map(struct, config.SEQ_LEN)
+                self.pair_indices.append(p_idx)
+
+                # Get Geometric Distance encoding
+                p_dist = get_distance_encoding(struct, config.SEQ_LEN)
+                self.pair_distances.append(p_dist)
+
+            self.pair_indices = np.array(self.pair_indices, dtype=np.int32)
+            self.pair_distances = np.array(self.pair_distances, dtype=np.float32)
+
+            # Process Targets (Train/Val only)
+            if split in ["train", "val"]:
+                t_list = []
+                # Load all target columns defined in Config to maintain index alignment
+                for col in config.TARGET_COLS:
+                    # df[col] contains lists/arrays. Stack them.
+                    # Ensure we handle potential missing values or format issues if any,
+                    # though metadata generation implies cleanliness.
+                    col_data = np.vstack(df[col].values)
+                    t_list.append(col_data)
+
+                # Stack to shape (N, 68, 5)
+                self.targets = np.stack(t_list, axis=2).astype(np.float32)
+            else:
+                self.targets = None
+
+            # Save to Cache
+            save_dict = {
+                "ids": self.ids,
+                "sequences": self.sequences,
+                "loop_types": self.loop_types,
+                "pair_indices": self.pair_indices,
+                "pair_distances": self.pair_distances,
+            }
+            if self.targets is not None:
+                save_dict["targets"] = self.targets
+
+            np.savez(cache_path, **save_dict)
+            print(f"Data cached to {cache_path}")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # Retrieve data
+        seq = self.sequences[idx].copy()
+        loop = self.loop_types[idx]
+        pair_idx = self.pair_indices[idx]
+        pair_dist = self.pair_distances[idx]
+
+        # Initialize mask labels with -100 (ignored by CrossEntropyLoss)
+        mask_labels = np.full_like(seq, -100)
+
+        # Dynamic Masking for Reconstruction Task (Train only)
+        if self.split == "train":
+            # Generate random probabilities
+            prob = self.rng.random(len(seq))
+
+            # Create boolean mask based on probability
+            mask_bool = prob < self.config.MASK_PROB
+
+            # Set targets for masked positions (the original token ID)
+            mask_labels[mask_bool] = seq[mask_bool]
+
+            # Replace input tokens with MASK token
+            seq[mask_bool] = self.config.MASK_TOKEN_ID
+
+        # Prepare dictionary
+        item = {
+            "seq": torch.tensor(seq, dtype=torch.long),
+            "loop": torch.tensor(loop, dtype=torch.long),
+            "pair_idx": torch.tensor(pair_idx, dtype=torch.long),
+            "pair_dist": torch.tensor(pair_dist, dtype=torch.float),
+            "mask_labels": torch.tensor(mask_labels, dtype=torch.long),
+        }
+
+        if self.targets is not None:
+            item["targets"] = torch.tensor(self.targets[idx], dtype=torch.float)
+
+        return item
+=======
+from library.features import get_distance_encoding
+
+
+class RNADataset(Dataset):
+    def __init__(self, split="train", config=Config(), load_cached_data=True):
+        """
+        PyTorch Dataset for RNA degradation prediction.
+
+        Args:
+            split (str): One of 'train', 'val', 'test'.
+            config (Config): Configuration object containing paths and hyperparameters.
+            load_cached_data (bool): Whether to try loading from cache first.
+        """
+        self.config = config
+        self.split = split
+        self.rng = np.random.default_rng(config.SEED)
+
+        # Ensure working directory exists
+        os.makedirs(config.WORKING_DIR, exist_ok=True)
+        cache_path = os.path.join(config.WORKING_DIR, f"{split}_data_clean.npz")
+
+        # 1. Load from Cache if available
+        if load_cached_data and os.path.exists(cache_path):
+            print(f"Loading cached {split} data from {cache_path}...")
+            data = np.load(cache_path, allow_pickle=True)
+            self.ids = data["ids"]
+            self.sequences = data["sequences"]
+            self.loop_types = data["loop_types"]
+            self.pair_distances = data["pair_distances"]
+
+            if split in ["train", "val"]:
+                self.targets = data["targets"]
+            else:
+                self.targets = None
+
+        # 2. Process from Scratch
+        else:
+            print(f"Processing {split} data from metadata...")
+            parquet_path = os.path.join(config.METADATA_DIR, f"{split}.parquet")
+
+            if not os.path.exists(parquet_path):
+                raise FileNotFoundError(f"Metadata file not found: {parquet_path}")
+
+            df = pd.read_parquet(parquet_path)
+
+            self.ids = df["id"].values
+
+            # Encode Sequences
+            self.sequences = []
+            for seq in df["sequence"]:
+                encoded = [config.TOKEN2ID.get(c, 0) for c in seq]
+                self.sequences.append(encoded)
+            self.sequences = np.array(self.sequences, dtype=np.int32)
+
+            # Encode Loop Types
+            self.loop_types = []
+            for lt in df["predicted_loop_type"]:
+                encoded = [config.LOOP2ID.get(c, 0) for c in lt]
+                self.loop_types.append(encoded)
+            self.loop_types = np.array(self.loop_types, dtype=np.int32)
+
+            # Process Structure Features using library.features
+            self.pair_distances = []
+
+            for struct in df["structure"]:
+                # Get Geometric Distance encoding (Cite solution_lesson_node_00016)
+                p_dist = get_distance_encoding(struct, config.SEQ_LEN)
+                self.pair_distances.append(p_dist)
+
+            self.pair_distances = np.array(self.pair_distances, dtype=np.float32)
+
+            # Process Targets (Train/Val only)
+            if split in ["train", "val"]:
+                t_list = []
+                # Load all target columns defined in Config to maintain index alignment
+                for col in config.TARGET_COLS:
+                    col_data = np.vstack(df[col].values)
+                    t_list.append(col_data)
+
+                # Stack to shape (N, 68, 5)
+                self.targets = np.stack(t_list, axis=2).astype(np.float32)
+            else:
+                self.targets = None
+
+            # Save to Cache
+            save_dict = {
+                "ids": self.ids,
+                "sequences": self.sequences,
+                "loop_types": self.loop_types,
+                "pair_distances": self.pair_distances,
+            }
+            if self.targets is not None:
+                save_dict["targets"] = self.targets
+
+            np.savez(cache_path, **save_dict)
+            print(f"Data cached to {cache_path}")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # Retrieve data
+        seq = self.sequences[idx].copy()
+        loop = self.loop_types[idx]
+        pair_dist = self.pair_distances[idx]
+
+        # Prepare dictionary (No masking, No paired_idx)
+        item = {
+            "seq": torch.tensor(seq, dtype=torch.long),
+            "loop": torch.tensor(loop, dtype=torch.long),
+            "pair_dist": torch.tensor(pair_dist, dtype=torch.float),
+        }
+
+        if self.targets is not None:
+            item["targets"] = torch.tensor(self.targets[idx], dtype=torch.float)
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RNAMultiTaskBiGRU(nn.Module):
+    """
+    Multi-Task Enhanced Distance-Aware Residual BiGRU.
+
+    Key Components:
+    1. Inputs: Masked Sequence, Loop Type, Sinusoidal Pair Distance.
+    2. Innovation: Paired-Base Identity Feature (Teleportation of semantic info).
+    3. Backbone: Deep Pre-LayerNorm Residual BiGRU.
+    4. Heads:
+       - Regression: Predicts 3 scored targets (reactivity, deg_Mg_pH10, deg_Mg_50C).
+       - Reconstruction: Predicts masked bases (A, G, C, U) for regularization.
+    """
+
+    def __init__(self, config=Config()):
+        super().__init__()
+        self.config = config
+
+        # 1. Feature Embeddings
+        self.seq_embed = nn.Embedding(config.VOCAB_SIZE, config.EMBED_DIM)
+        self.loop_embed = nn.Embedding(config.LOOP_VOCAB_SIZE, config.EMBED_DIM)
+        self.dist_embed = SinusoidalPositionalEmbedding(config.EMBED_DIM)
+
+        # 2. Input Projection
+        # Concatenating 4 features: Seq + Loop + Dist + PairedSeq
+        input_dim = config.EMBED_DIM * 4
+        self.input_proj = nn.Linear(input_dim, config.HIDDEN_DIM)
+        self.dropout = nn.Dropout(config.DROPOUT)
+
+        # 3. Backbone
+        self.layers = nn.ModuleList(
+            [
+                PreLNResidualBiGRU(config.HIDDEN_DIM, config.DROPOUT)
+                for _ in range(config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Output Heads
+        # Regression Head: Predicts the 3 scored columns
+        self.reg_head = nn.Sequential(
+            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(config.HIDDEN_DIM // 2, 3),
+        )
+
+        # Reconstruction Head: Predicts the 4 nucleotide bases
+        self.recon_head = nn.Sequential(
+            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(config.HIDDEN_DIM // 2, 4),
+        )
+
+    def forward(self, seq, loop, pair_idx, pair_dist):
+        """
+        Args:
+            seq: (B, L) Sequence token indices.
+            loop: (B, L) Loop type token indices.
+            pair_idx: (B, L) Indices of paired bases (-1 for unpaired).
+            pair_dist: (B, L) Geometric distances between pairs.
+
+        Returns:
+            reg_out: (B, L, 3) Regression predictions.
+            recon_out: (B, L, 4) Reconstruction logits.
+        """
+        # 1. Basic Embeddings
+        x_seq = self.seq_embed(seq)  # (B, L, D)
+        x_loop = self.loop_embed(loop)  # (B, L, D)
+        x_dist = self.dist_embed(pair_dist)  # (B, L, D)
+
+        # 2. Paired-Base Identity Feature
+        # "Teleport" the embedding of the paired base to the current position.
+        # pair_idx contains the index of the pair. Unpaired is -1.
+
+        # Handle unpaired indices (-1) by clamping to 0 temporarily
+        safe_pair_idx = pair_idx.clone()
+        unpaired_mask = safe_pair_idx == -1
+        safe_pair_idx[unpaired_mask] = 0
+
+        # Expand indices for gather: (B, L, D)
+        idx_expanded = safe_pair_idx.unsqueeze(-1).expand(-1, -1, self.config.EMBED_DIM)
+
+        # Gather embeddings from x_seq using the paired indices
+        x_paired = torch.gather(x_seq, 1, idx_expanded)
+
+        # Zero out features for unpaired positions
+        mask_expanded = unpaired_mask.unsqueeze(-1).expand(
+            -1, -1, self.config.EMBED_DIM
+        )
+        x_paired[mask_expanded] = 0.0
+
+        # 3. Combine Features & Project
+        x = torch.cat([x_seq, x_loop, x_dist, x_paired], dim=-1)
+        x = self.input_proj(x)
+        x = self.dropout(x)
+
+        # 4. Backbone Processing
+        for layer in self.layers:
+            x = layer(x)
+
+        # 5. Heads
+        reg_out = self.reg_head(x)
+        recon_out = self.recon_head(x)
+
+        return reg_out, recon_out
+=======
+class RNAResidualBiGRU(nn.Module):
+    """
+    Distance-Aware Residual BiGRU.
+    Reverts to the high-performing architecture from Lesson 17.
+    
+    Inputs: Sequence, Loop Type, Sinusoidal Pair Distance.
+    Backbone: Deep Pre-LayerNorm Residual BiGRU.
+    Head: Regression only (No MLM).
+    """
+
+    def __init__(self, config=Config()):
+        super().__init__()
+        self.config = config
+
+        # 1. Feature Embeddings
+        self.seq_embed = nn.Embedding(config.VOCAB_SIZE, config.EMBED_DIM)
+        self.loop_embed = nn.Embedding(config.LOOP_VOCAB_SIZE, config.EMBED_DIM)
+        self.dist_embed = SinusoidalPositionalEmbedding(config.EMBED_DIM)
+
+        # 2. Input Projection
+        # Concatenating 3 features: Seq + Loop + Dist
+        input_dim = config.EMBED_DIM * 3
+        self.input_proj = nn.Linear(input_dim, config.HIDDEN_DIM)
+        self.dropout = nn.Dropout(config.DROPOUT)
+
+        # 3. Backbone (Pre-LayerNorm Residual BiGRU - Cite solution_lesson_node_00017)
+        self.layers = nn.ModuleList(
+            [
+                PreLNResidualBiGRU(config.HIDDEN_DIM, config.DROPOUT)
+                for _ in range(config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Output Head (Regression Only)
+        self.reg_head = nn.Sequential(
+            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
+            nn.ReLU(),
+            nn.Linear(config.HIDDEN_DIM // 2, 3),
+        )
+
+    def forward(self, seq, loop, pair_dist):
+        """
+        Args:
+            seq: (B, L) Sequence token indices.
+            loop: (B, L) Loop type token indices.
+            pair_dist: (B, L) Geometric distances between pairs.
+
+        Returns:
+            reg_out: (B, L, 3) Regression predictions.
+        """
+        # 1. Embeddings
+        x_seq = self.seq_embed(seq)  # (B, L, D)
+        x_loop = self.loop_embed(loop)  # (B, L, D)
+        x_dist = self.dist_embed(pair_dist)  # (B, L, D)
+
+        # 2. Combine Features & Project
+        x = torch.cat([x_seq, x_loop, x_dist], dim=-1)
+        x = self.input_proj(x)
+        x = self.dropout(x)
+
+        # 3. Backbone Processing
+        for layer in self.layers:
+            x = layer(x)
+
+        # 4. Head
+        reg_out = self.reg_head(x)
+
+        return reg_out
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class JointAlignedLoss(nn.Module):
+    """
+    Implements the Joint Aligned Loss for the Multi-Task RNA Degradation Model.
+
+    This loss function combines:
+    1. Masked Mean Squared Error (MSE) for the regression task.
+       - Applied strictly to the first 68 positions (seq_scored).
+       - Applied strictly to the 3 scored columns: reactivity, deg_Mg_pH10, deg_Mg_50C.
+    2. Cross Entropy Loss for the reconstruction task (MLM).
+       - Applied only to masked sequence positions.
+       - Acts as a structural regularizer.
+
+    Equation: L = MSE_reg + lambda * CE_recon
+    """
+
+    def __init__(self, config=Config()):
+        super().__init__()
+        self.config = config
+        # Reconstruction loss ignores tokens labeled with -100 (unmasked positions)
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
+
+    def forward(self, reg_pred, recon_pred, targets, mask_labels):
+        """
+        Calculates the joint loss.
+
+        Args:
+            reg_pred (torch.Tensor): Model regression predictions of shape (B, Seq_Len, 3).
+            recon_pred (torch.Tensor): Model reconstruction logits of shape (B, Seq_Len, 4).
+            targets (torch.Tensor): Ground truth targets of shape (B, Scored_Len, 5).
+                                    Contains all 5 columns.
+            mask_labels (torch.Tensor): Ground truth labels for masked tokens of shape (B, Seq_Len).
+                                        Unmasked positions are -100.
+
+        Returns:
+            tuple: (total_loss, mse_loss, ce_loss)
+        """
+        # ==============================================================================
+        # 1. Regression Loss (Scored Columns Only)
+        # ==============================================================================
+
+        # The model outputs predictions for the full sequence length (e.g., 107),
+        # but we only score the first 68 positions.
+        # Slice predictions: (B, 107, 3) -> (B, 68, 3)
+        scored_preds = reg_pred[:, : self.config.SCORED_LEN, :]
+
+        # The dataset provides 5 target columns, but we only train on the 3 scored ones.
+        # The indices are defined in config (0: reactivity, 1: deg_Mg_pH10, 3: deg_Mg_50C).
+        # Slice targets: (B, 68, 5) -> (B, 68, 3)
+        scored_targets = targets[
+            :, : self.config.SCORED_LEN, self.config.SCORED_INDICES
+        ]
+
+        # Calculate Mean Squared Error
+        mse_loss = F.mse_loss(scored_preds, scored_targets)
+
+        # ==============================================================================
+        # 2. Reconstruction Loss (Masked Language Modeling)
+        # ==============================================================================
+
+        # CrossEntropyLoss expects input (B, C, L) and target (B, L).
+        # Transpose logits: (B, L, 4) -> (B, 4, L)
+        recon_logits = recon_pred.transpose(1, 2)
+
+        # Calculate Cross Entropy (ignores -100 in mask_labels)
+        ce_loss = self.ce_loss(recon_logits, mask_labels)
+
+        # ==============================================================================
+        # 3. Total Loss
+        # ==============================================================================
+
+        total_loss = mse_loss + self.config.LAMBDA_RECON * ce_loss
+
+        return total_loss, mse_loss, ce_loss
+=======
+class ScoredMSELoss(nn.Module):
+    """
+    Calculates Mean Squared Error strictly on the scored columns and positions.
+    Reverts to simple regression loss as advised by Lesson 20.
+    """
+
+    def __init__(self, config=Config()):
+        super().__init__()
+        self.config = config
+
+    def forward(self, reg_pred, targets):
+        """
+        Args:
+            reg_pred (torch.Tensor): Model regression predictions of shape (B, Seq_Len, 3).
+            targets (torch.Tensor): Ground truth targets of shape (B, Scored_Len, 5).
+        """
+        # Slice predictions: (B, 107, 3) -> (B, 68, 3)
+        scored_preds = reg_pred[:, : self.config.SCORED_LEN, :]
+
+        # Slice targets: (B, 68, 5) -> (B, 68, 3)
+        # Select reactivity, deg_Mg_pH10, deg_Mg_50C
+        scored_targets = targets[
+            :, : self.config.SCORED_LEN, self.config.SCORED_INDICES
+        ]
+
+        # Calculate Mean Squared Error
+        mse_loss = F.mse_loss(scored_preds, scored_targets)
+
+        return mse_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import RNAMultiTaskBiGRU
+from library.loss import JointAlignedLoss
+from library.utils import set_seed, mcrmse, build_submission_df
+
+
+def train_model(config=None):
+    """
+    Trains the RNA Multi-Task BiGRU model.
+
+    Args:
+        config (Config, optional): Configuration object. If None, uses default.
+
+    Returns:
+        float: The best validation MCRMSE score achieved.
+    """
+    if config is None:
+        config = Config()
+
+    # Ensure reproducibility
+    set_seed(config.SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Initialize Data Loaders
+    print("Initializing datasets...")
+    train_dataset = RNADataset("train", config=config)
+    val_dataset = RNADataset("val", config=config)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Initialize Model, Loss, Optimizer
+    model = RNAMultiTaskBiGRU(config).to(device)
+    criterion = JointAlignedLoss(config)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.EPOCHS
+    )
+
+    best_mcrmse = float("inf")
+    model_save_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    print("Starting training loop...")
+
+    for epoch in range(config.EPOCHS):
+        # --- Training Phase ---
+        model.train()
+        train_loss_accum = 0.0
+        mse_loss_accum = 0.0
+        ce_loss_accum = 0.0
+
+        for batch in train_loader:
+            # Move data to device
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_idx = batch["pair_idx"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+            mask_labels = batch["mask_labels"].to(device)
+            targets = batch["targets"].to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            reg_out, recon_out = model(seq, loop, pair_idx, pair_dist)
+
+            # Calculate loss
+            loss, mse, ce = criterion(reg_out, recon_out, targets, mask_labels)
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+
+            train_loss_accum += loss.item()
+            mse_loss_accum += mse.item()
+            ce_loss_accum += ce.item()
+
+        scheduler.step()
+
+        avg_train_loss = train_loss_accum / len(train_loader)
+        avg_mse = mse_loss_accum / len(train_loader)
+        avg_ce = ce_loss_accum / len(train_loader)
+
+        # --- Validation Phase ---
+        model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                seq = batch["seq"].to(device)
+                loop = batch["loop"].to(device)
+                pair_idx = batch["pair_idx"].to(device)
+                pair_dist = batch["pair_dist"].to(device)
+                targets = batch["targets"].to(device)
+
+                # Forward pass (only regression output needed for val metric)
+                reg_out, _ = model(seq, loop, pair_idx, pair_dist)
+
+                # Extract scored columns and positions
+                # targets shape: (B, 68, 5) -> select scored indices -> (B, 68, 3)
+                scored_targets = targets[:, : config.SCORED_LEN, config.SCORED_INDICES]
+
+                # preds shape: (B, 107, 3) -> select scored len -> (B, 68, 3)
+                scored_preds = reg_out[:, : config.SCORED_LEN, :]
+
+                all_preds.append(scored_preds.cpu().numpy())
+                all_targets.append(scored_targets.cpu().numpy())
+
+        # Concatenate for metric calculation
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        # Reshape to (N_samples * 68, 3) or keep as (N, 68, 3)
+        # The mcrmse util expects (N, 3), so we flatten the sequence dimension
+        flat_preds = all_preds.reshape(-1, 3)
+        flat_targets = all_targets.reshape(-1, 3)
+
+        val_mcrmse = mcrmse(flat_targets, flat_preds)
+
+        # Print metrics
+        print(f"Epoch {epoch+1}/{config.EPOCHS}")
+        print(f"  Train Loss: {avg_train_loss} (MSE: {avg_mse}, CE: {avg_ce})")
+        print(f"  Val MCRMSE: {val_mcrmse}")
+
+        # Checkpoint
+        if val_mcrmse < best_mcrmse:
+            best_mcrmse = val_mcrmse
+            torch.save(model.state_dict(), model_save_path)
+            print(f"  New best model saved to {model_save_path}")
+
+    print(f"Training complete. Best Validation MCRMSE: {best_mcrmse}")
+    return best_mcrmse
+
+
+def predict_and_submit(config=None):
+    """
+    Runs inference on the test set and generates a submission file.
+
+    Args:
+        config (Config, optional): Configuration object. If None, uses default.
+    """
+    if config is None:
+        config = Config()
+
+    set_seed(config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load Test Data
+    print("Loading test data...")
+    test_dataset = RNADataset("test", config=config)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Load Model
+    print("Loading model...")
+    model = RNAMultiTaskBiGRU(config).to(device)
+    model_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"Loaded weights from {model_path}")
+    else:
+        print(f"Warning: {model_path} not found. Using random weights.")
+
+    model.eval()
+    all_preds = []
+
+    print("Running inference...")
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_idx = batch["pair_idx"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+
+            # Forward pass
+            reg_out, _ = model(seq, loop, pair_idx, pair_dist)
+
+            # Store predictions (keep on CPU)
+            all_preds.append(reg_out.cpu().numpy())
+=======
+from library.model import RNAResidualBiGRU
+from library.loss import ScoredMSELoss
+from library.utils import set_seed, mcrmse, build_submission_df
+
+
+def train_model(config=None):
+    """
+    Trains the RNA Residual BiGRU model (Regression Only).
+
+    Args:
+        config (Config, optional): Configuration object. If None, uses default.
+
+    Returns:
+        float: The best validation MCRMSE score achieved.
+    """
+    if config is None:
+        config = Config()
+
+    # Ensure reproducibility
+    set_seed(config.SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Initialize Data Loaders
+    print("Initializing datasets...")
+    train_dataset = RNADataset("train", config=config)
+    val_dataset = RNADataset("val", config=config)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Initialize Model, Loss, Optimizer
+    model = RNAResidualBiGRU(config).to(device)
+    criterion = ScoredMSELoss(config)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LR)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.EPOCHS
+    )
+
+    best_mcrmse = float("inf")
+    model_save_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    print("Starting training loop...")
+
+    for epoch in range(config.EPOCHS):
+        # --- Training Phase ---
+        model.train()
+        train_loss_accum = 0.0
+
+        for batch in train_loader:
+            # Move data to device
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+            targets = batch["targets"].to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            reg_out = model(seq, loop, pair_dist)
+
+            # Calculate loss
+            loss = criterion(reg_out, targets)
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+
+            train_loss_accum += loss.item()
+
+        scheduler.step()
+
+        avg_train_loss = train_loss_accum / len(train_loader)
+
+        # --- Validation Phase ---
+        model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                seq = batch["seq"].to(device)
+                loop = batch["loop"].to(device)
+                pair_dist = batch["pair_dist"].to(device)
+                targets = batch["targets"].to(device)
+
+                # Forward pass
+                reg_out = model(seq, loop, pair_dist)
+
+                # Extract scored columns and positions
+                scored_targets = targets[:, : config.SCORED_LEN, config.SCORED_INDICES]
+                scored_preds = reg_out[:, : config.SCORED_LEN, :]
+
+                all_preds.append(scored_preds.cpu().numpy())
+                all_targets.append(scored_targets.cpu().numpy())
+
+        # Concatenate for metric calculation
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        # Reshape to (N_samples * 68, 3)
+        flat_preds = all_preds.reshape(-1, 3)
+        flat_targets = all_targets.reshape(-1, 3)
+
+        val_mcrmse = mcrmse(flat_targets, flat_preds)
+
+        # Print metrics
+        print(f"Epoch {epoch+1}/{config.EPOCHS}")
+        print(f"  Train Loss: {avg_train_loss:.6f}")
+        print(f"  Val MCRMSE: {val_mcrmse:.6f}")
+
+        # Checkpoint
+        if val_mcrmse < best_mcrmse:
+            best_mcrmse = val_mcrmse
+            torch.save(model.state_dict(), model_save_path)
+            print(f"  New best model saved to {model_save_path}")
+
+    print(f"Training complete. Best Validation MCRMSE: {best_mcrmse}")
+    return best_mcrmse
+
+
+def predict_and_submit(config=None):
+    """
+    Runs inference on the test set and generates a submission file.
+
+    Args:
+        config (Config, optional): Configuration object. If None, uses default.
+    """
+    if config is None:
+        config = Config()
+
+    set_seed(config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load Test Data
+    print("Loading test data...")
+    test_dataset = RNADataset("test", config=config)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    # Load Model
+    print("Loading model...")
+    model = RNAResidualBiGRU(config).to(device)
+    model_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"Loaded weights from {model_path}")
+    else:
+        print(f"Warning: {model_path} not found. Using random weights.")
+
+    model.eval()
+    all_preds = []
+
+    print("Running inference...")
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+
+            # Forward pass
+            reg_out = model(seq, loop, pair_dist)
+
+            # Store predictions (keep on CPU)
+            all_preds.append(reg_out.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import train_model, predict_and_submit
+from library.dataset import RNADataset
+from library.model import RNAMultiTaskBiGRU
+from library.utils import set_seed
+
+# ==================================================================================
+# CONFIGURATION
+# ==================================================================================
+
+
+class RunConfig(Config):
+    """
+    Configuration for the execution run.
+    Adjusts epochs for a fast baseline while maintaining model capacity.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.EPOCHS = 15  # Reduced from 25 for speed constraint
+        self.WORKING_DIR = "./working/execution"
+        self.SUBMISSION_PATH = "./submission/submission.csv"
+        self.BATCH_SIZE = 32
+        self.NUM_LAYERS = 5  # Keep deep architecture
+        self.HIDDEN_DIM = 256
+        self.DROPOUT = 0.1
+        self.LR = 1e-3
+        self.SEED = 42
+
+
+# ==================================================================================
+# FAILURE ANALYSIS
+# ==================================================================================
+
+
+def perform_failure_analysis(config):
+    """
+    Analyzes the correlation between model error and input features on the validation set.
+    """
+    print("\n" + "=" * 40)
+    print("FAILURE ANALYSIS")
+    print("=" * 40)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load Validation Data
+    val_dataset = RNADataset("val", config=config)
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2
+    )
+
+    # 2. Load Best Model
+    model = RNAMultiTaskBiGRU(config).to(device)
+    model_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    if not os.path.exists(model_path):
+        print("Error: Best model not found for failure analysis.")
+        return
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 3. Run Inference
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_idx = batch["pair_idx"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+            targets = batch["targets"].to(device)
+
+            # Forward pass
+            reg_out, _ = model(seq, loop, pair_idx, pair_dist)
+=======
+from library.train import train_model, predict_and_submit
+from library.dataset import RNADataset
+from library.model import RNAResidualBiGRU
+from library.utils import set_seed
+
+# ==================================================================================
+# CONFIGURATION
+# ==================================================================================
+
+
+class RunConfig(Config):
+    """
+    Configuration for the execution run.
+    Matches the successful parameters from Lesson 17.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.EPOCHS = 20
+        self.WORKING_DIR = "./working/execution"
+        self.SUBMISSION_PATH = "./submission/submission.csv"
+        self.BATCH_SIZE = 64
+        self.NUM_LAYERS = 5
+        self.HIDDEN_DIM = 384
+        self.EMBED_DIM = 192
+        self.DROPOUT = 0.1
+        self.LR = 1e-3
+        self.SEED = 42
+
+
+# ==================================================================================
+# FAILURE ANALYSIS
+# ==================================================================================
+
+
+def perform_failure_analysis(config):
+    """
+    Analyzes the correlation between model error and input features on the validation set.
+    """
+    print("\n" + "=" * 40)
+    print("FAILURE ANALYSIS")
+    print("=" * 40)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load Validation Data
+    val_dataset = RNADataset("val", config=config)
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2
+    )
+
+    # 2. Load Best Model
+    model = RNAResidualBiGRU(config).to(device)
+    model_path = os.path.join(config.WORKING_DIR, "best_model.pth")
+
+    if not os.path.exists(model_path):
+        print("Error: Best model not found for failure analysis.")
+        return
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 3. Run Inference
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_dist = batch["pair_dist"].to(device)
+            targets = batch["targets"].to(device)
+
+            # Forward pass
+            reg_out = model(seq, loop, pair_dist)
+>>>>>>> REPLACE
+```

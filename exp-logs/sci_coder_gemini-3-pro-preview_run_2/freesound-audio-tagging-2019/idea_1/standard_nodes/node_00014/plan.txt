@@ -1,0 +1,429 @@
+To optimize the audio tagging model, I will implement a series of improvements derived from the provided lessons, targeting the model architecture, data augmentation, and optimization strategy.
+
+**Strategy:**
+1.  **Transfer Learning with Modern Weights (Cite Lesson 6, 8):** I will replace the custom scratch-trained MobileNetV2 with a `torchvision` implementation initialized with `MobileNet_V2_Weights.DEFAULT` (ImageNetV2 recipe). I will adapt the first convolutional layer to handle 1-channel audio spectrograms by summing the pre-trained RGB weights, preserving spatial filters.
+2.  **Advanced Augmentation (Cite Lesson 7, 11, 13):**
+    *   **Mixup:** I will implement Mixup augmentation in the training loop with a uniform distribution ($\alpha=1.0$) to improve generalization in multi-label settings.
+    *   **SpecAugment:** I will add Frequency and Time masking in the `AudioDataset` to force the model to learn robust spectral features. I will use an aggressive frequency mask width of 30 bins.
+3.  **Optimization Refinement (Cite Lesson 10, 11):**
+    *   **Optimizer:** Switch from `Adam` to `AdamW` with decoupled weight decay.
+    *   **Scheduler:** Replace `ReduceLROnPlateau` with `CosineAnnealingLR` to better navigate the loss landscape.
+    *   **Batch Size:** Increase to 64 to improve training efficiency and generalization.
+4.  **Threshold Update:** Update the submission threshold in `runfile.py` to match the improved performance expectation (~0.8287).
+
+Here are the code modifications:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==== Training Hyperparameters ====
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    MAX_EPOCHS = 50
+    PATIENCE = 7  # Early stopping patience
+=======
+    # ==== Training Hyperparameters ====
+    BATCH_SIZE = 64  # Cite Lesson 10
+    LEARNING_RATE = 1e-3
+    MAX_EPOCHS = 50
+    PATIENCE = 7  # Early stopping patience
+    
+    # Augmentation
+    MIXUP_ALPHA = 1.0  # Cite Lesson 7
+    FREQ_MASK = 30     # Cite Lesson 13
+    TIME_MASK = 100    # Cite Lesson 11
+    
+    # Optimizer
+    WEIGHT_DECAY = 0.01  # Cite Lesson 11
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # 6. Instance-wise Normalization
+        mean = spec.mean()
+        std = spec.std()
+        spec = (spec - mean) / (std + 1e-6)
+
+        # 7. Get Label
+=======
+        # 6. Instance-wise Normalization
+        mean = spec.mean()
+        std = spec.std()
+        spec = (spec - mean) / (std + 1e-6)
+
+        # Cite Lesson 11 & 13: SpecAugment
+        if self.mode == "train":
+            # Frequency Masking
+            f_mask_param = Config.FREQ_MASK
+            C, F, T = spec.shape
+            for _ in range(2):
+                f = np.random.randint(0, f_mask_param + 1)
+                f0 = np.random.randint(0, F - f + 1)
+                spec[:, f0 : f0 + f, :] = 0.0
+
+            # Time Masking
+            t_mask_param = Config.TIME_MASK
+            for _ in range(2):
+                t = np.random.randint(0, t_mask_param + 1)
+                t0 = np.random.randint(0, max(1, T - t + 1))
+                spec[:, :, t0 : t0 + t] = 0.0
+
+        # 7. Get Label
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+def _make_divisible(v, divisor, min_value=None):
+    """
+    Ensures that all layers have a channel number that is divisible by 8.
+    This is important for optimizing performance on hardware accelerators.
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+class ConvBNReLU(nn.Sequential):
+    """
+    Standard block: Conv2d -> BatchNorm2d -> ReLU6
+    """
+
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1):
+        padding = (kernel_size - 1) // 2
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU6(inplace=True),
+        )
+
+
+class InvertedResidual(nn.Module):
+    """
+    Inverted Residual Block (MobileNetV2 Block).
+    Structure: Pointwise (Expansion) -> Depthwise -> Pointwise (Projection)
+    """
+
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super(InvertedResidual, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2]
+
+        hidden_dim = int(round(inp * expand_ratio))
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        if expand_ratio != 1:
+            # Pointwise Convolution (Expansion)
+            layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1))
+
+        layers.extend(
+            [
+                # Depthwise Convolution
+                ConvBNReLU(hidden_dim, hidden_dim, stride=stride, groups=hidden_dim),
+                # Pointwise Convolution (Projection) - No non-linearity
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            ]
+        )
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class AudioMobileNet(nn.Module):
+    """
+    Lightweight 2D CNN based on MobileNetV2 architecture.
+    Adapted for Audio Spectrogram inputs.
+    """
+
+    def __init__(self, width_mult=1.0):
+        super(AudioMobileNet, self).__init__()
+
+        input_channel = 32
+        last_channel = 1280
+        num_classes = Config.NUM_CLASSES
+
+        # MobileNetV2 Configuration:
+        # t: expansion factor, c: output channels, n: number of blocks, s: stride
+        inverted_residual_setting = [
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        # Build first layer
+        input_channel = _make_divisible(input_channel * width_mult, 8)
+        self.last_channel = (
+            _make_divisible(last_channel * width_mult, 8)
+            if width_mult > 1.0
+            else last_channel
+        )
+
+        # Initial Feature Extraction
+        # Input channels defined in Config (1 for Log-Mel Spectrogram)
+        self.features = [ConvBNReLU(Config.IN_CHANNELS, input_channel, stride=2)]
+
+        # Build Inverted Residual Blocks
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c * width_mult, 8)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                self.features.append(
+                    InvertedResidual(
+                        input_channel, output_channel, stride, expand_ratio=t
+                    )
+                )
+                input_channel = output_channel
+
+        # Build Last Convolutional Layer
+        self.features.append(
+            ConvBNReLU(input_channel, self.last_channel, kernel_size=1)
+        )
+
+        self.features = nn.Sequential(*self.features)
+
+        # Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(self.last_channel, num_classes),
+        )
+
+        # Weight Initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram of shape (Batch, 1, Freq, Time)
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes)
+        """
+        # Feature Extraction
+        x = self.features(x)
+
+        # Global Max Pooling
+        # Collapses spatial dimensions (Freq, Time) to (1, 1)
+        # Allows handling of variable length inputs
+        # Using Max Pooling to avoid signal dilution from zero-padding (Cite solution_lesson_node_00002)
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+=======
+import torch
+import torch.nn as nn
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from library.config import Config
+
+
+class AudioMobileNet(nn.Module):
+    """
+    MobileNetV2 with Transfer Learning and custom adaptation for Audio.
+    """
+
+    def __init__(self):
+        super(AudioMobileNet, self).__init__()
+
+        # Cite Lesson 8: Modern Pre-training Recipes (V2 Weights)
+        weights = MobileNet_V2_Weights.DEFAULT
+        self.model = mobilenet_v2(weights=weights)
+
+        # Cite Lesson 6: Cross-Modal Transfer Learning via Kernel Summation
+        # Modify the first layer to accept 1 channel instead of 3
+        first_conv = self.model.features[0][0]
+        new_conv = nn.Conv2d(
+            in_channels=Config.IN_CHANNELS,  # 1
+            out_channels=first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=first_conv.bias is not None,
+        )
+
+        # Initialize new kernel by summing weights along the channel dimension
+        with torch.no_grad():
+            new_conv.weight[:] = first_conv.weight.sum(dim=1, keepdim=True)
+            if first_conv.bias is not None:
+                new_conv.bias[:] = first_conv.bias
+
+        self.model.features[0][0] = new_conv
+
+        # Replace the classifier head
+        # MobileNetV2 classifier is (Dropout, Linear)
+        self.model.classifier[1] = nn.Linear(
+            self.model.last_channel, Config.NUM_CLASSES
+        )
+
+    def forward(self, x):
+        # Feature Extraction
+        x = self.model.features(x)
+
+        # Cite Lesson 2: Signal Dilution in GAP
+        # Use Adaptive Max Pooling instead of default Global Average Pooling
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.model.classifier(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+=======
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        # Cite Lesson 7: Mixup Augmentation with Uniform Distribution (Alpha=1.0)
+        lam = np.random.beta(Config.MIXUP_ALPHA, Config.MIXUP_ALPHA)
+        index = torch.randperm(images.size(0)).to(device)
+
+        mixed_images = lam * images + (1 - lam) * images[index]
+        mixed_targets = lam * targets + (1 - lam) * targets[index]
+
+        optimizer.zero_grad()
+        outputs = model(mixed_images)
+        loss = criterion(outputs, mixed_targets)
+
+        loss.backward()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+
+    # Scheduler: Reduce LR when validation metric plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.1, patience=2
+    )
+
+    best_score = 0.0
+    patience_counter = 0
+    best_model_path = Config.BEST_MODEL_PATH
+
+    print(f"Starting training for {epochs} epochs on {device}...")
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_score = validate(model, val_loader, criterion, device)
+
+        # Step scheduler based on LWLRAP
+        scheduler.step(val_score)
+
+        # Print metrics with full precision
+=======
+    criterion = nn.BCEWithLogitsLoss()
+    # Cite Lesson 11: AdamW with decoupled weight decay
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Cite Lesson 11: Cosine Annealing Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
+
+    best_score = 0.0
+    patience_counter = 0
+    best_model_path = Config.BEST_MODEL_PATH
+
+    print(f"Starting training for {epochs} epochs on {device}...")
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_score = validate(model, val_loader, criterion, device)
+
+        # Step scheduler (Cosine Annealing steps every epoch)
+        scheduler.step()
+
+        # Print metrics with full precision
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Generate Submission if threshold passed
+    if val_score > 0.6688040623183806:
+        print("Score threshold passed. Generating submission...")
+        predict(model, test_loader, device, Config.SUBMISSION_PATH)
+    else:
+        print(
+            f"Score {val_score} did not pass threshold 0.6688040623183806. Skipping submission."
+        )
+=======
+    # Generate Submission if threshold passed
+    if val_score > 0.8287354381163734:
+        print("Score threshold passed. Generating submission...")
+        predict(model, test_loader, device, Config.SUBMISSION_PATH)
+    else:
+        print(
+            f"Score {val_score} did not pass threshold 0.8287354381163734. Skipping submission."
+        )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,831 @@
+Based on the lessons learned, specifically Lesson 00110 ("Fixed Spatial Strides Outperform Stochastic Multi-Scale Sampling") and Lesson 00098 ("Decouple I/O from Training via Pre-Computed Tensor Caching"), I will optimize the solution by:
+
+1.  **Enforcing Fixed Stride**: Replacing the stochastic stride selection (2 vs 5) with a fixed stride of 5. This stabilizes the input distribution and allows for deterministic pre-processing.
+2.  **Optimized Sparse Caching**: Refactoring the `DataCacher` to pre-compute the final 12-channel input tensors. Instead of reading all slices of all modalities into RAM (which caused the 1-hour delay), the new logic will read the full FLAIR volume to calculate the ROI, but then perform "sparse reads" of only the 3 specific slices required for the other modalities. This drastically reduces I/O.
+3.  **Simplified Validation**: Removing the "Matched Ensemble" logic, as the single robust model with fixed stride is expected to perform better and train faster.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Stochastic Multi-Scale Stacking
+    # Randomly choose between Stride 2 (Texture) and Stride 5 (Context) during training
+    STRIDE_OPTIONS = [2, 5]
+
+    # Debugging / Development
+=======
+    # Fixed Spatial Stride (Cite solution_lesson_node_00110)
+    # Fixed stride of 5 provides consistent spatial context and outperforms stochastic sampling.
+    STRIDE = 5
+
+    # Debugging / Development
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working & Output
+    WORKING_DIR = "./working"
+    # Specific cache directory for deterministic data processing (Idea 40)
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_40")
+=======
+    # Working & Output
+    WORKING_DIR = "./working"
+    # Specific cache directory for optimized tensor caching (Idea Optimized)
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_optimized")
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    @staticmethod
+    def process_data(metadata_df, cache_key, load_cached_data=True):
+        """
+        Loads data into RAM, computing ROI centers and caching the result.
+
+        Args:
+            metadata_df (pd.DataFrame): Metadata containing paths.
+            cache_key (str): Identifier for the cache file (e.g. 'train', 'test').
+            load_cached_data (bool): Whether to attempt loading from disk.
+
+        Returns:
+            dict: {
+                'images': {braTS21ID: {modality: np.ndarray(D, H, W)}},
+                'roi_centers': {braTS21ID: int}
+            }
+        """
+        os.makedirs(Config.CACHE_DIR, exist_ok=True)
+        cache_path = os.path.join(Config.CACHE_DIR, f"{cache_key}.npy")
+
+        # 1. Attempt Load
+        if load_cached_data and os.path.exists(cache_path):
+            logger.info(f"Loading cached data from {cache_path}...")
+            try:
+                # allow_pickle=True is required for loading object arrays (dicts)
+                data = np.load(cache_path, allow_pickle=True).item()
+                logger.info("Cache loaded successfully.")
+                return data
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}. Reprocessing...")
+
+        # 2. Process from Scratch
+        logger.info(f"Processing {len(metadata_df)} subjects for {cache_key}...")
+
+        images_dict = {}
+        roi_centers = {}
+
+        # Debug limit
+        if Config.DEBUG_DATA_LIMIT:
+            metadata_df = metadata_df.head(Config.DEBUG_DATA_LIMIT)
+            logger.info(f"Debug Mode: Limiting to {Config.DEBUG_DATA_LIMIT} samples.")
+
+        for _, row in metadata_df.iterrows():
+            subject_id = row["BraTS21ID"]
+            subject_data = {}
+
+            # Load all modalities
+            for mod in Config.MODALITIES:
+                path_col = f"path_{mod}"
+                rel_path = row[path_col]
+                full_dir = os.path.join(Config.INPUT_DIR, rel_path)
+
+                file_paths = DataCacher._get_sorted_files(full_dir)
+
+                mod_slices = []
+                for fp in file_paths:
+                    img = read_dicom_robust(fp, target_size=Config.IMG_SIZE)
+                    mod_slices.append(img)
+
+                if not mod_slices:
+                    # Handle empty/missing directories by creating a dummy slice
+                    mod_slices = [
+                        np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32)
+                    ]
+
+                # Stack to (D, H, W)
+                subject_data[mod] = np.array(mod_slices, dtype=np.float32)
+
+            # Fidelity-Aligned ROI Selection (FLAIR Anchor)
+            flair_vol = subject_data["FLAIR"]
+            depth = flair_vol.shape[0]
+
+            # Bounds: 15% - 85%
+            start_idx = int(depth * Config.ROI_START_PCT)
+            end_idx = int(depth * Config.ROI_END_PCT)
+
+            if end_idx <= start_idx:
+                # Fallback for very shallow volumes
+                roi_center = depth // 2
+            else:
+                # Calculate intensity sums (Integral)
+                valid_slices = flair_vol[start_idx:end_idx]
+                intensities = np.sum(valid_slices, axis=(1, 2))
+                best_local = np.argmax(intensities)
+                roi_center = start_idx + best_local
+
+            roi_centers[subject_id] = roi_center
+            images_dict[subject_id] = subject_data
+
+        # Circuit Breaker Logic
+        if len(images_dict) == 0:
+            raise RuntimeError("No data processed! Circuit breaker triggered.")
+
+        # 3. Save to Cache
+        combined_data = {"images": images_dict, "roi_centers": roi_centers}
+
+        logger.info(f"Saving cache to {cache_path}...")
+        np.save(cache_path, combined_data)
+        logger.info("Cache saved.")
+
+        return combined_data
+=======
+    @staticmethod
+    def process_data(metadata_df, cache_key, load_cached_data=True):
+        """
+        Loads data, computes ROI, extracts specific slices, and caches the final tensors.
+        Optimized to reduce I/O by only reading necessary slices for non-anchor modalities.
+        Cite solution_lesson_node_00098: Decouple I/O via Pre-Computed Tensor Caching.
+
+        Args:
+            metadata_df (pd.DataFrame): Metadata containing paths.
+            cache_key (str): Identifier for the cache file.
+            load_cached_data (bool): Whether to attempt loading from disk.
+
+        Returns:
+            dict: {
+                'images': {braTS21ID: np.ndarray(12, H, W)},
+                'roi_centers': {braTS21ID: int}
+            }
+        """
+        os.makedirs(Config.CACHE_DIR, exist_ok=True)
+        cache_path = os.path.join(Config.CACHE_DIR, f"{cache_key}.npy")
+
+        if load_cached_data and os.path.exists(cache_path):
+            logger.info(f"Loading cached data from {cache_path}...")
+            try:
+                data = np.load(cache_path, allow_pickle=True).item()
+                logger.info("Cache loaded successfully.")
+                return data
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}. Reprocessing...")
+
+        logger.info(f"Processing {len(metadata_df)} subjects for {cache_key}...")
+
+        images_dict = {}
+        roi_centers = {}
+
+        if Config.DEBUG_DATA_LIMIT:
+            metadata_df = metadata_df.head(Config.DEBUG_DATA_LIMIT)
+
+        for _, row in metadata_df.iterrows():
+            subject_id = row["BraTS21ID"]
+            
+            # 1. Process FLAIR first to determine ROI (Cite solution_lesson_node_00093)
+            flair_path = os.path.join(Config.INPUT_DIR, row["path_FLAIR"])
+            flair_files = DataCacher._get_sorted_files(flair_path)
+            
+            flair_slices = []
+            for fp in flair_files:
+                flair_slices.append(read_dicom_robust(fp, target_size=Config.IMG_SIZE))
+            
+            if not flair_slices:
+                 # Fallback for empty FLAIR
+                 flair_vol = np.zeros((1, Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32)
+                 depth = 1
+            else:
+                flair_vol = np.array(flair_slices, dtype=np.float32)
+                depth = flair_vol.shape[0]
+
+            # ROI Selection
+            start_idx = int(depth * Config.ROI_START_PCT)
+            end_idx = int(depth * Config.ROI_END_PCT)
+
+            if end_idx <= start_idx:
+                roi_center = depth // 2
+            else:
+                valid_slices = flair_vol[start_idx:end_idx]
+                intensities = np.sum(valid_slices, axis=(1, 2))
+                best_local = np.argmax(intensities)
+                roi_center = start_idx + best_local
+            
+            roi_centers[subject_id] = roi_center
+
+            # 2. Extract Slices for All Modalities (Cite solution_lesson_node_00110: Fixed Stride)
+            # Indices: [Center-Stride, Center, Center+Stride]
+            stride = Config.STRIDE
+            indices = [roi_center - stride, roi_center, roi_center + stride]
+            
+            channels = []
+            
+            for mod in Config.MODALITIES:
+                if mod == "FLAIR":
+                    # We already have FLAIR volume in memory
+                    vol_depth = flair_vol.shape[0]
+                    for idx in indices:
+                        clamped_i = max(0, min(vol_depth - 1, idx))
+                        channels.append(flair_vol[clamped_i])
+                else:
+                    # Sparse Read: Only read specific files
+                    mod_path = os.path.join(Config.INPUT_DIR, row[f"path_{mod}"])
+                    mod_files = DataCacher._get_sorted_files(mod_path)
+                    vol_depth = len(mod_files)
+                    
+                    if vol_depth == 0:
+                        # Missing modality
+                        for _ in range(3):
+                            channels.append(np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32))
+                    else:
+                        for idx in indices:
+                            clamped_i = max(0, min(vol_depth - 1, idx))
+                            fp = mod_files[clamped_i]
+                            img = read_dicom_robust(fp, target_size=Config.IMG_SIZE)
+                            channels.append(img)
+
+            # Stack -> (12, H, W)
+            image_stack = np.stack(channels, axis=-1)
+            images_dict[subject_id] = image_stack
+
+        if len(images_dict) == 0:
+            raise RuntimeError("No data processed! Circuit breaker triggered.")
+
+        combined_data = {"images": images_dict, "roi_centers": roi_centers}
+        logger.info(f"Saving cache to {cache_path}...")
+        np.save(cache_path, combined_data)
+        logger.info("Cache saved.")
+
+        return combined_data
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class MRIDataset(Dataset):
+    """
+    PyTorch Dataset for Glioblastoma MGMT detection.
+    Implements Stochastic Multi-Scale Stacking and Geometric Augmentation.
+    """
+
+    def __init__(self, data_cache, metadata_df, transform=None, stride_mode="random"):
+        """
+        Args:
+            data_cache (dict): Output from DataCacher.
+            metadata_df (pd.DataFrame): Metadata with IDs and Labels.
+            transform (A.Compose): Albumentations transforms.
+            stride_mode (str or int): 'random' for training, or specific int (2 or 5) for eval.
+        """
+        self.images = data_cache["images"]
+        self.roi_centers = data_cache["roi_centers"]
+        self.metadata = metadata_df.reset_index(drop=True)
+        self.transform = transform
+        self.stride_mode = stride_mode
+
+        # Pre-filter metadata to only include IDs present in cache
+        valid_ids = set(self.images.keys())
+        self.metadata = self.metadata[
+            self.metadata["BraTS21ID"].isin(valid_ids)
+        ].reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get Label (if exists, else 0.5)
+        label = row["MGMT_value"] if "MGMT_value" in row else 0.5
+        label = torch.tensor(label, dtype=torch.float32)
+
+        # Get Data
+        subj_images = self.images[subject_id]
+        center_idx = self.roi_centers[subject_id]
+
+        # Determine Stride (Stochastic Multi-Scale)
+        if self.stride_mode == "random":
+            stride = np.random.choice(Config.STRIDE_OPTIONS)
+        else:
+            stride = int(self.stride_mode)
+
+        # Select Slices: [Center-Stride, Center, Center+Stride]
+        offsets = [-stride, 0, stride]
+        indices = [center_idx + o for o in offsets]
+
+        channels = []
+
+        for mod in Config.MODALITIES:
+            vol = subj_images[mod]
+            depth = vol.shape[0]
+
+            mod_slices = []
+            for i in indices:
+                # Edge Clamping for spatial neighbors
+                clamped_i = max(0, min(depth - 1, i))
+                slice_img = vol[clamped_i]
+                mod_slices.append(slice_img)
+
+            channels.extend(mod_slices)
+
+        # Stack -> (H, W, 12)
+        image_stack = np.stack(channels, axis=-1)
+
+        # Augmentation
+        if self.transform:
+            augmented = self.transform(image=image_stack)
+            image_stack = augmented["image"]
+
+        # Normalization: Independent Per-Channel Min-Max Scaling [0, 1]
+        # Handle both Tensor (from ToTensorV2) and numpy array
+        if isinstance(image_stack, torch.Tensor):
+            image_tensor = image_stack.float()
+            # Shape: (C, H, W)
+            for c in range(image_tensor.shape[0]):
+                c_min = image_tensor[c].min()
+                c_max = image_tensor[c].max()
+                if c_max > c_min:
+                    image_tensor[c] = (image_tensor[c] - c_min) / (c_max - c_min)
+                else:
+                    image_tensor[c] = 0.0
+        else:
+            # Shape: (H, W, C)
+            image_stack = image_stack.astype(np.float32)
+            for c in range(image_stack.shape[2]):
+                c_min = image_stack[:, :, c].min()
+                c_max = image_stack[:, :, c].max()
+                if c_max > c_min:
+                    image_stack[:, :, c] = (image_stack[:, :, c] - c_min) / (
+                        c_max - c_min
+                    )
+                else:
+                    image_stack[:, :, c] = 0.0
+            image_tensor = torch.from_numpy(image_stack.transpose(2, 0, 1))
+
+        return image_tensor, label
+=======
+class MRIDataset(Dataset):
+    """
+    PyTorch Dataset for Glioblastoma MGMT detection.
+    Uses pre-computed tensors for maximum efficiency.
+    """
+
+    def __init__(self, data_cache, metadata_df, transform=None):
+        """
+        Args:
+            data_cache (dict): Output from DataCacher.
+            metadata_df (pd.DataFrame): Metadata with IDs and Labels.
+            transform (A.Compose): Albumentations transforms.
+        """
+        self.images = data_cache["images"]
+        self.metadata = metadata_df.reset_index(drop=True)
+        self.transform = transform
+
+        # Pre-filter metadata to only include IDs present in cache
+        valid_ids = set(self.images.keys())
+        self.metadata = self.metadata[
+            self.metadata["BraTS21ID"].isin(valid_ids)
+        ].reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get Label (if exists, else 0.5)
+        label = row["MGMT_value"] if "MGMT_value" in row else 0.5
+        label = torch.tensor(label, dtype=torch.float32)
+
+        # Get Pre-computed Tensor (H, W, 12)
+        image_stack = self.images[subject_id]
+
+        # Augmentation
+        if self.transform:
+            augmented = self.transform(image=image_stack)
+            image_stack = augmented["image"]
+
+        # Normalization: Independent Per-Channel Min-Max Scaling [0, 1]
+        # Cite solution_lesson_node_00058: Independent Modality Normalization
+        if isinstance(image_stack, torch.Tensor):
+            image_tensor = image_stack.float()
+            # Shape: (C, H, W)
+            for c in range(image_tensor.shape[0]):
+                c_min = image_tensor[c].min()
+                c_max = image_tensor[c].max()
+                if c_max > c_min:
+                    image_tensor[c] = (image_tensor[c] - c_min) / (c_max - c_min)
+                else:
+                    image_tensor[c] = 0.0
+        else:
+            # Shape: (H, W, C)
+            image_stack = image_stack.astype(np.float32)
+            for c in range(image_stack.shape[2]):
+                c_min = image_stack[:, :, c].min()
+                c_max = image_stack[:, :, c].max()
+                if c_max > c_min:
+                    image_stack[:, :, c] = (image_stack[:, :, c] - c_min) / (
+                        c_max - c_min
+                    )
+                else:
+                    image_stack[:, :, c] = 0.0
+            image_tensor = torch.from_numpy(image_stack.transpose(2, 0, 1))
+
+        return image_tensor, label
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Datasets & Loaders
+    # Train: Stochastic Stride (Random 2 or 5)
+    train_dataset = MRIDataset(
+        data_cache=train_cache,
+        metadata_df=df_train,
+        transform=get_transforms("train"),
+        stride_mode="random",
+    )
+
+    # Validation: Matched Ensemble requires predictions from both Stride 2 and Stride 5
+    val_dataset_s2 = MRIDataset(
+        data_cache=val_cache,
+        metadata_df=df_val,
+        transform=get_transforms("val"),
+        stride_mode=2,
+    )
+    val_dataset_s5 = MRIDataset(
+        data_cache=val_cache,
+        metadata_df=df_val,
+        transform=get_transforms("val"),
+        stride_mode=5,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Validation loaders (shuffle=False to ensure alignment for ensembling)
+    val_loader_s2 = DataLoader(
+        val_dataset_s2,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+    val_loader_s5 = DataLoader(
+        val_dataset_s5,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+=======
+    # 4. Datasets & Loaders
+    # Train: Fixed Stride (Cite solution_lesson_node_00110)
+    train_dataset = MRIDataset(
+        data_cache=train_cache,
+        metadata_df=df_train,
+        transform=get_transforms("train"),
+    )
+
+    # Validation: Single Fixed Stride
+    val_dataset = MRIDataset(
+        data_cache=val_cache,
+        metadata_df=df_val,
+        transform=get_transforms("val"),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # --- Validation Phase (Matched Ensemble) ---
+        model.eval()
+        all_labels = []
+        all_preds_s2 = []
+        all_preds_s5 = []
+
+        with torch.no_grad():
+            # Pass 1: Stride 2
+            for images, labels in val_loader_s2:
+                images = images.to(device)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+                all_preds_s2.append(probs.cpu().numpy())
+                all_labels.append(labels.numpy())
+
+            # Pass 2: Stride 5
+            for images, _ in val_loader_s5:
+                images = images.to(device)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+                all_preds_s5.append(probs.cpu().numpy())
+
+        # Concatenate batches
+        y_true = np.concatenate(all_labels)
+        y_pred_s2 = np.concatenate(all_preds_s2)
+        y_pred_s5 = np.concatenate(all_preds_s5)
+
+        # Ensemble Average
+        y_pred_ensemble = (y_pred_s2 + y_pred_s5) / 2.0
+
+        # Calculate Metric
+        try:
+            val_auc = roc_auc_score(y_true, y_pred_ensemble)
+=======
+        # --- Validation Phase ---
+        model.eval()
+        all_labels = []
+        all_preds = []
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+                all_preds.append(probs.cpu().numpy())
+                all_labels.append(labels.numpy())
+
+        # Concatenate batches
+        y_true = np.concatenate(all_labels)
+        y_pred = np.concatenate(all_preds)
+
+        # Calculate Metric
+        try:
+            val_auc = roc_auc_score(y_true, y_pred)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        # 3. Datasets
+        # We need two datasets to easily retrieve Stride 2 and Stride 5 volumes for the same subject.
+        # transform=get_transforms("test") applies ToTensorV2 only.
+        ds_stride2 = MRIDataset(
+            data_cache=test_cache,
+            metadata_df=df_test,
+            transform=get_transforms("test"),
+            stride_mode=2,
+        )
+
+        ds_stride5 = MRIDataset(
+            data_cache=test_cache,
+            metadata_df=df_test,
+            transform=get_transforms("test"),
+            stride_mode=5,
+        )
+
+        # 4. Load Model
+        model = self.load_model()
+
+        # 5. Inference Loop
+        results = []
+
+        with torch.no_grad():
+            for i in range(len(ds_stride2)):
+                row = ds_stride2.metadata.iloc[i]
+                subject_id = row["BraTS21ID"]
+
+                # Retrieve base tensors (C, H, W)
+                # Dataset returns (image, label), we ignore the label
+                img_s2, _ = ds_stride2[i]
+                img_s5, _ = ds_stride5[i]
+
+                # Construct TTA Batch
+                # We want 6 predictions:
+                # Stride 2: [Original, H-Flip, V-Flip]
+                # Stride 5: [Original, H-Flip, V-Flip]
+
+                tta_batch = []
+
+                for img in [img_s2, img_s5]:
+                    # Original
+                    tta_batch.append(img)
+
+                    # Horizontal Flip (Flip width dimension: dim 2)
+                    tta_batch.append(torch.flip(img, dims=[2]))
+
+                    # Vertical Flip (Flip height dimension: dim 1)
+                    tta_batch.append(torch.flip(img, dims=[1]))
+
+                # Stack into a single batch: Shape (6, 12, H, W)
+                batch_tensor = torch.stack(tta_batch).to(self.device)
+
+                # Forward Pass
+                logits = model(batch_tensor)
+                probs = torch.sigmoid(logits)  # Shape (6, 1)
+
+                # Matched Ensemble Aggregation
+                avg_prob = torch.mean(probs).item()
+
+                results.append({"BraTS21ID": subject_id, "MGMT_value": avg_prob})
+
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1}/{len(ds_stride2)} subjects.")
+=======
+        # 3. Datasets
+        ds_test = MRIDataset(
+            data_cache=test_cache,
+            metadata_df=df_test,
+            transform=get_transforms("test"),
+        )
+
+        # 4. Load Model
+        model = self.load_model()
+
+        # 5. Inference Loop
+        results = []
+
+        with torch.no_grad():
+            for i in range(len(ds_test)):
+                row = ds_test.metadata.iloc[i]
+                subject_id = row["BraTS21ID"]
+
+                # Retrieve base tensor (C, H, W)
+                img, _ = ds_test[i]
+
+                # Construct TTA Batch
+                # [Original, H-Flip, V-Flip]
+                tta_batch = []
+                
+                # Original
+                tta_batch.append(img)
+                # Horizontal Flip (Flip width dimension: dim 2)
+                tta_batch.append(torch.flip(img, dims=[2]))
+                # Vertical Flip (Flip height dimension: dim 1)
+                tta_batch.append(torch.flip(img, dims=[1]))
+
+                # Stack into a single batch: Shape (3, 12, H, W)
+                batch_tensor = torch.stack(tta_batch).to(self.device)
+
+                # Forward Pass
+                logits = model(batch_tensor)
+                probs = torch.sigmoid(logits)  # Shape (3, 1)
+
+                # Aggregation
+                avg_prob = torch.mean(probs).item()
+
+                results.append({"BraTS21ID": subject_id, "MGMT_value": avg_prob})
+
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1}/{len(ds_test)} subjects.")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Initialize Datasets for Matched Ensemble (Stride 2 and Stride 5)
+    ds_s2 = MRIDataset(
+        val_cache, df_val, transform=get_transforms("val"), stride_mode=2
+    )
+    ds_s5 = MRIDataset(
+        val_cache, df_val, transform=get_transforms("val"), stride_mode=5
+    )
+
+    y_true = []
+    y_pred = []
+    errors = []
+
+    # Storage for feature extraction (Slice counts per modality)
+    # We will correlate error with the amount of data available (depth)
+    meta_features = {
+        "depth_FLAIR": [],
+        "depth_T1w": [],
+        "depth_T1wCE": [],
+        "depth_T2w": [],
+    }
+
+    logger.info("Running Validation Inference...")
+
+    with torch.no_grad():
+        for i in range(len(ds_s2)):
+            # 1. Get Data
+            # Note: ds_s2 and ds_s5 are aligned by index because they use the same metadata df
+            img_s2, label_tensor = ds_s2[i]
+            img_s5, _ = ds_s5[i]
+
+            label = label_tensor.item()
+
+            # 2. Construct TTA Batch
+            # Strategy: [Stride2_Orig, Stride2_HFlip, Stride2_VFlip, Stride5_Orig, Stride5_HFlip, Stride5_VFlip]
+            batch_imgs = []
+            for img in [img_s2, img_s5]:
+                batch_imgs.append(img)
+                batch_imgs.append(torch.flip(img, dims=[2]))  # Horizontal Flip (W)
+                batch_imgs.append(torch.flip(img, dims=[1]))  # Vertical Flip (H)
+
+            batch_tensor = torch.stack(batch_imgs).to(device)
+
+            # 3. Inference
+            logits = model(batch_tensor)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            # 4. Ensemble Aggregation
+            avg_prob = np.mean(probs)
+
+            # 5. Store Results
+            y_true.append(label)
+            y_pred.append(avg_prob)
+
+            # 6. Error Calculation for Analysis
+            error = abs(label - avg_prob)
+            errors.append(error)
+
+            # 7. Extract Features for Analysis
+            subject_id = ds_s2.metadata.iloc[i]["BraTS21ID"]
+            subj_data = val_cache["images"][subject_id]
+            for mod in Config.MODALITIES:
+                # Shape is (Depth, Height, Width)
+                depth = subj_data[mod].shape[0]
+                meta_features[f"depth_{mod}"].append(depth)
+=======
+    # Initialize Dataset
+    ds_val = MRIDataset(
+        val_cache, df_val, transform=get_transforms("val")
+    )
+
+    y_true = []
+    y_pred = []
+    errors = []
+
+    logger.info("Running Validation Inference...")
+
+    with torch.no_grad():
+        for i in range(len(ds_val)):
+            # 1. Get Data
+            img, label_tensor = ds_val[i]
+            label = label_tensor.item()
+
+            # 2. Construct TTA Batch
+            # Strategy: [Orig, HFlip, VFlip]
+            batch_imgs = []
+            batch_imgs.append(img)
+            batch_imgs.append(torch.flip(img, dims=[2]))  # Horizontal Flip (W)
+            batch_imgs.append(torch.flip(img, dims=[1]))  # Vertical Flip (H)
+
+            batch_tensor = torch.stack(batch_imgs).to(device)
+
+            # 3. Inference
+            logits = model(batch_tensor)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            # 4. Aggregation
+            avg_prob = np.mean(probs)
+
+            # 5. Store Results
+            y_true.append(label)
+            y_pred.append(avg_prob)
+
+            # 6. Error Calculation
+            error = abs(label - avg_prob)
+            errors.append(error)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Failure Analysis: Correlation
+    print("\nFailure Analysis (Correlation between Error Magnitude and Volume Depth):")
+    error_arr = np.array(errors)
+
+    for feat_name, values in meta_features.items():
+        val_arr = np.array(values)
+        # Handle constant input case to avoid NaN
+        if np.std(val_arr) == 0 or np.std(error_arr) == 0:
+            corr = 0.0
+        else:
+            corr = np.corrcoef(error_arr, val_arr)[0, 1]
+        print(f"Correlation with {feat_name}: {corr:.6f}")
+=======
+    # Failure Analysis: Basic Stats
+    print("\nFailure Analysis:")
+    print(f"Mean Absolute Error: {np.mean(errors):.4f}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,216 @@
+The `torch.OutOfMemoryError` indicates that the physical batch size of 256 exceeds the 16GB VRAM capacity of the available GPU, despite the `expandable_segments` setting (Cite debug_lesson_7). To fix this while preserving the convergence stability of the original batch size, I will implement **Gradient Accumulation** (Cite debug_lesson_8). This involves reducing the `BATCH_SIZE` in `Config` to 32 and introducing `GRAD_ACCUM_STEPS = 8` (maintaining an effective batch size of 256). I will then update the `Trainer` class in `library/trainer.py` to scale the loss, accumulate gradients over multiple steps, and update the optimizer/scheduler only after the accumulated steps, ensuring the memory footprint is minimized without altering the training dynamics.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 5. TRAINING CONFIG
+    # ==========================================
+    BATCH_SIZE = 256  # A100 40GB can handle large batches
+    LEARNING_RATE = 1e-4
+=======
+    # ==========================================
+    # 5. TRAINING CONFIG
+    # ==========================================
+    BATCH_SIZE = 32  # Reduced to fit 16GB VRAM
+    GRAD_ACCUM_STEPS = 8  # Accumulate to maintain effective batch size of 256
+    LEARNING_RATE = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        criterion: nn.Module,
+        device: str,
+        grad_clip: float,
+    ):
+        self.logger = setup_logger("Trainer")
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.criterion = criterion
+        self.device = device
+        self.grad_clip = grad_clip
+        self.scaler = GradScaler()
+
+    def train_epoch(self, epoch: int) -> float:
+        """
+        Runs one epoch of training.
+        """
+        self.model.train()
+        total_loss = 0.0
+        start_time = time.time()
+
+        # Log interval for large datasets
+        log_interval = max(1, len(self.train_loader) // 10)
+
+        for i, batch in enumerate(self.train_loader):
+            # Unpack batch
+            # src: (batch, src_len)
+            # tgt: (batch, tgt_len) - includes BOS and EOS
+            src, tgt = batch
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+
+            # Prepare inputs and targets for teacher forcing
+            # Input to decoder: BOS ... Token_N
+            tgt_input = tgt[:, :-1]
+            # Target for loss: Token_1 ... EOS
+            tgt_output = tgt[:, 1:]
+
+            self.optimizer.zero_grad()
+
+            # Forward pass with AMP
+            with autocast():
+                # logits: (batch, tgt_len-1, vocab_size)
+                logits = self.model(src, tgt_input)
+
+                # Reshape for loss calculation
+                # logits: (batch * seq_len, vocab_size)
+                # target: (batch * seq_len)
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1)
+                )
+
+            # Backward pass with Scaler
+            self.scaler.scale(loss).backward()
+
+            # Gradient Clipping
+            if self.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.scheduler.step()
+
+            total_loss += loss.item()
+
+            if (i + 1) % log_interval == 0:
+=======
+        criterion: nn.Module,
+        device: str,
+        grad_clip: float,
+        grad_accum_steps: int = 1,
+    ):
+        self.logger = setup_logger("Trainer")
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.criterion = criterion
+        self.device = device
+        self.grad_clip = grad_clip
+        self.grad_accum_steps = grad_accum_steps
+        self.scaler = GradScaler()
+
+    def train_epoch(self, epoch: int) -> float:
+        """
+        Runs one epoch of training.
+        """
+        self.model.train()
+        total_loss = 0.0
+        start_time = time.time()
+
+        # Initialize gradients
+        self.optimizer.zero_grad()
+
+        # Log interval for large datasets
+        log_interval = max(1, len(self.train_loader) // 10)
+
+        for i, batch in enumerate(self.train_loader):
+            # Unpack batch
+            # src: (batch, src_len)
+            # tgt: (batch, tgt_len) - includes BOS and EOS
+            src, tgt = batch
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+
+            # Prepare inputs and targets for teacher forcing
+            # Input to decoder: BOS ... Token_N
+            tgt_input = tgt[:, :-1]
+            # Target for loss: Token_1 ... EOS
+            tgt_output = tgt[:, 1:]
+
+            # Forward pass with AMP
+            with autocast():
+                # logits: (batch, tgt_len-1, vocab_size)
+                logits = self.model(src, tgt_input)
+
+                # Reshape for loss calculation
+                # logits: (batch * seq_len, vocab_size)
+                # target: (batch * seq_len)
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1)
+                )
+                # Scale loss for gradient accumulation
+                loss = loss / self.grad_accum_steps
+
+            # Backward pass with Scaler
+            self.scaler.scale(loss).backward()
+
+            # Step Optimizer and Scheduler only after accumulating gradients
+            if (i + 1) % self.grad_accum_steps == 0:
+                # Gradient Clipping
+                if self.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+            total_loss += loss.item() * self.grad_accum_steps
+
+            if (i + 1) % log_interval == 0:
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # Scheduler
+    total_steps = len(train_loader) * Config.EPOCHS
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=Config.WARMUP_STEPS, num_training_steps=total_steps
+    )
+
+    # 5. Start Training
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        device=Config.DEVICE,
+        grad_clip=Config.GRAD_CLIP,
+    )
+=======
+    # Scheduler
+    # Adjust total_steps for gradient accumulation
+    total_steps = (len(train_loader) // Config.GRAD_ACCUM_STEPS) * Config.EPOCHS
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=Config.WARMUP_STEPS, num_training_steps=total_steps
+    )
+
+    # 5. Start Training
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        device=Config.DEVICE,
+        grad_clip=Config.GRAD_CLIP,
+        grad_accum_steps=Config.GRAD_ACCUM_STEPS,
+    )
+>>>>>>> REPLACE
+```

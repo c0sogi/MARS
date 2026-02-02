@@ -1,0 +1,274 @@
+The error `KeyError: 'class_name'` occurs because the `GTDatabase` is empty, which is caused by a **Coordinate System Mismatch** (Cite `debug_lesson_7`). The Lidar points are in the **Sensor Frame** (near origin), while the Ground Truth bounding boxes are in the **Global Frame** (coordinates ~1800m). Consequently, the geometric filtering in `_generate_database` rejects all points, resulting in zero valid samples.
+
+To fix this, I will:
+1.  Implement a `NuScenesHelper` class in `library/dataset.py` to load the necessary metadata (`sample_data.json`, `ego_pose.json`, `calibrated_sensor.json`) and perform coordinate transformations.
+2.  Update `GTDatabase` to transform Ground Truth boxes from Global to Sensor frame before processing, ensuring they align with the Lidar points. I will also rename the cache file to `gt_database_sensor.parquet` to force regeneration (Cite `debug_lesson_1`).
+3.  Update `LidarDataset` to use `NuScenesHelper` to transform Ground Truth boxes to the Sensor frame during data loading, ensuring the model trains on aligned data.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+import os
+import math
+from library.config import Config
+
+
+class GTDatabase:
+=======
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+import os
+import math
+import json
+from library.config import Config
+
+
+class NuScenesHelper:
+    def __init__(self, root_dir):
+        self.root_dir = root_dir
+        self.sample_data = self._load_json("sample_data.json")
+        self.ego_pose = self._load_map("ego_pose.json")
+        self.calibrated_sensor = self._load_map("calibrated_sensor.json")
+        
+        # Index sample_token -> lidar_record
+        self.sample_to_lidar = {}
+        for item in self.sample_data:
+            if item["filename"].endswith(".bin"):
+                self.sample_to_lidar[item["sample_token"]] = item
+
+    def _load_json(self, name):
+        with open(os.path.join(self.root_dir, name), "r") as f:
+            return json.load(f)
+
+    def _load_map(self, name):
+        data = self._load_json(name)
+        return {item["token"]: item for item in data}
+
+    def get_matrix(self, record):
+        q = record["rotation"]
+        t = np.array(record["translation"], dtype=np.float32)
+        
+        # Quaternion to Matrix (w, x, y, z)
+        w, x, y, z = q
+        R = np.array([
+            [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+            [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+            [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+        ], dtype=np.float32)
+        
+        M = np.eye(4, dtype=np.float32)
+        M[:3, :3] = R
+        M[:3, 3] = t
+        return M
+
+    def global_to_sensor(self, box, sample_token):
+        # box: [x, y, z, w, l, h, yaw]
+        if sample_token not in self.sample_to_lidar:
+            return box 
+
+        sd_record = self.sample_to_lidar[sample_token]
+        ego_record = self.ego_pose[sd_record["ego_pose_token"]]
+        cs_record = self.calibrated_sensor[sd_record["calibrated_sensor_token"]]
+
+        # Global -> Ego -> Sensor
+        M_ego = self.get_matrix(ego_record)
+        M_sensor = self.get_matrix(cs_record)
+        
+        # M_global_to_sensor = inv(M_sensor) @ inv(M_ego)
+        M_inv = np.linalg.inv(M_ego @ M_sensor)
+
+        # Transform Center
+        center = np.array([box[0], box[1], box[2], 1.0], dtype=np.float32)
+        center_local = M_inv @ center
+        
+        # Transform Yaw
+        # Rotate unit vector
+        yaw = box[6]
+        vec = np.array([np.cos(yaw), np.sin(yaw), 0.0, 0.0], dtype=np.float32)
+        vec_local = M_inv @ vec
+        yaw_local = np.arctan2(vec_local[1], vec_local[0])
+
+        return np.array([center_local[0], center_local[1], center_local[2], box[3], box[4], box[5], yaw_local], dtype=np.float32)
+
+
+class GTDatabase:
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __init__(self, metadata_df, load_cached_data=True):
+        self.metadata_df = metadata_df
+        self.db_path = os.path.join(Config.GT_DATABASE_DIR, "gt_database.parquet")
+        self.points_path = os.path.join(Config.GT_DATABASE_DIR, "gt_points.bin")
+
+        self.database = None
+        self.indices = {}
+
+        if (
+            load_cached_data
+            and os.path.exists(self.db_path)
+            and os.path.exists(self.points_path)
+        ):
+            self.database = pd.read_parquet(self.db_path)
+        else:
+            self._generate_database()
+=======
+    def __init__(self, metadata_df, load_cached_data=True):
+        self.metadata_df = metadata_df
+        # Cite debug_lesson_1: Invalidate cache when changing logic
+        self.db_path = os.path.join(Config.GT_DATABASE_DIR, "gt_database_sensor.parquet")
+        self.points_path = os.path.join(Config.GT_DATABASE_DIR, "gt_points_sensor.bin")
+        
+        # Cite debug_lesson_7: Fix data mismatch globally
+        self.helper = NuScenesHelper(Config.TRAIN_DATA_ROOT)
+
+        self.database = None
+        self.indices = {}
+
+        if (
+            load_cached_data
+            and os.path.exists(self.db_path)
+            and os.path.exists(self.points_path)
+        ):
+            self.database = pd.read_parquet(self.db_path)
+        else:
+            self._generate_database()
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                        # Parse box: cx, cy, cz, w, l, h, yaw
+                        box = np.array(
+                            [float(parts[offset + j]) for j in range(7)],
+                            dtype=np.float32,
+                        )
+                        cls_name = parts[offset + 7]
+
+                        if cls_name not in Config.CLASS_NAMES:
+                            continue
+
+                        # --- Geometric Unit Test & Cropping ---
+                        # 1. Rough filter
+                        center = box[:3]
+=======
+                        # Parse box: cx, cy, cz, w, l, h, yaw
+                        box_global = np.array(
+                            [float(parts[offset + j]) for j in range(7)],
+                            dtype=np.float32,
+                        )
+                        cls_name = parts[offset + 7]
+
+                        if cls_name not in Config.CLASS_NAMES:
+                            continue
+                            
+                        # Transform to Sensor Frame
+                        # Cite debug_lesson_7: Transform GT to sensor frame
+                        box = self.helper.global_to_sensor(box_global, row["sample_token"])
+
+                        # --- Geometric Unit Test & Cropping ---
+                        # 1. Rough filter
+                        center = box[:3]
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def sample(self, existing_boxes):
+        """
+        Sample objects from DB and return points (global coords) and boxes.
+        existing_boxes: (N, 7)
+        """
+        if self.database is None or self.database.empty:
+            return [], [], []
+
+        sampled_points = []
+        sampled_boxes = []
+=======
+    def sample(self, existing_boxes):
+        """
+        Sample objects from DB and return points (sensor coords) and boxes.
+        existing_boxes: (N, 7)
+        """
+        if self.database is None or self.database.empty:
+            return [], [], []
+
+        sampled_points = []
+        sampled_boxes = []
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Voxelization Parameters
+        self.voxel_size = np.array(Config.VOXEL_SIZE, dtype=np.float32)
+        self.pc_range = np.array(Config.POINT_CLOUD_RANGE, dtype=np.float32)
+        self.grid_size = np.array(Config.GRID_SIZE, dtype=np.int32)
+        self.max_voxels = (
+            Config.MAX_VOXELS_TRAIN if self.is_train else Config.MAX_VOXELS_TEST
+        )
+
+    def __len__(self):
+=======
+        # Voxelization Parameters
+        self.voxel_size = np.array(Config.VOXEL_SIZE, dtype=np.float32)
+        self.pc_range = np.array(Config.POINT_CLOUD_RANGE, dtype=np.float32)
+        self.grid_size = np.array(Config.GRID_SIZE, dtype=np.int32)
+        self.max_voxels = (
+            Config.MAX_VOXELS_TRAIN if self.is_train else Config.MAX_VOXELS_TEST
+        )
+        
+        # Helper for coordinate transformation
+        # Cite debug_lesson_7: Fix data mismatch globally
+        data_root = Config.TRAIN_DATA_ROOT if split in ["train", "val"] else Config.TEST_DATA_ROOT
+        self.helper = NuScenesHelper(data_root)
+
+    def __len__(self):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                for i in range(num_objs):
+                    off = i * 8
+                    box = [float(parts[off + j]) for j in range(7)]
+                    name = parts[off + 7]
+                    if name in Config.CLASS_NAMES:
+                        gt_boxes.append(box)
+                        gt_names.append(name)
+
+        gt_boxes = (
+            np.array(gt_boxes, dtype=np.float32)
+            if gt_boxes
+            else np.zeros((0, 7), dtype=np.float32)
+        )
+=======
+                for i in range(num_objs):
+                    off = i * 8
+                    box_global = [float(parts[off + j]) for j in range(7)]
+                    name = parts[off + 7]
+                    if name in Config.CLASS_NAMES:
+                        # Transform to Sensor Frame
+                        box_sensor = self.helper.global_to_sensor(box_global, sample_token)
+                        gt_boxes.append(box_sensor)
+                        gt_names.append(name)
+
+        gt_boxes = (
+            np.array(gt_boxes, dtype=np.float32)
+            if gt_boxes
+            else np.zeros((0, 7), dtype=np.float32)
+        )
+>>>>>>> REPLACE
+```

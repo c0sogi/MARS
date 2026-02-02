@@ -1,0 +1,372 @@
+I will implement the following changes to optimize the solution:
+
+1.  **Upgrade Architecture to Pyramidal TCN**: I will modify `library/model.py` to replace the fixed-width Multi-Kernel CNN with a Pyramidal TCN. This branch will scale channels ($64 \to 128 \to 256 \to 512$) and dilations ($1, 2, 4, 8$) to match the capacity of the LSTM branch and capture multi-scale resistive dynamics, addressing the bottleneck identified in Lesson `solution_lesson_node_00057` and applying the scaling principle from Lesson `solution_lesson_node_00024`.
+2.  **Enable Full-Scale Training**: I will update `library/config.py` to set `DEBUG = False` and `EPOCHS = 60`. This moves the solution from a fast baseline to a converged regime, preventing the underfitting caused by data subsampling and short schedules as warned in Lesson `solution_lesson_node_00054`.
+3.  **Remove Debug Overrides**: I will clean `runfile.py` to ensure it uses the optimized configuration from `Config` rather than the hardcoded debug settings.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # 3. Training Hyperparameters (Critical Mass Regime)
+    # =========================================================================
+    # Strict adherence to Lesson 54: Full dataset, small batch, long training
+    BATCH_SIZE = 128
+    EPOCHS = 80
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 15
+
+    # Debugging / Development
+    # Set DEBUG = True to run on a small subset for rapid code verification
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 5000  # Number of breaths to use in debug mode
+
+    # =========================================================================
+    # 4. Model Architecture (FMDH-Net)
+    # =========================================================================
+    # Branch 1: Multi-Resolution Dense CNN (Resistive Stream)
+    CNN_FILTERS = 64
+    CNN_KERNELS = [3, 7, 11]  # Multi-scale local feature extraction
+    CNN_DROPOUT = 0.1
+=======
+    # =========================================================================
+    # 3. Training Hyperparameters (Critical Mass Regime)
+    # =========================================================================
+    # Strict adherence to Lesson 54: Full dataset, small batch, long training
+    BATCH_SIZE = 128
+    EPOCHS = 60  # Optimized for 4-hour runtime limit while ensuring convergence
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 15
+
+    # Debugging / Development
+    # Set DEBUG = True to run on a small subset for rapid code verification
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 15000
+
+    # =========================================================================
+    # 4. Model Architecture (FMDH-Net)
+    # =========================================================================
+    # Branch 1: Pyramidal TCN (Resistive Stream) - Cite solution_lesson_node_00057
+    # Channels scale: 64 -> 128 -> 256 -> 512
+    CNN_START_FILTERS = 64
+    CNN_KERNEL_SIZE = 5  # Cite solution_lesson_node_00026
+    CNN_DROPOUT = 0.1
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiKernelConvBlock(nn.Module):
+    """
+    A dense, multi-resolution convolutional block.
+    Applies parallel 1D convolutions with different kernel sizes and concatenates the results.
+    This allows the model to capture features at different local scales simultaneously
+    (e.g., sharp changes vs smooth trends) without using dilation.
+    """
+
+    def __init__(self, in_channels, out_channels, kernels, dropout=0.0):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        for k in kernels:
+            # Padding is set to k // 2 to maintain temporal alignment (same padding)
+            # Stride=1 and Dilation=1 ensure dense feature extraction
+            self.convs.append(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=k,
+                    padding=k // 2,
+                    stride=1,
+                    dilation=1,
+                )
+            )
+
+        # The output dimension is the sum of the outputs of all parallel convolutions
+        self.total_out_channels = out_channels * len(kernels)
+
+        self.bn = nn.BatchNorm1d(self.total_out_channels)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Seq_Len)
+        outputs = [conv(x) for conv in self.convs]
+        x = torch.cat(outputs, dim=1)
+        x = self.bn(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return x
+
+
+class FMDHNet(nn.Module):
+    """
+    Full-Scale Multi-Resolution Dense-Hybrid Network (FMDH-Net).
+
+    Architecture:
+    1. Parallel Branches:
+       - CNN Branch: Multi-Kernel Dense Convolutions (Resistive dynamics, high freq).
+       - LSTM Branch: High-Capacity Bidirectional LSTM (Elastic dynamics, integration).
+    2. Fusion:
+       - Concatenation of branch outputs.
+       - Deep MLP Head.
+
+    Constraints:
+    - No additive skip connections between branches (forces flow through integrators).
+    - Dense convolutions (no dilation) for maximum local fidelity.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Load hyperparameters from Config
+        input_dim = Config.INPUT_DIM
+
+        # CNN Hyperparameters
+        cnn_filters = Config.CNN_FILTERS
+        cnn_kernels = Config.CNN_KERNELS
+        cnn_dropout = Config.CNN_DROPOUT
+
+        # LSTM Hyperparameters
+        lstm_hidden = Config.LSTM_HIDDEN_SIZE
+        lstm_layers = Config.LSTM_LAYERS
+        lstm_bidir = Config.LSTM_BIDIRECTIONAL
+        lstm_dropout = Config.LSTM_DROPOUT
+
+        # Head Hyperparameters
+        fc_dropout = Config.FC_DROPOUT
+
+        # =====================================================================
+        # Branch 1: Multi-Resolution Dense CNN (Resistive Stream)
+        # =====================================================================
+
+        # Initial projection to map input features to the CNN feature space
+        self.cnn_projection = nn.Sequential(
+            nn.Conv1d(input_dim, cnn_filters, kernel_size=1),
+            nn.BatchNorm1d(cnn_filters),
+            nn.GELU(),
+        )
+
+        # Stack of Multi-Kernel Blocks
+        # We use a fixed depth of 4 blocks to ensure sufficient depth while relying on
+        # the width (multi-kernel) for feature diversity.
+        self.cnn_blocks = nn.ModuleList()
+
+        # Block 1: Input (cnn_filters) -> Output (cnn_filters * num_kernels)
+        self.cnn_blocks.append(
+            MultiKernelConvBlock(cnn_filters, cnn_filters, cnn_kernels, cnn_dropout)
+        )
+
+        # Calculate the channel dimension after the first block
+        # e.g., 64 * 3 = 192
+        cnn_current_dim = cnn_filters * len(cnn_kernels)
+
+        # Subsequent Blocks: Input (192) -> Output (192)
+        # To maintain constant width, we set the 'out_channels' of the parallel convs
+        # such that their sum equals the input dimension.
+        # However, to maximize capacity as per "Critical Mass", we will keep the
+        # individual kernel output size at 'cnn_filters', meaning the width stays at 192.
+        # Block 1: In 64 -> Out 192
+        # Block 2: In 192 -> Out 192 (Each conv takes 192, outputs 64)
+        for _ in range(3):
+            self.cnn_blocks.append(
+                MultiKernelConvBlock(
+                    cnn_current_dim, cnn_filters, cnn_kernels, cnn_dropout
+                )
+            )
+
+        self.cnn_out_dim = cnn_current_dim
+=======
+class TCNBlock(nn.Module):
+    """
+    A single block of the Pyramidal TCN.
+    Applies a dilated convolution with centered padding, followed by BN, GELU, and Dropout.
+    """
+
+    def __init__(self, in_c, out_c, kernel_size, dilation, dropout):
+        super().__init__()
+        # Calculate padding to maintain sequence length with centered alignment
+        # Padding = (Dilation * (Kernel - 1)) / 2
+        padding = (dilation * (kernel_size - 1)) // 2
+        
+        self.conv = nn.Conv1d(
+            in_channels=in_c,
+            out_channels=out_c,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            bias=False # BN follows
+        )
+        self.bn = nn.BatchNorm1d(out_c)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.act(self.bn(self.conv(x))))
+
+
+class FMDHNet(nn.Module):
+    """
+    Full-Scale Multi-Resolution Dense-Hybrid Network (FMDH-Net).
+    Updated to use a Pyramidal TCN branch to match LSTM capacity.
+    
+    Architecture:
+    1. Parallel Branches:
+       - TCN Branch: Pyramidal Dilated Convolutions (Resistive dynamics).
+         Scales channels: 64 -> 128 -> 256 -> 512.
+         Scales dilation: 1 -> 2 -> 4 -> 8.
+       - LSTM Branch: High-Capacity Bidirectional LSTM (Elastic dynamics).
+    2. Fusion:
+       - Concatenation of branch outputs.
+       - Deep MLP Head.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Load hyperparameters from Config
+        input_dim = Config.INPUT_DIM
+
+        # TCN Hyperparameters
+        tcn_start_filters = Config.CNN_START_FILTERS
+        tcn_kernel = Config.CNN_KERNEL_SIZE
+        tcn_dropout = Config.CNN_DROPOUT
+
+        # LSTM Hyperparameters
+        lstm_hidden = Config.LSTM_HIDDEN_SIZE
+        lstm_layers = Config.LSTM_LAYERS
+        lstm_bidir = Config.LSTM_BIDIRECTIONAL
+        lstm_dropout = Config.LSTM_DROPOUT
+
+        # Head Hyperparameters
+        fc_dropout = Config.FC_DROPOUT
+
+        # =====================================================================
+        # Branch 1: Pyramidal TCN (Resistive Stream)
+        # =====================================================================
+        # Cite solution_lesson_node_00057: "Balanced Capacity in Hybrid Physical Models"
+        # Cite solution_lesson_node_00024: "Scale channel width proportionally with dilation"
+        
+        self.tcn_blocks = nn.ModuleList()
+        
+        # Layer 1: Input -> 64, Dilation 1
+        self.tcn_blocks.append(
+            TCNBlock(input_dim, tcn_start_filters, tcn_kernel, dilation=1, dropout=tcn_dropout)
+        )
+        
+        # Layer 2: 64 -> 128, Dilation 2
+        self.tcn_blocks.append(
+            TCNBlock(tcn_start_filters, tcn_start_filters * 2, tcn_kernel, dilation=2, dropout=tcn_dropout)
+        )
+        
+        # Layer 3: 128 -> 256, Dilation 4
+        self.tcn_blocks.append(
+            TCNBlock(tcn_start_filters * 2, tcn_start_filters * 4, tcn_kernel, dilation=4, dropout=tcn_dropout)
+        )
+        
+        # Layer 4: 256 -> 512, Dilation 8
+        self.tcn_blocks.append(
+            TCNBlock(tcn_start_filters * 4, tcn_start_filters * 8, tcn_kernel, dilation=8, dropout=tcn_dropout)
+        )
+
+        self.cnn_out_dim = tcn_start_filters * 8  # 512
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # 1. Prepare Inputs
+        # CNN requires (Batch, Channels, Seq_Len)
+        x_cnn = x.transpose(1, 2)
+        # LSTM requires (Batch, Seq_Len, Features)
+        x_lstm = x
+
+        # 2. CNN Branch Forward
+        c = self.cnn_projection(x_cnn)
+        for block in self.cnn_blocks:
+            c = block(c)
+        # Transpose back to (Batch, Seq_Len, Channels)
+        c_out = c.transpose(1, 2)
+=======
+        # 1. Prepare Inputs
+        # CNN requires (Batch, Channels, Seq_Len)
+        x_cnn = x.transpose(1, 2)
+        # LSTM requires (Batch, Seq_Len, Features)
+        x_lstm = x
+
+        # 2. TCN Branch Forward
+        c = x_cnn
+        for block in self.tcn_blocks:
+            c = block(c)
+        # Transpose back to (Batch, Seq_Len, Channels)
+        c_out = c.transpose(1, 2)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Override Config for Fast Baseline Execution (Target < 2 hours)
+    # We use a subset of data and fewer epochs to demonstrate the pipeline quickly.
+    Config.DEBUG = True
+    Config.DEBUG_SAMPLE_SIZE = 15000  # ~1.2M samples, sufficient for convergence demo
+    Config.EPOCHS = 6  # Reduced from 80 to 6 for speed
+    Config.BATCH_SIZE = 128  # Keep batch size small as per "Critical Mass"
+
+    # Reproducibility
+    seed_everything(Config.SEED)
+
+    # Clean cache to ensure we process the debug subset, not load old full data
+    cleanup_cache()
+
+    print(
+        f"Running Fast Baseline with DEBUG={Config.DEBUG}, "
+        f"Samples={Config.DEBUG_SAMPLE_SIZE}, Epochs={Config.EPOCHS}"
+    )
+
+    # =========================================================================
+    # 2. Data Preparation
+    # =========================================================================
+    # load_cached_data=False forces regeneration of data with the DEBUG settings
+    train_loader, val_loader, test_loader, test_ids = prepare_data(
+        load_cached_data=False
+    )
+=======
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Use Full Configuration from Config class (DEBUG=False, EPOCHS=60)
+    # Cite solution_lesson_node_00054: "The Phase Transition of Data Volume"
+    
+    # Reproducibility
+    seed_everything(Config.SEED)
+
+    # Clean cache to ensure we process the full dataset fresh
+    cleanup_cache()
+
+    print(
+        f"Running Full Training with DEBUG={Config.DEBUG}, "
+        f"Epochs={Config.EPOCHS}, Batch Size={Config.BATCH_SIZE}"
+    )
+
+    # =========================================================================
+    # 2. Data Preparation
+    # =========================================================================
+    # load_cached_data=False forces regeneration of data
+    train_loader, val_loader, test_loader, test_ids = prepare_data(
+        load_cached_data=False
+    )
+>>>>>>> REPLACE
+```

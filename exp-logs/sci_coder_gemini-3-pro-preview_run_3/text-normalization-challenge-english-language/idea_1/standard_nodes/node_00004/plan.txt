@@ -1,0 +1,346 @@
+To improve the model's performance, I will implement a more granular **Hierarchical Backoff Strategy** as suggested in **Cite solution_lesson_node_00001**. The previous solution relied on Left-Context Bigrams (L2) and Unigrams (L1). I will expand this by adding **Trigrams (L3)** and **Right-Context Bigrams (L2-Next)** to the hierarchy.
+
+The rationale is that text normalization often depends on both preceding and succeeding context (e.g., distinguishing "1998" as a year in "in 1998" vs. a quantity in "1998 items"). By exhausting explicit memorization with larger and more specific context windows before falling back to general rules, we can better handle the "long tail" of ambiguous tokens.
+
+**Implementation Strategy:**
+1.  **Modify `library/data_loader.py`**: Update the data processing logic to generate a `next_before` column (shifting the `before` column by -1 within sentence groups), providing the necessary right-side context.
+2.  **Modify `library/stats_model.py`**:
+    *   Update `fit` to compute and cache statistics for L3 (`prev, curr, next`), L2-Next (`curr, next`), L2-Prev (`prev, curr`), and L1 (`curr`).
+    *   Update `predict` to follow the backoff order: **L3 -> L2-Prev -> L2-Next -> L1 -> Regex -> Identity**.
+3.  **Update `runfile.py`**: Update the baseline metric to the improved score achieved by the previous solution (`0.99193...`).
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+        # Add previous token column
+        # Group by sentence_id and shift 'before' column by 1
+        # fillna("<START>") marks the beginning of a sentence
+        df["prev_before"] = (
+            df.groupby("sentence_id")["before"].shift(1).fillna("<START>")
+        )
+
+        # 5. Save to Cache (only if full data)
+=======
+        # Add previous token column
+        # Group by sentence_id and shift 'before' column by 1
+        # fillna("<START>") marks the beginning of a sentence
+        df["prev_before"] = (
+            df.groupby("sentence_id")["before"].shift(1).fillna("<START>")
+        )
+
+        # Add next token column
+        # Group by sentence_id and shift 'before' column by -1
+        # fillna("<END>") marks the end of a sentence
+        df["next_before"] = (
+            df.groupby("sentence_id")["before"].shift(-1).fillna("<END>")
+        )
+
+        # 5. Save to Cache (only if full data)
+>>>>>>> REPLACE
+```
+
+```diff
+library/stats_model.py
+<<<<<<< SEARCH
+    def __init__(self, cache_dir="./working/idea_1"):
+        self.logger = setup_logger("HierarchicalLookupModel")
+        self.cache_dir = cache_dir
+        self.regex_engine = RegexTransducer()
+
+        # Lookup tables
+        self.l1_lookup = {}  # Map[token, normalized]
+        self.l2_lookup = {}  # Map[(prev_token, token), normalized]
+
+    def fit(self, train_split="train", load_cached_data=True, sample_ratio=1.0):
+        """
+        Learns the unigram and bigram mappings from the training data.
+        Implements strict caching for the learned statistics.
+        """
+        os.makedirs(self.cache_dir, exist_ok=True)
+        l1_path = os.path.join(self.cache_dir, "l1_stats.parquet")
+        l2_path = os.path.join(self.cache_dir, "l2_stats.parquet")
+
+        # 1. Try Loading from Cache
+        if load_cached_data and os.path.exists(l1_path) and os.path.exists(l2_path):
+            self.logger.info("Loading cached model statistics...")
+            try:
+                df_l1 = pd.read_parquet(l1_path)
+                df_l2 = pd.read_parquet(l2_path)
+
+                # Build L1 Dictionary
+                self.l1_lookup = dict(zip(df_l1["before"], df_l1["after"]))
+
+                # Build L2 Dictionary
+                # Zip creates tuples of (prev, curr) for keys
+                self.l2_lookup = dict(
+                    zip(zip(df_l2["prev_before"], df_l2["before"]), df_l2["after"])
+                )
+
+                self.logger.info(
+                    f"Loaded {len(self.l1_lookup)} unigram rules and {len(self.l2_lookup)} bigram rules."
+                )
+                return
+            except Exception as e:
+                self.logger.warning(f"Failed to load cache: {e}. Recomputing...")
+
+        # 2. Compute Statistics from Scratch
+        self.logger.info("Computing statistics from training data...")
+
+        # Load data with context processing
+        df = load_dataset(
+            split=train_split,
+            process_context=True,
+            load_cached_data=load_cached_data,
+            sample_ratio=sample_ratio,
+        )
+
+        # A. Unigram Statistics (L1)
+        self.logger.info("Aggregating Unigram Statistics...")
+        # Group by input and target, count occurrences
+        l1_counts = df.groupby(["before", "after"]).size().reset_index(name="count")
+        # Select the 'after' with the highest count for each 'before'
+        l1_best = l1_counts.sort_values(
+            ["before", "count"], ascending=[True, False]
+        ).drop_duplicates(["before"])
+
+        # Update internal state
+        self.l1_lookup = dict(zip(l1_best["before"], l1_best["after"]))
+
+        # Save to cache
+        l1_best[["before", "after"]].to_parquet(l1_path, index=False)
+
+        # B. Bigram Statistics (L2)
+        self.logger.info("Aggregating Bigram Statistics...")
+        # Group by prev, input, target
+        l2_counts = (
+            df.groupby(["prev_before", "before", "after"])
+            .size()
+            .reset_index(name="count")
+        )
+        # Select best target
+        l2_best = l2_counts.sort_values(
+            ["prev_before", "before", "count"], ascending=[True, True, False]
+        ).drop_duplicates(["prev_before", "before"])
+
+        # Update internal state
+        self.l2_lookup = dict(
+            zip(zip(l2_best["prev_before"], l2_best["before"]), l2_best["after"])
+        )
+
+        # Save to cache
+        l2_best[["prev_before", "before", "after"]].to_parquet(l2_path, index=False)
+
+        self.logger.info(
+            f"Training complete. Learned {len(self.l1_lookup)} unigram rules and {len(self.l2_lookup)} bigram rules."
+        )
+
+    def predict(self, df):
+        """
+        Predicts normalized text for a DataFrame containing 'before' and 'prev_before' columns.
+        Returns a list of predictions.
+        """
+        tokens = df["before"].tolist()
+        prev_tokens = df["prev_before"].tolist()
+
+        preds = []
+
+        # Iterate through tokens (List comprehension/loop is generally efficient for this lookup logic)
+        for token, prev in zip(tokens, prev_tokens):
+            # 1. L2 Lookup (Contextual)
+            l2_key = (prev, token)
+            if l2_key in self.l2_lookup:
+                preds.append(self.l2_lookup[l2_key])
+                continue
+
+            # 2. L1 Lookup (Global)
+            if token in self.l1_lookup:
+                preds.append(self.l1_lookup[token])
+                continue
+
+            # 3. Regex Fallback (Heuristic)
+=======
+    def __init__(self, cache_dir="./working/idea_1"):
+        self.logger = setup_logger("HierarchicalLookupModel")
+        self.cache_dir = cache_dir
+        self.regex_engine = RegexTransducer()
+
+        # Lookup tables
+        self.l1_lookup = {}  # Map[token, normalized]
+        self.l2_prev_lookup = {}  # Map[(prev_token, token), normalized]
+        self.l2_next_lookup = {}  # Map[(token, next_token), normalized]
+        self.l3_lookup = {}  # Map[(prev_token, token, next_token), normalized]
+
+    def fit(self, train_split="train", load_cached_data=True, sample_ratio=1.0):
+        """
+        Learns the unigram, bigram, and trigram mappings from the training data.
+        Implements strict caching for the learned statistics.
+        """
+        os.makedirs(self.cache_dir, exist_ok=True)
+        l1_path = os.path.join(self.cache_dir, "l1_stats.parquet")
+        l2_prev_path = os.path.join(self.cache_dir, "l2_prev_stats.parquet")
+        l2_next_path = os.path.join(self.cache_dir, "l2_next_stats.parquet")
+        l3_path = os.path.join(self.cache_dir, "l3_stats.parquet")
+
+        # 1. Try Loading from Cache
+        if (
+            load_cached_data
+            and os.path.exists(l1_path)
+            and os.path.exists(l2_prev_path)
+            and os.path.exists(l2_next_path)
+            and os.path.exists(l3_path)
+        ):
+            self.logger.info("Loading cached model statistics...")
+            try:
+                df_l1 = pd.read_parquet(l1_path)
+                df_l2_prev = pd.read_parquet(l2_prev_path)
+                df_l2_next = pd.read_parquet(l2_next_path)
+                df_l3 = pd.read_parquet(l3_path)
+
+                # Build Dictionaries
+                self.l1_lookup = dict(zip(df_l1["before"], df_l1["after"]))
+                self.l2_prev_lookup = dict(
+                    zip(
+                        zip(df_l2_prev["prev_before"], df_l2_prev["before"]),
+                        df_l2_prev["after"],
+                    )
+                )
+                self.l2_next_lookup = dict(
+                    zip(
+                        zip(df_l2_next["before"], df_l2_next["next_before"]),
+                        df_l2_next["after"],
+                    )
+                )
+                self.l3_lookup = dict(
+                    zip(
+                        zip(
+                            df_l3["prev_before"], df_l3["before"], df_l3["next_before"]
+                        ),
+                        df_l3["after"],
+                    )
+                )
+
+                self.logger.info(
+                    f"Loaded L1:{len(self.l1_lookup)}, L2_prev:{len(self.l2_prev_lookup)}, "
+                    f"L2_next:{len(self.l2_next_lookup)}, L3:{len(self.l3_lookup)} rules."
+                )
+                return
+            except Exception as e:
+                self.logger.warning(f"Failed to load cache: {e}. Recomputing...")
+
+        # 2. Compute Statistics from Scratch
+        self.logger.info("Computing statistics from training data...")
+
+        # Load data with context processing
+        df = load_dataset(
+            split=train_split,
+            process_context=True,
+            load_cached_data=load_cached_data,
+            sample_ratio=sample_ratio,
+        )
+
+        # Helper to compute and save best mapping
+        def compute_stats(groupby_cols, output_path):
+            self.logger.info(f"Aggregating stats for {groupby_cols}...")
+            counts = (
+                df.groupby(groupby_cols + ["after"]).size().reset_index(name="count")
+            )
+            # Sort by count desc, then drop duplicates to keep most frequent
+            best = counts.sort_values(
+                groupby_cols + ["count"], ascending=(True * len(groupby_cols)) + [False]
+            ).drop_duplicates(groupby_cols)
+            best[groupby_cols + ["after"]].to_parquet(output_path, index=False)
+            return best
+
+        # A. Unigram (L1)
+        l1_best = compute_stats(["before"], l1_path)
+        self.l1_lookup = dict(zip(l1_best["before"], l1_best["after"]))
+
+        # B. Bigram Left (L2 Prev)
+        l2_prev_best = compute_stats(["prev_before", "before"], l2_prev_path)
+        self.l2_prev_lookup = dict(
+            zip(
+                zip(l2_prev_best["prev_before"], l2_prev_best["before"]),
+                l2_prev_best["after"],
+            )
+        )
+
+        # C. Bigram Right (L2 Next)
+        l2_next_best = compute_stats(["before", "next_before"], l2_next_path)
+        self.l2_next_lookup = dict(
+            zip(
+                zip(l2_next_best["before"], l2_next_best["next_before"]),
+                l2_next_best["after"],
+            )
+        )
+
+        # D. Trigram (L3)
+        l3_best = compute_stats(["prev_before", "before", "next_before"], l3_path)
+        self.l3_lookup = dict(
+            zip(
+                zip(l3_best["prev_before"], l3_best["before"], l3_best["next_before"]),
+                l3_best["after"],
+            )
+        )
+
+        self.logger.info("Training complete.")
+
+    def predict(self, df):
+        """
+        Predicts normalized text for a DataFrame containing 'before', 'prev_before', and 'next_before'.
+        Returns a list of predictions.
+        """
+        tokens = df["before"].tolist()
+        prev_tokens = df["prev_before"].tolist()
+        next_tokens = df["next_before"].tolist()
+
+        preds = []
+
+        # Iterate through tokens
+        for token, prev, next_tok in zip(tokens, prev_tokens, next_tokens):
+            # 1. L3 Lookup (Trigram) - Cite solution_lesson_node_00001 (Hierarchical Backoff)
+            l3_key = (prev, token, next_tok)
+            if l3_key in self.l3_lookup:
+                preds.append(self.l3_lookup[l3_key])
+                continue
+
+            # 2. L2 Prev Lookup (Left Context)
+            l2_prev_key = (prev, token)
+            if l2_prev_key in self.l2_prev_lookup:
+                preds.append(self.l2_prev_lookup[l2_prev_key])
+                continue
+
+            # 3. L2 Next Lookup (Right Context)
+            l2_next_key = (token, next_tok)
+            if l2_next_key in self.l2_next_lookup:
+                preds.append(self.l2_next_lookup[l2_next_key])
+                continue
+
+            # 4. L1 Lookup (Global)
+            if token in self.l1_lookup:
+                preds.append(self.l1_lookup[token])
+                continue
+
+            # 5. Regex Fallback (Heuristic)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Submission
+    # Generate predictions for the test set and save to CSV
+    baseline_metric = 0.991657606341203
+    if val_accuracy > baseline_metric:
+        logger.info(
+            f"Validation accuracy {val_accuracy} exceeds baseline {baseline_metric}. Generating submission..."
+        )
+=======
+    # 5. Submission
+    # Generate predictions for the test set and save to CSV
+    baseline_metric = 0.9919315123243717
+    if val_accuracy > baseline_metric:
+        logger.info(
+            f"Validation accuracy {val_accuracy} exceeds baseline {baseline_metric}. Generating submission..."
+        )
+>>>>>>> REPLACE
+```

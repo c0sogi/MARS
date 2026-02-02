@@ -1,0 +1,560 @@
+Based on the lessons learned, specifically **Lesson ID: solution_lesson_node_00016** ("Prioritize High-Precision Signals via Cascading over Weighted Ensembling") and **Lesson ID: solution_lesson_node_00012** ("Vectorized Inference"), I will optimize the solution by:
+
+1.  **Switching to a Cascade Architecture**: I will replace the weighted linear ensemble with a strict priority cascade: **Repurchase > Behavioral CF > Global Trend**. This will be implemented using "Tiered Scoring" in the vectorized inference step, where high-priority signals are boosted by large constants (e.g., Repurchase scores + $10^6$, CF scores + $10^3$) to enforce the hierarchy without slow iterative logic.
+2.  **Removing Visual Features**: As noted in Lesson 16, visual similarity added noise and computational cost without improving the baseline cascade. I will remove the visual component entirely.
+3.  **Optimizing Collaborative Filtering**: I will increase `TOP_K_SIMILAR` from 20 to 100 to better capture the "long tail" of item similarities, leveraging the efficiency of the vectorized inference (Lesson 12).
+4.  **Simplifying Execution**: I will remove the hyperparameter tuning loop from `runfile.py` as the cascade logic is deterministic and relies on structural priority rather than tuned weights.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Visual Model Hyperparameters
+    # ==========================================
+    # Model Architecture (available in torchvision/timm)
+    VISUAL_MODEL_NAME = "resnet50"
+
+    # Image Preprocessing
+    IMAGE_SIZE = (224, 224)
+    IMAGE_MEAN = [0.485, 0.456, 0.406]
+    IMAGE_STD = [0.229, 0.224, 0.225]
+
+    # Inference Batch Size (A100 40GB can handle large batches)
+    BATCH_SIZE = 256
+
+    # ==========================================
+    # Ensemble & Similarity Hyperparameters
+    # ==========================================
+    # Number of neighbors to keep in sparse similarity matrices
+    TOP_K_SIMILAR = 20
+
+    # Number of predictions per customer
+    TOP_N_PREDICTIONS = 12
+
+    # Default Ensemble Weights (Linear Combination)
+    # Score = alpha*Repurchase + beta*Behavioral + gamma*Visual + delta*Trend
+    # These serve as initial values or fallbacks if tuning is skipped
+    WEIGHT_ALPHA = 1.0  # Repurchase (Habit)
+    WEIGHT_BETA = 0.6  # Behavioral (Co-occurrence)
+    WEIGHT_GAMMA = 0.4  # Visual (Content-based)
+    WEIGHT_DELTA = 0.2  # Global Trend (Popularity)
+=======
+    # ==========================================
+    # Ensemble & Similarity Hyperparameters
+    # ==========================================
+    # Number of neighbors to keep in sparse similarity matrices
+    # Cite solution_lesson_node_00012: Increased to capture long-tail signals via vectorized inference
+    TOP_K_SIMILAR = 100
+
+    # Number of predictions per customer
+    TOP_N_PREDICTIONS = 12
+>>>>>>> REPLACE
+```
+
+```diff
+library/hybrid_recommender.py
+<<<<<<< SEARCH
+from library.data_utils import (
+    get_global_mapper,
+    load_and_filter_data,
+    build_user_history_vectors,
+)
+from library.visual_features import compute_visual_similarity_matrix
+from library.collaborative_filtering import (
+    compute_behavioral_similarity_matrix,
+    calculate_global_trend,
+)
+
+
+class HybridRecommender:
+    """
+    Implements the Hybrid Multi-View Similarity Ensemble.
+    Aggregates signals from Repurchase (Habit), Behavioral Co-occurrence,
+    Visual Similarity, and Global Trends using a weighted linear combination.
+    """
+
+    def __init__(self, load_cached_data=True, train_weeks=Config.TRAIN_WEEKS):
+        """
+        Initializes the recommender by loading/computing all necessary matrices.
+
+        Args:
+            load_cached_data (bool): If True, attempts to load matrices from disk cache.
+            train_weeks (int): Number of weeks of transaction history to use.
+        """
+        print("Initializing HybridRecommender...")
+
+        # 1. Setup Mapper (Global Universe of Users/Items)
+        self.mapper = get_global_mapper()
+
+        # 2. Load Training Data
+        # We load this once and pass it to the component builders.
+        # This ensures all components use the exact same data split/window.
+        print(f"Loading training data (last {train_weeks} weeks)...")
+        self.train_df = load_and_filter_data(Config.PATH_TRAIN, weeks=train_weeks)
+
+        # 3. Build/Load Ensemble Components
+
+        # View 1: Habit (Repurchase)
+        # Sparse Matrix: (N_Users, N_Items)
+        self.U_hist = build_user_history_vectors(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 2: Behavioral Similarity (Co-occurrence)
+        # Sparse Matrix: (N_Items, N_Items)
+        self.S_behavior = compute_behavioral_similarity_matrix(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 3: Visual Similarity (Content)
+        # Sparse Matrix: (N_Items, N_Items)
+        self.S_visual = compute_visual_similarity_matrix(
+            self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 4: Global Trend (Popularity)
+        # Dense Vector: (N_Items,)
+        self.V_trend = calculate_global_trend(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # 4. Set Ensemble Weights
+        self.w_rep = Config.WEIGHT_ALPHA  # Alpha: Repurchase
+        self.w_beh = Config.WEIGHT_BETA  # Beta: Behavioral
+        self.w_vis = Config.WEIGHT_GAMMA  # Gamma: Visual
+        self.w_trend = Config.WEIGHT_DELTA  # Delta: Trend
+
+        print(
+            f"Ensemble Weights initialized: "
+            f"Repurchase={self.w_rep}, Behavioral={self.w_beh}, "
+            f"Visual={self.w_vis}, Trend={self.w_trend}"
+        )
+
+        # 5. Cleanup
+        # We no longer need the raw dataframe, as matrices are built.
+        del self.train_df
+        gc.collect()
+
+    def predict_scores(self, user_indices):
+        """
+        Computes the dense score matrix for a batch of users.
+
+        Formula:
+        Score = w_trend * V_trend
+              + w_rep * U_hist
+              + w_beh * (U_hist @ S_beh)
+              + w_vis * (U_hist @ S_vis)
+
+        Args:
+            user_indices (np.array): Array of valid user indices (0..N-1).
+
+        Returns:
+            np.array: Dense score matrix of shape (Batch_Size, N_Items).
+        """
+        batch_size = len(user_indices)
+
+        # Extract User History for this batch (Batch, N_Items) - Sparse
+        U_batch = self.U_hist[user_indices]
+
+        # Initialize dense scores with Global Trend
+        # Broadcast V_trend (N_Items,) to (Batch, N_Items)
+        # We use np.tile or broadcasting. Broadcasting is implicit in addition usually,
+        # but for initialization we need the shape.
+        # V_trend is (N_Items,), we want (Batch, N_Items).
+        scores = np.tile(self.V_trend, (batch_size, 1)) * self.w_trend
+
+        # Add Repurchase Signal (Habit)
+        if self.w_rep > 0:
+            # U_batch is sparse. We multiply by weight and densify.
+            # Note: Densifying a very sparse matrix is fast if batch size is reasonable.
+            scores += U_batch.multiply(self.w_rep).toarray()
+
+        # Add Behavioral Signal (Collaborative Filtering)
+        if self.w_beh > 0:
+            # Sparse @ Sparse -> Sparse
+            R_beh = U_batch.dot(self.S_behavior)
+            scores += R_beh.multiply(self.w_beh).toarray()
+
+        # Add Visual Signal (Content-Based)
+        if self.w_vis > 0:
+            # Sparse @ Sparse -> Sparse
+            R_vis = U_batch.dot(self.S_visual)
+            scores += R_vis.multiply(self.w_vis).toarray()
+
+        return scores
+=======
+from library.data_utils import (
+    get_global_mapper,
+    load_and_filter_data,
+    build_user_history_vectors,
+)
+from library.collaborative_filtering import (
+    compute_behavioral_similarity_matrix,
+    calculate_global_trend,
+)
+
+
+class HybridRecommender:
+    """
+    Implements a Cascading Hybrid Recommender.
+    Prioritizes signals in strict order: Repurchase > Behavioral CF > Global Trend.
+    Cite solution_lesson_node_00016: Prioritize High-Precision Signals via Cascading.
+    """
+
+    def __init__(self, load_cached_data=True, train_weeks=Config.TRAIN_WEEKS):
+        """
+        Initializes the recommender by loading/computing all necessary matrices.
+
+        Args:
+            load_cached_data (bool): If True, attempts to load matrices from disk cache.
+            train_weeks (int): Number of weeks of transaction history to use.
+        """
+        print("Initializing HybridRecommender (Cascade Mode)...")
+
+        # 1. Setup Mapper (Global Universe of Users/Items)
+        self.mapper = get_global_mapper()
+
+        # 2. Load Training Data
+        print(f"Loading training data (last {train_weeks} weeks)...")
+        self.train_df = load_and_filter_data(Config.PATH_TRAIN, weeks=train_weeks)
+
+        # 3. Build/Load Ensemble Components
+
+        # View 1: Habit (Repurchase)
+        # Sparse Matrix: (N_Users, N_Items)
+        self.U_hist = build_user_history_vectors(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 2: Behavioral Similarity (Co-occurrence)
+        # Sparse Matrix: (N_Items, N_Items)
+        self.S_behavior = compute_behavioral_similarity_matrix(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 3: Global Trend (Popularity)
+        # Dense Vector: (N_Items,)
+        self.V_trend = calculate_global_trend(
+            self.train_df, self.mapper, load_cached_data=load_cached_data
+        )
+
+        # 4. Cleanup
+        del self.train_df
+        gc.collect()
+
+    def predict_scores(self, user_indices):
+        """
+        Computes the dense score matrix for a batch of users using Tiered Scoring
+        to enforce a strict Cascade: Repurchase > CF > Trend.
+
+        Cite solution_lesson_node_00016: Cascade Strategy.
+        Cite solution_lesson_node_00012: Vectorized Inference.
+        Cite solution_lesson_node_00010: Numerical Stability (using float32).
+
+        Args:
+            user_indices (np.array): Array of valid user indices (0..N-1).
+
+        Returns:
+            np.array: Dense score matrix of shape (Batch_Size, N_Items).
+        """
+        batch_size = len(user_indices)
+
+        # Extract User History for this batch (Batch, N_Items) - Sparse
+        U_batch = self.U_hist[user_indices]
+
+        # --- Tier 3: Global Trend (Base Score: 0.0 - 1.0) ---
+        # Initialize with Trend
+        scores = np.tile(self.V_trend, (batch_size, 1))
+
+        # --- Tier 2: Behavioral CF (Base Score: ~1,000) ---
+        # Boost CF scores to strictly outrank Trend but be below Repurchase
+        # U_batch @ S_behavior gives weighted similarity sums
+        if self.S_behavior is not None:
+            R_beh = U_batch.dot(self.S_behavior)
+            # Multiply by 1e3 to shift range above Trend (which is max 1.0)
+            scores += R_beh.toarray() * 1e3
+
+        # --- Tier 1: Repurchase (Base Score: ~1,000,000) ---
+        # Boost Repurchase scores to strictly outrank CF
+        # Multiply by 1e6 to shift range above CF
+        scores += U_batch.toarray() * 1e6
+
+        return scores
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_validation_and_tuning(recommender):
+    print("Loading validation data...")
+    val_df = pd.read_csv(
+        Config.PATH_VAL,
+        dtype={"article_id": "int32", "price": "float32", "sales_channel_id": "int8"},
+    )
+    val_df["t_dat"] = pd.to_datetime(val_df["t_dat"])
+
+    # Time split for validation: Last 7 days is target, previous 5 weeks is input
+    max_date = val_df["t_dat"].max()
+    split_date = max_date - pd.Timedelta(days=7)
+    start_date = split_date - pd.Timedelta(weeks=Config.TRAIN_WEEKS)
+
+    print(
+        f"Splitting validation data. Input: {start_date} to {split_date}. Target: > {split_date}"
+    )
+
+    val_target = val_df[val_df["t_dat"] > split_date].copy()
+    val_input = val_df[
+        (val_df["t_dat"] <= split_date) & (val_df["t_dat"] > start_date)
+    ].copy()
+
+    target_users = val_target["customer_id"].unique()
+    print(f"Total validation target users: {len(target_users)}")
+
+    # Sample users for fast weight tuning
+    rng = np.random.RandomState(Config.SEED)
+    tune_users = rng.choice(
+        target_users, size=min(10000, len(target_users)), replace=False
+    )
+
+    # Build Ground Truth for Tuning
+    gt_df = val_target[val_target["customer_id"].isin(tune_users)]
+    gt_dict = gt_df.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    # Build Input History for Tuning
+    val_input_tune = val_input[val_input["customer_id"].isin(tune_users)]
+    U_hist_tune = build_user_history_vectors(
+        val_input_tune, recommender.mapper, load_cached_data=False
+    )
+    tune_indices = recommender.mapper.map_users(pd.Series(tune_users))
+
+    # Grid Search for Weights
+    # (Repurchase, Behavioral, Visual, Trend)
+    param_grid = [
+        (1.0, 0.6, 0.4, 0.2),  # Default
+        (1.5, 0.6, 0.4, 0.2),  # High Habit
+        (1.0, 1.0, 0.4, 0.2),  # High Co-occurrence
+        (1.0, 0.6, 1.0, 0.2),  # High Visual
+        (0.8, 0.8, 0.8, 0.2),  # Balanced
+    ]
+
+    best_score = -1
+    best_params = param_grid[0]
+
+    print("Tuning weights...")
+    # Temporarily swap U_hist
+    original_U_hist = recommender.U_hist
+    recommender.U_hist = U_hist_tune
+
+    for params in param_grid:
+        recommender.w_rep, recommender.w_beh, recommender.w_vis, recommender.w_trend = (
+            params
+        )
+
+        # Predict
+        scores = recommender.predict_scores(tune_indices)
+
+        # Extract Top 12
+        top_k = 12
+        top_indices = np.argpartition(scores, -top_k, axis=1)[:, -top_k:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        # Convert to IDs
+        pred_articles = []
+        for i in range(len(final_indices)):
+            ids = recommender.mapper.get_items_from_indices(final_indices[i])
+            pred_articles.append(list(ids))
+
+        actuals = [gt_dict.get(u, set()) for u in tune_users]
+        score = map_at_k(actuals, pred_articles, k=12)
+
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+    print(f"Best Params: {best_params} (MAP@12: {best_score:.6f})")
+
+    # Apply Best Params
+    recommender.w_rep, recommender.w_beh, recommender.w_vis, recommender.w_trend = (
+        best_params
+    )
+
+    # --- Final Validation on ALL Target Users ---
+    print("Running final validation...")
+
+    # Build history for ALL target users
+    val_input_all = val_input[val_input["customer_id"].isin(target_users)]
+    U_hist_all = build_user_history_vectors(
+        val_input_all, recommender.mapper, load_cached_data=False
+    )
+    recommender.U_hist = U_hist_all
+
+    all_indices = recommender.mapper.map_users(pd.Series(target_users)).values
+    gt_dict_all = val_target.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    batch_size = 2000
+    user_aps = []
+    user_hist_lens = []
+
+    for start in range(0, len(target_users), batch_size):
+        end = min(start + batch_size, len(target_users))
+        batch_indices = all_indices[start:end]
+        batch_users = target_users[start:end]
+
+        scores = recommender.predict_scores(batch_indices)
+
+        top_indices = np.argpartition(scores, -12, axis=1)[:, -12:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        for i, u in enumerate(batch_users):
+            truth = gt_dict_all.get(u, set())
+            if not truth:
+                continue
+
+            pred_ids = recommender.mapper.get_items_from_indices(final_indices[i])
+
+            # Compute AP
+            ap = 0.0
+            hits = 0.0
+            for k, p in enumerate(pred_ids):
+                if p in truth:
+                    hits += 1.0
+                    ap += hits / (k + 1.0)
+            ap /= min(len(truth), 12)
+            user_aps.append(ap)
+
+            # History Length
+            hist_len = U_hist_all[batch_indices[i]].getnnz()
+            user_hist_lens.append(hist_len)
+
+    # Restore original U_hist
+    recommender.U_hist = original_U_hist
+
+    final_map = np.mean(user_aps)
+    print(f"Final Validation Metric: {final_map:.10f}")
+
+    return final_map, user_aps, user_hist_lens
+=======
+def run_validation(recommender):
+    print("Loading validation data...")
+    val_df = pd.read_csv(
+        Config.PATH_VAL,
+        dtype={"article_id": "int32", "price": "float32", "sales_channel_id": "int8"},
+    )
+    val_df["t_dat"] = pd.to_datetime(val_df["t_dat"])
+
+    # Time split for validation: Last 7 days is target, previous 5 weeks is input
+    max_date = val_df["t_dat"].max()
+    split_date = max_date - pd.Timedelta(days=7)
+    start_date = split_date - pd.Timedelta(weeks=Config.TRAIN_WEEKS)
+
+    print(
+        f"Splitting validation data. Input: {start_date} to {split_date}. Target: > {split_date}"
+    )
+
+    val_target = val_df[val_df["t_dat"] > split_date].copy()
+    val_input = val_df[
+        (val_df["t_dat"] <= split_date) & (val_df["t_dat"] > start_date)
+    ].copy()
+
+    target_users = val_target["customer_id"].unique()
+    print(f"Total validation target users: {len(target_users)}")
+
+    # --- Final Validation on ALL Target Users ---
+    print("Running final validation...")
+
+    # Build history for ALL target users
+    # We must rebuild U_hist using the validation input split to avoid leakage
+    val_input_all = val_input[val_input["customer_id"].isin(target_users)]
+    
+    # Temporarily swap U_hist in recommender
+    original_U_hist = recommender.U_hist
+    
+    U_hist_all = build_user_history_vectors(
+        val_input_all, recommender.mapper, load_cached_data=False
+    )
+    recommender.U_hist = U_hist_all
+
+    all_indices = recommender.mapper.map_users(pd.Series(target_users)).values
+    gt_dict_all = val_target.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    batch_size = 2000
+    user_aps = []
+    user_hist_lens = []
+
+    for start in range(0, len(target_users), batch_size):
+        end = min(start + batch_size, len(target_users))
+        batch_indices = all_indices[start:end]
+        batch_users = target_users[start:end]
+
+        scores = recommender.predict_scores(batch_indices)
+
+        top_indices = np.argpartition(scores, -12, axis=1)[:, -12:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        for i, u in enumerate(batch_users):
+            truth = gt_dict_all.get(u, set())
+            if not truth:
+                continue
+
+            pred_ids = recommender.mapper.get_items_from_indices(final_indices[i])
+
+            # Compute AP
+            ap = 0.0
+            hits = 0.0
+            for k, p in enumerate(pred_ids):
+                if p in truth:
+                    hits += 1.0
+                    ap += hits / (k + 1.0)
+            ap /= min(len(truth), 12)
+            user_aps.append(ap)
+
+            # History Length
+            hist_len = U_hist_all[batch_indices[i]].getnnz()
+            user_hist_lens.append(hist_len)
+
+    # Restore original U_hist
+    recommender.U_hist = original_U_hist
+
+    final_map = np.mean(user_aps)
+    print(f"Final Validation Metric: {final_map:.10f}")
+
+    return final_map, user_aps, user_hist_lens
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Initialize Recommender (Loads Train Data & Builds Matrices)
+    rec = HybridRecommender(load_cached_data=True)
+
+    # 2. Validation & Tuning
+    val_metric, user_aps, user_hist_lens = run_validation_and_tuning(rec)
+
+    # 3. Failure Analysis
+    analyze_failures(user_aps, user_hist_lens)
+=======
+def main():
+    # 1. Initialize Recommender (Loads Train Data & Builds Matrices)
+    rec = HybridRecommender(load_cached_data=True)
+
+    # 2. Validation
+    val_metric, user_aps, user_hist_lens = run_validation(rec)
+
+    # 3. Failure Analysis
+    analyze_failures(user_aps, user_hist_lens)
+>>>>>>> REPLACE
+```

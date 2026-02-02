@@ -1,0 +1,308 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement the following optimizations to restore and improve performance:
+
+1.  **Backbone Replacement (Cite Lesson 00019, 00023)**: I will replace `convnext_nano` with `efficientnet_b3`. Lesson 00023 explicitly states that SE-equipped backbones like EfficientNet are superior for this noisy audio tagging task, and Lesson 00019 identifies `efficientnet_b3` as the "sweet spot" for model capacity.
+2.  **Aggregation Simplification (Cite Lesson 00023)**: I will replace the `MultiHeadAttentionPooling` with a simple, single-head `AttentionPooling` layer. The failure analysis of the previous solution indicated that complex multi-head mechanisms struggled with label density and introduced optimization difficulties.
+3.  **Classification Head Simplification**: I will remove `MultiSampleDropout` and use a standard linear layer. This aligns with the "simple" architecture that achieved the previous best score of ~0.855.
+4.  **Configuration**: I will update the project name to `idea_7` and ensure the training schedule (30 epochs) is sufficient for the B3 backbone (Cite Lesson 00017).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PROJECT_NAME = "idea_6"
+    INPUT_ROOT = "./input"
+    METADATA_DIR = "./metadata"
+=======
+    PROJECT_NAME = "idea_7"
+    INPUT_ROOT = "./input"
+    METADATA_DIR = "./metadata"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Parameters
+    # =========================================================================
+    BACKBONE = "convnext_nano"  # Architecture
+    PRETRAINED = True  # Use ImageNet weights
+=======
+    # =========================================================================
+    # Model Parameters
+    # =========================================================================
+    BACKBONE = "efficientnet_b3"  # Architecture
+    PRETRAINED = True  # Use ImageNet weights
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class LearnableBatchNorm(nn.Module):
+    """
+    Applies Batch Normalization to the input spectrogram.
+    Used to adapt audio statistics to the backbone's expected distribution.
+    """
+
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class MultiHeadAttentionPooling(nn.Module):
+    """
+    Aggregates temporal features using multiple parallel attention heads.
+    Allows the model to focus on multiple disjoint sound events simultaneously.
+    """
+
+    def __init__(self, in_dim, num_heads=4, hidden_dim=512):
+        super().__init__()
+        self.num_heads = num_heads
+        self.in_dim = in_dim
+
+        # Project input to hidden space for attention score calculation
+        self.linear1 = nn.Linear(in_dim, hidden_dim)
+        # Project hidden space to 'num_heads' attention scores
+        self.linear2 = nn.Linear(hidden_dim, num_heads)
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Time)
+
+        # Transpose to (Batch, Time, Channels) for Linear layers
+        x_t = x.transpose(1, 2)
+
+        # Calculate attention scores
+        # (Batch, Time, hidden_dim)
+        attn = torch.tanh(self.linear1(x_t))
+        # (Batch, Time, num_heads)
+        attn = self.linear2(attn)
+
+        # Apply softmax over the Time dimension (dim=1) to get probabilities
+        attn = torch.softmax(attn, dim=1)
+
+        # Compute weighted sum for each head
+        # We want: (Batch, num_heads, Channels)
+        # Transpose attn to (Batch, num_heads, Time)
+        attn = attn.transpose(1, 2)
+
+        # Batch Matrix Multiplication: (B, Heads, T) x (B, T, C) -> (B, Heads, C)
+        weighted = torch.bmm(attn, x_t)
+
+        # Flatten the heads: (Batch, num_heads * Channels)
+        out = weighted.reshape(weighted.size(0), -1)
+
+        return out
+
+
+class MultiSampleDropout(nn.Module):
+    """
+    Applies dropout multiple times and averages the predictions.
+    Acts as an internal ensemble to improve generalization.
+    """
+
+    def __init__(self, in_features, out_features, num_samples=5, dropout_rate=0.5):
+        super().__init__()
+        self.dropouts = nn.ModuleList(
+            [nn.Dropout(dropout_rate) for _ in range(num_samples)]
+        )
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        # x shape: (Batch, in_features)
+        logits = []
+        for drop in self.dropouts:
+            logits.append(self.linear(drop(x)))
+
+        # Stack logits: (num_samples, Batch, out_features)
+        logits = torch.stack(logits)
+
+        # Average over samples
+        return torch.mean(logits, dim=0)
+
+
+class AudioClassifier(nn.Module):
+    """
+    Main Audio Tagging Model.
+    Architecture:
+    1. Learnable BatchNorm (1-channel)
+    2. Input Repetition (1 -> 3 channels)
+    3. ConvNeXt-Nano Backbone (ImageNet weights)
+    4. Frequency Pooling
+    5. Multi-Head Attention Pooling
+    6. Multi-Sample Dropout Classification Head
+    """
+
+    def __init__(
+        self,
+        num_classes=Config.NUM_CLASSES,
+        backbone=Config.BACKBONE,
+        pretrained=Config.PRETRAINED,
+        num_heads=4,
+    ):
+        super().__init__()
+
+        # 1. Input Adaptation
+        # Normalize the single channel input
+        self.bn0 = LearnableBatchNorm(1)
+
+        # 2. Backbone
+        # Create ConvNeXt model
+        # num_classes=0 and global_pool='' ensures we get the feature map (B, C, H, W)
+        self.backbone = timm.create_model(
+            backbone, pretrained=pretrained, in_chans=3, num_classes=0, global_pool=""
+        )
+
+        # Determine backbone output dimension dynamically
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            features = self.backbone(dummy_input)
+            # features shape: (1, C, H, W)
+            self.backbone_dim = features.shape[1]
+
+        # 3. Aggregation
+        self.pool = MultiHeadAttentionPooling(
+            in_dim=self.backbone_dim, num_heads=num_heads
+        )
+
+        # 4. Classification Head
+        # The pooling layer outputs (Batch, num_heads * backbone_dim)
+        self.head_in_dim = self.backbone_dim * num_heads
+        self.fc = MultiSampleDropout(
+            in_features=self.head_in_dim, out_features=num_classes
+        )
+
+    def forward(self, x):
+=======
+class LearnableBatchNorm(nn.Module):
+    """
+    Applies Batch Normalization to the input spectrogram.
+    Used to adapt audio statistics to the backbone's expected distribution.
+    """
+
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class AttentionPooling(nn.Module):
+    """
+    Simple Attention Pooling layer.
+    Aggregates temporal features using a learnable weighted sum.
+    """
+
+    def __init__(self, in_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Time)
+        # Transpose to (Batch, Time, Channels) for Linear layers
+        x_t = x.transpose(1, 2)
+        # Calculate weights: (Batch, Time, 1)
+        w = self.attention(x_t)
+        # Weighted sum: (Batch, Channels)
+        # (Batch, Channels, Time) * (Batch, 1, Time) -> Sum over Time
+        return torch.sum(x * w.transpose(1, 2), dim=2)
+
+
+class AudioClassifier(nn.Module):
+    """
+    Main Audio Tagging Model.
+    Architecture:
+    1. Learnable BatchNorm (1-channel)
+    2. Input Repetition (1 -> 3 channels)
+    3. EfficientNet Backbone (ImageNet weights)
+    4. Frequency Pooling
+    5. Attention Pooling
+    6. Linear Classification Head
+    """
+
+    def __init__(
+        self,
+        num_classes=Config.NUM_CLASSES,
+        backbone=Config.BACKBONE,
+        pretrained=Config.PRETRAINED,
+    ):
+        super().__init__()
+
+        # 1. Input Adaptation
+        # Normalize the single channel input
+        self.bn0 = LearnableBatchNorm(1)
+
+        # 2. Backbone
+        # Create model
+        # num_classes=0 and global_pool='' ensures we get the feature map (B, C, H, W)
+        self.backbone = timm.create_model(
+            backbone, pretrained=pretrained, in_chans=3, num_classes=0, global_pool=""
+        )
+
+        # Determine backbone output dimension dynamically
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            features = self.backbone(dummy_input)
+            # features shape: (1, C, H, W)
+            self.backbone_dim = features.shape[1]
+
+        # 3. Aggregation
+        self.pool = AttentionPooling(in_dim=self.backbone_dim)
+
+        # 4. Classification Head
+        self.fc = nn.Linear(self.backbone_dim, num_classes)
+
+    def forward(self, x):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # 5. Multi-Head Attention Pooling
+        # Aggregates temporal sequence into a fixed vector
+        # (Batch, C, T_down) -> (Batch, num_heads * C)
+        x = self.pool(x)
+
+        # 6. Classification
+        logits = self.fc(x)
+
+        return logits
+=======
+        # 5. Attention Pooling
+        # Aggregates temporal sequence into a fixed vector
+        # (Batch, C, T_down) -> (Batch, C)
+        x = self.pool(x)
+
+        # 6. Classification
+        logits = self.fc(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = AudioClassifier(
+        num_classes=Config.NUM_CLASSES,
+        backbone=Config.BACKBONE,
+        pretrained=Config.PRETRAINED,
+        num_heads=4,  # As specified in the Idea
+    )
+    model = model.to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = AudioClassifier(
+        num_classes=Config.NUM_CLASSES,
+        backbone=Config.BACKBONE,
+        pretrained=Config.PRETRAINED,
+    )
+    model = model.to(device)
+>>>>>>> REPLACE
+```

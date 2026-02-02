@@ -1,0 +1,824 @@
+Based on the analysis of the previous results and the provided lessons, the hierarchical "Divide and Conquer" strategy (Idea 4) significantly degraded performance compared to the global approach (Idea 3) due to the fragmentation of an already small dataset (Cite solution_lesson_node_00015). The local "genus-expert" models lacked sufficient samples to robustly estimate covariance matrices.
+
+To optimize performance and recover the state-of-the-art results:
+1.  **Revert to Global LDA**: I will strip out the `HierarchicalLDA` and `TaxonomyEnsemble` classes and rely solely on `GlobalLDA` with automatic shrinkage. This leverages the entire dataset to estimate the shared covariance structure, which is critical for high-dimensional, small-sample data (Cite solution_lesson_node_00008).
+2.  **Simplify Preprocessing**: I will remove the genus extraction and encoding logic from the data pipeline, as it is no longer needed and adds unnecessary complexity.
+3.  **Update Execution Logic**: The `runfile.py` will be updated to train the single `GlobalLDA` model and check against the strict validation threshold.
+
+Here are the code changes:
+
+```diff
+library/models.py
+<<<<<<< SEARCH
+class HierarchicalLDA(BaseEstimator, ClassifierMixin):
+    """
+    Taxonomy-aware classifier that decomposes the problem into Genus and Species prediction.
+
+    Structure:
+    1. Genus Expert: Estimates P(Genus | X)
+    2. Species Experts: Estimate P(Species | Genus, X) using local LDA models per genus.
+
+    Fallback:
+    If a genus has insufficient samples, it defaults to a global model's conditional probabilities.
+    """
+
+    def __init__(
+        self,
+        min_samples=Config.MIN_SAMPLES_FOR_GENUS_MODEL,
+        solver=Config.GLOBAL_LDA_SOLVER,
+        shrinkage=Config.GLOBAL_LDA_SHRINKAGE,
+    ):
+        self.min_samples = min_samples
+        self.solver = solver
+        self.shrinkage = shrinkage
+
+        self.genus_model = None
+        self.species_models = {}
+        self.fallback_model = None
+
+        self.genus_to_species_map = {}
+        self.n_classes_ = 0
+
+    def fit(self, X, y, genus_labels):
+        # Determine total number of classes (assuming 0..N-1 encoding)
+        self.n_classes_ = len(np.unique(y))
+
+        # 1. Train Level 1: Genus Expert (P(Genus | X))
+        self.genus_model = LinearDiscriminantAnalysis(
+            solver=self.solver, shrinkage=self.shrinkage
+        )
+        self.genus_model.fit(X, genus_labels)
+
+        # 2. Train Fallback Model (Global P(Species | X) for fallback calculations)
+        self.fallback_model = LinearDiscriminantAnalysis(
+            solver=self.solver, shrinkage=self.shrinkage
+        )
+        self.fallback_model.fit(X, y)
+
+        # 3. Build Hierarchy and Train Level 2 Models (P(Species | Genus, X))
+        unique_genera = np.unique(genus_labels)
+
+        for g_idx in unique_genera:
+            # Identify samples for this genus
+            mask = genus_labels == g_idx
+            X_g = X[mask]
+            y_g = y[mask]
+
+            # Identify species belonging to this genus
+            species_in_genus = np.unique(y_g)
+            self.genus_to_species_map[g_idx] = species_in_genus
+
+            # Condition A: Check for sufficient samples to estimate covariance
+            if len(X_g) < self.min_samples:
+                continue
+
+            # Condition B: Check if discrimination is needed (more than 1 species)
+            if len(species_in_genus) < 2:
+                continue
+
+            # Train local expert model
+            local_model = LinearDiscriminantAnalysis(
+                solver=self.solver, shrinkage=self.shrinkage
+            )
+            local_model.fit(X_g, y_g)
+            self.species_models[g_idx] = local_model
+
+        return self
+
+    def predict_proba(self, X):
+        if self.genus_model is None:
+            raise RuntimeError("HierarchicalLDA model not fitted")
+
+        n_samples = X.shape[0]
+        # Initialize output probabilities matrix
+        final_probs = np.zeros((n_samples, self.n_classes_))
+
+        # Get Genus Probabilities: P(G | x)
+        # Shape: (n_samples, n_genera)
+        genus_probs_raw = self.genus_model.predict_proba(X)
+
+        # Get Global Fallback Probabilities: P_global(S | x)
+        global_probs = self.fallback_model.predict_proba(X)
+
+        # Iterate over each genus to calculate P(S | x) = P(S | G, x) * P(G | x)
+        # We iterate by index of the genus model's classes
+        for i, g_label in enumerate(self.genus_model.classes_):
+            # Probability of this genus for all samples
+            p_genus = genus_probs_raw[:, i]  # Shape (N,)
+
+            if g_label not in self.genus_to_species_map:
+                continue
+
+            species_indices = self.genus_to_species_map[g_label]
+
+            # Determine P(S | G, x)
+            if g_label in self.species_models:
+                # --- CASE 1: Use Local Expert ---
+                local_model = self.species_models[g_label]
+                local_probs = local_model.predict_proba(X)
+
+                # Map local columns to global species indices
+                # local_model.classes_ contains the actual species IDs
+                for j, s_label in enumerate(local_model.classes_):
+                    final_probs[:, s_label] += local_probs[:, j] * p_genus
+
+            else:
+                # --- CASE 2: Fallback Strategy ---
+                if len(species_indices) == 1:
+                    # Trivial case: Only one species in this genus. P(S|G) = 1.0
+                    s_label = species_indices[0]
+                    final_probs[:, s_label] += 1.0 * p_genus
+                else:
+                    # Sparse data case: Use global model's conditional probabilities
+                    # We extract the columns for the species in this genus from the global model
+
+                    # Find column indices in the global model corresponding to these species
+                    # fallback_model.classes_ is sorted, so we can use searchsorted
+                    col_indices = np.searchsorted(
+                        self.fallback_model.classes_, species_indices
+                    )
+
+                    # Extract subset of probabilities
+                    subset_probs = global_probs[:, col_indices]
+
+                    # Normalize to sum to 1 per row to get P(S | G, x)
+                    # Add epsilon to avoid division by zero
+                    row_sums = subset_probs.sum(axis=1, keepdims=True) + 1e-15
+                    cond_probs = subset_probs / row_sums
+
+                    # Distribute back to final matrix
+                    for j, s_idx in enumerate(col_indices):
+                        s_label = self.fallback_model.classes_[s_idx]
+                        final_probs[:, s_label] += cond_probs[:, j] * p_genus
+
+        return final_probs
+
+
+class TaxonomyEnsemble(BaseEstimator, ClassifierMixin):
+    """
+    Ensemble model that averages predictions from the GlobalLDA and HierarchicalLDA.
+    Acts as a regularizer: Global model stabilizes predictions where local data is sparse,
+    while Hierarchical model refines predictions where distinct sub-population structures exist.
+    """
+
+    def __init__(self):
+        self.global_model = GlobalLDA()
+        self.hierarchical_model = HierarchicalLDA()
+
+    def fit(self, X, y, genus_labels):
+        self.global_model.fit(X, y)
+        self.hierarchical_model.fit(X, y, genus_labels)
+        return self
+
+    def predict_proba(self, X):
+        # Get predictions from both branches
+        p_global = self.global_model.predict_proba(X)
+        p_hierarchical = self.hierarchical_model.predict_proba(X)
+
+        # Average the probabilities
+        avg_probs = (p_global + p_hierarchical) / 2.0
+
+        # Apply clipping to avoid log(0) in metric calculation
+        # Range: [1e-15, 1 - 1e-15]
+        clip_val = Config.PROB_CLIP
+        avg_probs = np.clip(avg_probs, clip_val, 1.0 - clip_val)
+
+        return avg_probs
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/preprocessing.py
+<<<<<<< SEARCH
+def load_and_preprocess_data(debug=False, load_cached_data=True):
+    """
+    Loads data, extracts features, generates genus labels, applies preprocessing,
+    and handles caching of the processed numpy arrays.
+
+    Args:
+        debug (bool): If True, uses a small subset of the data.
+        load_cached_data (bool): If True, attempts to load from disk.
+
+    Returns:
+        tuple: (X_train, y_train, genus_train,
+                X_val, y_val, genus_val,
+                X_test, test_ids,
+                species_encoder, genus_encoder)
+    """
+    # Define cache file paths
+    cache_dir = Config.WORKING_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    files = {
+        "X_train": os.path.join(cache_dir, "X_train.npy"),
+        "y_train": os.path.join(cache_dir, "y_train.npy"),
+        "genus_train": os.path.join(cache_dir, "genus_train.npy"),
+        "X_val": os.path.join(cache_dir, "X_val.npy"),
+        "y_val": os.path.join(cache_dir, "y_val.npy"),
+        "genus_val": os.path.join(cache_dir, "genus_val.npy"),
+        "X_test": os.path.join(cache_dir, "X_test.npy"),
+        "test_ids": os.path.join(cache_dir, "test_ids.npy"),
+        "species_classes": os.path.join(cache_dir, "species_classes.npy"),
+        "genus_classes": os.path.join(cache_dir, "genus_classes.npy"),
+    }
+
+    # 1. Try to load from cache
+    if load_cached_data:
+        all_exist = all(os.path.exists(f) for f in files.values())
+        if all_exist:
+            print("Loading preprocessed data from cache...")
+            X_train = np.load(files["X_train"])
+            y_train = np.load(files["y_train"])
+            genus_train = np.load(files["genus_train"])
+            X_val = np.load(files["X_val"])
+            y_val = np.load(files["y_val"])
+            genus_val = np.load(files["genus_val"])
+            X_test = np.load(files["X_test"])
+            test_ids = np.load(files["test_ids"])
+
+            # Reconstruct encoders
+            species_encoder = LabelEncoder()
+            species_encoder.classes_ = np.load(
+                files["species_classes"], allow_pickle=True
+            )
+
+            genus_encoder = LabelEncoder()
+            genus_encoder.classes_ = np.load(files["genus_classes"], allow_pickle=True)
+
+            return (
+                X_train,
+                y_train,
+                genus_train,
+                X_val,
+                y_val,
+                genus_val,
+                X_test,
+                test_ids,
+                species_encoder,
+                genus_encoder,
+            )
+        else:
+            print("Cache miss. Processing data from scratch...")
+
+    # 2. Load Raw Data
+    print("Loading raw metadata...")
+    df_train = pd.read_csv(Config.TRAIN_CSV)
+    df_val = pd.read_csv(Config.VAL_CSV)
+    df_test = pd.read_csv(Config.TEST_CSV)
+
+    if debug:
+        print("Debug mode: Subsampling data...")
+        # Cite debug_lesson_1: Filter Classes, Don't Just Slice Rows
+        # Filter to top 5 species to ensure density, then slice.
+        top_species = df_train[Config.TARGET_COL].value_counts().nlargest(5).index
+        df_train = df_train[df_train[Config.TARGET_COL].isin(top_species)].head(50)
+
+        # Ensure validation set only contains species present in the training subset
+        present_species = df_train[Config.TARGET_COL].unique()
+        df_val = df_val[df_val[Config.TARGET_COL].isin(present_species)].head(50)
+
+        df_test = df_test.head(50)
+
+    # 3. Feature Extraction
+    feature_cols = Config.get_feature_columns()
+
+    # Extract features
+    X_train_raw = df_train[feature_cols].values
+    X_val_raw = df_val[feature_cols].values
+    X_test_raw = df_test[feature_cols].values
+
+    test_ids = df_test[Config.ID_COL].values
+
+    # 4. Target Engineering (Species & Genus)
+    y_train_raw = df_train[Config.TARGET_COL].values
+    y_val_raw = df_val[Config.TARGET_COL].values
+
+    # Derive Genus
+    genus_train_raw = (
+        df_train[Config.TARGET_COL].apply(Config.get_genus_from_species).values
+    )
+    genus_val_raw = (
+        df_val[Config.TARGET_COL].apply(Config.get_genus_from_species).values
+    )
+
+    # 5. Preprocessing (Transformation + Scaling)
+    print("Fitting preprocessor (Yeo-Johnson + StandardScaler)...")
+    preprocessor = get_preprocessor()
+
+    # Fit on training data only
+    X_train = preprocessor.fit_transform(X_train_raw)
+
+    # Transform validation and test
+    X_val = preprocessor.transform(X_val_raw)
+    X_test = preprocessor.transform(X_test_raw)
+
+    # 6. Label Encoding
+    print("Encoding targets...")
+    species_encoder = LabelEncoder()
+    y_train = species_encoder.fit_transform(y_train_raw)
+    y_val = species_encoder.transform(y_val_raw)
+
+    genus_encoder = LabelEncoder()
+    genus_train = genus_encoder.fit_transform(genus_train_raw)
+    genus_val = genus_encoder.transform(genus_val_raw)
+
+    # 7. Cache Results
+    print(f"Caching processed data to {cache_dir}...")
+    np.save(files["X_train"], X_train)
+    np.save(files["y_train"], y_train)
+    np.save(files["genus_train"], genus_train)
+
+    np.save(files["X_val"], X_val)
+    np.save(files["y_val"], y_val)
+    np.save(files["genus_val"], genus_val)
+
+    np.save(files["X_test"], X_test)
+    np.save(files["test_ids"], test_ids)
+
+    np.save(files["species_classes"], species_encoder.classes_)
+    np.save(files["genus_classes"], genus_encoder.classes_)
+
+    return (
+        X_train,
+        y_train,
+        genus_train,
+        X_val,
+        y_val,
+        genus_val,
+        X_test,
+        test_ids,
+        species_encoder,
+        genus_encoder,
+    )
+=======
+def load_and_preprocess_data(debug=False, load_cached_data=True):
+    """
+    Loads data, extracts features, applies preprocessing, and handles caching.
+
+    Args:
+        debug (bool): If True, uses a small subset of the data.
+        load_cached_data (bool): If True, attempts to load from disk.
+
+    Returns:
+        tuple: (X_train, y_train,
+                X_val, y_val,
+                X_test, test_ids,
+                species_encoder)
+    """
+    # Define cache file paths
+    cache_dir = Config.WORKING_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    files = {
+        "X_train": os.path.join(cache_dir, "X_train.npy"),
+        "y_train": os.path.join(cache_dir, "y_train.npy"),
+        "X_val": os.path.join(cache_dir, "X_val.npy"),
+        "y_val": os.path.join(cache_dir, "y_val.npy"),
+        "X_test": os.path.join(cache_dir, "X_test.npy"),
+        "test_ids": os.path.join(cache_dir, "test_ids.npy"),
+        "species_classes": os.path.join(cache_dir, "species_classes.npy"),
+    }
+
+    # 1. Try to load from cache
+    if load_cached_data:
+        all_exist = all(os.path.exists(f) for f in files.values())
+        if all_exist:
+            print("Loading preprocessed data from cache...")
+            X_train = np.load(files["X_train"])
+            y_train = np.load(files["y_train"])
+            X_val = np.load(files["X_val"])
+            y_val = np.load(files["y_val"])
+            X_test = np.load(files["X_test"])
+            test_ids = np.load(files["test_ids"])
+
+            # Reconstruct encoders
+            species_encoder = LabelEncoder()
+            species_encoder.classes_ = np.load(
+                files["species_classes"], allow_pickle=True
+            )
+
+            return (
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                X_test,
+                test_ids,
+                species_encoder,
+            )
+        else:
+            print("Cache miss. Processing data from scratch...")
+
+    # 2. Load Raw Data
+    print("Loading raw metadata...")
+    df_train = pd.read_csv(Config.TRAIN_CSV)
+    df_val = pd.read_csv(Config.VAL_CSV)
+    df_test = pd.read_csv(Config.TEST_CSV)
+
+    if debug:
+        print("Debug mode: Subsampling data...")
+        # Cite debug_lesson_1: Filter Classes, Don't Just Slice Rows
+        # Filter to top 5 species to ensure density, then slice.
+        top_species = df_train[Config.TARGET_COL].value_counts().nlargest(5).index
+        df_train = df_train[df_train[Config.TARGET_COL].isin(top_species)].head(50)
+
+        # Ensure validation set only contains species present in the training subset
+        present_species = df_train[Config.TARGET_COL].unique()
+        df_val = df_val[df_val[Config.TARGET_COL].isin(present_species)].head(50)
+
+        df_test = df_test.head(50)
+
+    # 3. Feature Extraction
+    feature_cols = Config.get_feature_columns()
+
+    # Extract features
+    X_train_raw = df_train[feature_cols].values
+    X_val_raw = df_val[feature_cols].values
+    X_test_raw = df_test[feature_cols].values
+
+    test_ids = df_test[Config.ID_COL].values
+
+    # 4. Target Engineering (Species)
+    y_train_raw = df_train[Config.TARGET_COL].values
+    y_val_raw = df_val[Config.TARGET_COL].values
+
+    # 5. Preprocessing (Transformation + Scaling)
+    print("Fitting preprocessor (Yeo-Johnson + StandardScaler)...")
+    preprocessor = get_preprocessor()
+
+    # Fit on training data only
+    X_train = preprocessor.fit_transform(X_train_raw)
+
+    # Transform validation and test
+    X_val = preprocessor.transform(X_val_raw)
+    X_test = preprocessor.transform(X_test_raw)
+
+    # 6. Label Encoding
+    print("Encoding targets...")
+    species_encoder = LabelEncoder()
+    y_train = species_encoder.fit_transform(y_train_raw)
+    y_val = species_encoder.transform(y_val_raw)
+
+    # 7. Cache Results
+    print(f"Caching processed data to {cache_dir}...")
+    np.save(files["X_train"], X_train)
+    np.save(files["y_train"], y_train)
+
+    np.save(files["X_val"], X_val)
+    np.save(files["y_val"], y_val)
+
+    np.save(files["X_test"], X_test)
+    np.save(files["test_ids"], test_ids)
+
+    np.save(files["species_classes"], species_encoder.classes_)
+
+    return (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        test_ids,
+        species_encoder,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def load_data(debug: bool = False, load_cached_data: bool = True):
+    """
+    Loads and preprocesses the leaf dataset for the Taxonomy-Regularized Hierarchical LDA.
+
+    This function acts as a facade for the library's preprocessing pipeline. It ensures
+    that data is loaded from the metadata CSVs, features are extracted, the taxonomic
+    hierarchy (Genus) is derived from the species labels, and the data is transformed
+    (Yeo-Johnson + Standard Scaler) and cached.
+
+    Args:
+        debug (bool): If True, loads a small subset (e.g., 50 rows) of the data
+                      for rapid debugging and testing.
+        load_cached_data (bool): If True, attempts to load pre-processed numpy arrays
+                                 from the cache directory to save time. If False or
+                                 if the cache is missing, data is processed from scratch.
+
+    Returns:
+        tuple: A tuple containing the following elements:
+            - X_train (np.ndarray): Transformed training feature matrix (N_train, 192).
+            - y_train (np.ndarray): Encoded training species labels.
+            - genus_train (np.ndarray): Encoded training genus labels.
+            - X_val (np.ndarray): Transformed validation feature matrix (N_val, 192).
+            - y_val (np.ndarray): Encoded validation species labels.
+            - genus_val (np.ndarray): Encoded validation genus labels.
+            - X_test (np.ndarray): Transformed test feature matrix (N_test, 192).
+            - test_ids (np.ndarray): IDs for the test images.
+            - species_encoder (LabelEncoder): Fitted encoder mapping integers to species names.
+            - genus_encoder (LabelEncoder): Fitted encoder mapping integers to genus names.
+    """
+    # The library function 'load_and_preprocess_data' already implements:
+    # 1. Metadata loading from ./metadata/
+    # 2. Feature extraction
+    # 3. Taxonomy logic (Genus derivation)
+    # 4. Preprocessing (PowerTransform + Scaling)
+    # 5. Strict caching logic (checking file existence, saving to ./working/idea_4/)
+    return load_and_preprocess_data(debug=debug, load_cached_data=load_cached_data)
+=======
+def load_data(debug: bool = False, load_cached_data: bool = True):
+    """
+    Loads and preprocesses the leaf dataset for the Global LDA model.
+
+    This function acts as a facade for the library's preprocessing pipeline. It ensures
+    that data is loaded from the metadata CSVs, features are extracted, and the data is
+    transformed (Yeo-Johnson + Standard Scaler) and cached.
+
+    Args:
+        debug (bool): If True, loads a small subset (e.g., 50 rows) of the data
+                      for rapid debugging and testing.
+        load_cached_data (bool): If True, attempts to load pre-processed numpy arrays
+                                 from the cache directory to save time. If False or
+                                 if the cache is missing, data is processed from scratch.
+
+    Returns:
+        tuple: A tuple containing the following elements:
+            - X_train (np.ndarray): Transformed training feature matrix (N_train, 192).
+            - y_train (np.ndarray): Encoded training species labels.
+            - X_val (np.ndarray): Transformed validation feature matrix (N_val, 192).
+            - y_val (np.ndarray): Encoded validation species labels.
+            - X_test (np.ndarray): Transformed test feature matrix (N_test, 192).
+            - test_ids (np.ndarray): IDs for the test images.
+            - species_encoder (LabelEncoder): Fitted encoder mapping integers to species names.
+    """
+    # The library function 'load_and_preprocess_data' already implements:
+    # 1. Metadata loading from ./metadata/
+    # 2. Feature extraction
+    # 3. Preprocessing (PowerTransform + Scaling)
+    # 4. Strict caching logic (checking file existence, saving to ./working/idea_4/)
+    return load_and_preprocess_data(debug=debug, load_cached_data=load_cached_data)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.models import TaxonomyEnsemble
+from library.evaluation import calculate_log_loss, create_submission
+
+# Suppress warnings for clean output
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Configuration and Hardware Detection
+    # Initialize Config to set seeds and directories
+    config = Config()
+
+    # Automatically detect device (Requirement: Detect and utilize available GPU)
+    # Note: While we detect the GPU here, the specific TaxonomyEnsemble model
+    # relies on scikit-learn (CPU-bound). We perform this check to satisfy
+    # the environment capability detection requirement.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Data Loading
+    # Load data with caching DISABLED to ensure full dataset is processed
+    # Previous error was caused by loading stale 'debug' cache with missing classes
+    data = load_data(debug=False, load_cached_data=False)
+    (
+        X_train,
+        y_train,
+        genus_train,
+        X_val,
+        y_val,
+        genus_val,
+        X_test,
+        test_ids,
+        species_encoder,
+        genus_encoder,
+    ) = data
+
+    # 3. Model Training
+    # Instantiate the Taxonomy-Regularized Hierarchical LDA Ensemble
+    model = TaxonomyEnsemble()
+
+    # Fit the model on training data
+    # The ensemble handles the hierarchical training (Genus -> Species) internally
+    model.fit(X_train, y_train, genus_train)
+
+    # 4. Validation
+    # Generate probability predictions for the validation set
+    val_probs = model.predict_proba(X_val)
+
+    # Calculate the Multi-class Log Loss metric
+    val_loss = calculate_log_loss(y_val, val_probs)
+
+    # Print the validation metric in the required format
+    print(f"Final Validation Metric: {val_loss}")
+
+    # 5. Failure Analysis
+    # We analyze which features correlate with higher error magnitudes.
+
+    # Calculate per-sample error (Negative Log Likelihood of the true class)
+    # Clip probabilities to match the metric calculation stability
+    eps = Config.PROB_CLIP
+    val_probs_clipped = np.clip(val_probs, eps, 1.0 - eps)
+
+    # Extract the probability assigned to the true class for each sample
+    true_class_probs = val_probs_clipped[np.arange(len(y_val)), y_val]
+
+    # Error magnitude = -log(p_true)
+    sample_errors = -np.log(true_class_probs)
+
+    # Vectorized correlation calculation between Features and Error
+    # X_val shape: (N_samples, N_features)
+    # sample_errors shape: (N_samples,)
+
+    # Center the data
+    X_centered = X_val - X_val.mean(axis=0)
+    error_centered = sample_errors - sample_errors.mean()
+
+    # Calculate standard deviations
+    X_std = X_val.std(axis=0)
+    error_std = sample_errors.std()
+
+    # Avoid division by zero for constant features
+    valid_features_mask = X_std > 0
+    n_features = X_val.shape[1]
+    correlations = np.zeros(n_features)
+
+    if error_std > 0:
+        # Covariance = mean(X_centered * error_centered)
+        covariance = np.mean(
+            X_centered[:, valid_features_mask] * error_centered[:, None], axis=0
+        )
+        # Correlation = Covariance / (std_X * std_error)
+        correlations[valid_features_mask] = covariance / (
+            X_std[valid_features_mask] * error_std
+        )
+
+    # Identify top correlations
+    feature_names = Config.get_feature_columns()
+    sorted_indices = np.argsort(correlations)
+
+    # Top 5 Negative Correlations (Low feature value -> High error)
+    top_neg_indices = sorted_indices[:5]
+
+    # Top 5 Positive Correlations (High feature value -> High error)
+    top_pos_indices = sorted_indices[-5:][::-1]
+
+    print("\nFailure Analysis - Correlation between Feature Value and Error Magnitude:")
+    print("Top Positive Correlations (High Feature Value associated with High Error):")
+    for idx in top_pos_indices:
+        print(f"  {feature_names[idx]}: {correlations[idx]:.4f}")
+
+    print("\nTop Negative Correlations (Low Feature Value associated with High Error):")
+    for idx in top_neg_indices:
+        print(f"  {feature_names[idx]}: {correlations[idx]:.4f}")
+
+    # 6. Submission Generation
+    # Strict threshold check as per instructions
+    THRESHOLD = 1.4705545687989736e-08
+
+    if val_loss < THRESHOLD:
+        # Generate predictions for the test set
+        test_probs = model.predict_proba(X_test)
+
+        # Create and save the submission file
+        create_submission(
+            test_ids=test_ids,
+            predictions=test_probs,
+            class_names=species_encoder.classes_,
+        )
+    else:
+        # If metric is not better than the threshold, we do not save the submission.
+        pass
+=======
+from library.models import GlobalLDA
+from library.evaluation import calculate_log_loss, create_submission
+
+# Suppress warnings for clean output
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Configuration and Hardware Detection
+    # Initialize Config to set seeds and directories
+    config = Config()
+
+    # Automatically detect device (Requirement: Detect and utilize available GPU)
+    # Note: While we detect the GPU here, the specific GlobalLDA model
+    # relies on scikit-learn (CPU-bound). We perform this check to satisfy
+    # the environment capability detection requirement.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Data Loading
+    # Load data with caching DISABLED to ensure full dataset is processed
+    # Cite solution_lesson_node_00015: Avoid data fragmentation; use global dataset.
+    data = load_data(debug=False, load_cached_data=False)
+    (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        test_ids,
+        species_encoder,
+    ) = data
+
+    # 3. Model Training
+    # Instantiate the Global LDA model
+    # Cite solution_lesson_node_00008: Use standalone global model when ensemble weights skew to 1.0.
+    model = GlobalLDA()
+
+    # Fit the model on training data
+    model.fit(X_train, y_train)
+
+    # 4. Validation
+    # Generate probability predictions for the validation set
+    val_probs = model.predict_proba(X_val)
+
+    # Calculate the Multi-class Log Loss metric
+    val_loss = calculate_log_loss(y_val, val_probs)
+
+    # Print the validation metric in the required format
+    print(f"Final Validation Metric: {val_loss}")
+
+    # 5. Failure Analysis
+    # We analyze which features correlate with higher error magnitudes.
+
+    # Calculate per-sample error (Negative Log Likelihood of the true class)
+    # Clip probabilities to match the metric calculation stability
+    eps = Config.PROB_CLIP
+    val_probs_clipped = np.clip(val_probs, eps, 1.0 - eps)
+
+    # Extract the probability assigned to the true class for each sample
+    true_class_probs = val_probs_clipped[np.arange(len(y_val)), y_val]
+
+    # Error magnitude = -log(p_true)
+    sample_errors = -np.log(true_class_probs)
+
+    # Vectorized correlation calculation between Features and Error
+    # X_val shape: (N_samples, N_features)
+    # sample_errors shape: (N_samples,)
+
+    # Center the data
+    X_centered = X_val - X_val.mean(axis=0)
+    error_centered = sample_errors - sample_errors.mean()
+
+    # Calculate standard deviations
+    X_std = X_val.std(axis=0)
+    error_std = sample_errors.std()
+
+    # Avoid division by zero for constant features
+    valid_features_mask = X_std > 0
+    n_features = X_val.shape[1]
+    correlations = np.zeros(n_features)
+
+    if error_std > 0:
+        # Covariance = mean(X_centered * error_centered)
+        covariance = np.mean(
+            X_centered[:, valid_features_mask] * error_centered[:, None], axis=0
+        )
+        # Correlation = Covariance / (std_X * std_error)
+        correlations[valid_features_mask] = covariance / (
+            X_std[valid_features_mask] * error_std
+        )
+
+    # Identify top correlations
+    feature_names = Config.get_feature_columns()
+    sorted_indices = np.argsort(correlations)
+
+    # Top 5 Negative Correlations (Low feature value -> High error)
+    top_neg_indices = sorted_indices[:5]
+
+    # Top 5 Positive Correlations (High feature value -> High error)
+    top_pos_indices = sorted_indices[-5:][::-1]
+
+    print("\nFailure Analysis - Correlation between Feature Value and Error Magnitude:")
+    print("Top Positive Correlations (High Feature Value associated with High Error):")
+    for idx in top_pos_indices:
+        print(f"  {feature_names[idx]}: {correlations[idx]:.4f}")
+
+    print("\nTop Negative Correlations (Low Feature Value associated with High Error):")
+    for idx in top_neg_indices:
+        print(f"  {feature_names[idx]}: {correlations[idx]:.4f}")
+
+    # 6. Submission Generation
+    # Strict threshold check as per instructions
+    THRESHOLD = 1.4705447816556679e-08
+
+    if val_loss < THRESHOLD:
+        # Generate predictions for the test set
+        test_probs = model.predict_proba(X_test)
+
+        # Create and save the submission file
+        create_submission(
+            test_ids=test_ids,
+            predictions=test_probs,
+            class_names=species_encoder.classes_,
+        )
+    else:
+        # If metric is not better than the threshold, we do not save the submission.
+        pass
+>>>>>>> REPLACE
+```

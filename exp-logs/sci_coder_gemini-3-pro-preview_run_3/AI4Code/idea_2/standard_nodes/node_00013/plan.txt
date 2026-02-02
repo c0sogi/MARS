@@ -1,0 +1,1002 @@
+To improve the performance of the cell ordering task, I will transition the solution from a Deep Learning approach (DSAPR) to a Gradient Boosting approach (LightGBM) using explicit alignment features derived from semantic embeddings. This strategy is directly supported by the provided lessons, which indicate that explicit features like "Best Match Location" and "Center of Mass" outperform end-to-end attention mechanisms in this domain (Lesson 00012) and that maximizing data volume is crucial for regressor performance (Lesson 00009).
+
+Here is the implementation strategy:
+
+1.  **`library/config.py`**: Update the configuration to include LightGBM hyperparameters and adjust the batch size for tabular inference.
+2.  **`library/dataset.py`**: Modify the `NotebookSequenceDataset` to replace the tensor generation logic with explicit feature engineering. I will calculate cosine similarity statistics (max, mean, std, best match location, center of mass) between markdown and code embeddings (Cite Lesson 00004).
+3.  **`library/model.py`**: Replace the `DSAPR` PyTorch module with a `LGBMModel` wrapper class to handle LightGBM training and prediction (Cite Lesson 00012).
+4.  **`library/trainer.py`**: Update `ModelTrainer` to prepare tabular data (`X`, `y`) from the dataset and train the LightGBM model.
+5.  **`library/inference.py`**: Adapt the inference engine to extract the same explicit features and use the LightGBM model for prediction.
+6.  **`runfile.py`**: Remove the data limits to train on the full dataset (Cite Lesson 00009) and update the validation loop to interact with the new LightGBM-based trainer.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 64
+    LEARNING_RATE = 2e-4
+    NUM_EPOCHS = 15
+    PATIENCE = 3  # Early stopping patience
+    WEIGHT_DECAY = 0.01
+    WARMUP_RATIO = 0.1
+    MAX_GRAD_NORM = 1.0
+
+    # =========================================================================
+    # Hardware and Environment
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 2048  # Larger batch size for tabular inference
+    
+    # LightGBM Parameters
+    LGBM_PARAMS = {
+        "objective": "regression",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "n_estimators": 2000,
+        "early_stopping_rounds": 50,
+        "verbose": -1,
+        "n_jobs": 12,
+        "random_state": SEED
+    }
+
+    # =========================================================================
+    # Hardware and Environment
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def _process_and_cache(self, debug_limit):
+        """
+        Loads features from Parquet, processes them into samples, and saves to cache.
+        """
+        print(f"Processing dataset for split: {self.split}...")
+
+        # Identify source file
+        if self.split == "train":
+            parquet_path = Config.TRAIN_CACHE_PATH
+        elif self.split == "val":
+            parquet_path = Config.VAL_CACHE_PATH
+        elif self.split == "test":
+            parquet_path = Config.TEST_CACHE_PATH
+        else:
+            raise ValueError(f"Unknown split: {self.split}")
+
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(
+                f"Feature file not found: {parquet_path}. Run feature extraction first."
+            )
+
+        # Load Data
+        df = pd.read_parquet(parquet_path)
+
+        if debug_limit:
+            # Filter by notebook_id to keep integrity of notebooks
+            nb_ids = df["notebook_id"].unique()[:debug_limit]
+            df = df[df["notebook_id"].isin(nb_ids)]
+
+        samples = []
+
+        # Helper to preserve order for test set
+        # We assume the parquet file preserves the insertion order of rows
+        df["orig_index"] = np.arange(len(df))
+
+        # Group by notebook
+        grouped = df.groupby("notebook_id")
+
+        for nb_id, group in grouped:
+            # Separate Code and Markdown
+            code_df = group[group["cell_type"] == "code"]
+            md_df = group[group["cell_type"] == "markdown"]
+
+            # Determine Context Sequence (Code Cells)
+            if self.split in ["train", "val"]:
+                # For training/validation, we trust the 'rank' column derived from ground truth
+                code_df = code_df.sort_values("rank")
+            else:
+                # For test, we trust the appearance order in the JSON (proxy: orig_index)
+                code_df = code_df.sort_values("orig_index")
+
+            # Extract embeddings
+            if len(code_df) > 0:
+                # Convert list of lists to numpy array
+                # Note: df['embedding'] contains lists
+                code_embeddings = np.stack(code_df["embedding"].values).astype(
+                    np.float32
+                )
+                code_ranks = code_df["rank"].values
+            else:
+                code_embeddings = np.zeros((0, self.embed_dim), dtype=np.float32)
+                code_ranks = np.array([])
+
+            n_code = len(code_embeddings)
+
+            # Create a sample for each markdown cell
+            for _, row in md_df.iterrows():
+                md_emb = np.array(row["embedding"], dtype=np.float32)
+                cell_id = row["cell_id"]
+
+                # Calculate Target
+                target = 0.0
+                if self.split in ["train", "val"]:
+                    md_rank = row["rank"]
+                    if n_code > 0:
+                        # Target is the fraction of code cells that come BEFORE this markdown cell
+                        # rank is global position.
+                        # sum(code_rank < md_rank) counts code cells preceding this md
+                        n_before = np.sum(code_ranks < md_rank)
+                        target = float(n_before) / float(n_code)
+                    else:
+                        # Fallback for notebooks with no code cells
+                        target = 0.5
+                else:
+                    # Dummy target for test
+                    target = -1.0
+
+                # Store sample
+                # Note: We store a reference to the 'code_embeddings' array.
+                # Since 'code_embeddings' is created once per notebook loop,
+                # all markdown samples for this notebook share the same memory for context.
+                samples.append(
+                    {
+                        "nb_id": nb_id,
+                        "cell_id": cell_id,
+                        "query": md_emb,
+                        "context": code_embeddings,
+                        "target": target,
+                    }
+                )
+
+        # Save to cache
+        print(f"Saving processed dataset to {self.cache_path}...")
+        torch.save(samples, self.cache_path)
+
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+
+        # 1. Query (Markdown)
+        query = torch.tensor(sample["query"], dtype=torch.float32)
+
+        # 2. Context (Code Sequence)
+        context_raw = sample["context"]
+        seq_len = len(context_raw)
+
+        # Pad or Truncate
+        if seq_len >= self.max_seq_len:
+            # Truncate: take the first MAX_SEQ_LEN code cells
+            # (Assumption: early code cells (imports, data load) are most informative)
+            context_np = context_raw[: self.max_seq_len]
+            mask_np = np.ones(self.max_seq_len, dtype=np.float32)
+        else:
+            # Pad
+            context_np = np.zeros((self.max_seq_len, self.embed_dim), dtype=np.float32)
+            if seq_len > 0:
+                context_np[:seq_len] = context_raw
+
+            # Mask: 1 for Real, 0 for Pad
+            mask_np = np.zeros(self.max_seq_len, dtype=np.float32)
+            mask_np[:seq_len] = 1.0
+
+        context = torch.tensor(context_np, dtype=torch.float32)
+        mask = torch.tensor(mask_np, dtype=torch.float32)
+
+        # 3. Label
+        label = torch.tensor(sample["target"], dtype=torch.float32)
+
+        # 4. IDs (for inference reconstruction)
+        ids = (sample["nb_id"], sample["cell_id"])
+
+        return {
+            "query": query,
+            "context": context,
+            "mask": mask,
+            "label": label,
+            "ids": ids,
+        }
+=======
+    def _process_and_cache(self, debug_limit):
+        """
+        Loads features from Parquet, processes them into explicit features for LightGBM, and saves to cache.
+        Cite solution_lesson_node_00004: Use similarity-weighted positional statistics.
+        """
+        print(f"Processing dataset for split: {self.split}...")
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        # Identify source file
+        if self.split == "train":
+            parquet_path = Config.TRAIN_CACHE_PATH
+        elif self.split == "val":
+            parquet_path = Config.VAL_CACHE_PATH
+        elif self.split == "test":
+            parquet_path = Config.TEST_CACHE_PATH
+        else:
+            raise ValueError(f"Unknown split: {self.split}")
+
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(
+                f"Feature file not found: {parquet_path}. Run feature extraction first."
+            )
+
+        # Load Data
+        df = pd.read_parquet(parquet_path)
+
+        if debug_limit:
+            nb_ids = df["notebook_id"].unique()[:debug_limit]
+            df = df[df["notebook_id"].isin(nb_ids)]
+
+        samples = []
+
+        # Helper to preserve order for test set
+        df["orig_index"] = np.arange(len(df))
+
+        # Group by notebook
+        grouped = df.groupby("notebook_id")
+
+        for nb_id, group in grouped:
+            # Separate Code and Markdown
+            code_df = group[group["cell_type"] == "code"]
+            md_df = group[group["cell_type"] == "markdown"]
+
+            # Determine Context Sequence (Code Cells)
+            if self.split in ["train", "val"]:
+                code_df = code_df.sort_values("rank")
+            else:
+                code_df = code_df.sort_values("orig_index")
+
+            # Extract embeddings
+            if len(code_df) > 0:
+                code_embeddings = np.stack(code_df["embedding"].values).astype(np.float32)
+                code_ranks = code_df["rank"].values
+            else:
+                code_embeddings = np.zeros((0, self.embed_dim), dtype=np.float32)
+                code_ranks = np.array([])
+
+            n_code = len(code_embeddings)
+
+            # Create a sample for each markdown cell
+            for _, row in md_df.iterrows():
+                md_emb = np.array(row["embedding"], dtype=np.float32)
+                cell_id = row["cell_id"]
+
+                # Calculate Target
+                target = 0.0
+                if self.split in ["train", "val"]:
+                    md_rank = row["rank"]
+                    if n_code > 0:
+                        n_before = np.sum(code_ranks < md_rank)
+                        target = float(n_before) / float(n_code)
+                    else:
+                        target = 0.5
+                else:
+                    target = -1.0
+                
+                # Feature Engineering (Cite solution_lesson_node_00004)
+                if n_code > 0:
+                    # Compute cosine similarity: (1, embed_dim) x (n_code, embed_dim).T -> (1, n_code)
+                    sims = cosine_similarity(md_emb.reshape(1, -1), code_embeddings)[0]
+                    
+                    sim_max = float(sims.max())
+                    best_match_loc = float(np.argmax(sims)) / n_code
+                    sim_mean = float(sims.mean())
+                    sim_std = float(sims.std())
+                    
+                    # Center of Mass
+                    # Use ReLU to ignore negative similarities for weighting
+                    weights = np.maximum(sims, 0)
+                    if weights.sum() > 1e-6:
+                        com = np.average(np.arange(n_code), weights=weights) / n_code
+                    else:
+                        com = 0.5
+                else:
+                    # Fallback for notebooks with no code cells
+                    sim_max = 0.0
+                    best_match_loc = 0.5
+                    sim_mean = 0.0
+                    sim_std = 0.0
+                    com = 0.5
+
+                samples.append(
+                    {
+                        "nb_id": nb_id,
+                        "cell_id": cell_id,
+                        "features": np.array([sim_max, best_match_loc, sim_mean, sim_std, com], dtype=np.float32),
+                        "target": target,
+                    }
+                )
+
+        # Save to cache
+        print(f"Saving processed dataset to {self.cache_path}...")
+        torch.save(samples, self.cache_path)
+
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Return features as tensor for compatibility with DataLoader (though we might convert back to numpy later)
+        features = torch.tensor(sample["features"], dtype=torch.float32)
+        label = torch.tensor(sample["target"], dtype=torch.float32)
+        ids = (sample["nb_id"], sample["cell_id"])
+
+        return {
+            "features": features,
+            "label": label,
+            "ids": ids,
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+class DSAPR(nn.Module):
+    """
+    Deep Sequence-Aware Position Regressor (DSAPR).
+
+    This model predicts the relative rank (0 to 1) of a Markdown cell (Query)
+    within a sequence of Code cells (Context).
+
+    Architecture:
+    1. Input: Markdown Embedding (Query) + Sequence of Code Embeddings (Context).
+    2. Positional Encoding: Added to Code embeddings to preserve order.
+    3. Transformer Encoder: Attends to context to learn semantic relationships.
+    4. Regression Head: MLP predicting the scalar rank.
+    """
+
+    def __init__(self):
+        super(DSAPR, self).__init__()
+
+        # Hyperparameters from Config
+        self.embed_dim = Config.EMBED_DIM
+        self.max_len = Config.MAX_SEQ_LEN
+        self.n_layers = Config.TRANSFORMER_LAYERS
+        self.n_heads = Config.TRANSFORMER_HEADS
+        self.dropout_rate = Config.DROPOUT
+        self.forward_expansion = Config.FORWARD_EXPANSION
+
+        # 1. Positional Embeddings for the Context (Code Sequence)
+        # We use a learnable parameter. Shape: (1, max_len, embed_dim)
+        # Initialized with small random values.
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, self.max_len, self.embed_dim) * 0.02
+        )
+
+        # 2. Transformer Encoder
+        # batch_first=True ensures input shape is (Batch, Seq_Len, Dim)
+        # norm_first=True (Pre-LN) is generally more stable for convergence
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim,
+            nhead=self.n_heads,
+            dim_feedforward=self.embed_dim * self.forward_expansion,
+            dropout=self.dropout_rate,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=self.n_layers
+        )
+
+        # 3. Regression Head
+        # Projects the Query output state to a single scalar [0, 1]
+        self.regressor = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.embed_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for linear layers using Xavier Uniform."""
+        for p in self.regressor.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, query, context, mask):
+        """
+        Forward pass of the DSAPR model.
+
+        Args:
+            query (Tensor): Markdown cell embeddings. Shape (B, embed_dim).
+            context (Tensor): Code cell embeddings sequence. Shape (B, max_len, embed_dim).
+            mask (Tensor): Mask for context (1 for valid, 0 for pad). Shape (B, max_len).
+
+        Returns:
+            Tensor: Predicted relative rank. Shape (B,).
+        """
+        batch_size = query.size(0)
+
+        # --- 1. Prepare Inputs ---
+
+        # Expand query to sequence format: (B, 1, embed_dim)
+        query_seq = query.unsqueeze(1)
+
+        # Add positional encodings to context
+        # We slice pos_embedding to match the current context length (usually max_len)
+        # Broadcasting handles the batch dimension.
+        seq_len = context.size(1)
+        context_pos = context + self.pos_embedding[:, :seq_len, :]
+
+        # Concatenate Query and Context along sequence dimension
+        # Result: [Query, Code_1, Code_2, ..., Code_N]
+        # Shape: (B, 1 + seq_len, embed_dim)
+        src = torch.cat([query_seq, context_pos], dim=1)
+
+        # --- 2. Prepare Attention Mask ---
+
+        # The transformer needs to know which positions are padding.
+        # We also need to ensure the Query token is never masked.
+        # Create a mask for the query token (all 1s/valid)
+        query_mask = torch.ones((batch_size, 1), device=mask.device, dtype=mask.dtype)
+
+        # Concatenate with context mask: (B, 1 + seq_len)
+        full_mask = torch.cat([query_mask, mask], dim=1)
+
+        # Convert to BoolTensor for PyTorch Transformer
+        # In PyTorch Transformer, True indicates the value should be IGNORED (i.e., padding).
+        # Our input mask has 1=Valid, 0=Pad.
+        # So we want True where mask == 0.
+        src_key_padding_mask = full_mask == 0
+
+        # --- 3. Transformer Pass ---
+
+        # Output shape: (B, 1 + seq_len, embed_dim)
+        encoded_output = self.transformer_encoder(
+            src, src_key_padding_mask=src_key_padding_mask
+        )
+
+        # --- 4. Regression ---
+
+        # We only care about the output state of the Query token (index 0)
+        # This token has attended to all code cells and gathered context.
+        query_output = encoded_output[:, 0, :]  # Shape: (B, embed_dim)
+
+        # Predict rank
+        prediction = self.regressor(query_output)  # Shape: (B, 1)
+
+        return prediction.squeeze(-1)  # Shape: (B,)
+=======
+import lightgbm as lgb
+import joblib
+from library.config import Config
+
+class LGBMModel:
+    """
+    Wrapper for LightGBM Regressor.
+    Cite solution_lesson_node_00012: Explicit Alignment Features Outperform End-to-End Attention.
+    """
+    def __init__(self):
+        self.model = None
+
+    def train(self, train_data, valid_data):
+        self.model = lgb.train(
+            Config.LGBM_PARAMS,
+            train_data,
+            valid_sets=[train_data, valid_data],
+            valid_names=['train', 'valid'],
+            callbacks=[lgb.log_evaluation(100)]
+        )
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def save(self, path):
+        joblib.dump(self.model, path)
+
+    def load(self, path):
+        self.model = joblib.load(path)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from library.config import Config
+from library.utils import set_seed
+from library.dataset import NotebookSequenceDataset
+from library.model import DSAPR
+
+
+class ModelTrainer:
+    """
+    Manages the training and validation lifecycle of the DSAPR model.
+    """
+
+    def __init__(self, debug_limit: int = None):
+        """
+        Initialize the trainer with data, model, and optimization components.
+
+        Args:
+            debug_limit (int, optional): Limit the number of notebooks for debugging purposes.
+        """
+        # 1. Setup Environment
+        set_seed(Config.SEED)
+        self.device = Config.DEVICE
+        self.save_path = Config.MODEL_SAVE_PATH
+
+        # Ensure working directory exists (redundant if Config handles it, but good practice)
+        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+
+        print(f"Initializing ModelTrainer on device: {self.device}")
+
+        # 2. Prepare Data
+        # We rely on the Dataset class to handle caching logic internally
+        self.train_dataset = NotebookSequenceDataset(
+            split="train", load_cached_data=True, debug_limit=debug_limit
+        )
+        self.val_dataset = NotebookSequenceDataset(
+            split="val", load_cached_data=True, debug_limit=debug_limit
+        )
+
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True if self.device == "cuda" else False,
+        )
+
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True if self.device == "cuda" else False,
+        )
+
+        # 3. Initialize Model
+        self.model = DSAPR().to(self.device)
+
+        # 4. Optimization
+        self.criterion = nn.MSELoss()
+
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler: Linear Warmup + Cosine Decay
+        # OneCycleLR provides a good approximation of this strategy
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=Config.LEARNING_RATE,
+            steps_per_epoch=len(self.train_loader),
+            epochs=Config.NUM_EPOCHS,
+            pct_start=Config.WARMUP_RATIO,
+            anneal_strategy="cos",
+        )
+
+    def train_epoch(self, epoch_idx):
+        """
+        Runs one epoch of training.
+        """
+        self.model.train()
+        running_loss = 0.0
+        count = 0
+
+        for batch in self.train_loader:
+            # Move batch to device
+            query = batch["query"].to(self.device)
+            context = batch["context"].to(self.device)
+            mask = batch["mask"].to(self.device)
+            label = batch["label"].to(self.device)
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            preds = self.model(query, context, mask)
+
+            # Compute loss
+            loss = self.criterion(preds, label)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), Config.MAX_GRAD_NORM
+            )
+
+            # Optimizer step
+            self.optimizer.step()
+            self.scheduler.step()
+
+            # Statistics
+            running_loss += loss.item() * query.size(0)
+            count += query.size(0)
+
+        avg_loss = running_loss / count if count > 0 else 0.0
+        return avg_loss
+
+    def validate(self):
+        """
+        Runs validation on the validation set.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        count = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                query = batch["query"].to(self.device)
+                context = batch["context"].to(self.device)
+                mask = batch["mask"].to(self.device)
+                label = batch["label"].to(self.device)
+
+                preds = self.model(query, context, mask)
+                loss = self.criterion(preds, label)
+
+                running_loss += loss.item() * query.size(0)
+                count += query.size(0)
+
+        avg_loss = running_loss / count if count > 0 else 0.0
+        return avg_loss
+
+    def train(self):
+        """
+        Main training loop with Early Stopping.
+        """
+        print("Starting training...")
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+
+        for epoch in range(Config.NUM_EPOCHS):
+            # Train
+            train_loss = self.train_epoch(epoch)
+
+            # Validate
+            val_loss = self.validate()
+
+            # Print metrics (full precision)
+            print(
+                f"Epoch {epoch+1}/{Config.NUM_EPOCHS} | Train MSE: {train_loss} | Val MSE: {val_loss}"
+            )
+
+            # Checkpoint & Early Stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(self.model.state_dict(), self.save_path)
+                print(f"Validation loss improved. Model saved to {self.save_path}")
+            else:
+                patience_counter += 1
+                print(f"No improvement. Patience: {patience_counter}/{Config.PATIENCE}")
+
+            if patience_counter >= Config.PATIENCE:
+                print("Early stopping triggered.")
+                break
+
+        print(f"Training complete. Best Validation MSE: {best_val_loss}")
+=======
+import os
+import numpy as np
+import lightgbm as lgb
+from library.config import Config
+from library.utils import set_seed
+from library.dataset import NotebookSequenceDataset
+from library.model import LGBMModel
+
+
+class ModelTrainer:
+    """
+    Manages the training and validation lifecycle of the LightGBM model.
+    """
+
+    def __init__(self, debug_limit: int = None):
+        set_seed(Config.SEED)
+        self.save_path = Config.MODEL_SAVE_PATH
+        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+
+        print("Initializing ModelTrainer for LightGBM...")
+
+        # Load Data
+        self.train_dataset = NotebookSequenceDataset(
+            split="train", load_cached_data=True, debug_limit=debug_limit
+        )
+        self.val_dataset = NotebookSequenceDataset(
+            split="val", load_cached_data=True, debug_limit=debug_limit
+        )
+        
+        # Prepare Data for LightGBM
+        # We extract the features and labels from the dataset samples list
+        print("Preparing LightGBM datasets...")
+        self.X_train, self.y_train = self._prepare_data(self.train_dataset)
+        self.X_val, self.y_val = self._prepare_data(self.val_dataset)
+
+        self.model = LGBMModel()
+
+    def _prepare_data(self, dataset):
+        features = []
+        targets = []
+        for sample in dataset.samples:
+            features.append(sample["features"])
+            targets.append(sample["target"])
+        return np.array(features), np.array(targets)
+
+    def train(self):
+        print("Starting LightGBM training...")
+        
+        train_data = lgb.Dataset(self.X_train, label=self.y_train)
+        val_data = lgb.Dataset(self.X_val, label=self.y_val, reference=train_data)
+        
+        self.model.train(train_data, val_data)
+        self.model.save(self.save_path)
+        
+        print(f"Training complete. Model saved to {self.save_path}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        # 3. Load Model
+        print("Loading model...")
+        model = DSAPR().to(self.device)
+
+        if not os.path.exists(Config.MODEL_SAVE_PATH):
+            raise FileNotFoundError(
+                f"Model weights not found at {Config.MODEL_SAVE_PATH}. "
+                "Please train the model before running inference."
+            )
+
+        model.load_state_dict(
+            torch.load(Config.MODEL_SAVE_PATH, map_location=self.device)
+        )
+        model.eval()
+
+        # 4. Prediction Loop
+        print(f"Starting inference on {len(dataset)} markdown cells...")
+        predictions = {}
+
+        with torch.no_grad():
+            for batch in loader:
+                query = batch["query"].to(self.device)
+                context = batch["context"].to(self.device)
+                mask = batch["mask"].to(self.device)
+
+                # ids is a list of tuples: [(nb_ids...), (cell_ids...)] due to default_collate
+                ids = batch["ids"]
+                nb_ids_batch = ids[0]
+                cell_ids_batch = ids[1]
+
+                # Forward pass
+                # Output shape: (Batch_Size,)
+                preds = model(query, context, mask)
+                preds_np = preds.cpu().numpy()
+
+                # Store predictions
+                for i in range(len(preds_np)):
+                    nb_id = nb_ids_batch[i]
+                    cell_id = cell_ids_batch[i]
+                    predictions[(nb_id, cell_id)] = float(preds_np[i])
+=======
+        # 3. Load Model
+        print("Loading model...")
+        from library.model import LGBMModel
+        model = LGBMModel()
+
+        if not os.path.exists(Config.MODEL_SAVE_PATH):
+            raise FileNotFoundError(
+                f"Model weights not found at {Config.MODEL_SAVE_PATH}. "
+                "Please train the model before running inference."
+            )
+
+        model.load(Config.MODEL_SAVE_PATH)
+
+        # 4. Prediction Loop
+        print(f"Starting inference on {len(dataset)} markdown cells...")
+        predictions = {}
+        
+        # Extract features for batch prediction
+        X_test = []
+        ids_list = []
+        for sample in dataset.samples:
+            X_test.append(sample["features"])
+            ids_list.append((sample["nb_id"], sample["cell_id"]))
+            
+        X_test = np.array(X_test)
+        preds = model.predict(X_test)
+        
+        for (nb_id, cell_id), pred in zip(ids_list, preds):
+            predictions[(nb_id, cell_id)] = float(pred)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Adjust Config for a fast baseline run
+    Config.NUM_EPOCHS = 3  # Reduce epochs for speed
+    TRAIN_LIMIT = 10000  # Limit training samples
+    VAL_LIMIT = 2000  # Limit validation samples for quick check
+
+    set_seed(Config.SEED)
+    print("Configuration set for fast baseline.")
+    print(f"Training on {TRAIN_LIMIT} notebooks for {Config.NUM_EPOCHS} epochs.")
+
+    # =========================================================================
+    # 2. Feature Extraction
+    # =========================================================================
+    print("\n[Step 1/5] Feature Extraction...")
+
+    # Generate features for Training set (limited)
+    # We force regeneration (load_cached_data=False) to ensure we use the limit
+    gen = EmbeddingGenerator()
+    gen.process_split("train", load_cached_data=False, debug_limit=TRAIN_LIMIT)
+
+    # Generate features for Validation set (limited)
+    gen.process_split("val", load_cached_data=False, debug_limit=VAL_LIMIT)
+
+    # Note: Test features are generated on-demand by InferenceEngine if needed.
+
+    # =========================================================================
+    # 3. Model Training
+    # =========================================================================
+    print("\n[Step 2/5] Model Training...")
+
+    # Initialize trainer with the debug limit to load the correct subset
+    trainer = ModelTrainer(debug_limit=TRAIN_LIMIT)
+    trainer.train()
+
+    # =========================================================================
+    # 4. Validation & Metric Calculation
+    # =========================================================================
+    print("\n[Step 3/5] Validation & Metric Calculation...")
+
+    # Load validation features to get notebook structure
+    val_features = pd.read_parquet(Config.VAL_CACHE_PATH)
+
+    # Load ground truth metadata
+    val_metadata = pd.read_csv(Config.VAL_METADATA_PATH)
+
+    # Filter metadata to match the limited validation set
+    val_nb_ids = val_features["notebook_id"].unique()
+    val_metadata = val_metadata[val_metadata["id"].isin(val_nb_ids)]
+
+    # Build Ground Truth Dictionary: id -> list of cell_ids
+    gt_dict = {
+        row["id"]: row["cell_order"].split() for _, row in val_metadata.iterrows()
+    }
+
+    # Load best model for inference
+    model = trainer.model
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(
+            torch.load(Config.MODEL_SAVE_PATH, map_location=Config.DEVICE)
+        )
+    model.eval()
+
+    # Use the validation dataset prepared by the trainer
+    val_loader = DataLoader(
+        trainer.val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=(Config.DEVICE == "cuda"),
+    )
+
+    # Run Inference
+    preds_map = {}
+    print(f"Running inference on {len(trainer.val_dataset)} validation samples...")
+
+    with torch.no_grad():
+        for batch in val_loader:
+            query = batch["query"].to(Config.DEVICE)
+            context = batch["context"].to(Config.DEVICE)
+            mask = batch["mask"].to(Config.DEVICE)
+
+            ids = batch["ids"]
+            nb_ids = ids[0]
+            cell_ids = ids[1]
+
+            outputs = model(query, context, mask)
+            outputs = outputs.cpu().numpy()
+
+            for nb, cell, score in zip(nb_ids, cell_ids, outputs):
+                preds_map[(nb, cell)] = float(score)
+=======
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Cite solution_lesson_node_00009: Maximize Downstream Data Volume.
+    TRAIN_LIMIT = None 
+    VAL_LIMIT = None
+
+    set_seed(Config.SEED)
+    print("Configuration set for full run.")
+    
+    # =========================================================================
+    # 2. Feature Extraction
+    # =========================================================================
+    print("\n[Step 1/5] Feature Extraction...")
+
+    # Generate features for Training set
+    gen = EmbeddingGenerator()
+    gen.process_split("train", load_cached_data=True, debug_limit=TRAIN_LIMIT)
+
+    # Generate features for Validation set
+    gen.process_split("val", load_cached_data=True, debug_limit=VAL_LIMIT)
+
+    # =========================================================================
+    # 3. Model Training
+    # =========================================================================
+    print("\n[Step 2/5] Model Training...")
+
+    # Initialize trainer
+    trainer = ModelTrainer(debug_limit=TRAIN_LIMIT)
+    trainer.train()
+
+    # =========================================================================
+    # 4. Validation & Metric Calculation
+    # =========================================================================
+    print("\n[Step 3/5] Validation & Metric Calculation...")
+
+    # Load validation features to get notebook structure
+    val_features = pd.read_parquet(Config.VAL_CACHE_PATH)
+
+    # Load ground truth metadata
+    val_metadata = pd.read_csv(Config.VAL_METADATA_PATH)
+
+    # Filter metadata if limits were applied (though now None)
+    val_nb_ids = val_features["notebook_id"].unique()
+    val_metadata = val_metadata[val_metadata["id"].isin(val_nb_ids)]
+
+    # Build Ground Truth Dictionary: id -> list of cell_ids
+    gt_dict = {
+        row["id"]: row["cell_order"].split() for _, row in val_metadata.iterrows()
+    }
+
+    # Run Inference
+    preds_map = {}
+    print(f"Running inference on {len(trainer.val_dataset)} validation samples...")
+    
+    # Use the trainer's prepared validation data
+    X_val = trainer.X_val
+    preds = trainer.model.predict(X_val)
+    
+    for sample, pred in zip(trainer.val_dataset.samples, preds):
+        preds_map[(sample["nb_id"], sample["cell_id"])] = float(pred)
+>>>>>>> REPLACE
+```

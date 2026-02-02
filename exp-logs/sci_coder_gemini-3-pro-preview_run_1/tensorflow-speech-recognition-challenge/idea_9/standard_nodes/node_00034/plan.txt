@@ -1,0 +1,588 @@
+I will optimize the solution by reverting the architecture from the over-engineered Dual-Channel EfficientNet to the more robust Single-Channel Dilated EfficientNet-B2, as suggested by **Cite solution_lesson_node_00033**. This simplification allows for the re-introduction of **SpecAugment** (Time and Frequency Masking), a proven regularization technique for audio spectrograms (**Cite solution_lesson_node_00003**), which was missing in the previous solution. I will also modify the `AudioProcessor` to generate standard Log-Mel Spectrograms and apply these augmentations. Finally, I will increase the training duration to 30 epochs to ensure convergence with the added regularization (**Cite solution_lesson_node_00029**) and update the model initialization to use channel-averaged weights for the single-channel input (**Cite solution_lesson_node_00016**).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Cache Directory for this specific idea/experiment
+    # Used to store processed spectrograms or intermediate features
+    CACHE_DIR = "./working/idea_9"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # --------------------------------------------------------------------------
+    # Audio Parameters (Dual-Channel Architecture)
+    # --------------------------------------------------------------------------
+    SR = 16000
+    DURATION = 1.0  # Seconds
+    AUDIO_LEN_SAMPLES = int(SR * DURATION)
+
+    # Mel Spectrogram Shared Params
+    N_MELS = 128
+    HOP_LENGTH = 160  # 10ms at 16kHz
+
+    # Channel 1: High-Frequency Resolution (Formants)
+    # Window size ~64ms
+    N_FFT_FREQ = 1024
+
+    # Channel 2: High-Temporal Resolution (Transients)
+    # Window size ~25ms
+    N_FFT_TIME = 400
+
+    # Noise Injection Parameters
+    NOISE_SNR_MIN = 10
+=======
+    # Cache Directory for this specific idea/experiment
+    # Used to store processed spectrograms or intermediate features
+    CACHE_DIR = "./working/idea_opt"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # --------------------------------------------------------------------------
+    # Audio Parameters
+    # --------------------------------------------------------------------------
+    SR = 16000
+    DURATION = 1.0  # Seconds
+    AUDIO_LEN_SAMPLES = int(SR * DURATION)
+
+    # Mel Spectrogram Params
+    N_MELS = 128
+    HOP_LENGTH = 160  # 10ms at 16kHz
+    N_FFT = 1024      # 64ms window
+
+    # SpecAugment Parameters
+    SPECAUG_FREQ_MASK = 30
+    SPECAUG_TIME_MASK = 40
+
+    # Noise Injection Parameters
+    NOISE_SNR_MIN = 10
+>>>>>>> REPLACE
+```
+
+```diff
+library/audio_transforms.py
+<<<<<<< SEARCH
+class DualChannelProcessor:
+    """
+    Handles waveform processing, augmentation, and dual-channel spectrogram generation.
+    """
+
+    def __init__(self, load_cached_data: bool = True):
+        # Load noise bank for augmentation and silence synthesis
+        self.noise_bank = load_noise_bank(load_cached_data)
+
+        # Channel 1: High Frequency Resolution (Formants)
+        # Window size ~64ms (1024 samples)
+        self.mel_freq = torchaudio.transforms.MelSpectrogram(
+            sample_rate=Config.SR,
+            n_fft=Config.N_FFT_FREQ,
+            hop_length=Config.HOP_LENGTH,
+            n_mels=Config.N_MELS,
+            power=2.0,
+            center=True,
+            normalized=False,
+        )
+
+        # Channel 2: High Temporal Resolution (Transients)
+        # Window size ~25ms (400 samples)
+        self.mel_time = torchaudio.transforms.MelSpectrogram(
+            sample_rate=Config.SR,
+            n_fft=Config.N_FFT_TIME,
+            hop_length=Config.HOP_LENGTH,
+            n_mels=Config.N_MELS,
+            power=2.0,
+            center=True,
+            normalized=False,
+        )
+
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80.0)
+
+    def _get_noise_crop(self, length: int) -> torch.Tensor:
+        """
+        Extracts a random crop of specified length from the noise bank.
+        """
+        if not self.noise_bank:
+            return torch.zeros(1, length)
+
+        noise_wav = random.choice(self.noise_bank)
+        c, t = noise_wav.shape
+
+        if t <= length:
+            # Repeat to fill if noise clip is shorter than target
+            repeats = (length // t) + 1
+            noise_wav = noise_wav.repeat(1, repeats)
+            t = noise_wav.shape[1]
+
+        start = random.randint(0, t - length)
+        return noise_wav[:, start : start + length]
+
+    def augment_waveform(
+        self, waveform: torch.Tensor, snr_min: float, snr_max: float
+    ) -> torch.Tensor:
+        """
+        Mixes background noise into the waveform with a random SNR.
+        """
+        # Calculate signal power
+        sig_pow = waveform.pow(2).mean()
+        if sig_pow == 0:
+            return waveform
+
+        # Get noise crop
+        noise = self._get_noise_crop(waveform.shape[1])
+        noise_pow = noise.pow(2).mean()
+        if noise_pow == 0:
+            return waveform
+
+        # Determine target SNR and coefficient
+        snr = random.uniform(snr_min, snr_max)
+        target_ratio = 10 ** (snr / 10)
+
+        # coeff = sqrt(P_sig / (P_noise * ratio))
+        coeff = torch.sqrt(sig_pow / (noise_pow * target_ratio))
+
+        return waveform + coeff * noise
+
+    def __call__(
+        self, waveform: torch.Tensor, mode: str = "train", label: str = None
+    ) -> torch.Tensor:
+        """
+        Processes a raw waveform into a Dual-Channel Spectrogram.
+
+        Args:
+            waveform (torch.Tensor): Input waveform (1, Time).
+            mode (str): 'train' or 'val'.
+            label (str): Label of the sample (used for silence synthesis).
+
+        Returns:
+            torch.Tensor: (2, 128, 101) tensor.
+        """
+        target_len = Config.AUDIO_LEN_SAMPLES
+
+        # 1. Dynamic Silence Synthesis
+        # If label is silence, ignore input and generate fresh noise
+        if label == Config.SILENCE_LABEL and mode == "train":
+            waveform = self._get_noise_crop(target_len)
+        else:
+            # 2. Length Standardization (Pad/Crop)
+            c, t = waveform.shape
+            if t > target_len:
+                if mode == "train":
+                    # Random crop for training
+                    start = random.randint(0, t - target_len)
+                    waveform = waveform[:, start : start + target_len]
+                else:
+                    # Center crop for validation/test
+                    start = (t - target_len) // 2
+                    waveform = waveform[:, start : start + target_len]
+            elif t < target_len:
+                # Pad with zeros
+                padding = target_len - t
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+
+        # 3. Augmentation (Noise Injection)
+        # Apply to non-silence samples during training
+        if mode == "train" and label != Config.SILENCE_LABEL:
+            if random.random() < Config.NOISE_PROB:
+                waveform = self.augment_waveform(
+                    waveform, Config.NOISE_SNR_MIN, Config.NOISE_SNR_MAX
+                )
+
+        # 4. Dual Spectrogram Generation
+        # Channel 1: Frequency Focus
+        spec_freq = self.mel_freq(waveform)  # (1, 128, T)
+
+        # Channel 2: Time Focus
+        spec_time = self.mel_time(waveform)  # (1, 128, T)
+
+        # Convert to dB
+        spec_freq = self.amp_to_db(spec_freq)
+        spec_time = self.amp_to_db(spec_time)
+
+        # Remove channel dim (1, F, T) -> (F, T)
+        spec_freq = spec_freq.squeeze(0)
+        spec_time = spec_time.squeeze(0)
+
+        # Stack into (2, F, T)
+        dual_spec = torch.stack([spec_freq, spec_time], dim=0)
+
+        # 5. Instance Normalization
+        # Normalize per sample: (x - mean) / std
+        mean = dual_spec.mean(dim=(1, 2), keepdim=True)
+        std = dual_spec.std(dim=(1, 2), keepdim=True) + 1e-5
+        dual_spec = (dual_spec - mean) / std
+
+        return dual_spec
+=======
+class AudioProcessor:
+    """
+    Handles waveform processing, augmentation, and single-channel spectrogram generation.
+    """
+
+    def __init__(self, load_cached_data: bool = True):
+        # Load noise bank for augmentation and silence synthesis
+        self.noise_bank = load_noise_bank(load_cached_data)
+
+        # Mel Spectrogram
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=Config.SR,
+            n_fft=Config.N_FFT,
+            hop_length=Config.HOP_LENGTH,
+            n_mels=Config.N_MELS,
+            power=2.0,
+            center=True,
+            normalized=False,
+        )
+
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(top_db=80.0)
+
+        # SpecAugment
+        self.time_masking = torchaudio.transforms.TimeMasking(
+            time_mask_param=Config.SPECAUG_TIME_MASK
+        )
+        self.freq_masking = torchaudio.transforms.FrequencyMasking(
+            freq_mask_param=Config.SPECAUG_FREQ_MASK
+        )
+
+    def _get_noise_crop(self, length: int) -> torch.Tensor:
+        """
+        Extracts a random crop of specified length from the noise bank.
+        """
+        if not self.noise_bank:
+            return torch.zeros(1, length)
+
+        noise_wav = random.choice(self.noise_bank)
+        c, t = noise_wav.shape
+
+        if t <= length:
+            # Repeat to fill if noise clip is shorter than target
+            repeats = (length // t) + 1
+            noise_wav = noise_wav.repeat(1, repeats)
+            t = noise_wav.shape[1]
+
+        start = random.randint(0, t - length)
+        return noise_wav[:, start : start + length]
+
+    def augment_waveform(
+        self, waveform: torch.Tensor, snr_min: float, snr_max: float
+    ) -> torch.Tensor:
+        """
+        Mixes background noise into the waveform with a random SNR.
+        """
+        # Calculate signal power
+        sig_pow = waveform.pow(2).mean()
+        if sig_pow == 0:
+            return waveform
+
+        # Get noise crop
+        noise = self._get_noise_crop(waveform.shape[1])
+        noise_pow = noise.pow(2).mean()
+        if noise_pow == 0:
+            return waveform
+
+        # Determine target SNR and coefficient
+        snr = random.uniform(snr_min, snr_max)
+        target_ratio = 10 ** (snr / 10)
+
+        # coeff = sqrt(P_sig / (P_noise * ratio))
+        coeff = torch.sqrt(sig_pow / (noise_pow * target_ratio))
+
+        return waveform + coeff * noise
+
+    def __call__(
+        self, waveform: torch.Tensor, mode: str = "train", label: str = None
+    ) -> torch.Tensor:
+        """
+        Processes a raw waveform into a Single-Channel Spectrogram.
+
+        Args:
+            waveform (torch.Tensor): Input waveform (1, Time).
+            mode (str): 'train' or 'val'.
+            label (str): Label of the sample (used for silence synthesis).
+
+        Returns:
+            torch.Tensor: (1, 128, 101) tensor.
+        """
+        target_len = Config.AUDIO_LEN_SAMPLES
+
+        # 1. Dynamic Silence Synthesis
+        # If label is silence, ignore input and generate fresh noise
+        if label == Config.SILENCE_LABEL and mode == "train":
+            waveform = self._get_noise_crop(target_len)
+        else:
+            # 2. Length Standardization (Pad/Crop)
+            c, t = waveform.shape
+            if t > target_len:
+                if mode == "train":
+                    # Random crop for training
+                    start = random.randint(0, t - target_len)
+                    waveform = waveform[:, start : start + target_len]
+                else:
+                    # Center crop for validation/test
+                    start = (t - target_len) // 2
+                    waveform = waveform[:, start : start + target_len]
+            elif t < target_len:
+                # Pad with zeros
+                padding = target_len - t
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+
+        # 3. Augmentation (Noise Injection)
+        # Apply to non-silence samples during training
+        if mode == "train" and label != Config.SILENCE_LABEL:
+            if random.random() < Config.NOISE_PROB:
+                waveform = self.augment_waveform(
+                    waveform, Config.NOISE_SNR_MIN, Config.NOISE_SNR_MAX
+                )
+
+        # 4. Spectrogram Generation
+        spec = self.mel_spec(waveform)  # (1, 128, T)
+        spec = self.amp_to_db(spec)
+
+        # 5. SpecAugment (Training Only)
+        if mode == "train":
+            spec = self.freq_masking(spec)
+            spec = self.time_masking(spec)
+
+        # 6. Instance Normalization
+        # Normalize per sample: (x - mean) / std
+        mean = spec.mean(dim=(1, 2), keepdim=True)
+        std = spec.std(dim=(1, 2), keepdim=True) + 1e-5
+        spec = (spec - mean) / std
+
+        return spec
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DualResEfficientNet(nn.Module):
+    """
+    Multi-Resolution Dilated EfficientNet-B2 with Dual-Channel Input.
+
+    Architecture:
+    - Backbone: EfficientNet-B2 (Pretrained)
+    - Input: 2 Channels (Freq-Resolution Spec, Time-Resolution Spec)
+    - Modification: First conv layer adapted for 2 channels.
+    - Modification: Dilated Convolutions in the final stage.
+    - Head: Attentive Pooling + Linear Classifier.
+    """
+
+    def __init__(self, num_classes=Config.NUM_CLASSES, pretrained=True):
+        super(DualResEfficientNet, self).__init__()
+
+        # 1. Load Backbone
+        # We disable the built-in global pooling and classifier
+        self.backbone = timm.create_model(
+            "efficientnet_b2", pretrained=pretrained, num_classes=0, global_pool=""
+        )
+
+        # 2. Modify Input Layer (3 channels -> 2 channels)
+        self._modify_first_conv(pretrained)
+
+        # 3. Apply Dilation to Final Stage
+        self._apply_dilation_to_last_stage()
+
+        # 4. Classification Head
+        self.num_features = self.backbone.num_features
+        self.att_pool = AttentivePooling(self.num_features)
+        self.fc = nn.Linear(self.num_features, num_classes)
+
+    def _modify_first_conv(self, pretrained):
+        """
+        Adapts the first convolution layer to accept 2 input channels.
+        Initializes weights by averaging ImageNet weights and duplicating.
+        """
+        old_stem = self.backbone.conv_stem
+        new_stem = nn.Conv2d(
+            in_channels=2,
+            out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size,
+            stride=old_stem.stride,
+            padding=old_stem.padding,
+            bias=old_stem.bias is not None,
+        )
+
+        if pretrained:
+            with torch.no_grad():
+                # old_weight: (Out, 3, K, K)
+                old_weight = old_stem.weight
+                # Average over RGB channels -> (Out, 1, K, K)
+                avg_weight = torch.mean(old_weight, dim=1, keepdim=True)
+                # Duplicate for 2 channels -> (Out, 2, K, K)
+                new_weight = avg_weight.repeat(1, 2, 1, 1)
+                new_stem.weight.copy_(new_weight)
+
+        self.backbone.conv_stem = new_stem
+=======
+class DilatedEfficientNet(nn.Module):
+    """
+    Dilated EfficientNet-B2 with Single-Channel Input.
+
+    Architecture:
+    - Backbone: EfficientNet-B2 (Pretrained)
+    - Input: 1 Channel (Log-Mel Spectrogram)
+    - Modification: First conv layer adapted for 1 channel.
+    - Modification: Dilated Convolutions in the final stage.
+    - Head: Attentive Pooling + Linear Classifier.
+    """
+
+    def __init__(self, num_classes=Config.NUM_CLASSES, pretrained=True):
+        super(DilatedEfficientNet, self).__init__()
+
+        # 1. Load Backbone
+        # We disable the built-in global pooling and classifier
+        self.backbone = timm.create_model(
+            "efficientnet_b2", pretrained=pretrained, num_classes=0, global_pool=""
+        )
+
+        # 2. Modify Input Layer (3 channels -> 1 channel)
+        self._modify_first_conv(pretrained)
+
+        # 3. Apply Dilation to Final Stage
+        self._apply_dilation_to_last_stage()
+
+        # 4. Classification Head
+        self.num_features = self.backbone.num_features
+        self.att_pool = AttentivePooling(self.num_features)
+        self.fc = nn.Linear(self.num_features, num_classes)
+
+    def _modify_first_conv(self, pretrained):
+        """
+        Adapts the first convolution layer to accept 1 input channel.
+        Initializes weights by averaging ImageNet weights.
+        """
+        old_stem = self.backbone.conv_stem
+        new_stem = nn.Conv2d(
+            in_channels=1,
+            out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size,
+            stride=old_stem.stride,
+            padding=old_stem.padding,
+            bias=old_stem.bias is not None,
+        )
+
+        if pretrained:
+            with torch.no_grad():
+                # old_weight: (Out, 3, K, K)
+                old_weight = old_stem.weight
+                # Average over RGB channels -> (Out, 1, K, K)
+                avg_weight = torch.mean(old_weight, dim=1, keepdim=True)
+                new_stem.weight.copy_(avg_weight)
+
+        self.backbone.conv_stem = new_stem
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from library.audio_transforms import DualChannelProcessor
+=======
+from library.audio_transforms import AudioProcessor
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Apply Dual-Channel Processing
+        if self.transform:
+            # label_str is passed to handle silence synthesis logic
+            spec = self.transform(waveform, mode=self.mode, label=label_str)
+        else:
+            spec = torch.zeros(2, Config.N_MELS, 101)
+=======
+        # Apply Single-Channel Processing
+        if self.transform:
+            # label_str is passed to handle silence synthesis logic
+            spec = self.transform(waveform, mode=self.mode, label=label_str)
+        else:
+            spec = torch.zeros(1, Config.N_MELS, 101)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # Initialize Processor (handles noise bank caching internally)
+    processor = DualChannelProcessor(load_cached_data=load_cached_data)
+=======
+    # Initialize Processor (handles noise bank caching internally)
+    processor = AudioProcessor(load_cached_data=load_cached_data)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import DualResEfficientNet
+=======
+from library.model import DilatedEfficientNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Model
+        self.model = DualResEfficientNet(num_classes=self.num_classes, pretrained=True)
+        self.model.to(self.device)
+=======
+        # Model
+        self.model = DilatedEfficientNet(num_classes=self.num_classes, pretrained=True)
+        self.model.to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import DualResEfficientNet
+=======
+from library.model import DilatedEfficientNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    logger.info(f"Loading model from {model_path}...")
+    # Initialize model structure (pretrained=False because we load our own weights)
+    model = DualResEfficientNet(num_classes=Config.NUM_CLASSES, pretrained=False)
+
+    # Load trained weights
+=======
+    logger.info(f"Loading model from {model_path}...")
+    # Initialize model structure (pretrained=False because we load our own weights)
+    model = DilatedEfficientNet(num_classes=Config.NUM_CLASSES, pretrained=False)
+
+    # Load trained weights
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 1. Configuration for Fast Baseline
+    # Override Config attributes for optimized runtime on A100
+    Config.EPOCHS = 15
+    Config.BATCH_SIZE = 256
+=======
+    # 1. Configuration for Fast Baseline
+    # Override Config attributes for optimized runtime on A100
+    Config.EPOCHS = 30
+    Config.BATCH_SIZE = 256
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Collect data for analysis
+            # Feature: Mean intensity of the spectrogram (proxy for signal energy/loudness)
+            # inputs shape: (B, 2, F, T) -> mean over (1, 2, 3)
+            spec_means = inputs.mean(dim=(1, 2, 3)).cpu().numpy()
+=======
+            # Collect data for analysis
+            # Feature: Mean intensity of the spectrogram (proxy for signal energy/loudness)
+            # inputs shape: (B, 1, F, T) -> mean over (1, 2, 3)
+            spec_means = inputs.mean(dim=(1, 2, 3)).cpu().numpy()
+>>>>>>> REPLACE
+```

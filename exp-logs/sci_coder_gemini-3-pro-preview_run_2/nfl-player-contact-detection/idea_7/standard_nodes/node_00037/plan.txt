@@ -1,0 +1,281 @@
+To improve the model's performance, I will simplify the architecture by replacing the Convolutional KETR-Net with a **Kinematic Multi-Layer Perceptron (K-MLP)**. This aligns with **Lesson 00023**, which states that simple models often outperform complex ones on this task by allowing better data scaling and stability, and **Lesson 00011**, which warns that architectures with global pooling (or shared weights across time like CNNs) can obscure the specific temporal alignment required for centered event detection. The MLP will receive a flattened vector of the temporal window, allowing it to learn distinct weights for the critical center frame ($t=0$) versus the context frames.
+
+I will also optimize the data processing by removing a redundant sort operation, as the `repeat` and `tile` operations already guarantee the correct order (`sample_id`, `window_idx`).
+
+Here are the changes:
+
+1.  **`library/config.py`**: Update `artifact_dir` to `idea_8`, increase `dense_hidden_units` to 256 to compensate for the removal of the CNN backbone, and remove unused CNN parameters.
+2.  **`library/model.py`**: Replace `KETRNet` with `KinematicMLP`, which flattens the input tensor and passes it through a dense network.
+3.  **`library/train.py`**: Update the import and instantiation to use `KinematicMLP`.
+4.  **`library/data_processing.py`**: Remove the expensive and unnecessary `sort_values` call.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Specific directory for this idea's artifacts
+    artifact_dir: str = "./working/idea_7"
+
+    # --- Data Processing ---
+    # Window size for the 1D CNN (must be odd to have a center frame)
+    # 11 frames = t-5 to t+5 (approx +/- 0.5 seconds context)
+    window_size: int = 11
+=======
+    # Specific directory for this idea's artifacts
+    artifact_dir: str = "./working/idea_8"
+
+    # --- Data Processing ---
+    # Window size for the MLP (approx +/- 0.5 seconds context)
+    window_size: int = 11
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Model Architecture ---
+    # Number of filters in the 1D Conv layers
+    cnn_filters: int = 64
+    # Kernel size for convolution
+    cnn_kernel_size: int = 3
+    # Hidden units in the dense head
+    dense_hidden_units: int = 64
+    dropout: float = 0.2
+=======
+    # --- Model Architecture ---
+    # Hidden units in the MLP layers
+    dense_hidden_units: int = 256
+    dropout: float = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class KETRNet(nn.Module):
+    """
+    Kinematically-Explicit Time-Resolved Network (KETR-Net).
+
+    A 1D Convolutional Network designed for contact detection that strictly preserves
+    temporal alignment and prioritizes the instantaneous state at the center frame.
+
+    Architecture:
+    1. Input: (Batch, Window_Size, Features)
+    2. Conv1D Backbone: Extracts temporal patterns without pooling.
+    3. Residual Connection: Concatenates flattened Conv output with raw Center Frame features.
+    4. Head: Dense layers for classification.
+    """
+
+    def __init__(self, config: Config):
+        super(KETRNet, self).__init__()
+
+        self.window_size = config.window_size
+        self.num_features = len(config.feature_cols)
+        self.filters = config.cnn_filters
+        self.kernel_size = config.cnn_kernel_size
+        self.dropout_rate = config.dropout
+
+        # Ensure window size is odd for a distinct center frame
+        if self.window_size % 2 == 0:
+            raise ValueError(f"Window size must be odd, got {self.window_size}")
+
+        self.center_idx = self.window_size // 2
+
+        # --- Time-Resolved Backbone ---
+        # Stack of 1D Convolutions.
+        # padding='same' ensures output length == input length (Window_Size).
+        # No pooling layers are used to preserve temporal resolution.
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(
+                in_channels=self.num_features,
+                out_channels=self.filters,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(
+                in_channels=self.filters,
+                out_channels=self.filters * 2,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters * 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(
+                in_channels=self.filters * 2,
+                out_channels=self.filters,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters),
+            nn.ReLU(),
+        )
+
+        # --- Dimension Calculation ---
+        # Flattened Conv Output Size = Filters * Window_Size
+        self.flattened_conv_size = self.filters * self.window_size
+
+        # Total Dense Input Size = Flattened Conv Output + Raw Center Features
+        self.dense_input_size = self.flattened_conv_size + self.num_features
+
+        # --- Unified Classification Head ---
+        self.head = nn.Sequential(
+            nn.Linear(self.dense_input_size, config.dense_hidden_units),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            nn.Linear(config.dense_hidden_units, config.dense_hidden_units // 2),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            nn.Linear(config.dense_hidden_units // 2, 1),  # Output logit
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (Batch, Window_Size, Features)
+
+        Returns:
+            logits: Tensor of shape (Batch, 1)
+        """
+        batch_size = x.size(0)
+
+        # 1. Extract Center Frame Features for Residual Connection
+        # Shape: (Batch, Features)
+        center_features = x[:, self.center_idx, :]
+
+        # 2. Process through Conv Backbone
+        # Permute for Conv1d: (Batch, Features, Window_Size)
+        x_permuted = x.permute(0, 2, 1)
+
+        # Apply Convolutions
+        # Output Shape: (Batch, Filters, Window_Size)
+        conv_out = self.conv_block(x_permuted)
+
+        # 3. Flatten Temporal Features
+        # Shape: (Batch, Filters * Window_Size)
+        conv_flat = conv_out.view(batch_size, -1)
+
+        # 4. Center-Frame Residual Connection
+        # Concatenate learned temporal context with exact instantaneous state
+        # Shape: (Batch, Filters*Window + Features)
+        combined = torch.cat([conv_flat, center_features], dim=1)
+
+        # 5. Classification Head
+        logits = self.head(combined)
+
+        return logits.squeeze(1)
+=======
+class KinematicMLP(nn.Module):
+    """
+    Kinematic Multi-Layer Perceptron.
+    
+    Flattens the temporal window of features into a single wide vector and processes it
+    through a dense network. This allows the model to learn time-specific weights for 
+    each feature in the window (e.g., prioritizing t=0).
+    
+    Cite Lesson 00023: Simplicity Enables Data Scale.
+    Cite Lesson 00011: Avoids Global Pooling to preserve temporal alignment.
+    """
+
+    def __init__(self, config: Config):
+        super(KinematicMLP, self).__init__()
+
+        self.window_size = config.window_size
+        self.num_features = len(config.feature_cols)
+        self.dropout_rate = config.dropout
+        
+        # Input size = Window * Features
+        self.input_size = self.window_size * self.num_features
+
+        self.model = nn.Sequential(
+            nn.Linear(self.input_size, config.dense_hidden_units),
+            nn.BatchNorm1d(config.dense_hidden_units),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            
+            nn.Linear(config.dense_hidden_units, config.dense_hidden_units),
+            nn.BatchNorm1d(config.dense_hidden_units),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            
+            nn.Linear(config.dense_hidden_units, config.dense_hidden_units // 2),
+            nn.BatchNorm1d(config.dense_hidden_units // 2),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            
+            nn.Linear(config.dense_hidden_units // 2, 1)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (Batch, Window_Size, Features)
+        Returns:
+            logits: Tensor of shape (Batch, 1)
+        """
+        batch_size = x.size(0)
+        
+        # Flatten input: (Batch, Window * Features)
+        x_flat = x.view(batch_size, -1)
+        
+        logits = self.model(x_flat)
+        
+        return logits.squeeze(1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import KETRNet
+
+
+class Trainer:
+    """
+    Manages the training, validation, and optimization lifecycle of the KETR-Net model.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize Model
+        self.model = KETRNet(config).to(self.device)
+=======
+from library.model import KinematicMLP
+
+
+class Trainer:
+    """
+    Manages the training, validation, and optimization lifecycle of the KinematicMLP model.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize Model
+        self.model = KinematicMLP(config).to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+        # 7. Reshape to (Batch, Window, Features)
+        print("  Reshaping to 3D tensor...")
+        feature_cols = self.config.feature_cols
+
+        # Sort to ensure correct window order: sample_id, then window_idx (-5 to +5)
+        expanded = expanded.sort_values(by=["sample_id", "window_idx"])
+
+        # Extract numpy array
+=======
+        # 7. Reshape to (Batch, Window, Features)
+        print("  Reshaping to 3D tensor...")
+        feature_cols = self.config.feature_cols
+
+        # Note: expanded is already ordered by sample_id then window_idx due to 
+        # index.repeat and tile logic. Explicit sort is redundant and slow.
+        
+        # Extract numpy array
+>>>>>>> REPLACE
+```

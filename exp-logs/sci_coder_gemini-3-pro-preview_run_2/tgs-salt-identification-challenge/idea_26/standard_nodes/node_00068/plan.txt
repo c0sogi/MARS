@@ -1,0 +1,872 @@
+Based on the provided lessons, the previous solution's underperformance can be attributed to the use of a Multi-Task Learning (MTL) approach (Idea 26) which disconnected the depth information from the decoder, rather than the superior **Explicit Feature Injection** strategy (Idea 8) identified in the lessons. Additionally, the complex semi-supervised pipeline consumed training time without yielding gains over a well-tuned supervised baseline (Cite solution_lesson_node_00045).
+
+To optimize performance, I will revert to the "Current Best" architecture described in the lessons:
+1.  **Architecture**: Modify `ResNet34WideLinkNet` to explicitly inject depth information at the bottleneck via concatenation. I will use a non-linear MLP to project the scalar depth into a 32-dimensional embedding before concatenation, as simple linear projections are less effective (Cite solution_lesson_node_00029, solution_lesson_node_00041).
+2.  **Training Schedule**: Increase `EPOCHS` from 15 to 50. Short schedules with cosine annealing can cause underfitting due to rapid learning rate decay (Cite solution_lesson_node_00035).
+3.  **Pipeline**: Simplify to a single-stage supervised training loop on the full training set. Ensembling provided no gain over the single-model baseline in previous experiments (Cite solution_lesson_node_00067), and pseudo-labeling is risky without a maximized supervised baseline (Cite solution_lesson_node_00049).
+4.  **Loss**: Remove the auxiliary depth regression loss (MTL) and focus solely on the sum of BCE and Lovasz-Hinge loss (Cite solution_lesson_node_00036).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    EPOCHS = 50
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-2
+
+    # Loss Configuration
+    # Total Loss = Lovasz + BCE + (DEPTH_LOSS_WEIGHT * MSE)
+    DEPTH_LOSS_WEIGHT = 0.1
+=======
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    EPOCHS = 50
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-2
+
+    # Loss Configuration
+    # Total Loss = Lovasz + BCE
+    # DEPTH_LOSS_WEIGHT removed (Explicit Injection used instead)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # 3. Auxiliary Depth Head
+        # Attached to the bottleneck features (Layer 4).
+        # Predicts a scalar depth value. This forces the encoder to retain
+        # depth-correlated features without injecting depth into the decoder.
+        self.depth_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 1),
+        )
+
+        # 4. Decoder (Wide-LinkNet)
+        # Uses additive skip connections.
+
+        # Dec4: Takes Layer4 (512), Upsamples to 1/16, Adds Layer3 (256)
+        # Output channels set to 256 to match Layer3 for addition.
+        self.dec4 = DecoderBlock(512, 256)
+=======
+        # 3. Depth Injection (Explicit Feature Fusion)
+        # Project scalar depth to embedding and concatenate at bottleneck.
+        # Using MLP as per Lesson 00029.
+        self.depth_projector = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 32),
+            nn.ReLU(inplace=True),
+        )
+
+        # 4. Decoder (Wide-LinkNet)
+        # Uses additive skip connections.
+
+        # Dec4: Takes Layer4 (512) + Depth (32) = 544. Upsamples to 1/16.
+        # Output channels set to 256 to match Layer3 for addition.
+        self.dec4 = DecoderBlock(544, 256)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, x):
+        # --- Encoder ---
+        x0 = self.conv1(x)  # 64x64, 64ch
+        x0_bn = self.bn1(x0)
+        x0_relu = self.relu(x0_bn)
+
+        x1_in = self.maxpool(x0_relu)  # 32x32, 64ch
+
+        e1 = self.layer1(x1_in)  # 32x32, 64ch
+        e2 = self.layer2(e1)  # 16x16, 128ch
+        e3 = self.layer3(e2)  # 8x8, 256ch
+        e4 = self.layer4(e3)  # 4x4, 512ch (Bottleneck)
+
+        # --- Auxiliary Task ---
+        # Predict depth from the bottleneck features
+        pred_depth = self.depth_head(e4)
+
+        # --- Decoder ---
+        # LinkNet style: Decoder Block Output + Encoder Feature (Additive Skip)
+
+        # Block 4
+        d4 = self.dec4(e4)
+        d4 = d4 + e3
+=======
+    def forward(self, x, depth):
+        # --- Encoder ---
+        x0 = self.conv1(x)  # 64x64, 64ch
+        x0_bn = self.bn1(x0)
+        x0_relu = self.relu(x0_bn)
+
+        x1_in = self.maxpool(x0_relu)  # 32x32, 64ch
+
+        e1 = self.layer1(x1_in)  # 32x32, 64ch
+        e2 = self.layer2(e1)  # 16x16, 128ch
+        e3 = self.layer3(e2)  # 8x8, 256ch
+        e4 = self.layer4(e3)  # 4x4, 512ch (Bottleneck)
+
+        # --- Depth Injection ---
+        # depth: (B, 1) -> (B, 32)
+        d_emb = self.depth_projector(depth)
+        # Expand to (B, 32, 4, 4) to concatenate with e4
+        d_emb = d_emb.unsqueeze(2).unsqueeze(3).expand(-1, -1, e4.size(2), e4.size(3))
+        
+        # Concatenate: (B, 512, 4, 4) + (B, 32, 4, 4) -> (B, 544, 4, 4)
+        e4_d = torch.cat([e4, d_emb], dim=1)
+
+        # --- Decoder ---
+        # LinkNet style: Decoder Block Output + Encoder Feature (Additive Skip)
+
+        # Block 4
+        d4 = self.dec4(e4_d)
+        d4 = d4 + e3
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Return dictionary for MultiTaskLoss
+        return {"mask": logits, "depth": pred_depth}
+=======
+        # Return logits directly
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+class MultiTaskLoss(nn.Module):
+    """
+    Multi-task loss combining Segmentation Loss (Lovasz + BCE) and Depth Regression Loss (MSE).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+        self.mse = nn.MSELoss()
+        self.depth_weight = Config.DEPTH_LOSS_WEIGHT
+
+    def forward(self, preds, targets):
+        """
+        Args:
+            preds (dict): Dictionary containing:
+                - 'mask': Tensor of shape (B, 1, H, W) containing logits.
+                - 'depth': Tensor of shape (B, 1) or (B,) containing predicted depths.
+            targets (dict): Dictionary containing:
+                - 'mask': Tensor of shape (B, 1, H, W) containing binary ground truth.
+                - 'depth': Tensor of shape (B, 1) or (B,) containing true depths.
+
+        Returns:
+            torch.Tensor: Weighted total loss.
+            dict: Dictionary of loss components for logging.
+        """
+        # Unpack
+        mask_logits = preds["mask"]
+        pred_depth = preds["depth"]
+
+        gt_mask = targets["mask"].float()
+        gt_depth = targets["depth"].float()
+
+        # --- Segmentation Loss ---
+        # BCE expects (B, 1, H, W) or (B, H, W) matching input.
+        # Lovasz expects (B, H, W) usually.
+
+        # Squeeze channel dim for Lovasz if present (B, 1, H, W) -> (B, H, W)
+        if mask_logits.dim() == 4 and mask_logits.shape[1] == 1:
+            mask_logits_flat = mask_logits.squeeze(1)
+        else:
+            mask_logits_flat = mask_logits
+
+        if gt_mask.dim() == 4 and gt_mask.shape[1] == 1:
+            gt_mask_flat = gt_mask.squeeze(1)
+        else:
+            gt_mask_flat = gt_mask
+
+        bce_loss = self.bce(mask_logits, gt_mask)
+        lovasz_loss = self.lovasz(mask_logits_flat, gt_mask_flat)
+        seg_loss = bce_loss + lovasz_loss
+
+        # --- Depth Loss ---
+        # Ensure shapes match (B,)
+        depth_loss = self.mse(pred_depth.view(-1), gt_depth.view(-1))
+
+        # --- Total Loss ---
+        total_loss = seg_loss + (self.depth_weight * depth_loss)
+
+        return total_loss, {
+            "loss": total_loss.item(),
+            "bce": bce_loss.item(),
+            "lovasz": lovasz_loss.item(),
+            "seg_loss": seg_loss.item(),
+            "depth_loss": depth_loss.item(),
+        }
+=======
+class SegmentationLoss(nn.Module):
+    """
+    Combined Segmentation Loss (Lovasz + BCE).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+
+    def forward(self, mask_logits, gt_mask):
+        gt_mask = gt_mask.float()
+
+        # Squeeze channel dim for Lovasz if present (B, 1, H, W) -> (B, H, W)
+        if mask_logits.dim() == 4 and mask_logits.shape[1] == 1:
+            mask_logits_flat = mask_logits.squeeze(1)
+        else:
+            mask_logits_flat = mask_logits
+
+        if gt_mask.dim() == 4 and gt_mask.shape[1] == 1:
+            gt_mask_flat = gt_mask.squeeze(1)
+        else:
+            gt_mask_flat = gt_mask
+
+        bce_loss = self.bce(mask_logits, gt_mask)
+        lovasz_loss = self.lovasz(mask_logits_flat, gt_mask_flat)
+        
+        # Summing losses (1.0 + 1.0)
+        total_loss = bce_loss + lovasz_loss
+
+        return total_loss, {
+            "loss": total_loss.item(),
+            "bce": bce_loss.item(),
+            "lovasz": lovasz_loss.item(),
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    criterion = MultiTaskLoss()
+
+    total_loss_meter = 0.0
+    bce_loss_meter = 0.0
+    lovasz_loss_meter = 0.0
+    depth_loss_meter = 0.0
+    count = 0
+
+    for batch in dataloader:
+        images = batch["image"].to(device)
+        masks = batch["mask"].to(device)
+        depths = batch["depth"].to(device)
+
+        optimizer.zero_grad()
+
+        preds = model(images)
+        targets = {"mask": masks, "depth": depths}
+
+        loss, loss_dict = criterion(preds, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        batch_size = images.size(0)
+        total_loss_meter += loss.item() * batch_size
+        bce_loss_meter += loss_dict["bce"] * batch_size
+        lovasz_loss_meter += loss_dict["lovasz"] * batch_size
+        depth_loss_meter += loss_dict["depth_loss"] * batch_size
+        count += batch_size
+
+    metrics = {
+        "loss": total_loss_meter / count,
+        "bce": bce_loss_meter / count,
+        "lovasz": lovasz_loss_meter / count,
+        "depth": depth_loss_meter / count,
+    }
+
+    print(
+        f"Epoch {epoch} Train Loss: {metrics['loss']:.10f} (BCE: {metrics['bce']:.6f}, Lovasz: {metrics['lovasz']:.6f}, Depth: {metrics['depth']:.6f})"
+    )
+    return metrics["loss"]
+
+
+def validate(model, dataloader, device, return_probs=False):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    criterion = MultiTaskLoss()
+
+    total_loss_meter = 0.0
+    map_score_meter = 0.0
+    count = 0
+
+    all_probs = []
+    all_masks = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+            depths = batch["depth"].to(device)
+
+            preds = model(images)
+            targets = {"mask": masks, "depth": depths}
+
+            loss, _ = criterion(preds, targets)
+
+            batch_size = images.size(0)
+            total_loss_meter += loss.item() * batch_size
+
+            # Get Probabilities
+            pred_probs = torch.sigmoid(preds["mask"])
+
+            # Move to CPU/Numpy for metric calculation
+            pred_probs_np = pred_probs.cpu().numpy()
+            gt_masks_np = masks.cpu().numpy()
+=======
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    criterion = SegmentationLoss()
+
+    total_loss_meter = 0.0
+    bce_loss_meter = 0.0
+    lovasz_loss_meter = 0.0
+    count = 0
+
+    for batch in dataloader:
+        images = batch["image"].to(device)
+        masks = batch["mask"].to(device)
+        depths = batch["depth"].to(device)
+
+        optimizer.zero_grad()
+
+        # Pass both image and depth to model
+        preds = model(images, depths)
+
+        loss, loss_dict = criterion(preds, masks)
+
+        loss.backward()
+        optimizer.step()
+
+        batch_size = images.size(0)
+        total_loss_meter += loss.item() * batch_size
+        bce_loss_meter += loss_dict["bce"] * batch_size
+        lovasz_loss_meter += loss_dict["lovasz"] * batch_size
+        count += batch_size
+
+    metrics = {
+        "loss": total_loss_meter / count,
+        "bce": bce_loss_meter / count,
+        "lovasz": lovasz_loss_meter / count,
+    }
+
+    print(
+        f"Epoch {epoch} Train Loss: {metrics['loss']:.10f} (BCE: {metrics['bce']:.6f}, Lovasz: {metrics['lovasz']:.6f})"
+    )
+    return metrics["loss"]
+
+
+def validate(model, dataloader, device, return_probs=False):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    criterion = SegmentationLoss()
+
+    total_loss_meter = 0.0
+    map_score_meter = 0.0
+    count = 0
+
+    all_probs = []
+    all_masks = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+            depths = batch["depth"].to(device)
+
+            # Pass both image and depth
+            preds = model(images, depths)
+
+            loss, _ = criterion(preds, masks)
+
+            batch_size = images.size(0)
+            total_loss_meter += loss.item() * batch_size
+
+            # Get Probabilities
+            pred_probs = torch.sigmoid(preds)
+
+            # Move to CPU/Numpy for metric calculation
+            pred_probs_np = pred_probs.cpu().numpy()
+            gt_masks_np = masks.cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.losses import MultiTaskLoss
+=======
+from library.losses import SegmentationLoss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # TTA: 1. Predict Original
+            preds_orig = model(images)["mask"]
+            probs_orig = torch.sigmoid(preds_orig)
+
+            # TTA: 2. Predict Flipped
+            images_flipped = torch.flip(images, dims=[3])  # Flip Width
+            preds_flip = model(images_flipped)["mask"]
+            probs_flip = torch.sigmoid(preds_flip)
+            probs_flip_back = torch.flip(probs_flip, dims=[3])
+=======
+            # Need depth for inference too
+            depths = batch["depth"].to(device)
+
+            # TTA: 1. Predict Original
+            preds_orig = model(images, depths)
+            probs_orig = torch.sigmoid(preds_orig)
+
+            # TTA: 2. Predict Flipped
+            images_flipped = torch.flip(images, dims=[3])  # Flip Width
+            preds_flip = model(images_flipped, depths)
+            probs_flip = torch.sigmoid(preds_flip)
+            probs_flip_back = torch.flip(probs_flip, dims=[3])
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_pipeline():
+    # -------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # -------------------------------------------------------------------------
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Running on device: {device}")
+
+    # Override Config for runtime constraints (Fast Baseline)
+    Config.EPOCHS = 15
+    Config.BATCH_SIZE = 32
+    PATIENCE = 5
+
+    # Ensure output directories exist
+    os.makedirs(Config.CHECKPOINTS_DIR, exist_ok=True)
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # STAGE 1: Multi-Task Ensemble Training
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" STAGE 1: Multi-Task Ensemble Training")
+    print("=" * 40)
+
+    # Load full training set
+    full_train_ds = SaltDataset(mode="train", load_cached_data=True)
+
+    # K-Fold Split
+    kf = KFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
+
+    ensemble_models = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(full_train_ds)):
+        print(f"\n--- Training Fold {fold + 1}/{Config.N_FOLDS} ---")
+
+        # Create Subsets
+        train_sub = Subset(full_train_ds, train_idx)
+        val_sub = Subset(full_train_ds, val_idx)
+
+        # Dataloaders
+        train_loader = DataLoader(
+            train_sub,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_sub,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Initialize Model
+        model = ResNet34WideLinkNet().to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Train
+        save_path = os.path.join(Config.CHECKPOINTS_DIR, f"fold_{fold}_best.pth")
+        train_model(
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            device,
+            epochs=Config.EPOCHS,
+            patience=PATIENCE,
+            save_path=save_path,
+        )
+
+        ensemble_models.append(save_path)
+
+        # Clean up
+        del model, optimizer, train_loader, val_loader, train_sub, val_sub
+        torch.cuda.empty_cache()
+
+    # -------------------------------------------------------------------------
+    # STAGE 2: Soft Pseudo-Label Generation
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" STAGE 2: Soft Pseudo-Label Generation")
+    print("=" * 40)
+
+    test_ds = SaltDataset(mode="test", load_cached_data=True)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Accumulate probabilities {id: accumulated_prob_sum}
+    accumulated_probs = {}
+
+    for fold_idx, model_path in enumerate(ensemble_models):
+        print(f"Predicting with model fold {fold_idx + 1}...")
+        model = ResNet34WideLinkNet().to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+
+        with torch.no_grad():
+            for batch in test_loader:
+                images = batch["image"].to(device)
+                ids = batch["id"]
+
+                # Simple Inference (No TTA for speed in this stage)
+                preds = model(images)["mask"]
+                probs = torch.sigmoid(preds).cpu().numpy()
+
+                for i, img_id in enumerate(ids):
+                    p = probs[i].squeeze()  # 128x128
+                    # Unpad to original 101x101
+                    p_unpad = unpad_image(p, (Config.ORIG_HEIGHT, Config.ORIG_WIDTH))
+
+                    if img_id not in accumulated_probs:
+                        accumulated_probs[img_id] = np.zeros(
+                            (Config.ORIG_HEIGHT, Config.ORIG_WIDTH), dtype=np.float32
+                        )
+
+                    accumulated_probs[img_id] += p_unpad
+
+        del model
+        torch.cuda.empty_cache()
+
+    # Average probabilities
+    for img_id in accumulated_probs:
+        accumulated_probs[img_id] /= Config.N_FOLDS
+
+    print("Pseudo-labels generated.")
+
+    # -------------------------------------------------------------------------
+    # STAGE 3: Student Distillation
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" STAGE 3: Student Distillation")
+    print("=" * 40)
+
+    # Prepare datasets
+    train_ds_labeled = SaltDataset(mode="train", load_cached_data=True)
+
+    # Use SafeSaltDataset for pseudo data to handle missing depths in test set
+    # Pass mean/std from labeled set to ensure consistent standardization
+    pseudo_ds = SafeSaltDataset(
+        mode="pseudo",
+        soft_masks=accumulated_probs,
+        depth_mean=train_ds_labeled.depth_mean,
+        depth_std=train_ds_labeled.depth_std,
+        load_cached_data=True,
+    )
+
+    combined_ds = ConcatDataset([train_ds_labeled, pseudo_ds])
+
+    # Hold-out Validation Set (The official val.csv)
+    holdout_val_ds = SaltDataset(mode="val", load_cached_data=True)
+
+    # Loaders
+    student_train_loader = DataLoader(
+        combined_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    holdout_val_loader = DataLoader(
+        holdout_val_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Student Model
+    student_model = ResNet34WideLinkNet().to(device)
+    optimizer = torch.optim.AdamW(
+        student_model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    student_save_path = os.path.join(Config.CHECKPOINTS_DIR, "student_best.pth")
+
+    # Train Student
+    best_threshold = train_model(
+        student_model,
+        student_train_loader,
+        holdout_val_loader,
+        optimizer,
+        device,
+        epochs=Config.EPOCHS,
+        patience=PATIENCE,
+        save_path=student_save_path,
+    )
+
+    # -------------------------------------------------------------------------
+    # Validation & Failure Analysis
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" Validation & Failure Analysis")
+    print("=" * 40)
+
+    # Load best student
+    student_model.load_state_dict(torch.load(student_save_path, map_location=device))
+    student_model.eval()
+
+    # Get predictions on validation set
+    val_loss, val_map, val_probs, val_masks = validate(
+        student_model, holdout_val_loader, device, return_probs=True
+    )
+
+    print(f"Final Validation Metric: {val_map:.10f}")
+
+    # Failure Analysis: Correlation between IoU and Features
+    val_df = holdout_val_ds.df
+    ious = []
+    depths = val_df["z"].values
+    coverages = val_df["salt_coverage"].values
+
+    for prob, mask in zip(val_probs, val_masks):
+        pred_bin = (prob > best_threshold).astype(np.uint8)
+        iou = calc_iou(pred_bin, mask)
+        ious.append(iou)
+
+    ious = np.array(ious)
+
+    # Handle potential NaNs in correlation calculation
+    if len(ious) > 1:
+        corr_depth, _ = pearsonr(depths, ious)
+        corr_cov, _ = pearsonr(coverages, ious)
+    else:
+        corr_depth, corr_cov = 0.0, 0.0
+
+    print("-" * 30)
+    print("Failure Analysis Report")
+    print("-" * 30)
+    print(f"Correlation (IoU vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (IoU vs Salt Coverage): {corr_cov:.4f}")
+
+    # -------------------------------------------------------------------------
+    # Submission
+    # -------------------------------------------------------------------------
+    if val_map > 0.7985:
+        print("\n=== Generating Submission ===")
+
+        # Load Final Test Set
+        test_ds_final = SaltDataset(mode="test", load_cached_data=True)
+        test_loader_final = DataLoader(
+            test_ds_final,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        predict_and_submit(
+            student_model,
+            test_loader_final,
+            device,
+            best_threshold,
+            Config.SUBMISSION_PATH,
+        )
+=======
+def run_pipeline():
+    # -------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # -------------------------------------------------------------------------
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Running on device: {device}")
+
+    # Override Config for runtime constraints
+    Config.EPOCHS = 50
+    Config.BATCH_SIZE = 32
+    PATIENCE = 10
+
+    # Ensure output directories exist
+    os.makedirs(Config.CHECKPOINTS_DIR, exist_ok=True)
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # Supervised Training (Single Model)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" Supervised Training (ResNet34 + Depth Injection)")
+    print("=" * 40)
+
+    # Load datasets
+    train_ds = SaltDataset(mode="train", load_cached_data=True)
+    val_ds = SaltDataset(mode="val", load_cached_data=True)
+
+    # Dataloaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Initialize Model
+    model = ResNet34WideLinkNet().to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    save_path = os.path.join(Config.CHECKPOINTS_DIR, "best_model.pth")
+
+    # Train
+    best_threshold = train_model(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        device,
+        epochs=Config.EPOCHS,
+        patience=PATIENCE,
+        save_path=save_path,
+    )
+
+    # -------------------------------------------------------------------------
+    # Validation & Failure Analysis
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 40)
+    print(" Validation & Failure Analysis")
+    print("=" * 40)
+
+    # Load best model
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    model.eval()
+
+    # Get predictions on validation set
+    val_loss, val_map, val_probs, val_masks = validate(
+        model, val_loader, device, return_probs=True
+    )
+
+    print(f"Final Validation Metric: {val_map:.10f}")
+
+    # Failure Analysis: Correlation between IoU and Features
+    val_df = val_ds.df
+    ious = []
+    depths = val_df["z"].values
+    coverages = val_df["salt_coverage"].values
+
+    for prob, mask in zip(val_probs, val_masks):
+        pred_bin = (prob > best_threshold).astype(np.uint8)
+        iou = calc_iou(pred_bin, mask)
+        ious.append(iou)
+
+    ious = np.array(ious)
+
+    # Handle potential NaNs in correlation calculation
+    if len(ious) > 1:
+        corr_depth, _ = pearsonr(depths, ious)
+        corr_cov, _ = pearsonr(coverages, ious)
+    else:
+        corr_depth, corr_cov = 0.0, 0.0
+
+    print("-" * 30)
+    print("Failure Analysis Report")
+    print("-" * 30)
+    print(f"Correlation (IoU vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (IoU vs Salt Coverage): {corr_cov:.4f}")
+
+    # -------------------------------------------------------------------------
+    # Submission
+    # -------------------------------------------------------------------------
+    if val_map > 0.7985:
+        print("\n=== Generating Submission ===")
+
+        # Load Test Set (SafeSaltDataset handles missing depths if any, though standard SaltDataset might be fine if test.csv has depths)
+        # Using SafeSaltDataset just in case test depths are missing
+        test_ds_final = SafeSaltDataset(mode="test", load_cached_data=True)
+        test_loader_final = DataLoader(
+            test_ds_final,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        predict_and_submit(
+            model,
+            test_loader_final,
+            device,
+            best_threshold,
+            Config.SUBMISSION_PATH,
+        )
+>>>>>>> REPLACE
+```

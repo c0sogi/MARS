@@ -1,0 +1,653 @@
+My optimization strategy focuses on removing the ineffective "Energy-Gated" mechanism and restoring proven regularization techniques to the `DilatedEfficientNet` backbone.
+
+1.  **Revert Energy Gating**: The failure analysis showed a negligible correlation (0.02) between signal energy and error, confirming that the explicit energy branch was redundant (Cite {solution_lesson_node_00040}). I will remove `EnergyGatedAttentivePooling` and revert to standard `AttentivePooling`.
+2.  **Restore SpecAugment**: The previous solution omitted SpecAugment, which likely contributed to the performance drop compared to the best historical result. I will re-introduce `FrequencyMasking` and `TimeMasking` to the training pipeline (Cite {solution_lesson_node_00003}, {solution_lesson_node_00033}).
+3.  **Optimize Training Duration**: I will increase `EPOCHS` from 15 to 30. Strong regularization (Mixup + SpecAugment + Noise Injection) slows convergence but leads to better final generalization, requiring a longer training horizon.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for this specific idea (caching, checkpoints)
+    WORK_DIR = "./working/idea_12"
+    os.makedirs(WORK_DIR, exist_ok=True)
+=======
+    # Working directory for this specific idea (caching, checkpoints)
+    WORK_DIR = "./working/optimized"
+    os.makedirs(WORK_DIR, exist_ok=True)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Augmentation
+    NOISE_SNR_MIN = 10
+    NOISE_SNR_MAX = 30
+    NOISE_PROB = 0.5
+
+    # ==========================================
+    # 3. Model Architecture
+    # ==========================================
+    BACKBONE = "tf_efficientnet_b2"
+    PRETRAINED = True
+    IN_CHANNELS = 1  # Log-Mel Spectrogram is 1 channel
+
+    # Energy Gating
+    USE_ENERGY_GATING = True
+=======
+    # Augmentation
+    NOISE_SNR_MIN = 10
+    NOISE_SNR_MAX = 30
+    NOISE_PROB = 0.5
+
+    # SpecAugment
+    FREQ_MASK_PARAM = 15
+    TIME_MASK_PARAM = 35
+
+    # ==========================================
+    # 3. Model Architecture
+    # ==========================================
+    BACKBONE = "tf_efficientnet_b2"
+    PRETRAINED = True
+    IN_CHANNELS = 1  # Log-Mel Spectrogram is 1 channel
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        self.db_transform = torchaudio.transforms.AmplitudeToDB()
+
+        # Preload noise files for efficiency
+=======
+        self.db_transform = torchaudio.transforms.AmplitudeToDB()
+
+        # SpecAugment
+        self.spec_augment = torch.nn.Sequential(
+            torchaudio.transforms.FrequencyMasking(freq_mask_param=Config.FREQ_MASK_PARAM),
+            torchaudio.transforms.TimeMasking(time_mask_param=Config.TIME_MASK_PARAM),
+        )
+
+        # Preload noise files for efficiency
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        # 1. Get Waveform
+        waveform = self._get_audio(idx)
+
+        # 2. Augmentation (Noise Injection)
+        if self.mode == "train":
+            waveform = self._inject_noise(waveform)
+
+        # 3. Spectrogram (Power Spectrogram)
+        mel_spec = self.mel_transform(waveform)
+
+        # 4. Energy Calculation (Frame-wise RMS from Spectrogram)
+        # Input mel_spec is (1, n_mels, time). We average over n_mels.
+        # This gives a proxy for frame energy.
+        energy = torch.mean(mel_spec, dim=1, keepdim=True)  # (1, 1, T)
+
+        # 5. Log Mel
+        log_mel = self.db_transform(mel_spec)
+
+        # 6. Label
+        label_str = self.df.iloc[idx]["label"]
+        if self.mode == "test":
+            label_id = -1
+        else:
+            try:
+                label_id = self.label_encoder.transform([label_str])[0]
+            except:
+                label_id = 0  # Fallback
+
+        # Return: Spec (1, F, T), Energy (T), Label (int)
+        return log_mel, energy.squeeze(), label_id
+=======
+    def __getitem__(self, idx):
+        # 1. Get Waveform
+        waveform = self._get_audio(idx)
+
+        # 2. Augmentation (Noise Injection)
+        if self.mode == "train":
+            waveform = self._inject_noise(waveform)
+
+        # 3. Spectrogram (Power Spectrogram)
+        mel_spec = self.mel_transform(waveform)
+
+        # 4. Log Mel
+        log_mel = self.db_transform(mel_spec)
+
+        # 5. SpecAugment
+        if self.mode == "train":
+            log_mel = self.spec_augment(log_mel)
+
+        # 6. Label
+        label_str = self.df.iloc[idx]["label"]
+        if self.mode == "test":
+            label_id = -1
+        else:
+            try:
+                label_id = self.label_encoder.transform([label_str])[0]
+            except:
+                label_id = 0  # Fallback
+
+        # Return: Spec (1, F, T), Label (int)
+        return log_mel, label_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class EnergyGatedAttentivePooling(nn.Module):
+    """
+    Implements the Energy-Gated Attention Mechanism.
+
+    This layer computes a weighted average of temporal features, where the weights
+    are derived from both the semantic features (spectrogram) and the absolute
+    signal energy. This helps the model distinguish between 'silence' (low energy)
+    and 'speech' (high energy) more effectively than spectral features alone.
+    """
+
+    def __init__(self, feat_dim, hidden_dim=128):
+        super().__init__()
+        # Project the 1D energy vector to the same dimension as the features
+        self.energy_proj = nn.Conv1d(1, feat_dim, kernel_size=1)
+
+        # Attention mechanism components
+        # W_feat * f_t
+        self.w_feat = nn.Conv1d(feat_dim, hidden_dim, kernel_size=1)
+        # W_energy * e_t
+        self.w_energy = nn.Conv1d(feat_dim, hidden_dim, kernel_size=1)
+        # v^T * ...
+        self.v = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, x, energy):
+        """
+        Args:
+            x (torch.Tensor): Feature map from backbone. Shape (B, C, T).
+            energy (torch.Tensor): RMS energy vector. Shape (B, 1, T_orig).
+
+        Returns:
+            torch.Tensor: Global feature representation. Shape (B, C).
+        """
+        B, C, T = x.shape
+
+        # 1. Align Energy Vector to Feature Map Temporal Resolution
+        # The backbone downsamples the time dimension. We interpolate energy to match.
+        # energy is (B, 1, T_orig)
+        if energy.shape[-1] != T:
+            energy_aligned = F.interpolate(
+                energy, size=T, mode="linear", align_corners=False
+            )
+        else:
+            energy_aligned = energy
+
+        # 2. Project Energy to Feature Dimension
+        # (B, 1, T) -> (B, C, T)
+        e_proj = self.energy_proj(energy_aligned)
+
+        # 3. Compute Attention Scores
+        # Score = v^T * tanh(W_f * x + W_e * e)
+        feat_attn = self.w_feat(x)  # (B, H, T)
+        energy_attn = self.w_energy(e_proj)  # (B, H, T)
+
+        # Additive combination
+        combined = torch.tanh(feat_attn + energy_attn)
+
+        # Project to scalar score per time step
+        scores = self.v(combined)  # (B, 1, T)
+
+        # 4. Compute Attention Weights
+        alpha = F.softmax(scores, dim=2)  # (B, 1, T)
+
+        # 5. Weighted Pooling
+        # x: (B, C, T), alpha: (B, 1, T) -> (B, C)
+        context = torch.sum(x * alpha, dim=2)
+
+        return context
+
+
+class EnergyGatedEfficientNet(nn.Module):
+    """
+    Dilated EfficientNet-B2 with Energy-Gated Attentive Pooling.
+    """
+
+    def __init__(self, num_classes):
+        super().__init__()
+
+        # 1. Backbone: EfficientNet-B2
+        # - in_chans=1: Adapts first conv for Log-Mel Spectrograms
+        # - output_stride=16: Enforces dilated convolutions in the final stages
+        #   (Stage 5) to preserve temporal resolution (stride 1, dilation 2).
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            in_chans=Config.IN_CHANNELS,
+            output_stride=16,
+            num_classes=0,  # Remove default classifier
+            global_pool="",  # Remove default pooling
+        )
+
+        # Determine feature dimension (1408 for EfficientNet-B2)
+        self.feat_dim = self.backbone.num_features
+
+        # 2. Energy-Gated Pooling
+        self.att_pool = EnergyGatedAttentivePooling(self.feat_dim)
+
+        # 3. Classification Head
+        self.classifier = nn.Linear(self.feat_dim, num_classes)
+
+        # 4. Dropout (Optional but recommended)
+        self.dropout = nn.Dropout(Config.DROPOUT_RATE)
+
+    def forward(self, x, energy):
+        """
+        Args:
+            x (torch.Tensor): Log-Mel Spectrogram. Shape (B, 1, F, T).
+            energy (torch.Tensor): Energy vector. Shape (B, 1, T_orig).
+
+        Returns:
+            torch.Tensor: Logits. Shape (B, num_classes).
+        """
+        # 1. Extract Features
+        # Output shape: (B, C, F', T')
+        features = self.backbone(x)
+
+        # 2. Frequency Pooling
+        # We average over the frequency dimension to get temporal feature sequences.
+        # (B, C, F', T') -> (B, C, T')
+        features = torch.mean(features, dim=2)
+
+        # 3. Energy-Gated Attentive Pooling
+        # Integrates the raw energy signal to guide attention
+        embedding = self.att_pool(features, energy)
+
+        # 4. Classification
+        embedding = self.dropout(embedding)
+        logits = self.classifier(embedding)
+
+        return logits
+=======
+class AttentivePooling(nn.Module):
+    """
+    Standard Attentive Pooling layer.
+    """
+
+    def __init__(self, feat_dim, hidden_dim=128):
+        super().__init__()
+        self.w = nn.Conv1d(feat_dim, hidden_dim, kernel_size=1)
+        self.v = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Feature map. Shape (B, C, T).
+        Returns:
+            torch.Tensor: Global feature representation. Shape (B, C).
+        """
+        # Attention Score
+        attn = torch.tanh(self.w(x))
+        scores = self.v(attn)
+        alpha = F.softmax(scores, dim=2)
+
+        # Weighted Pooling
+        context = torch.sum(x * alpha, dim=2)
+        return context
+
+
+class DilatedEfficientNet(nn.Module):
+    """
+    Dilated EfficientNet-B2 with Attentive Pooling.
+    """
+
+    def __init__(self, num_classes):
+        super().__init__()
+
+        # 1. Backbone: EfficientNet-B2
+        # - output_stride=16: Preserves temporal resolution via dilation
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            in_chans=Config.IN_CHANNELS,
+            output_stride=16,
+            num_classes=0,
+            global_pool="",
+        )
+
+        self.feat_dim = self.backbone.num_features
+
+        # 2. Attentive Pooling
+        self.att_pool = AttentivePooling(self.feat_dim)
+
+        # 3. Classification Head
+        self.classifier = nn.Linear(self.feat_dim, num_classes)
+        self.dropout = nn.Dropout(Config.DROPOUT_RATE)
+
+    def forward(self, x):
+        # x: (B, 1, F, T)
+        features = self.backbone(x)  # (B, C, F', T')
+        features = torch.mean(features, dim=2)  # (B, C, T')
+        embedding = self.att_pool(features)
+        embedding = self.dropout(embedding)
+        logits = self.classifier(embedding)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def train_epoch(self, epoch):
+        """
+        Runs one epoch of training with Mixup regularization.
+        """
+        self.model.train()
+        running_loss = 0.0
+
+        for batch_idx, (inputs, energy, targets) in enumerate(self.train_loader):
+            inputs = inputs.to(self.device)
+            energy = energy.to(self.device)
+            targets = targets.to(self.device)
+
+            # Mixup Regularization
+            if Config.MIXUP_ALPHA > 0:
+                lam = np.random.beta(Config.MIXUP_ALPHA, Config.MIXUP_ALPHA)
+                index = torch.randperm(inputs.size(0)).to(self.device)
+
+                # Mix inputs and energy vectors
+                mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                mixed_energy = lam * energy + (1 - lam) * energy[index]
+                target_a, target_b = targets, targets[index]
+
+                # Forward pass
+                outputs = self.model(mixed_inputs, mixed_energy.unsqueeze(1))
+
+                # Mixup Loss
+                loss = lam * self.criterion(outputs, target_a) + (
+                    1 - lam
+                ) * self.criterion(outputs, target_b)
+            else:
+                outputs = self.model(inputs, energy.unsqueeze(1))
+                loss = self.criterion(outputs, targets)
+
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item()
+=======
+    def train_epoch(self, epoch):
+        """
+        Runs one epoch of training with Mixup regularization.
+        """
+        self.model.train()
+        running_loss = 0.0
+
+        for batch_idx, (inputs, targets) in enumerate(self.train_loader):
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
+
+            # Mixup Regularization
+            if Config.MIXUP_ALPHA > 0:
+                lam = np.random.beta(Config.MIXUP_ALPHA, Config.MIXUP_ALPHA)
+                index = torch.randperm(inputs.size(0)).to(self.device)
+
+                # Mix inputs
+                mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                target_a, target_b = targets, targets[index]
+
+                # Forward pass
+                outputs = self.model(mixed_inputs)
+
+                # Mixup Loss
+                loss = lam * self.criterion(outputs, target_a) + (
+                    1 - lam
+                ) * self.criterion(outputs, target_b)
+            else:
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item()
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def validate(self):
+        """
+        Evaluates the model on the validation set.
+        Computes both Fine-Grained Accuracy and the Mapped Competition Accuracy.
+        """
+        self.model.eval()
+        correct_fine = 0
+        total = 0
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for inputs, energy, targets in self.val_loader:
+                inputs = inputs.to(self.device)
+                energy = energy.to(self.device)
+                targets = targets.to(self.device)
+
+                outputs = self.model(inputs, energy.unsqueeze(1))
+                _, predicted = torch.max(outputs.data, 1)
+
+                # Fine-grained stats
+                total += targets.size(0)
+                correct_fine += (predicted == targets).sum().item()
+
+                # Collect for mapping
+                all_preds.extend(predicted.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+=======
+    def validate(self):
+        """
+        Evaluates the model on the validation set.
+        Computes both Fine-Grained Accuracy and the Mapped Competition Accuracy.
+        """
+        self.model.eval()
+        correct_fine = 0
+        total = 0
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for inputs, targets in self.val_loader:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+
+                outputs = self.model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+
+                # Fine-grained stats
+                total += targets.size(0)
+                correct_fine += (predicted == targets).sum().item()
+
+                # Collect for mapping
+                all_preds.extend(predicted.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def predict(self):
+        """
+        Generates predictions for the test set using the best saved model.
+        Saves the result to submission.csv.
+        """
+        best_model_path = os.path.join(self.work_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            self.model.load_state_dict(
+                torch.load(best_model_path, map_location=self.device)
+            )
+            print("Loaded best model for inference.")
+        else:
+            print("Warning: Best model not found. Using current weights.")
+
+        self.model.eval()
+        all_preds = []
+
+        # Retrieve filenames from the dataset dataframe
+        test_df = self.test_loader.dataset.df
+        fnames = [os.path.basename(f) for f in test_df["filepath"]]
+
+        with torch.no_grad():
+            for inputs, energy, _ in self.test_loader:
+                inputs = inputs.to(self.device)
+                energy = energy.to(self.device)
+
+                outputs = self.model(inputs, energy.unsqueeze(1))
+                _, predicted = torch.max(outputs.data, 1)
+                all_preds.extend(predicted.cpu().numpy())
+=======
+    def predict(self):
+        """
+        Generates predictions for the test set using the best saved model.
+        Saves the result to submission.csv.
+        """
+        best_model_path = os.path.join(self.work_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            self.model.load_state_dict(
+                torch.load(best_model_path, map_location=self.device)
+            )
+            print("Loaded best model for inference.")
+        else:
+            print("Warning: Best model not found. Using current weights.")
+
+        self.model.eval()
+        all_preds = []
+
+        # Retrieve filenames from the dataset dataframe
+        test_df = self.test_loader.dataset.df
+        fnames = [os.path.basename(f) for f in test_df["filepath"]]
+
+        with torch.no_grad():
+            for inputs, _ in self.test_loader:
+                inputs = inputs.to(self.device)
+
+                outputs = self.model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                all_preds.extend(predicted.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config, set_seed
+from library.dataset import get_dataloaders
+from library.model import EnergyGatedEfficientNet
+from library.trainer import Trainer
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Configuration & Setup
+    # ---------------------------------------------------------
+    # Override Config for fast baseline execution
+    Config.EPOCHS = 15
+
+    # Set reproducibility
+    set_seed(Config.SEED)
+    print(f"Configuration: Epochs={Config.EPOCHS}, Device={Config.DEVICE}")
+=======
+from library.config import Config, set_seed
+from library.dataset import get_dataloaders
+from library.model import DilatedEfficientNet
+from library.trainer import Trainer
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Configuration & Setup
+    # ---------------------------------------------------------
+    # Override Config for robust training
+    Config.EPOCHS = 30
+
+    # Set reproducibility
+    set_seed(Config.SEED)
+    print(f"Configuration: Epochs={Config.EPOCHS}, Device={Config.DEVICE}")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 3. Model Initialization
+    # ---------------------------------------------------------
+    print("Initializing model...")
+    model = EnergyGatedEfficientNet(num_classes=num_classes)
+
+    # ---------------------------------------------------------
+    # 4. Training
+=======
+    # ---------------------------------------------------------
+    # 3. Model Initialization
+    # ---------------------------------------------------------
+    print("Initializing model...")
+    model = DilatedEfficientNet(num_classes=num_classes)
+
+    # ---------------------------------------------------------
+    # 4. Training
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Storage for Failure Analysis
+    feature_energy_means = []
+    feature_spec_means = []
+
+    with torch.no_grad():
+        for inputs, energy, targets in val_loader:
+            inputs = inputs.to(device)
+            energy_gpu = energy.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            outputs = model(inputs, energy_gpu.unsqueeze(1))
+            _, predicted = torch.max(outputs.data, 1)
+
+            # Collect predictions and targets
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+
+            # Collect features for failure analysis
+            # Energy is (B, T), take mean per sample
+            feature_energy_means.extend(energy.mean(dim=1).numpy())
+            # Spectrogram inputs are (B, 1, F, T), take global mean
+            feature_spec_means.extend(inputs.mean(dim=(1, 2, 3)).cpu().numpy())
+=======
+    # Storage for Failure Analysis
+    feature_spec_means = []
+
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+
+            # Collect predictions and targets
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+
+            # Collect features for failure analysis
+            # Spectrogram inputs are (B, 1, F, T), take global mean
+            feature_spec_means.extend(inputs.mean(dim=(1, 2, 3)).cpu().numpy())
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if len(error_flags) > 0 and np.sum(error_flags) > 0:
+        # Correlation with Mean Energy
+        corr_energy, _ = pearsonr(error_flags, feature_energy_means)
+        print(f"Correlation between Error and Mean Energy: {corr_energy:.6f}")
+
+        # Correlation with Spectrogram Intensity
+        corr_spec, _ = pearsonr(error_flags, feature_spec_means)
+        print(f"Correlation between Error and Spectrogram Intensity: {corr_spec:.6f}")
+    else:
+=======
+    if len(error_flags) > 0 and np.sum(error_flags) > 0:
+        # Correlation with Spectrogram Intensity
+        corr_spec, _ = pearsonr(error_flags, feature_spec_means)
+        print(f"Correlation between Error and Spectrogram Intensity: {corr_spec:.6f}")
+    else:
+>>>>>>> REPLACE
+```

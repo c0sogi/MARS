@@ -1,0 +1,525 @@
+Based on the failure analysis of the previous solution (SR-DGN) and the lessons learned from DGC-KN, I will optimize the solution by reverting the destabilizing changes (Stochastic Depth and Static Confidence Loss) and restoring the successful architectural and loss components.
+
+1.  **Architecture**: I will rename `SRDGN` to `DGCKN` (Decoupled-Gated Central-Kinematic Network) and remove the `StochasticDepth` modules. The lesson `solution_lesson_node_00137` highlighted that stochastic depth caused catastrophic failure on this dataset.
+2.  **Loss Function**: I will modify `CascadedLoss` to replace the "MSE against Targets" (which encourages static confidence and majority class collapse) with "Temporal Smoothing Loss" (Truncated MSE of log-probabilities between adjacent frames). This aligns with `solution_lesson_node_00138` and `solution_lesson_node_00055`, ensuring the model learns contiguous gestures rather than disjoint frames.
+3.  **Configuration**: I will remove the unused `STOCHASTIC_DROP_PROB` parameter.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Model Hyperparameters
+    HIDDEN_DIM = 96
+    DROPOUT = 0.4
+    STOCHASTIC_DROP_PROB = 0.2
+
+    # Training
+=======
+    # Model Hyperparameters
+    HIDDEN_DIM = 96
+    DROPOUT = 0.4
+
+    # Training
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StochasticDepth(nn.Module):
+    """
+    Stochastic Depth (DropPath) module.
+
+    Randomly drops the entire residual branch during training with probability `prob`.
+    This forces the network to rely on the identity connection, effectively training
+    an ensemble of shallower networks.
+    """
+
+    def __init__(self, prob=0.2):
+        super().__init__()
+        self.prob = prob
+
+    def forward(self, x):
+        if not self.training or self.prob == 0.0:
+            return x
+
+        # Bernoulli trial: drop entire tensor with probability self.prob
+        if torch.rand(1).item() < self.prob:
+            return torch.zeros_like(x)
+        return x
+
+
+class TemporalBlock(nn.Module):
+    """
+    Gated Dilated Temporal Convolutional Block with Stochastic Depth.
+
+    Structure:
+    - Conv1 (Dilated) -> ReLU -> Dropout
+    - Conv2 (Dilated) -> ReLU -> Dropout
+    - Residual Connection + Stochastic Depth
+    """
+
+    def __init__(
+        self,
+        n_inputs,
+        n_outputs,
+        kernel_size,
+        stride,
+        dilation,
+        padding,
+        dropout=0.2,
+        stochastic_prob=0.0,
+    ):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(
+            n_inputs,
+            n_outputs,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            n_outputs,
+            n_outputs,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.relu1, self.dropout1, self.conv2, self.relu2, self.dropout2
+        )
+
+        self.downsample = (
+            nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        )
+
+        self.relu = nn.ReLU()
+        self.stochastic = StochasticDepth(stochastic_prob)
+
+    def forward(self, x):
+        # x: [Batch, Channels, Time]
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+
+        # Apply Stochastic Depth to the residual branch
+        out = self.stochastic(out)
+
+        return self.relu(out + res)
+
+
+class SRDGN(nn.Module):
+    """
+    Stochastic-Regularized Decoupled-Gated Network (SR-DGN).
+
+    A Three-Stage Cascaded Network:
+    1. Stage 1: Decoupled-Gated Bi-GRU Encoder (Raw Features -> P1)
+    2. Stage 2: Stochastic-Depth Monotonic TCN Refinement (P1 -> P2)
+    3. Stage 3: Independent Stochastic-Depth Refinement (P2 -> P3)
+    """
+
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+
+        # ==========================
+        # Stage 1: Encoder
+        # ==========================
+        self.gating = DecoupledGating(input_dim)
+        self.gru = nn.GRU(
+            input_dim,
+            Config.HIDDEN_DIM,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=Config.DROPOUT,
+        )
+        # Bi-GRU output is Hidden*2
+        self.fc1 = nn.Linear(Config.HIDDEN_DIM * 2, num_classes)
+
+        # ==========================
+        # Stage 2: Refinement
+        # ==========================
+        # Monotonically increasing dilation for large receptive field
+        tcn_channels = [64, 64, 64, 64, 64]
+        kernel_size = 3
+        dilations = [1, 2, 4, 8, 16]
+
+        self.tcn2 = nn.ModuleList()
+        in_ch = num_classes
+        for i, d in enumerate(dilations):
+            out_ch = tcn_channels[i]
+            padding = (kernel_size - 1) * d // 2
+            self.tcn2.append(
+                TemporalBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size,
+                    stride=1,
+                    dilation=d,
+                    padding=padding,
+                    dropout=0.2,
+                    stochastic_prob=Config.STOCHASTIC_DROP_PROB,
+                )
+            )
+            in_ch = out_ch
+        self.fc2 = nn.Linear(in_ch, num_classes)
+
+        # ==========================
+        # Stage 3: Independent Refinement
+        # ==========================
+        self.tcn3 = nn.ModuleList()
+        in_ch = num_classes  # Input is P2 (num_classes)
+        for i, d in enumerate(dilations):
+            out_ch = tcn_channels[i]
+            padding = (kernel_size - 1) * d // 2
+            self.tcn3.append(
+                TemporalBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size,
+                    stride=1,
+                    dilation=d,
+                    padding=padding,
+                    dropout=0.2,
+                    stochastic_prob=Config.STOCHASTIC_DROP_PROB,
+                )
+            )
+            in_ch = out_ch
+        self.fc3 = nn.Linear(in_ch, num_classes)
+=======
+class TemporalBlock(nn.Module):
+    """
+    Gated Dilated Temporal Convolutional Block.
+
+    Structure:
+    - Conv1 (Dilated) -> ReLU -> Dropout
+    - Conv2 (Dilated) -> ReLU -> Dropout
+    - Residual Connection
+    """
+
+    def __init__(
+        self,
+        n_inputs,
+        n_outputs,
+        kernel_size,
+        stride,
+        dilation,
+        padding,
+        dropout=0.2,
+    ):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(
+            n_inputs,
+            n_outputs,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            n_outputs,
+            n_outputs,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.relu1, self.dropout1, self.conv2, self.relu2, self.dropout2
+        )
+
+        self.downsample = (
+            nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        )
+
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x: [Batch, Channels, Time]
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class DGCKN(nn.Module):
+    """
+    Decoupled-Gated Central-Kinematic Network (DGC-KN).
+    Cite solution_lesson_node_00132
+    
+    A Three-Stage Cascaded Network:
+    1. Stage 1: Decoupled-Gated Bi-GRU Encoder (Raw Features -> P1)
+    2. Stage 2: Monotonic TCN Refinement (P1 -> P2)
+    3. Stage 3: Independent Refinement (P2 -> P3)
+    """
+
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+
+        # ==========================
+        # Stage 1: Encoder
+        # ==========================
+        self.gating = DecoupledGating(input_dim)
+        self.gru = nn.GRU(
+            input_dim,
+            Config.HIDDEN_DIM,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=Config.DROPOUT,
+        )
+        # Bi-GRU output is Hidden*2
+        self.fc1 = nn.Linear(Config.HIDDEN_DIM * 2, num_classes)
+
+        # ==========================
+        # Stage 2: Refinement
+        # ==========================
+        # Monotonically increasing dilation for large receptive field
+        tcn_channels = [64, 64, 64, 64, 64]
+        kernel_size = 3
+        dilations = [1, 2, 4, 8, 16]
+
+        self.tcn2 = nn.ModuleList()
+        in_ch = num_classes
+        for i, d in enumerate(dilations):
+            out_ch = tcn_channels[i]
+            padding = (kernel_size - 1) * d // 2
+            self.tcn2.append(
+                TemporalBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size,
+                    stride=1,
+                    dilation=d,
+                    padding=padding,
+                    dropout=0.2,
+                )
+            )
+            in_ch = out_ch
+        self.fc2 = nn.Linear(in_ch, num_classes)
+
+        # ==========================
+        # Stage 3: Independent Refinement
+        # ==========================
+        self.tcn3 = nn.ModuleList()
+        in_ch = num_classes  # Input is P2 (num_classes)
+        for i, d in enumerate(dilations):
+            out_ch = tcn_channels[i]
+            padding = (kernel_size - 1) * d // 2
+            self.tcn3.append(
+                TemporalBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size,
+                    stride=1,
+                    dilation=d,
+                    padding=padding,
+                    dropout=0.2,
+                )
+            )
+            in_ch = out_ch
+        self.fc3 = nn.Linear(in_ch, num_classes)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import SRDGN
+from library.utils import set_seed, run_length_encoding, compute_metric, setup_logger
+
+# Setup logger
+logger = setup_logger("train_module", os.path.join(Config.WORKING_DIR, "train.log"))
+
+
+class CascadedLoss(nn.Module):
+    """
+    Cascaded Loss function for SR-DGN.
+    Combines Weighted Cross-Entropy and Truncated MSE (Log-Space Smoothing)
+    across all three stages of the network.
+    """
+
+    def __init__(self, weight=None):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=weight)
+        self.mse_lambda = Config.MSE_LAMBDA
+
+    def forward(self, logits_list, targets):
+        total_loss = 0
+        C = logits_list[0].shape[2]
+        targets_flat = targets.view(-1)
+        # One-hot encoding for MSE regularization
+        one_hot = F.one_hot(targets_flat, num_classes=C).float()
+
+        for logits in logits_list:
+            logits_flat = logits.reshape(-1, C)
+
+            # Weighted Cross-Entropy (No Label Smoothing)
+            loss_ce = self.ce(logits_flat, targets_flat)
+
+            # Truncated MSE / Probability Smoothing
+            probs = torch.softmax(logits_flat, dim=1)
+            loss_mse = F.mse_loss(probs, one_hot)
+
+            total_loss += loss_ce + self.mse_lambda * loss_mse
+
+        return total_loss
+=======
+from library.model import DGCKN
+from library.utils import set_seed, run_length_encoding, compute_metric, setup_logger
+
+# Setup logger
+logger = setup_logger("train_module", os.path.join(Config.WORKING_DIR, "train.log"))
+
+
+class CascadedLoss(nn.Module):
+    """
+    Cascaded Loss function for DGC-KN.
+    Combines Weighted Cross-Entropy and Temporal Smoothing (Log-Space MSE)
+    across all three stages of the network.
+    Cite solution_lesson_node_00138
+    """
+
+    def __init__(self, weight=None):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=weight)
+        self.mse_lambda = Config.MSE_LAMBDA
+
+    def forward(self, logits_list, targets):
+        total_loss = 0
+        C = logits_list[0].shape[2]
+        targets_flat = targets.view(-1)
+        
+        for logits in logits_list:
+            logits_flat = logits.reshape(-1, C)
+
+            # Weighted Cross-Entropy
+            loss_ce = self.ce(logits_flat, targets_flat)
+
+            # Temporal Smoothing (Log-Space MSE between adjacent frames)
+            # Penalizes rapid changes in prediction confidence
+            log_probs = F.log_softmax(logits, dim=2)
+            # Truncated MSE with threshold 1.0 (Cite solution_lesson_node_00055)
+            loss_smooth = torch.mean(torch.clamp((log_probs[:, 1:, :] - log_probs[:, :-1, :])**2, min=0, max=1.0))
+
+            total_loss += loss_ce + self.mse_lambda * loss_smooth
+
+        return total_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Input dim: 180 (kinematics) + 13 (audio) = 193
+    model = SRDGN(input_dim=193, num_classes=Config.NUM_CLASSES).to(device)
+=======
+    # Input dim: 180 (kinematics) + 13 (audio) = 193
+    model = DGCKN(input_dim=193, num_classes=Config.NUM_CLASSES).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+from library.model import SRDGN
+from library.data_loader import GestureDataset
+from library.utils import set_seed, setup_logger, run_length_encoding
+=======
+from library.model import DGCKN
+from library.data_loader import GestureDataset
+from library.utils import set_seed, setup_logger, run_length_encoding
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+class InferenceEngine:
+    """
+    Manages the inference process using the SR-DGN model.
+    """
+
+    def __init__(self, checkpoint_path, device=None):
+        """
+        Initialize the inference engine.
+
+        Args:
+            checkpoint_path (str): Path to the trained model weights.
+            device (torch.device, optional): Compute device. Defaults to auto-detect.
+        """
+        self.device = (
+            device
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        # Initialize model architecture: 180 (kinematics) + 13 (audio) = 193 input dim
+        self.model = SRDGN(input_dim=193, num_classes=Config.NUM_CLASSES).to(
+            self.device
+        )
+=======
+class InferenceEngine:
+    """
+    Manages the inference process using the DGC-KN model.
+    """
+
+    def __init__(self, checkpoint_path, device=None):
+        """
+        Initialize the inference engine.
+
+        Args:
+            checkpoint_path (str): Path to the trained model weights.
+            device (torch.device, optional): Compute device. Defaults to auto-detect.
+        """
+        self.device = (
+            device
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        # Initialize model architecture: 180 (kinematics) + 13 (audio) = 193 input dim
+        self.model = DGCKN(input_dim=193, num_classes=Config.NUM_CLASSES).to(
+            self.device
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SRDGN
+from library.train import CascadedLoss, Trainer
+=======
+from library.model import DGCKN
+from library.train import CascadedLoss, Trainer
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    # Input dim: 180 (kinematics) + 13 (audio) = 193
+    model = SRDGN(input_dim=193, num_classes=Config.NUM_CLASSES).to(device)
+=======
+    # 3. Model Initialization
+    # Input dim: 180 (kinematics) + 13 (audio) = 193
+    model = DGCKN(input_dim=193, num_classes=Config.NUM_CLASSES).to(device)
+>>>>>>> REPLACE
+```

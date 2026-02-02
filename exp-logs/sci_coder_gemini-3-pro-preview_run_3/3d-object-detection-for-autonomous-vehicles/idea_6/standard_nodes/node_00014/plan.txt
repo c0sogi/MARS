@@ -1,0 +1,345 @@
+The issue is that the Ground Truth Database generation fails to find any points inside the bounding boxes because of a coordinate system mismatch. The Lidar points are in the **Sensor Frame** (relative to the ego vehicle), while the `train.csv` annotations are in the **Global Frame**. Comparing them directly results in zero matches, an empty database, and subsequently a `KeyError: 'class_name'` when the dataset tries to access the empty database.
+
+To fix this, I will modify `library/utils.py` to:
+1.  Implement a helper `_get_transform_matrix` to handle coordinate transformations.
+2.  Update `create_gt_database` to load the necessary NuScenes metadata (`sample_data`, `ego_pose`, `calibrated_sensor`) and calculate the Global-to-Sensor transformation matrix for each sample.
+3.  Transform the Ground Truth bounding boxes from Global Frame to Sensor Frame before performing the point-in-box check.
+4.  Add logic to invalidate/regenerate the cache if it is found to be empty or invalid (Cite debug_lesson_1, debug_lesson_5).
+5.  Explicitly define DataFrame columns to prevent `KeyError` even if the database ends up empty.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def format_submission_string(boxes, scores, classes, score_thresh=0.0):
+    """
+    Formats predictions into the submission string format.
+    Format: confidence center_x center_y center_z width length height yaw class_name
+    """
+    pred_strings = []
+    for i in range(len(boxes)):
+        score = float(scores[i])
+        if score < score_thresh:
+            continue
+
+        box = boxes[i]
+        cls_name = classes[i]
+
+        # box: [x, y, z, w, l, h, yaw]
+        s = f"{score:.4f} {box[0]:.4f} {box[1]:.4f} {box[2]:.4f} {box[3]:.4f} {box[4]:.4f} {box[5]:.4f} {box[6]:.4f} {cls_name}"
+        pred_strings.append(s)
+
+    return " ".join(pred_strings)
+
+
+def create_gt_database(metadata_path, load_cached_data=True, max_samples=None):
+    """
+    Generates or loads a Ground Truth Database for augmentation.
+    Caches the result as a parquet file and binary point files.
+    """
+    save_dir = Config.GT_DATABASE_DIR
+    db_info_path = os.path.join(save_dir, "gt_database.parquet")
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1. Load Cache
+    if load_cached_data and os.path.exists(db_info_path):
+        print(f"Loading GT Database from {db_info_path}")
+        return pd.read_parquet(db_info_path)
+
+    print("Generating GT Database (this may take a while)...")
+
+    # 2. Process
+    df = pd.read_csv(metadata_path)
+    if max_samples:
+        df = df.iloc[:max_samples]
+
+    all_gt_infos = []
+
+    # Stats
+    total_samples = len(df)
+
+    for idx, row in df.iterrows():
+        sample_token = row["sample_token"]
+        lidar_path = os.path.join(Config.INPUT_DIR, row["lidar_path"])
+        label_str = row["label"]
+
+        # Load Points
+        try:
+            points = read_points(lidar_path)
+        except FileNotFoundError:
+            continue
+
+        # Parse Boxes
+        gt_boxes, gt_classes = parse_label_string(label_str)
+        if len(gt_boxes) == 0:
+            continue
+
+        # Crop Points
+        # points: (N, 4/5), boxes: (M, 7)
+        # We only use XYZ for cropping
+        point_indices = points_in_boxes_cpu(points[:, :3], gt_boxes)
+
+        for i in range(len(gt_boxes)):
+            cls_name = gt_classes[i]
+            # Filter points for this box
+            mask = point_indices[:, i]
+            box_points = points[mask]
+
+            # Skip empty boxes or boxes with too few points
+            if box_points.shape[0] < 5:
+                continue
+
+            # Save points to binary file
+            # Shift points to be relative to box center for easier augmentation placement
+            box_center = gt_boxes[i, :3]
+            box_points_shifted = box_points.copy()
+            box_points_shifted[:, :3] -= box_center
+
+            filename = f"{sample_token}_{cls_name}_{i}.bin"
+            filepath = os.path.join(save_dir, filename)
+            box_points_shifted.tofile(filepath)
+
+            # Record Info
+            info = {
+                "sample_token": sample_token,
+                "class_name": cls_name,
+                "box_idx": i,
+                "box_k": list(gt_boxes[i]),  # Store as list for serialization
+                "num_points": box_points.shape[0],
+                "file_path": filename,  # Relative to GT_DATABASE_DIR
+            }
+            all_gt_infos.append(info)
+
+        if idx % 250 == 0:
+            print(f"Processed {idx}/{total_samples} samples for GT Database")
+
+    # 3. Save Cache
+    gt_df = pd.DataFrame(all_gt_infos)
+
+    # Save as parquet
+    gt_df.to_parquet(db_info_path)
+    print(f"Saved GT Database with {len(gt_df)} objects to {db_info_path}")
+
+    return gt_df
+=======
+def format_submission_string(boxes, scores, classes, score_thresh=0.0):
+    """
+    Formats predictions into the submission string format.
+    Format: confidence center_x center_y center_z width length height yaw class_name
+    """
+    pred_strings = []
+    for i in range(len(boxes)):
+        score = float(scores[i])
+        if score < score_thresh:
+            continue
+
+        box = boxes[i]
+        cls_name = classes[i]
+
+        # box: [x, y, z, w, l, h, yaw]
+        s = f"{score:.4f} {box[0]:.4f} {box[1]:.4f} {box[2]:.4f} {box[3]:.4f} {box[4]:.4f} {box[5]:.4f} {box[6]:.4f} {cls_name}"
+        pred_strings.append(s)
+
+    return " ".join(pred_strings)
+
+
+def _get_transform_matrix(translation, rotation):
+    """
+    Convert translation list and rotation quaternion to 4x4 homogenous matrix.
+    Rotation is [w, x, y, z].
+    """
+    w, x, y, z = rotation
+    # Rotation matrix from quaternion
+    R = np.array(
+        [
+            [1 - 2 * y**2 - 2 * z**2, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w],
+            [2 * x * y + 2 * z * w, 1 - 2 * x**2 - 2 * z**2, 2 * y * z - 2 * x * w],
+            [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x**2 - 2 * y**2],
+        ]
+    )
+    T = np.array(translation)
+
+    M = np.eye(4)
+    M[:3, :3] = R
+    M[:3, 3] = T
+    return M
+
+
+def create_gt_database(metadata_path, load_cached_data=True, max_samples=None):
+    """
+    Generates or loads a Ground Truth Database for augmentation.
+    Caches the result as a parquet file and binary point files.
+    """
+    save_dir = Config.GT_DATABASE_DIR
+    db_info_path = os.path.join(save_dir, "gt_database.parquet")
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1. Load Cache
+    # Cite debug_lesson_1: Invalidate cache if it might be broken (empty)
+    if load_cached_data and os.path.exists(db_info_path):
+        try:
+            df = pd.read_parquet(db_info_path)
+            # Cite debug_lesson_5: Check cache validity (columns and size)
+            if "class_name" in df.columns and len(df) > 0:
+                print(f"Loading GT Database from {db_info_path}")
+                return df
+            else:
+                print("Cached GT Database is invalid/empty. Regenerating...")
+        except Exception:
+            print("Error loading cached GT Database. Regenerating...")
+
+    print("Generating GT Database (this may take a while)...")
+
+    # 2. Load NuScenes metadata for coordinate transformation
+    print("Loading NuScenes metadata for coordinate transformation...")
+    try:
+        with open(os.path.join(Config.TRAIN_DATA_DIR, "sample_data.json"), "r") as f:
+            sample_data = json.load(f)
+        with open(os.path.join(Config.TRAIN_DATA_DIR, "ego_pose.json"), "r") as f:
+            ego_pose = json.load(f)
+        with open(
+            os.path.join(Config.TRAIN_DATA_DIR, "calibrated_sensor.json"), "r"
+        ) as f:
+            calibrated_sensor = json.load(f)
+    except FileNotFoundError:
+        print("Warning: NuScenes JSONs not found. Cannot transform coordinates.")
+        return pd.DataFrame(
+            columns=[
+                "sample_token",
+                "class_name",
+                "box_idx",
+                "box_k",
+                "num_points",
+                "file_path",
+            ]
+        )
+
+    # Indexing for speed
+    sample_to_lidar_sd = {}
+    for sd in sample_data:
+        if "LIDAR_TOP" in sd["filename"]:
+            sample_to_lidar_sd[sd["sample_token"]] = sd
+
+    ep_by_token = {x["token"]: x for x in ego_pose}
+    cs_by_token = {x["token"]: x for x in calibrated_sensor}
+
+    # 3. Process
+    df = pd.read_csv(metadata_path)
+    if max_samples:
+        df = df.iloc[:max_samples]
+
+    all_gt_infos = []
+    total_samples = len(df)
+
+    for idx, row in df.iterrows():
+        sample_token = row["sample_token"]
+        lidar_path = os.path.join(Config.INPUT_DIR, row["lidar_path"])
+        label_str = row["label"]
+
+        # Load Points (Sensor Frame)
+        try:
+            points = read_points(lidar_path)
+        except FileNotFoundError:
+            continue
+
+        # Parse Boxes (Global Frame)
+        gt_boxes_global, gt_classes = parse_label_string(label_str)
+        if len(gt_boxes_global) == 0:
+            continue
+
+        # Get Transformation Matrix: Global -> Sensor
+        if sample_token not in sample_to_lidar_sd:
+            continue
+
+        sd = sample_to_lidar_sd[sample_token]
+        ep = ep_by_token[sd["ego_pose_token"]]
+        cs = cs_by_token[sd["calibrated_sensor_token"]]
+
+        # T_global_sensor = T_global_ego @ T_ego_sensor
+        T_ego_sensor = _get_transform_matrix(cs["translation"], cs["rotation"])
+        T_global_ego = _get_transform_matrix(ep["translation"], ep["rotation"])
+        T_global_sensor = T_global_ego @ T_ego_sensor
+
+        # T_sensor_global = inv(T_global_sensor)
+        T_sensor_global = np.linalg.inv(T_global_sensor)
+
+        # Transform Boxes to Sensor Frame
+        # Center: P_sensor = T_sensor_global @ P_global
+        centers_global = gt_boxes_global[:, :3]
+        centers_global_hom = np.hstack(
+            [centers_global, np.ones((len(centers_global), 1))]
+        )
+        centers_sensor = (T_sensor_global @ centers_global_hom.T).T[:, :3]
+
+        # Yaw: Rotate vector (cos, sin, 0) by Rotation part of T_sensor_global
+        yaws_global = gt_boxes_global[:, 6]
+        c = np.cos(yaws_global)
+        s = np.sin(yaws_global)
+        zeros = np.zeros_like(c)
+        # Vectors in global frame
+        vecs_global = np.stack([c, s, zeros], axis=1)  # (N, 3)
+        # Rotate: R_sensor_global @ vec
+        R_sensor_global = T_sensor_global[:3, :3]
+        vecs_sensor = (R_sensor_global @ vecs_global.T).T
+        yaws_sensor = np.arctan2(vecs_sensor[:, 1], vecs_sensor[:, 0])
+
+        # Construct GT Boxes in Sensor Frame
+        # [x, y, z, w, l, h, yaw]
+        gt_boxes_sensor = gt_boxes_global.copy()
+        gt_boxes_sensor[:, :3] = centers_sensor
+        gt_boxes_sensor[:, 6] = yaws_sensor
+
+        # Crop Points (Now both in Sensor Frame)
+        point_indices = points_in_boxes_cpu(points[:, :3], gt_boxes_sensor)
+
+        for i in range(len(gt_boxes_sensor)):
+            cls_name = gt_classes[i]
+            mask = point_indices[:, i]
+            box_points = points[mask]
+
+            if box_points.shape[0] < 5:
+                continue
+
+            # Save points relative to box center (Sensor Frame)
+            box_center = gt_boxes_sensor[i, :3]
+            box_points_shifted = box_points.copy()
+            box_points_shifted[:, :3] -= box_center
+
+            filename = f"{sample_token}_{cls_name}_{i}.bin"
+            filepath = os.path.join(save_dir, filename)
+            box_points_shifted.tofile(filepath)
+
+            # Record Info
+            # We store the sensor frame box as reference for dimensions/yaw.
+            info = {
+                "sample_token": sample_token,
+                "class_name": cls_name,
+                "box_idx": i,
+                "box_k": list(gt_boxes_sensor[i]),
+                "num_points": box_points.shape[0],
+                "file_path": filename,
+            }
+            all_gt_infos.append(info)
+
+        if idx % 250 == 0:
+            print(f"Processed {idx}/{total_samples} samples for GT Database")
+
+    # 4. Save Cache
+    # Explicit columns to avoid KeyError if empty
+    columns = [
+        "sample_token",
+        "class_name",
+        "box_idx",
+        "box_k",
+        "num_points",
+        "file_path",
+    ]
+    gt_df = pd.DataFrame(all_gt_infos, columns=columns)
+
+    gt_df.to_parquet(db_info_path)
+    print(f"Saved GT Database with {len(gt_df)} objects to {db_info_path}")
+
+    return gt_df
+>>>>>>> REPLACE
+```

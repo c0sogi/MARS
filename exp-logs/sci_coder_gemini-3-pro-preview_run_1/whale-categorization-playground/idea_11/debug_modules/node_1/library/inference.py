@@ -1,0 +1,145 @@
+import os
+import torch
+import pandas as pd
+import numpy as np
+from library.config import Config
+from library.model import WhaleDenseNet
+from library.utils import seed_everything
+
+
+def predict_ensemble(checkpoint_paths, test_loader, device=None):
+    """
+    Performs ensemble inference on the test set using multiple model checkpoints.
+    Applies Test-Time Augmentation (Horizontal Flip), averages logits across
+    all models, and generates the final submission CSV.
+
+    Args:
+        checkpoint_paths (list): List of file paths to the trained model checkpoints.
+        test_loader (DataLoader): DataLoader for the test dataset.
+        device (torch.device, optional): The device to run inference on. Defaults to Config.DEVICE.
+    """
+    if device is None:
+        device = torch.device(Config.DEVICE)
+
+    seed_everything(Config.SEED)
+
+    # Variables to store aggregated results
+    aggregated_logits = None
+    image_names = []
+    idx_to_class = None
+
+    print(f"Starting Ensemble Inference with {len(checkpoint_paths)} models.")
+
+    for i, ckpt_path in enumerate(checkpoint_paths):
+        print(f"Processing model {i + 1}/{len(checkpoint_paths)}: {ckpt_path}")
+
+        if not os.path.exists(ckpt_path):
+            print(f"Error: Checkpoint not found at {ckpt_path}. Skipping.")
+            continue
+
+        # Load Checkpoint
+        try:
+            checkpoint = torch.load(ckpt_path, map_location=device)
+        except Exception as e:
+            print(f"Error loading checkpoint {ckpt_path}: {e}")
+            continue
+
+        state_dict = checkpoint["state_dict"]
+
+        # On the first successfully loaded model, retrieve class mapping
+        if idx_to_class is None:
+            class_to_idx = checkpoint.get("class_to_idx")
+            if class_to_idx is None:
+                raise ValueError(
+                    f"Checkpoint {ckpt_path} does not contain 'class_to_idx' mapping."
+                )
+            idx_to_class = {v: k for k, v in class_to_idx.items()}
+            num_classes = len(class_to_idx)
+
+        # Initialize Model
+        # We assume all ensemble members share the same architecture and class count
+        model = WhaleDenseNet(num_classes=num_classes, pretrained=False)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+
+        # Inference Loop
+        model_logits_list = []
+        collect_names = len(image_names) == 0
+
+        with torch.no_grad():
+            for batch_idx, (images, names) in enumerate(test_loader):
+                images = images.to(device)
+
+                # 1. Forward Pass - Original
+                # labels=None ensures the head returns scaled cosine logits without margin
+                logits_orig = model(images, labels=None)
+
+                # 2. Forward Pass - TTA (Horizontal Flip)
+                if Config.TTA_FLIP:
+                    # Flip along width dimension (dim 3 for NCHW)
+                    images_flip = torch.flip(images, dims=[3])
+                    logits_flip = model(images_flip, labels=None)
+
+                    # Average logits for this model
+                    logits_batch = (logits_orig + logits_flip) / 2.0
+                else:
+                    logits_batch = logits_orig
+
+                # Move to CPU to conserve GPU memory
+                model_logits_list.append(logits_batch.cpu())
+
+                if collect_names:
+                    image_names.extend(names)
+
+        # Concatenate all batches for this model: (N_samples, N_classes)
+        model_full_logits = torch.cat(model_logits_list, dim=0)
+
+        # Add to ensemble aggregation
+        if aggregated_logits is None:
+            aggregated_logits = model_full_logits
+        else:
+            aggregated_logits += model_full_logits
+
+        # Cleanup to free memory for next model
+        del model
+        torch.cuda.empty_cache()
+
+    if aggregated_logits is None:
+        print("Error: No predictions were generated. Please check checkpoint paths.")
+        return
+
+    # Average logits across the ensemble
+    aggregated_logits /= len(checkpoint_paths)
+
+    print("Generating submission file...")
+
+    # Get Top 5 Predictions
+    # torch.topk returns (values, indices)
+    _, top_indices = torch.topk(aggregated_logits, k=Config.TOP_K, dim=1)
+
+    # Convert indices to class labels
+    submission_rows = []
+    top_indices_np = top_indices.numpy()
+
+    for idx, img_name in enumerate(image_names):
+        indices = top_indices_np[idx]
+        # Map integer indices back to string IDs
+        labels = [idx_to_class[i] for i in indices]
+        label_str = " ".join(labels)
+        submission_rows.append({"Image": img_name, "Id": label_str})
+
+    # Create DataFrame
+    df_submission = pd.DataFrame(submission_rows)
+
+    # Ensure submission directory exists
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+    save_path = os.path.join(Config.SUBMISSION_DIR, "submission.csv")
+
+    # Save to CSV
+    df_submission.to_csv(save_path, index=False)
+
+    print(f"Submission saved to {save_path}")
+    print(f"Total predictions: {len(df_submission)}")
+    print("Sample predictions:")
+    print(df_submission.head())

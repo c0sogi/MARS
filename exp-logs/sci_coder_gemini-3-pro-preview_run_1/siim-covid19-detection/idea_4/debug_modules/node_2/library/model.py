@@ -1,0 +1,140 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from library.config import Config
+
+
+class DecoderBlock(nn.Module):
+    """
+    Standard U-Net Decoder Block: Upsample -> Concat -> ConvBlock.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Input to conv is upsampled features + skip connection features
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x, skip=None):
+        x = self.up(x)
+
+        if skip is not None:
+            # Handle potential rounding errors in dimensions during upsampling
+            if x.shape[-2:] != skip.shape[-2:]:
+                x = F.interpolate(
+                    x, size=skip.shape[-2:], mode="bilinear", align_corners=True
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class EfficientNetB4Unet(nn.Module):
+    """
+    EfficientNet-B4 U-Net with Deep Supervision and Constrained Classification Head.
+    """
+
+    def __init__(self):
+        super(EfficientNetB4Unet, self).__init__()
+
+        # 1. Encoder (Backbone)
+        # Load pre-trained EfficientNet-B4
+        # features_only=True returns the feature maps at different strides
+        self.encoder = timm.create_model(
+            Config.BACKBONE,
+            pretrained=True,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),  # Strides: 2, 4, 8, 16, 32
+        )
+
+        # Get channel counts from the backbone
+        # Typical B4 channels: [24, 32, 56, 160, 448]
+        enc_channels = self.encoder.feature_info.channels()
+        c0, c1, c2, c3, c4 = enc_channels
+
+        # 2. Constrained Classification Head
+        # Single Linear layer on top of Global Average Pooling of the bottleneck (c4)
+        self.cls_head = nn.Linear(c4, Config.NUM_CLASSES)
+
+        # 3. Decoder Path
+        # We start from the bottleneck (c4, stride 32)
+
+        # Block 1: Up 32 -> 16
+        self.dec1 = DecoderBlock(c4, c3, 256)
+
+        # Block 2: Up 16 -> 8
+        self.dec2 = DecoderBlock(256, c2, 128)
+
+        # Block 3: Up 8 -> 4
+        self.dec3 = DecoderBlock(128, c1, 64)
+
+        # Block 4: Up 4 -> 2
+        self.dec4 = DecoderBlock(64, c0, 32)
+
+        # Block 5: Up 2 -> 1 (Final Resolution)
+        # No skip connection from raw input typically used here in this design
+        self.dec5 = DecoderBlock(32, 0, 16)
+
+        # 4. Segmentation Heads
+        self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
+
+        self.deep_supervision = Config.DEEP_SUPERVISION
+        if self.deep_supervision:
+            # Auxiliary heads for Deep Supervision
+            # Attached at Stride 2 (Output of dec4)
+            self.aux_head_s2 = nn.Conv2d(32, 1, kernel_size=1)
+            # Attached at Stride 4 (Output of dec3)
+            self.aux_head_s4 = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        features = self.encoder(x)
+        # f0: stride 2
+        # f1: stride 4
+        # f2: stride 8
+        # f3: stride 16
+        # f4: stride 32 (Bottleneck)
+        f0, f1, f2, f3, f4 = features
+
+        # --- Classification Path ---
+        # Global Average Pooling
+        x_cls = F.adaptive_avg_pool2d(f4, (1, 1)).flatten(1)
+        study_logits = self.cls_head(x_cls)
+
+        # --- Decoder Path ---
+        d1 = self.dec1(f4, f3)  # -> Stride 16
+        d2 = self.dec2(d1, f2)  # -> Stride 8
+        d3 = self.dec3(d2, f1)  # -> Stride 4
+        d4 = self.dec4(d3, f0)  # -> Stride 2
+        d5 = self.dec5(d4)  # -> Stride 1
+
+        # --- Segmentation Heads ---
+        mask_logits_s1 = self.final_conv(d5)
+
+        if self.deep_supervision and self.training:
+            # Compute aux outputs
+            mask_logits_s2 = self.aux_head_s2(d4)
+            mask_logits_s4 = self.aux_head_s4(d3)
+
+            # Return list for HybridLoss to handle
+            return study_logits, [mask_logits_s1, mask_logits_s2, mask_logits_s4]
+        else:
+            # Inference or Val: Return only final resolution mask
+            return study_logits, mask_logits_s1

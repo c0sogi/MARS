@@ -1,0 +1,108 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block.
+    Cite solution_lesson_node_00012: Accelerating Convergence via Channel-Wise Attention.
+    """
+
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class SEResNetBlock(nn.Module):
+    """
+    Standard ResNet Block with SE Attention.
+    Cite solution_lesson_node_00063: Standard 1x1 Convolutional Projections Outperform Dense 3x3 Shortcuts.
+    """
+
+    def __init__(self, in_planes, planes, stride=1, reduction=16):
+        super(SEResNetBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.se = SEBlock(planes, reduction)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class WideSEResNet(nn.Module):
+    """
+    Wide SE-ResNet with Multi-Scale Aggregation.
+    Cite solution_lesson_node_00064: Maximizing Representation in Low-Resolution Inputs via Wide SE-ResNeXt and Multi-Scale Aggregation.
+    Cite solution_lesson_node_00016: Efficiency via Multi-Scale Feature Aggregation.
+    """
+
+    def __init__(self):
+        super(WideSEResNet, self).__init__()
+        # Initial Conv: 32x32 input
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+
+        # Stage 1: 32x32 -> 32x32. Channels: 64
+        self.layer1 = self._make_layer(64, 64, num_blocks=2, stride=1)
+
+        # Stage 2: 32x32 -> 16x16. Channels: 128
+        self.layer2 = self._make_layer(64, 128, num_blocks=2, stride=2)
+
+        # Stage 3: 16x16 -> 8x8. Channels: 256
+        self.layer3 = self._make_layer(128, 256, num_blocks=2, stride=2)
+
+        # Head: Multi-Scale Aggregation
+        self.fc = nn.Linear(128 + 256, 1)
+
+    def _make_layer(self, in_planes, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(SEResNetBlock(in_planes, planes, stride=s))
+            in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))  # 32x32
+
+        out1 = self.layer1(out)  # 32x32
+        out2 = self.layer2(out1)  # 16x16
+        out3 = self.layer3(out2)  # 8x8
+
+        # Multi-Scale Aggregation
+        gap2 = F.adaptive_avg_pool2d(out2, 1).view(out2.size(0), -1)  # 128
+        gap3 = F.adaptive_avg_pool2d(out3, 1).view(out3.size(0), -1)  # 256
+
+        combined = torch.cat([gap2, gap3], dim=1)
+        return self.fc(combined)

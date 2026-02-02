@@ -1,0 +1,314 @@
+Based on the lessons learned, specifically **Lesson 00037** (preferring additive concatenation over multiplicative FiLM for auxiliary data) and **Lesson 00029** (using non-linear embeddings for scalar context), I will optimize the solution by replacing the FiLM-based architecture with a Concatenation-based approach. The depth scalar will be projected via an MLP and concatenated to the bottleneck features. Additionally, I will increase the training epochs to 50 to ensure full convergence as suggested by **Lesson 00035**.
+
+Here are the code changes:
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ResFiLM(nn.Module):
+    """
+    Residual Feature-wise Linear Modulation.
+    Projects a scalar depth value into scale (gamma) and shift (beta) vectors.
+    Initialized to Identity (gamma=0, beta=0).
+    """
+
+    def __init__(self, in_channels, depth_dim=1):
+        super(ResFiLM, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(depth_dim, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels, in_channels * 2),
+        )
+        # Initialize final layer to 0 for identity fallback
+        nn.init.constant_(self.mlp[2].weight, 0)
+        nn.init.constant_(self.mlp[2].bias, 0)
+
+    def forward(self, x, depth):
+        # depth: (B, 1)
+        params = self.mlp(depth)  # (B, 2*C)
+        gamma, beta = params.chunk(2, dim=1)
+
+        # Reshape for broadcasting: (B, C, 1, 1)
+        gamma = gamma.unsqueeze(2).unsqueeze(3)
+        beta = beta.unsqueeze(2).unsqueeze(3)
+
+        # F' = (1 + gamma) * F + beta
+        return (1 + gamma) * x + beta
+
+
+class WideDecoderBlock(nn.Module):
+=======
+class DepthProjector(nn.Module):
+    """
+    Projects scalar depth into a dense embedding vector using an MLP.
+    Cite solution_lesson_node_00029: Non-linear embeddings outperform linear projections.
+    """
+
+    def __init__(self, in_features=1, out_features=32):
+        super(DepthProjector, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, out_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_features, out_features),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class WideDecoderBlock(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ResFiLM_LinkNet34(nn.Module):
+    def __init__(self):
+        super(ResFiLM_LinkNet34, self).__init__()
+
+        # Load Pretrained ResNet34
+        # Using legacy pretrained=True for compatibility
+        base = models.resnet34(pretrained=True)
+
+        # Input Adaptation: Modify first conv for 1-channel input
+        w = base.conv1.weight
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # Sum weights across RGB channels
+        base.conv1.weight.data = w.sum(dim=1, keepdim=True)
+
+        # Encoder Layers
+        self.in_block = nn.Sequential(base.conv1, base.bn1, base.relu)
+        self.maxpool = base.maxpool
+        self.enc1 = base.layer1  # 64 channels, 32x32 (if input 128)
+        self.enc2 = base.layer2  # 128 channels, 16x16
+        self.enc3 = base.layer3  # 256 channels, 8x8
+        self.enc4 = base.layer4  # 512 channels, 4x4
+
+        # Bottleneck: ResFiLM
+        self.film = ResFiLM(512)
+
+        # Decoder Layers (Wide-LinkNet)
+        # Dec4: 512 -> 256 (matches Enc3)
+        self.dec4 = WideDecoderBlock(512, 256)
+        # Dec3: 256 -> 128 (matches Enc2)
+        self.dec3 = WideDecoderBlock(256, 128)
+        # Dec2: 128 -> 64 (matches Enc1)
+        self.dec2 = WideDecoderBlock(128, 64)
+        # Dec1: 64 -> 64 (matches in_block output/Enc1 resolution)
+        # Note: Enc1 is 64ch, 32x32. in_block is 64ch, 64x64.
+        # We need to upsample to 64x64.
+        self.dec1 = WideDecoderBlock(64, 64)
+
+        # Final Upsample: 64x64 -> 128x128
+        self.final_dec = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x, depth):
+        # x: (B, 1, 128, 128)
+        # depth: (B, 1)
+
+        # Encoder
+        x0 = self.in_block(x)  # (B, 64, 64, 64)
+        x1 = self.maxpool(x0)  # (B, 64, 32, 32)
+        e1 = self.enc1(x1)  # (B, 64, 32, 32)
+        e2 = self.enc2(e1)  # (B, 128, 16, 16)
+        e3 = self.enc3(e2)  # (B, 256, 8, 8)
+        e4 = self.enc4(e3)  # (B, 512, 4, 4)
+
+        # Bottleneck with FiLM
+        b = self.film(e4, depth)
+
+        # Decoder with Additive Skips
+        d4 = self.dec4(b)  # (B, 256, 8, 8)
+        d4 = d4 + e3
+
+        d3 = self.dec3(d4)  # (B, 128, 16, 16)
+        d3 = d3 + e2
+
+        d2 = self.dec2(d3)  # (B, 64, 32, 32)
+        d2 = d2 + e1
+
+        d1 = self.dec1(d2)  # (B, 64, 64, 64)
+        d1 = d1 + x0
+
+        out = self.final_dec(d1)  # (B, 32, 128, 128)
+        logits = self.final_conv(out)
+
+        return logits
+=======
+class DepthAwareLinkNet34(nn.Module):
+    """
+    LinkNet34 with explicit depth injection via concatenation at the bottleneck.
+    Cite solution_lesson_node_00037: Additive concatenation outperforms multiplicative modulation (FiLM).
+    Cite solution_lesson_node_00009: Concatenation is more efficient than heavy convolutional fusion.
+    """
+
+    def __init__(self):
+        super(DepthAwareLinkNet34, self).__init__()
+
+        # Load Pretrained ResNet34
+        base = models.resnet34(pretrained=True)
+
+        # Input Adaptation: Modify first conv for 1-channel input
+        w = base.conv1.weight
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        base.conv1.weight.data = w.sum(dim=1, keepdim=True)
+
+        # Encoder Layers
+        self.in_block = nn.Sequential(base.conv1, base.bn1, base.relu)
+        self.maxpool = base.maxpool
+        self.enc1 = base.layer1  # 64 channels
+        self.enc2 = base.layer2  # 128 channels
+        self.enc3 = base.layer3  # 256 channels
+        self.enc4 = base.layer4  # 512 channels
+
+        # Depth Projector
+        self.depth_projector = DepthProjector(1, 32)
+
+        # Decoder Layers (Wide-LinkNet)
+        # Bottleneck Input: 512 (Encoder) + 32 (Depth) = 544
+        self.dec4 = WideDecoderBlock(544, 256)
+        self.dec3 = WideDecoderBlock(256, 128)
+        self.dec2 = WideDecoderBlock(128, 64)
+        self.dec1 = WideDecoderBlock(64, 64)
+
+        # Final Upsample
+        self.final_dec = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x, depth):
+        # Encoder
+        x0 = self.in_block(x)
+        x1 = self.maxpool(x0)
+        e1 = self.enc1(x1)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)  # (B, 512, 4, 4)
+
+        # Depth Injection
+        d_emb = self.depth_projector(depth)  # (B, 32)
+        # Expand depth embedding to spatial dimensions
+        d_emb = (
+            d_emb.unsqueeze(2).unsqueeze(3).expand(-1, -1, e4.size(2), e4.size(3))
+        )  # (B, 32, 4, 4)
+
+        # Concatenate: (B, 544, 4, 4)
+        b = torch.cat([e4, d_emb], dim=1)
+
+        # Decoder
+        d4 = self.dec4(b)
+        d4 = d4 + e3
+
+        d3 = self.dec3(d4)
+        d3 = d3 + e2
+
+        d2 = self.dec2(d3)
+        d2 = d2 + e1
+
+        d1 = self.dec1(d2)
+        d1 = d1 + x0
+
+        out = self.final_dec(d1)
+        logits = self.final_conv(out)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import ResFiLM_LinkNet34
+from library.dataset import load_and_cache_data, SaltDataset, get_transforms
+=======
+from library.model import DepthAwareLinkNet34
+from library.dataset import load_and_cache_data, SaltDataset, get_transforms
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # Initialize Model, Loss, Optimizer
+    model = ResFiLM_LinkNet34().to(DEVICE)
+    criterion = CombinedLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+=======
+    # Initialize Model, Loss, Optimizer
+    model = DepthAwareLinkNet34().to(DEVICE)
+    criterion = CombinedLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # Load Model
+    model = ResFiLM_LinkNet34().to(DEVICE)
+    model.load_state_dict(torch.load(os.path.join(IDEA_DIR, "best_model.pth")))
+=======
+    # Load Model
+    model = DepthAwareLinkNet34().to(DEVICE)
+    model.load_state_dict(torch.load(os.path.join(IDEA_DIR, "best_model.pth")))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ResFiLM_LinkNet34
+from library.losses import CombinedLoss
+from library.trainer import train_one_epoch, validate, generate_submission
+
+# Constants
+IDEA_DIR = "./working/idea_12"
+EPOCHS = 35
+BATCH_SIZE = 32
+=======
+from library.model import DepthAwareLinkNet34
+from library.losses import CombinedLoss
+from library.trainer import train_one_epoch, validate, generate_submission
+
+# Constants
+IDEA_DIR = "./working/idea_12"
+EPOCHS = 50
+BATCH_SIZE = 32
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Initialize Model
+    model = ResFiLM_LinkNet34().to(DEVICE)
+    criterion = CombinedLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+=======
+    # 4. Initialize Model
+    model = DepthAwareLinkNet34().to(DEVICE)
+    criterion = CombinedLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+>>>>>>> REPLACE
+```

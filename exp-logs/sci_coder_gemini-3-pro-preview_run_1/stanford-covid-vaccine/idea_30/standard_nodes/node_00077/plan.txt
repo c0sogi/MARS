@@ -1,0 +1,518 @@
+Based on the lessons learned from previous iterations, I will optimize the solution by reverting the "Zoneout-Regularized Wide-Stream" architecture to a standard "Wide-Stream Residual BiGRU" with specific hyperparameter adjustments that have historically yielded the best performance.
+
+**Implementation Strategy:**
+
+1.  **Configuration (`library/config.py`)**:
+    *   **Hidden Dimension**: Reduce `HIDDEN_DIM` from 512 to 384. Lesson 00022 and 00070 indicate that 384 is the optimal capacity for this dataset size; 512 introduces instability and sensitivity to weight decay.
+    *   **Regularization**: Remove `ZONEOUT_PROB` and replace it with `DROPOUT = 0.1`. Lesson 00076 explicitly states that inter-layer dropout outperforms recurrent state regularization (Zoneout) for this task.
+    *   **Training Duration**: Restore `EPOCHS` to 20 to ensure the Cosine Annealing scheduler has sufficient time to converge (Cite Lesson 00051).
+
+2.  **Layers (`library/layers.py`)**:
+    *   **Embedding Optimization**: Modify `SinusoidalPairingEmbedding` to use the full embedding dimension for frequency encoding, rather than padding half with zeros. This improves feature utilization.
+    *   **Block Architecture**: Replace `ZoneoutBiGRUBlock` with `ResidualBiGRUBlock`. This new block implements a standard BiGRU followed by a Dropout layer, aligning with the successful "Current Best" architecture described in the lessons.
+
+3.  **Model (`library/model.py`)**:
+    *   Update the `WideResBiGRU` class to utilize the new `ResidualBiGRUBlock` and the optimized hyperparameters.
+
+4.  **Execution (`runfile.py`)**:
+    *   Update the model instantiation to use the optimized `WideResBiGRU`.
+    *   Remove the manual override of `Config.EPOCHS = 15` to allow the full 20-epoch training cycle defined in the config.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Architecture
+    # (Zoneout-Regularized Wide-Stream Residual BiGRU)
+    # =========================================================================
+    EMBED_DIM = 128  # High-Dimensional Embeddings to prevent bottlenecks
+    HIDDEN_DIM = 512  # Wide-Stream capacity (W=512)
+    NUM_LAYERS = 6  # Shallow and Wide backbone
+    ZONEOUT_PROB = 0.1  # Internal regularization for RNN dynamics
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 20
+    BATCH_SIZE = 32  # Optimized for A100 GPU
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4  # Low weight decay; relying on Zoneout for regularization
+=======
+    # =========================================================================
+    # Model Architecture
+    # (Wide-Stream Residual BiGRU)
+    # =========================================================================
+    EMBED_DIM = 128  # High-Dimensional Embeddings
+    HIDDEN_DIM = 384  # Optimized capacity (Cite solution_lesson_node_00022)
+    NUM_LAYERS = 6  # Deep backbone
+    DROPOUT = 0.1  # Inter-layer dropout (Cite solution_lesson_node_00076)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 20  # Sufficient convergence time (Cite solution_lesson_node_00051)
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4  # Conservative weight decay (Cite solution_lesson_node_00070)
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+        # Pre-compute the frequency divisors
+        # div_term = 10000^(2i/d_model)
+        # We compute this once and register as buffer
+        half_dim = embed_dim // 2
+        div_term = torch.exp(
+            torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
+        )
+        self.register_buffer("div_term", div_term)
+
+    def forward(self, pair_dists: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pair_dists (torch.Tensor): Signed distances of shape (Batch, Seq_Len).
+                                       Values are floats (e.g., -5.0, 12.0, 0.0).
+        Returns:
+            torch.Tensor: Embeddings of shape (Batch, Seq_Len, Embed_Dim).
+        """
+        # pair_dists: (B, L) -> (B, L, 1)
+        x = pair_dists.unsqueeze(-1)
+
+        # div_term: (D/2,)
+        # x * div_term -> (B, L, D/2)
+        # Note: We only compute for half the dimension because sin/cos pairs take 2 slots
+        scaled_dists = x * self.div_term
+
+        # Create the encoding
+        # We need to interleave sin and cos or concat them.
+        # Standard implementation often concats sin(x) and cos(x).
+        pe_sin = torch.sin(scaled_dists)
+        pe_cos = torch.cos(scaled_dists)
+
+        # Concatenate along the last dimension -> (B, L, D) (approx)
+        # If embed_dim is odd, this logic needs adjustment, but typically it's even (128).
+        pe = torch.cat([pe_sin, pe_cos], dim=-1)
+
+        # If embed_dim was not perfectly divisible by the logic above, pad or trim.
+        # With standard even dims (e.g. 128), this matches perfectly.
+        if pe.shape[-1] != self.embed_dim:
+            # Fallback for odd dimensions or mismatches (though unlikely with standard configs)
+            pe = F.pad(pe, (0, self.embed_dim - pe.shape[-1]))
+
+        return pe
+
+
+class ZoneoutBiGRUBlock(nn.Module):
+    """
+    A Bidirectional GRU block with Zoneout regularization.
+    Unrolls the sequence to apply stochastic state updates during training.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        zoneout_prob: float = Config.ZONEOUT_PROB,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.zoneout_prob = zoneout_prob
+
+        # Forward and Backward Cells
+        self.fwd_cell = nn.GRUCell(input_size, hidden_size)
+        self.bwd_cell = nn.GRUCell(input_size, hidden_size)
+
+    def forward(
+        self, x: torch.Tensor, h_0: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input sequence of shape (Batch, Seq_Len, Input_Size).
+            h_0 (torch.Tensor, optional): Initial hidden state (Batch, Hidden_Size * 2).
+
+        Returns:
+            torch.Tensor: Output sequence of shape (Batch, Seq_Len, Hidden_Size * 2).
+        """
+        batch_size, seq_len, _ = x.size()
+
+        # Initialize hidden states
+        if h_0 is None:
+            h_fwd = torch.zeros(
+                batch_size, self.hidden_size, device=x.device, dtype=x.dtype
+            )
+            h_bwd = torch.zeros(
+                batch_size, self.hidden_size, device=x.device, dtype=x.dtype
+            )
+        else:
+            # Assuming h_0 is concatenated [h_fwd, h_bwd]
+            h_fwd = h_0[:, : self.hidden_size]
+            h_bwd = h_0[:, self.hidden_size :]
+
+        outputs_fwd = []
+        outputs_bwd = []
+
+        # Pre-generate masks for efficiency if training
+        # We need masks for every step: (Seq_Len, Batch, Hidden_Size)
+        use_zoneout = self.training and self.zoneout_prob > 0.0
+
+        # Forward Pass
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            h_next = self.fwd_cell(x_t, h_fwd)
+
+            if use_zoneout:
+                # Zoneout: h_t = d_t * h_next + (1 - d_t) * h_prev
+                # d_t ~ Bernoulli(1 - prob) (1 means keep new, 0 means keep old)
+                # We sample a mask where 1 = update, 0 = keep old
+                mask = torch.bernoulli(torch.full_like(h_next, 1.0 - self.zoneout_prob))
+                h_fwd = mask * h_next + (1 - mask) * h_fwd
+            elif self.zoneout_prob > 0.0:
+                # Evaluation: Expectation
+                # h_t = (1 - p) * h_next + p * h_prev
+                h_fwd = (1 - self.zoneout_prob) * h_next + self.zoneout_prob * h_fwd
+            else:
+                # Standard GRU update
+                h_fwd = h_next
+
+            outputs_fwd.append(h_fwd)
+
+        # Backward Pass
+        for t in range(seq_len - 1, -1, -1):
+            x_t = x[:, t, :]
+            h_next = self.bwd_cell(x_t, h_bwd)
+
+            if use_zoneout:
+                mask = torch.bernoulli(torch.full_like(h_next, 1.0 - self.zoneout_prob))
+                h_bwd = mask * h_next + (1 - mask) * h_bwd
+            elif self.zoneout_prob > 0.0:
+                h_bwd = (1 - self.zoneout_prob) * h_next + self.zoneout_prob * h_bwd
+            else:
+                h_bwd = h_next
+
+            outputs_bwd.insert(0, h_bwd)
+
+        # Stack and Concatenate
+        # outputs_fwd: List of (B, H) -> (B, L, H)
+        out_fwd = torch.stack(outputs_fwd, dim=1)
+        out_bwd = torch.stack(outputs_bwd, dim=1)
+
+        # (B, L, 2*H)
+        output = torch.cat([out_fwd, out_bwd], dim=2)
+
+        return output
+=======
+        # Pre-compute the frequency divisors
+        # div_term = 10000^(2i/d_model)
+        # We compute this once and register as buffer
+        # Optimized to use full embed_dim
+        div_term = torch.exp(
+            torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim)
+        )
+        self.register_buffer("div_term", div_term)
+
+    def forward(self, pair_dists: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pair_dists (torch.Tensor): Signed distances of shape (Batch, Seq_Len).
+        Returns:
+            torch.Tensor: Embeddings of shape (Batch, Seq_Len, Embed_Dim).
+        """
+        # pair_dists: (B, L) -> (B, L, 1)
+        x = pair_dists.unsqueeze(-1)
+
+        # scaled_dists: (B, L, D/2)
+        scaled_dists = x * self.div_term
+
+        # Create the encoding
+        pe_sin = torch.sin(scaled_dists)
+        pe_cos = torch.cos(scaled_dists)
+
+        # Concatenate along the last dimension -> (B, L, D)
+        pe = torch.cat([pe_sin, pe_cos], dim=-1)
+
+        return pe
+
+
+class ResidualBiGRUBlock(nn.Module):
+    """
+    Standard Bidirectional GRU block with Inter-Layer Dropout.
+    Replaces Zoneout to improve local feature learning (Cite solution_lesson_node_00076).
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        dropout: float = Config.DROPOUT,
+    ):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input sequence (Batch, Seq_Len, Input_Size).
+        Returns:
+            torch.Tensor: Output sequence (Batch, Seq_Len, Hidden_Size * 2).
+        """
+        # GRU Output: (B, L, 2*H_hidden)
+        # We assume 2*H_hidden matches input_size for the residual stream
+        out, _ = self.gru(x)
+        return self.dropout(out)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.layers import SinusoidalPairingEmbedding, ZoneoutBiGRUBlock, ScalarMixture
+
+
+class ZoneoutWideResBiGRU(nn.Module):
+    """
+    Zoneout-Regularized Wide-Stream Residual BiGRU Model.
+
+    Architecture:
+    1. Multi-Modal Embeddings (Sequence, Loop Type, Pairing Distance)
+    2. Recurrent Stem (BiGRU Projection)
+    3. Stack of Zoneout-Regularized Residual BiGRU Blocks (Pre-LN)
+    4. Scalar Mixture Aggregation
+    5. Linear Output Head
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # =====================================================================
+        # 1. Embeddings
+        # =====================================================================
+        self.embed_dim = Config.EMBED_DIM
+
+        # Atomic Sequence Embedding (A, G, C, U)
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE, self.embed_dim)
+
+        # Predicted Loop Type Embedding (S, M, I, B, H, E, X)
+        self.loop_embed = nn.Embedding(Config.LOOP_TYPES, self.embed_dim)
+
+        # Signed Sinusoidal Pairing Distance Embedding
+        self.pair_embed = SinusoidalPairingEmbedding(self.embed_dim)
+
+        # Total input dimension to the stem
+        # 3 channels * 128 dim = 384
+        self.input_dim = self.embed_dim * 3
+
+        # =====================================================================
+        # 2. Recurrent Stem
+        # =====================================================================
+        self.hidden_dim = Config.HIDDEN_DIM  # 512
+
+        # Projects inputs to the residual stream width W=512
+        # BiGRU: hidden_size = 512 // 2 = 256 per direction
+        self.stem = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # =====================================================================
+        # 3. Backbone: Zoneout-Regularized Residual Blocks
+        # =====================================================================
+        self.num_layers = Config.NUM_LAYERS
+        self.blocks = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(self.num_layers):
+            # Pre-LayerNorm
+            self.norms.append(nn.LayerNorm(self.hidden_dim))
+
+            # Zoneout BiGRU Block
+            # Input size matches hidden_dim (residual stream width)
+            # Hidden size is half of hidden_dim (for bidirectional concat)
+            self.blocks.append(
+                ZoneoutBiGRUBlock(
+                    input_size=self.hidden_dim,
+                    hidden_size=self.hidden_dim // 2,
+                    zoneout_prob=Config.ZONEOUT_PROB,
+                )
+            )
+
+        # =====================================================================
+        # 4. Aggregation
+        # =====================================================================
+        # Aggregates outputs from Stem + 6 Blocks
+        self.mixture = ScalarMixture(num_layers=self.num_layers + 1)
+
+        # =====================================================================
+        # 5. Output Head
+        # =====================================================================
+        self.head = nn.Linear(self.hidden_dim, Config.NUM_TARGETS)
+=======
+from library.layers import SinusoidalPairingEmbedding, ResidualBiGRUBlock, ScalarMixture
+
+
+class WideResBiGRU(nn.Module):
+    """
+    Wide-Stream Residual BiGRU Model.
+    Optimized for RNA degradation prediction using inter-layer dropout and scalar aggregation.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # =====================================================================
+        # 1. Embeddings
+        # =====================================================================
+        self.embed_dim = Config.EMBED_DIM
+
+        # Atomic Sequence Embedding (A, G, C, U)
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE, self.embed_dim)
+
+        # Predicted Loop Type Embedding (S, M, I, B, H, E, X)
+        self.loop_embed = nn.Embedding(Config.LOOP_TYPES, self.embed_dim)
+
+        # Signed Sinusoidal Pairing Distance Embedding
+        self.pair_embed = SinusoidalPairingEmbedding(self.embed_dim)
+
+        # Total input dimension to the stem
+        # 3 channels * 128 dim = 384
+        self.input_dim = self.embed_dim * 3
+
+        # =====================================================================
+        # 2. Recurrent Stem
+        # =====================================================================
+        self.hidden_dim = Config.HIDDEN_DIM  # 384
+
+        # Projects inputs to the residual stream width W
+        # BiGRU: hidden_size = W // 2 per direction
+        self.stem = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # =====================================================================
+        # 3. Backbone: Residual Blocks
+        # =====================================================================
+        self.num_layers = Config.NUM_LAYERS
+        self.blocks = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(self.num_layers):
+            # Pre-LayerNorm
+            self.norms.append(nn.LayerNorm(self.hidden_dim))
+
+            # Residual BiGRU Block
+            # Input size matches hidden_dim (residual stream width)
+            # Hidden size is half of hidden_dim (for bidirectional concat)
+            self.blocks.append(
+                ResidualBiGRUBlock(
+                    input_size=self.hidden_dim,
+                    hidden_size=self.hidden_dim // 2,
+                    dropout=Config.DROPOUT,
+                )
+            )
+
+        # =====================================================================
+        # 4. Aggregation
+        # =====================================================================
+        # Aggregates outputs from Stem + 6 Blocks
+        self.mixture = ScalarMixture(num_layers=self.num_layers + 1)
+
+        # =====================================================================
+        # 5. Output Head
+        # =====================================================================
+        self.head = nn.Linear(self.hidden_dim, Config.NUM_TARGETS)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for norm_layer, block in zip(self.norms, self.blocks):
+            # Pre-LayerNorm: Norm -> Block -> Add
+            # 1. Norm
+            normed_features = norm_layer(current_features)
+
+            # 2. Block (Zoneout BiGRU)
+            block_out = block(normed_features)
+
+            # 3. Residual Connection
+            current_features = current_features + block_out
+=======
+        for norm_layer, block in zip(self.norms, self.blocks):
+            # Pre-LayerNorm: Norm -> Block -> Add
+            # 1. Norm
+            normed_features = norm_layer(current_features)
+
+            # 2. Block (BiGRU + Dropout)
+            block_out = block(normed_features)
+
+            # 3. Residual Connection
+            current_features = current_features + block_out
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ZoneoutWideResBiGRU
+from library.engine import train_model, validate, generate_submission
+
+
+def perform_failure_analysis(model, val_loader, device):
+=======
+from library.model import WideResBiGRU
+from library.engine import train_model, validate, generate_submission
+
+
+def perform_failure_analysis(model, val_loader, device):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = Config.DEVICE
+
+    # Adjust Config for Fast Baseline
+    # 15 epochs is sufficient for convergence on this small dataset
+    Config.EPOCHS = 15
+
+    print(f"Initializing run on {device}...")
+
+    # 2. Data Loading
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # 3. Model Initialization
+    model = ZoneoutWideResBiGRU().to(device)
+
+    # 4. Optimizer and Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+=======
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = Config.DEVICE
+
+    print(f"Initializing run on {device}...")
+
+    # 2. Data Loading
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # 3. Model Initialization
+    model = WideResBiGRU().to(device)
+
+    # 4. Optimizer and Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+>>>>>>> REPLACE
+```

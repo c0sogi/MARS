@@ -1,0 +1,249 @@
+To improve the model's performance, I will implement the following changes based on the provided lessons and analysis:
+
+1.  **Real Background Noise Injection (Cite `solution_lesson_node_00055`)**: The previous solution used synthetic Gaussian noise, which was identified as a cause for performance regression compared to using real environmental noise. I will replace the `WaveformAugment` (Gaussian) with a new `BackgroundNoiseAugment` class in `library/transforms.py`. This class will sample real noise clips from the `_background_noise_` directory, which I will load and concatenate into a GPU buffer in `library/trainer.py`.
+2.  **Optimized SWA Schedule (Cite `solution_lesson_node_00051`, `solution_lesson_node_00048`)**: The previous run used a compressed 15-epoch schedule which likely under-converged before SWA activation. I will extend the training to 25 epochs with SWA starting at epoch 15. This balances the efficiency of SWA with the need for a stable convergence basin.
+3.  **Configuration Cleanup**: I will update `library/config.py` with the new schedule and remove the manual override in `runfile.py` to ensure the optimized settings are used.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # SWA Strategy
+    epochs: int = 40
+    swa_start_epoch: int = 30
+    swa_lr: float = 5e-5  # Constant LR for SWA phase (matches min_lr)
+=======
+    # SWA Strategy
+    epochs: int = 25
+    swa_start_epoch: int = 15
+    swa_lr: float = 5e-5  # Constant LR for SWA phase (matches min_lr)
+>>>>>>> REPLACE
+```
+
+```diff
+library/transforms.py
+<<<<<<< SEARCH
+class WaveformAugment(nn.Module):
+    """
+    Applies additive Gaussian noise to the waveform based on a random SNR.
+    """
+
+    def __init__(
+        self, min_snr_db: float = 10.0, max_snr_db: float = 30.0, p: float = 0.5
+    ):
+        super().__init__()
+        self.min_snr_db = min_snr_db
+        self.max_snr_db = max_snr_db
+        self.p = p
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            waveform: Tensor of shape (Batch, Time)
+        Returns:
+            Noisy waveform: Tensor of shape (Batch, Time)
+        """
+        # Only apply augmentation during training (assuming caller handles mode,
+        # but we check self.training for safety if model.eval() is called)
+        if not self.training:
+            return waveform
+
+        # Apply with probability p
+        if torch.rand(1).item() > self.p:
+            return waveform
+
+        batch_size, time_steps = waveform.shape
+        device = waveform.device
+
+        # Calculate signal power: mean(x^2) along time axis
+        # Shape: (Batch, 1)
+        sig_power = waveform.pow(2).mean(dim=1, keepdim=True)
+
+        # Avoid division by zero for silent signals
+        sig_power = torch.clamp(sig_power, min=1e-9)
+
+        # Generate random SNR values for each sample in the batch
+        snr_db = torch.empty(batch_size, 1, device=device).uniform_(
+            self.min_snr_db, self.max_snr_db
+        )
+
+        # Calculate noise power required
+        # SNR_db = 10 * log10(P_signal / P_noise)
+        # => P_noise = P_signal / 10^(SNR_db / 10)
+        noise_power = sig_power / (10 ** (snr_db / 10))
+
+        # Generate noise
+        # Standard normal distribution N(0, 1)
+        noise = torch.randn_like(waveform)
+
+        # Scale noise to match required power
+        # Expected power of N(0,1) is 1. We multiply by sqrt(target_power).
+        scaled_noise = noise * torch.sqrt(noise_power)
+
+        return waveform + scaled_noise
+=======
+class BackgroundNoiseAugment(nn.Module):
+    """
+    Applies real background noise injection.
+    Cite solution_lesson_node_00055: Data realism beats algorithmic complexity.
+    """
+
+    def __init__(
+        self,
+        noises: torch.Tensor,
+        min_snr_db: float = 10.0,
+        max_snr_db: float = 30.0,
+        p: float = 0.5,
+    ):
+        super().__init__()
+        self.register_buffer("noises", noises)
+        self.min_snr_db = min_snr_db
+        self.max_snr_db = max_snr_db
+        self.p = p
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            waveform: Tensor of shape (Batch, Time)
+        Returns:
+            Noisy waveform: Tensor of shape (Batch, Time)
+        """
+        if not self.training:
+            return waveform
+
+        if torch.rand(1).item() > self.p:
+            return waveform
+
+        batch_size, time_steps = waveform.shape
+        device = waveform.device
+        noise_len = self.noises.shape[0]
+
+        # Select random noise segments
+        max_start = noise_len - time_steps
+        if max_start <= 0:
+            return waveform
+
+        start_indices = torch.randint(0, max_start, (batch_size,), device=device)
+
+        # Vectorized gather: (Batch, 1) + (1, Time) -> (Batch, Time)
+        indices = start_indices.unsqueeze(1) + torch.arange(
+            time_steps, device=device
+        ).unsqueeze(0)
+        noise_clips = self.noises[indices]
+
+        # Calculate powers
+        sig_power = waveform.pow(2).mean(dim=1, keepdim=True)
+        noise_power = noise_clips.pow(2).mean(dim=1, keepdim=True)
+
+        # Avoid div by zero
+        sig_power = torch.clamp(sig_power, min=1e-9)
+        noise_power = torch.clamp(noise_power, min=1e-9)
+
+        # Random SNR
+        snr_db = torch.empty(batch_size, 1, device=device).uniform_(
+            self.min_snr_db, self.max_snr_db
+        )
+
+        # Target noise power
+        target_noise_power = sig_power / (10 ** (snr_db / 10))
+
+        # Scale factor
+        scale = torch.sqrt(target_noise_power / noise_power)
+
+        return waveform + noise_clips * scale
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, update_bn
+import numpy as np
+import pandas as pd
+from library.config import TRAIN_CONFIG, PATH_CONFIG, LABEL_CONFIG, AUDIO_CONFIG
+from library.model import DilatedEfficientNetB2
+from library.transforms import LogMelSpectrogram, WaveformAugment, SpecAugment
+=======
+import os
+import glob
+import torch
+import torch.nn as nn
+import torchaudio
+import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, update_bn
+import numpy as np
+import pandas as pd
+from library.config import TRAIN_CONFIG, PATH_CONFIG, LABEL_CONFIG, AUDIO_CONFIG
+from library.model import DilatedEfficientNetB2
+from library.transforms import LogMelSpectrogram, BackgroundNoiseAugment, SpecAugment
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # GPU Transforms
+        self.log_mel = LogMelSpectrogram(AUDIO_CONFIG).to(self.device)
+        self.wave_aug = WaveformAugment(p=0.5).to(self.device)
+        self.spec_aug = SpecAugment(p=0.5).to(self.device)
+=======
+        # GPU Transforms
+        self.log_mel = LogMelSpectrogram(AUDIO_CONFIG).to(self.device)
+
+        # Load Background Noise for Augmentation (Cite solution_lesson_node_00055)
+        noise_files = glob.glob(
+            os.path.join(
+                PATH_CONFIG.input_root, "train", "audio", "_background_noise_", "*.wav"
+            )
+        )
+        noise_tensors = []
+        for f in noise_files:
+            try:
+                w, sr = torchaudio.load(f)
+                if sr != AUDIO_CONFIG.sample_rate:
+                    w = torchaudio.transforms.Resample(sr, AUDIO_CONFIG.sample_rate)(w)
+                if w.shape[0] > 1:
+                    w = w.mean(dim=0, keepdim=True)
+                noise_tensors.append(w.squeeze(0))
+            except Exception:
+                continue
+
+        if noise_tensors:
+            self.noise_bank = torch.cat(noise_tensors, dim=0).to(self.device)
+        else:
+            self.noise_bank = torch.zeros(16000).to(self.device)
+
+        self.wave_aug = BackgroundNoiseAugment(self.noise_bank, p=0.5).to(self.device)
+        self.spec_aug = SpecAugment(p=0.5).to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration and Setup
+    # Override config for a fast baseline execution
+    TRAIN_CONFIG.epochs = 15
+    TRAIN_CONFIG.swa_start_epoch = 10
+
+    set_seed(TRAIN_CONFIG.seed)
+    device = torch.device(TRAIN_CONFIG.device)
+
+    print(
+        f"Running fast baseline with {TRAIN_CONFIG.epochs} epochs (SWA start: {TRAIN_CONFIG.swa_start_epoch})..."
+    )
+=======
+def main():
+    # 1. Configuration and Setup
+    set_seed(TRAIN_CONFIG.seed)
+    device = torch.device(TRAIN_CONFIG.device)
+
+    print(
+        f"Running training with {TRAIN_CONFIG.epochs} epochs (SWA start: {TRAIN_CONFIG.swa_start_epoch})..."
+    )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,458 @@
+I will optimize the solution by simplifying the architecture and adjusting the training dynamics, citing the provided lessons.
+1.  **Revert to Standard U-Net**: I will remove the Deep Supervision auxiliary heads. Lesson 8 (`solution_lesson_node_00008`) and Lesson 21 (`solution_lesson_node_00021`) suggest that for this task, simpler architectures (like standard U-Net) often outperform complex ones (like FPN or Deep Supervision) which can lead to instability or overfitting on the proxy task.
+2.  **Reduce Batch Size**: I will reduce the batch size from 32 to 16. Lesson 20 (`solution_lesson_node_00020`) highlights the "Iteration Deficit" where increasing batch size without compensating (via more epochs or LR scaling) leads to underfitting. Reverting to 16 ensures sufficient gradient updates.
+3.  **Maintain Regularization**: I will keep `CoarseDropout` (Lesson 4) and `CosineAnnealingLR` (Lesson 23) as they have proven beneficial.
+4.  **Metric Consistency**: I will ensure the loss weights (`SEG_LOSS_WEIGHT=10.0`) are maintained to prioritize the dense task (Lesson 10).
+
+This approach aims to recover the performance of the "Current Best" baseline (~0.49 mAP) by removing the detrimental complexity introduced in `idea_7`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    EXPERIMENT_NAME = "idea_7_deep_sup_resnet18"
+    SEED = 42
+
+    # ==========================
+    # Directories & Paths
+    # ==========================
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    WORKING_DIR = "./working/idea_7"
+=======
+    EXPERIMENT_NAME = "idea_8_optimized_unet"
+    SEED = 42
+
+    # ==========================
+    # Directories & Paths
+    # ==========================
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    WORKING_DIR = "./working/idea_8"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    IMG_SIZE = 512
+    NUM_WORKERS = 12  # Optimized for 12 vCPUs
+    BATCH_SIZE = 32  # Max feasible for A100 with ResNet18
+
+    # Debugging / Development
+=======
+    IMG_SIZE = 512
+    NUM_WORKERS = 12  # Optimized for 12 vCPUs
+    BATCH_SIZE = 16  # Reduced to ensure sufficient iterations (Cite solution_lesson_node_00020)
+
+    # Debugging / Development
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    CLS_LOSS_WEIGHT = 1.0
+    SEG_LOSS_WEIGHT = 10.0
+
+    # Deep Supervision Weights for Segmentation Heads
+    # L_seg = weights[0]*Final + weights[1]*Aux1(1/2) + weights[2]*Aux2(1/4)
+    DEEP_SUP_WEIGHTS = [1.0, 0.5, 0.25]
+
+    # ==========================
+    # Inference
+=======
+    CLS_LOSS_WEIGHT = 1.0
+    SEG_LOSS_WEIGHT = 10.0
+
+    # ==========================
+    # Inference
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DeepSupervisedResNet18UNet(nn.Module):
+    """
+    ResNet18 Encoder + U-Net Decoder with Deep Supervision.
+
+    Outputs:
+        - logit_cls: Study-level classification (N, 4)
+        - logit_seg_final: Segmentation mask at full resolution (N, 1, H, W)
+        - logit_seg_aux1: Segmentation mask at 1/2 resolution (N, 1, H/2, W/2)
+        - logit_seg_aux2: Segmentation mask at 1/4 resolution (N, 1, H/4, W/4)
+    """
+
+    def __init__(self, pretrained=Config.PRETRAINED):
+        super(DeepSupervisedResNet18UNet, self).__init__()
+
+        # 1. Encoder (ResNet18)
+        # ---------------------
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        resnet = models.resnet18(weights=weights)
+
+        # Extract layers
+        # conv1 output is 64 channels, stride 2 (H/2)
+        self.encoder_conv1 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
+
+        # maxpool stride 2 -> H/4
+        self.encoder_maxpool = resnet.maxpool
+
+        # layer1: 64 channels, H/4
+        self.encoder_layer1 = resnet.layer1
+        # layer2: 128 channels, H/8
+        self.encoder_layer2 = resnet.layer2
+        # layer3: 256 channels, H/16
+        self.encoder_layer3 = resnet.layer3
+        # layer4: 512 channels, H/32
+        self.encoder_layer4 = resnet.layer4
+
+        # 2. Decoder
+        # ----------
+        # d4: Up(e4) + e3 -> (512 + 256) -> 256. Res: H/16
+        self.decoder4 = DecoderBlock(
+            in_channels=512, skip_channels=256, out_channels=256
+        )
+
+        # d3: Up(d4) + e2 -> (256 + 128) -> 128. Res: H/8
+        self.decoder3 = DecoderBlock(
+            in_channels=256, skip_channels=128, out_channels=128
+        )
+
+        # d2: Up(d3) + e1 -> (128 + 64) -> 64. Res: H/4
+        self.decoder2 = DecoderBlock(in_channels=128, skip_channels=64, out_channels=64)
+
+        # d1: Up(d2) + e0 -> (64 + 64) -> 32. Res: H/2
+        self.decoder1 = DecoderBlock(in_channels=64, skip_channels=64, out_channels=32)
+
+        # d0: Up(d1) -> (32 + 0) -> 16. Res: H
+        # Final upsample block to reach full resolution
+        self.decoder0 = DecoderBlock(in_channels=32, skip_channels=0, out_channels=16)
+
+        # 3. Heads
+        # --------
+
+        # Classification Head (Study Level)
+        # Attached to the bottleneck (e4)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, Config.NUM_STUDY_CLASSES)
+
+        # Segmentation Heads (Image Level)
+        # Final resolution (H, W) - Attached to decoder0 output
+        self.seg_head_final = nn.Conv2d(16, 1, kernel_size=1)
+
+        # Aux Head 1 (H/2, W/2) - Attached to decoder1 output
+        self.seg_head_aux1 = nn.Conv2d(32, 1, kernel_size=1)
+
+        # Aux Head 2 (H/4, W/4) - Attached to decoder2 output
+        self.seg_head_aux2 = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        # -------
+        e0 = self.encoder_conv1(x)  # (B, 64, H/2, W/2)
+        x_mp = self.encoder_maxpool(e0)
+        e1 = self.encoder_layer1(x_mp)  # (B, 64, H/4, W/4)
+        e2 = self.encoder_layer2(e1)  # (B, 128, H/8, W/8)
+        e3 = self.encoder_layer3(e2)  # (B, 256, H/16, W/16)
+        e4 = self.encoder_layer4(e3)  # (B, 512, H/32, W/32)
+
+        # Classification Branch
+        # ---------------------
+        cls_feat = self.avgpool(e4)
+        cls_feat = torch.flatten(cls_feat, 1)
+        logit_cls = self.fc(cls_feat)
+
+        # Decoder Branch
+        # --------------
+        d4 = self.decoder4(e4, e3)  # (B, 256, H/16, W/16)
+        d3 = self.decoder3(d4, e2)  # (B, 128, H/8, W/8)
+
+        d2 = self.decoder2(d3, e1)  # (B, 64, H/4, W/4)
+        logit_seg_aux2 = self.seg_head_aux2(d2)  # Aux Head 2 (1/4 res)
+
+        d1 = self.decoder1(d2, e0)  # (B, 32, H/2, W/2)
+        logit_seg_aux1 = self.seg_head_aux1(d1)  # Aux Head 1 (1/2 res)
+
+        d0 = self.decoder0(d1)  # (B, 16, H, W)
+        logit_seg_final = self.seg_head_final(d0)  # Final Head (Full res)
+
+        return logit_cls, logit_seg_final, logit_seg_aux1, logit_seg_aux2
+=======
+class ResNet18UNet(nn.Module):
+    """
+    Standard ResNet18 Encoder + U-Net Decoder.
+    Simplified to remove Deep Supervision (Cite solution_lesson_node_00008, solution_lesson_node_00021).
+
+    Outputs:
+        - logit_cls: Study-level classification (N, 4)
+        - logit_seg: Segmentation mask at full resolution (N, 1, H, W)
+    """
+
+    def __init__(self, pretrained=Config.PRETRAINED):
+        super(ResNet18UNet, self).__init__()
+
+        # 1. Encoder (ResNet18)
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        resnet = models.resnet18(weights=weights)
+
+        self.encoder_conv1 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
+        self.encoder_maxpool = resnet.maxpool
+        self.encoder_layer1 = resnet.layer1
+        self.encoder_layer2 = resnet.layer2
+        self.encoder_layer3 = resnet.layer3
+        self.encoder_layer4 = resnet.layer4
+
+        # 2. Decoder
+        self.decoder4 = DecoderBlock(
+            in_channels=512, skip_channels=256, out_channels=256
+        )
+        self.decoder3 = DecoderBlock(
+            in_channels=256, skip_channels=128, out_channels=128
+        )
+        self.decoder2 = DecoderBlock(in_channels=128, skip_channels=64, out_channels=64)
+        self.decoder1 = DecoderBlock(in_channels=64, skip_channels=64, out_channels=32)
+        self.decoder0 = DecoderBlock(in_channels=32, skip_channels=0, out_channels=16)
+
+        # 3. Heads
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, Config.NUM_STUDY_CLASSES)
+        self.seg_head = nn.Conv2d(16, 1, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        e0 = self.encoder_conv1(x)  # (B, 64, H/2, W/2)
+        x_mp = self.encoder_maxpool(e0)
+        e1 = self.encoder_layer1(x_mp)  # (B, 64, H/4, W/4)
+        e2 = self.encoder_layer2(e1)  # (B, 128, H/8, W/8)
+        e3 = self.encoder_layer3(e2)  # (B, 256, H/16, W/16)
+        e4 = self.encoder_layer4(e3)  # (B, 512, H/32, W/32)
+
+        # Classification Branch
+        cls_feat = self.avgpool(e4)
+        cls_feat = torch.flatten(cls_feat, 1)
+        logit_cls = self.fc(cls_feat)
+
+        # Decoder Branch
+        d4 = self.decoder4(e4, e3)
+        d3 = self.decoder3(d4, e2)
+        d2 = self.decoder2(d3, e1)
+        d1 = self.decoder1(d2, e0)
+        d0 = self.decoder0(d1)
+        logit_seg = self.seg_head(d0)
+
+        return logit_cls, logit_seg
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Forward pass
+        # Outputs: logit_cls, logit_seg_final, logit_seg_aux1, logit_seg_aux2
+        logit_cls, logit_seg_final, logit_seg_aux1, logit_seg_aux2 = model(images)
+
+        # -------------------------
+        # 1. Classification Loss
+        # -------------------------
+        # labels are one-hot (N, 4), CrossEntropy expects class indices (N,) or probabilities
+        # Since we have one-hot, we take argmax for target indices
+        target_cls = torch.argmax(labels, dim=1)
+        loss_cls = criterion_cls(logit_cls, target_cls)
+
+        # -------------------------
+        # 2. Segmentation Loss (Deep Supervision)
+        # -------------------------
+        # Final Head (Full Res)
+        loss_seg_final = criterion_seg(logit_seg_final, masks)
+
+        # Aux Head 1 (1/2 Res)
+        # Downsample GT mask to match output
+        target_aux1 = F.interpolate(masks, scale_factor=0.5, mode="nearest")
+        loss_seg_aux1 = criterion_seg(logit_seg_aux1, target_aux1)
+
+        # Aux Head 2 (1/4 Res)
+        # Downsample GT mask to match output
+        target_aux2 = F.interpolate(masks, scale_factor=0.25, mode="nearest")
+        loss_seg_aux2 = criterion_seg(logit_seg_aux2, target_aux2)
+
+        # Weighted Sum of Seg Losses
+        weights = Config.DEEP_SUP_WEIGHTS
+        loss_seg = (
+            weights[0] * loss_seg_final
+            + weights[1] * loss_seg_aux1
+            + weights[2] * loss_seg_aux2
+        )
+=======
+        # Forward pass
+        logit_cls, logit_seg = model(images)
+
+        # -------------------------
+        # 1. Classification Loss
+        # -------------------------
+        target_cls = torch.argmax(labels, dim=1)
+        loss_cls = criterion_cls(logit_cls, target_cls)
+
+        # -------------------------
+        # 2. Segmentation Loss
+        # -------------------------
+        loss_seg = criterion_seg(logit_seg, masks)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # Forward
+            logit_cls, logit_seg_final, logit_seg_aux1, logit_seg_aux2 = model(images)
+
+            # -------------------------
+            # Loss Calculation (for monitoring)
+            # -------------------------
+            target_cls = torch.argmax(labels, dim=1)
+            loss_cls = criterion_cls(logit_cls, target_cls)
+
+            loss_seg_final = criterion_seg(logit_seg_final, masks)
+            target_aux1 = F.interpolate(masks, scale_factor=0.5, mode="nearest")
+            loss_seg_aux1 = criterion_seg(logit_seg_aux1, target_aux1)
+            target_aux2 = F.interpolate(masks, scale_factor=0.25, mode="nearest")
+            loss_seg_aux2 = criterion_seg(logit_seg_aux2, target_aux2)
+
+            weights = Config.DEEP_SUP_WEIGHTS
+            loss_seg = (
+                weights[0] * loss_seg_final
+                + weights[1] * loss_seg_aux1
+                + weights[2] * loss_seg_aux2
+            )
+
+            loss_total = (
+                Config.CLS_LOSS_WEIGHT * loss_cls + Config.SEG_LOSS_WEIGHT * loss_seg
+            )
+
+            loss_meter.update(loss_total.item(), batch_size)
+
+            # -------------------------
+            # Study Accuracy
+            # -------------------------
+            preds_cls = torch.argmax(logit_cls, dim=1)
+            correct_studies += (preds_cls == target_cls).sum().item()
+            total_studies += batch_size
+
+            # -------------------------
+            # Image mAP Prep
+            # -------------------------
+            # Sigmoid on final mask
+            probs_seg = torch.sigmoid(logit_seg_final)  # (B, 1, H, W)
+=======
+            # Forward
+            logit_cls, logit_seg = model(images)
+
+            # -------------------------
+            # Loss Calculation
+            # -------------------------
+            target_cls = torch.argmax(labels, dim=1)
+            loss_cls = criterion_cls(logit_cls, target_cls)
+            loss_seg = criterion_seg(logit_seg, masks)
+
+            loss_total = (
+                Config.CLS_LOSS_WEIGHT * loss_cls + Config.SEG_LOSS_WEIGHT * loss_seg
+            )
+
+            loss_meter.update(loss_total.item(), batch_size)
+
+            # -------------------------
+            # Study Accuracy
+            # -------------------------
+            preds_cls = torch.argmax(logit_cls, dim=1)
+            correct_studies += (preds_cls == target_cls).sum().item()
+            total_studies += batch_size
+
+            # -------------------------
+            # Image mAP Prep
+            # -------------------------
+            probs_seg = torch.sigmoid(logit_seg)  # (B, 1, H, W)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DeepSupervisedResNet18UNet
+from library.engine import train_one_epoch, valid_one_epoch
+from library.utils import get_bbox_from_mask
+
+
+def run():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # Create submission directory
+    os.makedirs("./submission", exist_ok=True)
+
+    print(f"Device: {device}")
+
+    # 2. Data Loading
+    # Using load_cached_data=True to speed up if available
+    train_loader, val_loader, test_loader = get_loaders(
+        load_cached_data=True,
+        debug=Config.DEBUG,
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # 3. Model
+    model = DeepSupervisedResNet18UNet(pretrained=Config.PRETRAINED)
+    model = model.to(device)
+=======
+from library.model import ResNet18UNet
+from library.engine import train_one_epoch, valid_one_epoch
+from library.utils import get_bbox_from_mask
+
+
+def run():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # Create submission directory
+    os.makedirs("./submission", exist_ok=True)
+
+    print(f"Device: {device}")
+
+    # 2. Data Loading
+    # Using load_cached_data=True to speed up if available
+    train_loader, val_loader, test_loader = get_loaders(
+        load_cached_data=True,
+        debug=Config.DEBUG,
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # 3. Model
+    model = ResNet18UNet(pretrained=Config.PRETRAINED)
+    model = model.to(device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # Forward
+            logit_cls, _, _, _ = model(images)
+
+            # Calculate classification loss per sample
+=======
+            # Forward
+            logit_cls, _ = model(images)
+
+            # Calculate classification loss per sample
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                # Original Forward
+                logit_cls, logit_seg, _, _ = model(images)
+                prob_cls = torch.softmax(logit_cls, dim=1)
+                prob_seg = torch.sigmoid(logit_seg)
+
+                # TTA: Horizontal Flip
+                images_flipped = torch.flip(images, dims=[3])
+                logit_cls_tta, logit_seg_tta, _, _ = model(images_flipped)
+                prob_cls_tta = torch.softmax(logit_cls_tta, dim=1)
+                prob_seg_tta = torch.sigmoid(logit_seg_tta)
+=======
+                # Original Forward
+                logit_cls, logit_seg = model(images)
+                prob_cls = torch.softmax(logit_cls, dim=1)
+                prob_seg = torch.sigmoid(logit_seg)
+
+                # TTA: Horizontal Flip
+                images_flipped = torch.flip(images, dims=[3])
+                logit_cls_tta, logit_seg_tta = model(images_flipped)
+                prob_cls_tta = torch.softmax(logit_cls_tta, dim=1)
+                prob_seg_tta = torch.sigmoid(logit_seg_tta)
+>>>>>>> REPLACE
+```

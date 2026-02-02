@@ -1,0 +1,311 @@
+I will optimize the solution by implementing three key improvements derived from the provided lessons:
+
+1.  **Metric-Aligned Checkpointing (Cite solution_lesson_node_00010):** I will replace the 2D Dice-based validation with a full 3D metric evaluation (`validate_3d`) during training. This function will reconstruct 3D volumes, apply Connected Component Analysis (CCA), and calculate the exact competition score (0.4 * Dice + 0.6 * (1 - Hausdorff)). This ensures the model is selected based on the actual objective, avoiding models that maximize pixel overlap at the cost of creating distance-penalizing outliers.
+2.  **Throughput & Stability Optimization (Cite solution_lesson_node_00007, solution_lesson_node_00009):** I will increase the `BATCH_SIZE` to 64 to stabilize gradients and maximize GPU utilization. I will also refactor the training loop to use a modular `train_one_epoch` function while ensuring the `GradScaler` is instantiated *outside* the loop, preventing the state reset bug identified in the lessons.
+3.  **Loss Function Tuning for Precision (Cite solution_lesson_node_00010):** To further mitigate the "outlier" problem that degrades the Hausdorff score, I will adjust the Tversky Loss parameters. I will increase `TVERSKY_ALPHA` (False Positive penalty) from 0.3 to 0.7 and decrease `TVERSKY_BETA` (False Negative penalty) to 0.3. This prioritizes precision, discouraging the model from predicting noise far from the organ boundaries.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BATCH_SIZE = 32
+    EPOCHS = 20
+
+    # Optimizer settings
+=======
+    BATCH_SIZE = 64
+    EPOCHS = 20
+
+    # Optimizer settings
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    TVERSKY_ALPHA = 0.3  # False Positive penalty
+    TVERSKY_BETA = 0.7  # False Negative penalty (higher to recall small organs)
+=======
+    TVERSKY_ALPHA = 0.7  # False Positive penalty (higher to reduce outliers for Hausdorff)
+    TVERSKY_BETA = 0.3  # False Negative penalty
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.utils import set_seed, MetricMonitor, dice_coef
+from library.loss import BCETverskyLoss
+from library.model import UNetEfficientNet
+from library.data import UWDataset, get_transforms, prepare_data
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch):
+    """
+    Handles the training of a single epoch.
+    """
+    model.train()
+    metric_monitor = MetricMonitor()
+
+    # Iterate over batches
+    for i, (images, masks) in enumerate(train_loader):
+        images = images.to(device, dtype=torch.float32)
+        masks = masks.to(device, dtype=torch.float32)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        y_pred = model(images)
+
+        # Compute loss
+        loss = criterion(y_pred, masks)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Update metrics
+        metric_monitor.update("Loss", loss.item())
+
+    return metric_monitor.get("Loss")
+=======
+from collections import defaultdict
+from library.utils import set_seed, MetricMonitor, dice_coef, hausdorff_3d, post_process_3d
+from library.loss import BCETverskyLoss
+from library.model import UNetEfficientNet
+from library.data import UWDataset, get_transforms, prepare_data
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch):
+    """
+    Handles the training of a single epoch using AMP.
+    Cite solution_lesson_node_00009: Scaler passed as argument to persist state.
+    """
+    model.train()
+    metric_monitor = MetricMonitor()
+
+    for i, (images, masks) in enumerate(train_loader):
+        images = images.to(device, dtype=torch.float32)
+        masks = masks.to(device, dtype=torch.float32)
+
+        optimizer.zero_grad()
+
+        # Forward pass with AMP
+        with autocast():
+            y_pred = model(images)
+            loss = criterion(y_pred, masks)
+
+        # Backward pass with Scaler
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # Update metrics
+        metric_monitor.update("Loss", loss.item())
+
+    return metric_monitor.get("Loss")
+
+
+def validate_3d(model, val_loader, df_val, device):
+    """
+    Evaluates the model using the competition metric (3D Dice + Hausdorff).
+    Cite solution_lesson_node_00010: Metric-aware validation.
+    """
+    model.eval()
+    results = defaultdict(lambda: {"slice_nums": [], "preds": [], "gts": []})
+    
+    # Track current index in dataframe
+    current_idx = 0
+    
+    with torch.no_grad():
+        for images, masks in val_loader:
+            images = images.to(device, dtype=torch.float32)
+            # masks: (B, C, H, W)
+            
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+            preds = (probs > Config.PRED_THR).float().cpu().numpy()
+            gts = masks.cpu().numpy()
+            
+            batch_size = images.size(0)
+            batch_rows = df_val.iloc[current_idx : current_idx + batch_size]
+            current_idx += batch_size
+            
+            for pred, gt, (_, row) in zip(preds, gts, batch_rows.iterrows()):
+                case_day = f"{row['case']}_{row['day']}"
+                results[case_day]["slice_nums"].append(int(row["slice"]))
+                results[case_day]["preds"].append(pred)
+                results[case_day]["gts"].append(gt)
+
+    dice_scores = []
+    hausdorff_scores = []
+    
+    for case_day, data in results.items():
+        sorted_indices = np.argsort(data["slice_nums"])
+        vol_pred = np.stack(data["preds"])[sorted_indices]
+        vol_gt = np.stack(data["gts"])[sorted_indices]
+        
+        # (D, C, H, W) -> (C, D, H, W)
+        vol_pred = vol_pred.transpose(1, 0, 2, 3)
+        vol_gt = vol_gt.transpose(1, 0, 2, 3)
+        
+        for c in range(Config.NUM_CLASSES):
+            p = vol_pred[c]
+            g = vol_gt[c]
+            
+            # Apply 3D Post-Processing (CCA)
+            # Cite solution_lesson_node_00005
+            p = post_process_3d(p)
+            
+            dice_scores.append(dice_coef(g, p))
+            hausdorff_scores.append(hausdorff_3d(g, p))
+            
+    mean_dice = np.mean(dice_scores)
+    mean_hausdorff = np.mean(hausdorff_scores)
+    
+    # Score = 0.4 * Dice + 0.6 * (1 - Hausdorff)
+    score = 0.4 * mean_dice + 0.6 * (1.0 - mean_hausdorff)
+    
+    return score, mean_dice, mean_hausdorff
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 7. Training Loop
+    best_dice = -np.inf
+    best_epoch = -1
+    patience = 5  # Early stopping patience
+    patience_counter = 0
+
+    print("\nStarting Training...")
+
+    for epoch in range(1, Config.EPOCHS + 1):
+        start_time = time.time()
+
+        # Train
+        # Inline train_one_epoch logic to support AMP
+        model.train()
+        metric_monitor = MetricMonitor()
+
+        for i, (images, masks) in enumerate(train_loader):
+            images = images.to(device, dtype=torch.float32)
+            masks = masks.to(device, dtype=torch.float32)
+
+            optimizer.zero_grad()
+
+            # Forward pass with AMP
+            with autocast():
+                y_pred = model(images)
+                loss = criterion(y_pred, masks)
+
+            # Backward pass with Scaler
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Update metrics
+            metric_monitor.update("Loss", loss.item())
+
+        train_loss = metric_monitor.get("Loss")
+
+        # Validate
+        val_loss, val_dice = validate(model, val_loader, criterion, device)
+
+        # Step Scheduler
+        scheduler.step()
+
+        elapsed = time.time() - start_time
+
+        # Logging
+        print(
+            f"Epoch {epoch}/{Config.EPOCHS} | Time: {elapsed:.0f}s | "
+            f"Train Loss: {train_loss:.10f} | "
+            f"Val Loss: {val_loss:.10f} | Val Dice: {val_dice:.10f}"
+        )
+
+        # Model Checkpointing
+        if val_dice > best_dice:
+            print(
+                f"Validation Dice Improved ({best_dice:.6f} ---> {val_dice:.6f}). Saving model..."
+            )
+            best_dice = val_dice
+            best_epoch = epoch
+            torch.save(model.state_dict(), Config.CHECKPOINT_PATH)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+        # Early Stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch}.")
+            break
+
+    print(
+        f"\nTraining Complete. Best Validation Dice: {best_dice:.10f} at Epoch {best_epoch}"
+    )
+=======
+    # 7. Training Loop
+    best_score = -np.inf
+    best_epoch = -1
+    patience = 5  # Early stopping patience
+    patience_counter = 0
+
+    print("\nStarting Training...")
+
+    for epoch in range(1, Config.EPOCHS + 1):
+        start_time = time.time()
+
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device, epoch
+        )
+
+        # Validate (Loss and 2D Dice)
+        val_loss, val_dice_2d = validate(model, val_loader, criterion, device)
+        
+        # Validate (3D Metric)
+        val_score, val_dice_3d, val_hausdorff = validate_3d(model, val_loader, df_val, device)
+
+        # Step Scheduler
+        scheduler.step()
+
+        elapsed = time.time() - start_time
+
+        # Logging
+        print(
+            f"Epoch {epoch}/{Config.EPOCHS} | Time: {elapsed:.0f}s | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"2D Dice: {val_dice_2d:.4f} | 3D Dice: {val_dice_3d:.4f} | "
+            f"3D Hausdorff: {val_hausdorff:.4f} | Score: {val_score:.4f}"
+        )
+
+        # Model Checkpointing based on Competition Metric
+        if val_score > best_score:
+            print(
+                f"Validation Score Improved ({best_score:.6f} ---> {val_score:.6f}). Saving model..."
+            )
+            best_score = val_score
+            best_epoch = epoch
+            torch.save(model.state_dict(), Config.CHECKPOINT_PATH)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+        # Early Stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch}.")
+            break
+
+    print(
+        f"\nTraining Complete. Best Validation Score: {best_score:.6f} at Epoch {best_epoch}"
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 6. Submission
+    THRESHOLD = 0.443941
+    if final_score > THRESHOLD:
+=======
+    # 6. Submission
+    THRESHOLD = 0.448050
+    if final_score > THRESHOLD:
+>>>>>>> REPLACE
+```

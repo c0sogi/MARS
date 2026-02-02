@@ -1,0 +1,602 @@
+The strategy involves transitioning from the baseline frozen Bi-Encoder to a fine-tuned **Cross-Encoder** architecture. As implied by Lesson 2 (Cite solution_lesson_node_00002), while Bi-Encoders are efficient, Cross-Encoders capture deeper semantic signals by allowing the attention mechanism to process the anchor and target tokens simultaneously. I will replace the `sentence-transformers/all-MiniLM-L6-v2` model with `microsoft/deberta-v3-small`, a robust model for NLU tasks. The implementation will include a custom `PatentDataset` for tokenizing pairs (anchor+context, target) and a `CrossEncoderModel` class with a training loop using mixed precision (AMP) to ensure efficiency on the A100 GPU.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- Model Configuration ---
+    # Pre-trained Sentence Transformer backbone
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Text processing
+    MAX_LENGTH = 128  # Max token length for the tokenizer
+
+    # --- Compute Configuration ---
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    # Batch size for generating embeddings (inference mode)
+    BATCH_SIZE = 128
+    NUM_WORKERS = 4
+
+    # --- Training/Algorithm Hyperparameters ---
+    # Regularization strength for the Ridge Regression head
+    # Higher values specify stronger regularization.
+    RIDGE_ALPHA = 1.0
+=======
+    # --- Model Configuration ---
+    # Pre-trained Transformer backbone (Cross-Encoder)
+    MODEL_NAME = "microsoft/deberta-v3-small"
+
+    # Text processing
+    MAX_LENGTH = 128  # Max token length for the tokenizer
+
+    # --- Compute Configuration ---
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NUM_WORKERS = 2
+
+    # --- Training/Algorithm Hyperparameters ---
+    TRAIN_BATCH_SIZE = 32
+    VAL_BATCH_SIZE = 64
+    EPOCHS = 4
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    WARMUP_RATIO = 0.1
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_manager.py
+<<<<<<< SEARCH
+import os
+import pandas as pd
+from library.config import Config
+
+
+def load_csv(file_path: str) -> pd.DataFrame:
+    """
+    Reads a CSV file into a pandas DataFrame.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    return pd.read_csv(file_path)
+
+
+def preprocess_inputs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Formats the text data according to the model requirements.
+
+    Logic:
+    1. Concatenates 'anchor' and 'context' with ' [SEP] ' separator.
+    2. Renames columns to 'anchor_input' and 'target_input' for clarity.
+    3. Retains 'id' and 'score' (if present).
+    """
+    df_processed = df.copy()
+
+    # Concatenate anchor and context
+    # We use " [SEP] " as a separator to indicate the boundary to the tokenizer
+    df_processed["anchor_input"] = (
+        df_processed["anchor"].astype(str)
+        + " [SEP] "
+        + df_processed["context"].astype(str)
+    )
+
+    # Target remains as is, but we rename it for consistency
+    df_processed["target_input"] = df_processed["target"].astype(str)
+
+    # Select relevant columns
+    cols_to_keep = ["id", "anchor_input", "target_input", "anchor", "target", "context"]
+    if "score" in df_processed.columns:
+        cols_to_keep.append("score")
+
+    return df_processed[cols_to_keep]
+=======
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from library.config import Config
+
+
+def load_csv(file_path: str) -> pd.DataFrame:
+    """
+    Reads a CSV file into a pandas DataFrame.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found at: {file_path}")
+    return pd.read_csv(file_path)
+
+
+def preprocess_inputs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Formats the text data according to the model requirements.
+    
+    Logic:
+    1. Concatenates 'context' and 'anchor' with a space.
+       Context (domain) provides scope for the anchor.
+    2. Renames columns to 'anchor_input' and 'target_input'.
+    """
+    df_processed = df.copy()
+
+    # Combine context and anchor. 
+    # E.g., "A47 abatement"
+    df_processed["anchor_input"] = (
+        df_processed["context"].astype(str)
+        + " "
+        + df_processed["anchor"].astype(str)
+    )
+
+    df_processed["target_input"] = df_processed["target"].astype(str)
+
+    cols_to_keep = ["id", "anchor_input", "target_input", "anchor", "target", "context"]
+    if "score" in df_processed.columns:
+        cols_to_keep.append("score")
+
+    return df_processed[cols_to_keep]
+
+
+class PatentDataset(Dataset):
+    """
+    PyTorch Dataset for the Phrase Similarity Task.
+    Tokenizes pairs of (anchor_input, target_input).
+    """
+    def __init__(self, df, tokenizer, max_len=128, is_test=False):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.is_test = is_test
+        
+        self.anchors = df["anchor_input"].values
+        self.targets = df["target_input"].values
+        
+        if not is_test:
+            self.scores = df["score"].values
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        text1 = str(self.anchors[idx])
+        text2 = str(self.targets[idx])
+
+        # Tokenize the pair
+        encoding = self.tokenizer(
+            text1,
+            text2,
+            truncation=True,
+            max_length=self.max_len,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
+        item = {
+            "input_ids": encoding["input_ids"].flatten(),
+            "attention_mask": encoding["attention_mask"].flatten(),
+        }
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.scores[idx], dtype=torch.float)
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+from library.config import Config
+from library.utils import compute_pearson_correlation
+
+
+class SimilarityRegressor:
+    """
+    Implements the Linear Regression Head on top of frozen embeddings.
+    Uses Ridge Regression to predict similarity scores based on
+    concatenated embeddings and their absolute difference.
+    """
+
+    def __init__(self):
+        """
+        Initializes the Ridge regressor with parameters from Config.
+        """
+        self.alpha = Config.RIDGE_ALPHA
+        self.random_state = Config.SEED
+        self.model = Ridge(alpha=self.alpha, random_state=self.random_state)
+
+    def _construct_features(self, anchors, targets):
+        """
+        Constructs the feature vector for the linear model.
+        Features: Concatenation of [anchor_embedding, target_embedding, |anchor - target|].
+
+        Args:
+            anchors (np.ndarray): Anchor embeddings of shape (N, D).
+            targets (np.ndarray): Target embeddings of shape (N, D).
+
+        Returns:
+            np.ndarray: Combined features of shape (N, 3*D).
+        """
+        # Calculate element-wise absolute difference
+        diff = np.abs(anchors - targets)
+
+        # Concatenate u, v, and |u-v|
+        features = np.concatenate([anchors, targets, diff], axis=1)
+        return features
+
+    def fit(
+        self,
+        train_anchors,
+        train_targets,
+        train_scores,
+        val_anchors=None,
+        val_targets=None,
+        val_scores=None,
+    ):
+        """
+        Trains the Ridge regression model.
+
+        Args:
+            train_anchors (np.ndarray): Training anchor embeddings.
+            train_targets (np.ndarray): Training target embeddings.
+            train_scores (np.ndarray): Training target scores.
+            val_anchors (np.ndarray, optional): Validation anchor embeddings.
+            val_targets (np.ndarray, optional): Validation target embeddings.
+            val_scores (np.ndarray, optional): Validation target scores.
+        """
+        # Construct training features
+        X_train = self._construct_features(train_anchors, train_targets)
+
+        # Train the model
+        self.model.fit(X_train, train_scores)
+
+        # Evaluate on Training Data
+        train_preds = self.predict(train_anchors, train_targets)
+        train_corr = compute_pearson_correlation(train_scores, train_preds)
+        print(f"Training Pearson Correlation: {train_corr}")
+
+        # Evaluate on Validation Data (if provided)
+        if (
+            val_anchors is not None
+            and val_targets is not None
+            and val_scores is not None
+        ):
+            val_preds = self.predict(val_anchors, val_targets)
+            val_corr = compute_pearson_correlation(val_scores, val_preds)
+            print(f"Validation Pearson Correlation: {val_corr}")
+
+    def predict(self, anchors, targets):
+        """
+        Generates similarity score predictions.
+
+        Args:
+            anchors (np.ndarray): Anchor embeddings.
+            targets (np.ndarray): Target embeddings.
+
+        Returns:
+            np.ndarray: Predicted scores clipped to [0, 1].
+        """
+        X = self._construct_features(anchors, targets)
+        preds = self.model.predict(X)
+
+        # Clip predictions to valid range [0, 1]
+        return np.clip(preds, 0.0, 1.0)
+
+
+def generate_submission(model, test_df, test_anchors, test_targets):
+    """
+    Generates predictions for the test set and saves them to the submission file.
+
+    Args:
+        model (SimilarityRegressor): The trained model instance.
+        test_df (pd.DataFrame): The test dataframe containing 'id'.
+        test_anchors (np.ndarray): Test anchor embeddings.
+        test_targets (np.ndarray): Test target embeddings.
+    """
+    # Generate predictions
+    preds = model.predict(test_anchors, test_targets)
+
+    # Create submission DataFrame
+    submission = pd.DataFrame({"id": test_df["id"], "score": preds})
+
+    # Ensure output directory exists (handled by Config setup, but good practice)
+    # Config.SUBMISSION_FILE includes the directory path
+
+    # Save to CSV
+    submission.to_csv(Config.SUBMISSION_FILE, index=False)
+=======
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
+from tqdm import tqdm
+from library.config import Config
+from library.data_manager import PatentDataset
+from library.utils import compute_pearson_correlation
+
+
+class CrossEncoderModel:
+    """
+    Implements a Cross-Encoder model using a pre-trained Transformer.
+    The model takes pairs of (anchor, target) and predicts a similarity score.
+    Cite solution_lesson_node_00002: Moving from Bi-Encoder to Cross-Encoder to capture deeper signal.
+    """
+
+    def __init__(self):
+        self.device = Config.DEVICE
+        self.tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            Config.MODEL_NAME, num_labels=1
+        )
+        self.model.to(self.device)
+
+    def fit(self, train_df, val_df):
+        """
+        Fine-tunes the transformer model.
+        """
+        # Prepare DataLoaders
+        train_dataset = PatentDataset(train_df, self.tokenizer, Config.MAX_LENGTH)
+        val_dataset = PatentDataset(val_df, self.tokenizer, Config.MAX_LENGTH)
+
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=Config.TRAIN_BATCH_SIZE, 
+            shuffle=True, 
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=Config.VAL_BATCH_SIZE, 
+            shuffle=False, 
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
+
+        # Optimization
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=Config.LEARNING_RATE, 
+            weight_decay=Config.WEIGHT_DECAY
+        )
+        
+        num_training_steps = len(train_loader) * Config.EPOCHS
+        num_warmup_steps = int(num_training_steps * Config.WARMUP_RATIO)
+        
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=num_warmup_steps, 
+            num_training_steps=num_training_steps
+        )
+        
+        loss_fn = nn.MSELoss()
+        scaler = torch.cuda.amp.GradScaler()
+
+        print(f"Starting training for {Config.EPOCHS} epochs...")
+        
+        best_val_corr = -1.0
+        
+        for epoch in range(Config.EPOCHS):
+            self.model.train()
+            train_loss = 0
+            
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.EPOCHS}", leave=False):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                optimizer.zero_grad()
+
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits.squeeze(-1)
+                    loss = loss_fn(logits, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                train_loss += loss.item()
+
+            avg_train_loss = train_loss / len(train_loader)
+            
+            # Validation
+            val_preds = self._predict_loader(val_loader)
+            val_corr = compute_pearson_correlation(val_df["score"].values, val_preds)
+            
+            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} - Val Corr: {val_corr:.4f}")
+            
+            if val_corr > best_val_corr:
+                best_val_corr = val_corr
+                # In a real scenario, we would save the model checkpoint here
+                # torch.save(self.model.state_dict(), "best_model.pth")
+
+    def predict(self, df):
+        """
+        Generates predictions for a dataframe.
+        """
+        dataset = PatentDataset(df, self.tokenizer, Config.MAX_LENGTH, is_test=True)
+        loader = DataLoader(
+            dataset, 
+            batch_size=Config.VAL_BATCH_SIZE, 
+            shuffle=False, 
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True
+        )
+        return self._predict_loader(loader)
+
+    def _predict_loader(self, loader):
+        self.model.eval()
+        all_preds = []
+        
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits.squeeze(-1)
+                
+                all_preds.append(logits.cpu().numpy())
+                
+        preds = np.concatenate(all_preds)
+        # Clip predictions to valid range [0, 1]
+        return np.clip(preds, 0.0, 1.0)
+
+
+def generate_submission(model, test_df):
+    """
+    Generates predictions for the test set and saves them to the submission file.
+    """
+    # Generate predictions
+    preds = model.predict(test_df)
+
+    # Create submission DataFrame
+    submission = pd.DataFrame({"id": test_df["id"], "score": preds})
+
+    # Save to CSV
+    submission.to_csv(Config.SUBMISSION_FILE, index=False)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.data_manager import get_data
+from library.feature_extractor import SentenceEncoder, extract_embeddings
+from library.model import SimilarityRegressor, generate_submission
+from library.utils import compute_pearson_correlation
+
+
+def main():
+    # 1. Setup Environment
+    Config.setup()
+
+    # 2. Load Data
+    # The data manager handles preprocessing (concatenating context) and caching
+    train_df = get_data("train", load_cached_data=Config.LOAD_CACHED_DATA)
+    val_df = get_data("val", load_cached_data=Config.LOAD_CACHED_DATA)
+    test_df = get_data("test", load_cached_data=Config.LOAD_CACHED_DATA)
+
+    # 3. Feature Extraction (Embeddings)
+    # Initialize the frozen Bi-Encoder
+    encoder = SentenceEncoder()
+
+    # Extract embeddings for all splits
+    # This uses the GPU if available and caches results to ./working/idea_1
+    train_anchors, train_targets = extract_embeddings(
+        train_df, encoder, "train", load_cached_data=Config.LOAD_CACHED_DATA
+    )
+    val_anchors, val_targets = extract_embeddings(
+        val_df, encoder, "val", load_cached_data=Config.LOAD_CACHED_DATA
+    )
+    test_anchors, test_targets = extract_embeddings(
+        test_df, encoder, "test", load_cached_data=Config.LOAD_CACHED_DATA
+    )
+
+    # 4. Model Training
+    # Initialize Ridge Regression Head
+    model = SimilarityRegressor()
+
+    # Train the linear head on the frozen embeddings
+    # We pass validation data here for internal logging, but we calculate the final metric explicitly below
+    model.fit(
+        train_anchors,
+        train_targets,
+        train_df["score"].values,
+        val_anchors,
+        val_targets,
+        val_df["score"].values,
+    )
+
+    # 5. Validation Assessment
+    # Predict on validation set
+    val_preds = model.predict(val_anchors, val_targets)
+
+    # Compute and print the final metric
+    val_metric = compute_pearson_correlation(val_df["score"].values, val_preds)
+    print(f"Final Validation Metric: {val_metric}")
+
+    # 6. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate error magnitude
+    val_df["pred"] = val_preds
+    val_df["error"] = (val_df["score"] - val_df["pred"]).abs()
+
+    # Generate simple meta-features for analysis
+    val_df["anchor_len"] = val_df["anchor"].astype(str).str.len()
+    val_df["target_len"] = val_df["target"].astype(str).str.len()
+    val_df["len_diff"] = (val_df["anchor_len"] - val_df["target_len"]).abs()
+
+    # Calculate correlation between error and features
+    analysis_features = ["anchor_len", "target_len", "len_diff", "score"]
+    correlations = val_df[analysis_features].corrwith(val_df["error"])
+
+    print("Correlation between Error Magnitude and Features:")
+    print(correlations)
+
+    # 7. Submission Generation
+    generate_submission(model, test_df, test_anchors, test_targets)
+    print(f"Submission saved to {Config.SUBMISSION_FILE}")
+=======
+from library.config import Config
+from library.data_manager import get_data
+from library.model import CrossEncoderModel, generate_submission
+from library.utils import compute_pearson_correlation
+
+
+def main():
+    # 1. Setup Environment
+    Config.setup()
+
+    # 2. Load Data
+    # The data manager handles preprocessing (concatenating context) and caching
+    train_df = get_data("train", load_cached_data=Config.LOAD_CACHED_DATA)
+    val_df = get_data("val", load_cached_data=Config.LOAD_CACHED_DATA)
+    test_df = get_data("test", load_cached_data=Config.LOAD_CACHED_DATA)
+
+    # 3. Model Training
+    # Initialize Cross-Encoder Model
+    model = CrossEncoderModel()
+
+    # Train the model
+    model.fit(train_df, val_df)
+
+    # 4. Validation Assessment
+    # Predict on validation set
+    val_preds = model.predict(val_df)
+
+    # Compute and print the final metric
+    val_metric = compute_pearson_correlation(val_df["score"].values, val_preds)
+    print(f"Final Validation Metric: {val_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate error magnitude
+    val_df["pred"] = val_preds
+    val_df["error"] = (val_df["score"] - val_df["pred"]).abs()
+
+    # Generate simple meta-features for analysis
+    val_df["anchor_len"] = val_df["anchor"].astype(str).str.len()
+    val_df["target_len"] = val_df["target"].astype(str).str.len()
+    val_df["len_diff"] = (val_df["anchor_len"] - val_df["target_len"]).abs()
+
+    # Calculate correlation between error and features
+    analysis_features = ["anchor_len", "target_len", "len_diff", "score"]
+    correlations = val_df[analysis_features].corrwith(val_df["error"])
+
+    print("Correlation between Error Magnitude and Features:")
+    print(correlations)
+
+    # 6. Submission Generation
+    # Only generate submission if performance improved over baseline
+    if val_metric > 0.6332441392956121:
+        generate_submission(model, test_df)
+        print(f"Submission saved to {Config.SUBMISSION_FILE}")
+    else:
+        print("Validation metric did not improve baseline. Submission skipped.")
+>>>>>>> REPLACE
+```

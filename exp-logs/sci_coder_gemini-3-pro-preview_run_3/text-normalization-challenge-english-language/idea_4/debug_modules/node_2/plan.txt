@@ -1,0 +1,571 @@
+The previous execution failed because the demo run created a "toy" tokenizer (vocab size 19) which persisted in the working directory. When `create_dataloaders` was called with `load_cached_data=True`, it loaded this inadequate tokenizer instead of training a proper one on the dataset, causing the neural model to fail on unseen characters (like digits) during inference. This is a state persistence error (Cite debug_lesson_3).
+
+To fix this:
+1.  I will introduce a `configure_paths` helper to dynamically update `Config` paths and ensure clean working directories for different run modes.
+2.  I will update `run_demo` to explicitly clean up stale artifacts (`shutil.rmtree`) and force `load_cached_data=False` during data loading to ensure a valid tokenizer is generated from the actual sample data.
+3.  I will implement `run_full_task` to execute the complete training pipeline on the full dataset after the demo verification, ensuring the final submission is generated with a robust model.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import os
+import shutil
+import random
+import numpy as np
+import pandas as pd
+import torch
+import warnings
+
+# Import library components
+from library.config import Config
+from library.text_utils import CharTokenizer, is_hard_token, get_context_window
+from library.symbolic_layer import SymbolicMemory
+from library.retrieval_system import SimilarityIndex
+from library.dataset_factory import create_dataloaders, RAGDataset
+from library.neural_architecture import RAGTransformer
+from library.trainer import ModelTrainer
+from library.inference_pipeline import CascadeSolver
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def run_demo():
+    print("=== Starting Text Normalization Library Demo ===\n")
+
+    # ==========================================
+    # 0. Configuration & Setup
+    # ==========================================
+    print("--- Step 0: Configuring for Speed ---")
+
+    # Override Config for fast execution
+    Config.WORKING_DIR = "./working/demo_execution"
+    Config.STATS_DIR = os.path.join(Config.WORKING_DIR, "stats")
+    Config.PROCESSED_DIR = os.path.join(Config.WORKING_DIR, "processed")
+    Config.SUBMISSION_DIR = os.path.join(Config.WORKING_DIR, "submission")
+
+    # Update derived paths in Config
+    Config.TRIGRAM_STATS_PATH = os.path.join(Config.STATS_DIR, "trigram_stats.parquet")
+    Config.BIGRAM_LEFT_STATS_PATH = os.path.join(
+        Config.STATS_DIR, "bigram_left_stats.parquet"
+    )
+    Config.BIGRAM_RIGHT_STATS_PATH = os.path.join(
+        Config.STATS_DIR, "bigram_right_stats.parquet"
+    )
+    Config.UNIGRAM_STATS_PATH = os.path.join(Config.STATS_DIR, "unigram_stats.parquet")
+
+    Config.TFIDF_MODEL_PATH = os.path.join(
+        Config.WORKING_DIR, "tfidf_vectorizer.joblib"
+    )
+    Config.KNN_INDEX_PATH = os.path.join(Config.WORKING_DIR, "knn_index.bin")
+    Config.HARD_SAMPLES_PATH = os.path.join(
+        Config.PROCESSED_DIR, "hard_samples.parquet"
+    )
+
+    Config.TOKENIZER_PATH = os.path.join(Config.WORKING_DIR, "tokenizer.json")
+    Config.MODEL_CHECKPOINT_PATH = os.path.join(Config.WORKING_DIR, "model_demo.pt")
+
+    # Limit data and model size
+    Config.MAX_TRAIN_SAMPLES = 5000  # Use only 5k samples for stats/training
+    Config.EPOCHS = 1
+    Config.BATCH_SIZE = 16
+    Config.EMBED_DIM = 32
+    Config.HIDDEN_DIM = 64
+    Config.N_HEADS = 2
+    Config.N_ENCODER_LAYERS = 1
+    Config.N_DECODER_LAYERS = 1
+    Config.MAX_SEQ_LEN = 64
+
+    # Re-run setup to create new directories
+    Config.setup()
+    set_seed(Config.SEED)
+    print("Configuration updated for demo run.")
+
+    # ==========================================
+    # 1. Text Utilities & Tokenizer
+    # ==========================================
+    print("\n--- Step 1: Validating Text Utilities ---")
+
+    # Test is_hard_token
+    assert is_hard_token("DATE", "2023") is True
+    assert is_hard_token("PLAIN", "hello") is False
+    assert is_hard_token("VERBATIM", "hello") is False  # Alpha is handled by heuristic
+    assert is_hard_token("MONEY", "$5") is True
+    print("is_hard_token logic verified.")
+
+    # Test Tokenizer
+    tokenizer = CharTokenizer()
+    sample_texts = ["hello", "world", "$123", "cat"]
+    tokenizer.train(sample_texts)
+
+    encoded = tokenizer.encode("cat", add_special_tokens=True)
+    decoded = tokenizer.decode(encoded, skip_special_tokens=True)
+
+    print(f"Vocab Size: {tokenizer.vocab_size}")
+    print(f"Encoded 'cat': {encoded}")
+    print(f"Decoded: '{decoded}'")
+
+    assert decoded == "cat"
+    assert tokenizer.sos_token_id in encoded
+    assert tokenizer.eos_token_id in encoded
+
+    # Save/Load check - USE TEMP PATH TO AVOID POLLUTING PIPELINE
+    temp_tokenizer_path = Config.TOKENIZER_PATH + ".test"
+    tokenizer.save(temp_tokenizer_path)
+    tokenizer_loaded = CharTokenizer()
+    tokenizer_loaded.load(temp_tokenizer_path)
+    assert tokenizer_loaded.char2id == tokenizer.char2id
+    print("Tokenizer save/load verified.")
+
+    # ==========================================
+    # 2. Symbolic Memory Layer
+    # ==========================================
+    print("\n--- Step 2: Validating Symbolic Memory ---")
+
+    symbolic_mem = SymbolicMemory()
+    # Force build from scratch using the small MAX_TRAIN_SAMPLES
+    symbolic_mem.build_stats(load_cached_data=False)
+
+    # Verify internal state
+    print(f"Stats built. Unigrams: {len(symbolic_mem.unigram_stats)}")
+
+    # Test Query (Mocking a known entry if possible, or just checking return type)
+    # Since we used a random subset of 5000, we can't guarantee specific tokens exist,
+    # but we can check the API handles queries without crashing.
+    res = symbolic_mem.query("unknown_token_xyz", None, None)
+    assert res is None
+    print("Symbolic memory query API verified.")
+
+    # ==========================================
+    # 3. Retrieval System
+    # ==========================================
+    print("\n--- Step 3: Validating Retrieval System ---")
+
+    sim_index = SimilarityIndex()
+    # Build index from scratch
+    sim_index.build_index(load_cached_data=False)
+
+    # Test Retrieval
+    query = "$100"
+    results = sim_index.retrieve(query, k=2)
+    print(f"Query: '{query}'")
+    for r in results:
+        print(f"  -> Found: '{r['source']}' (Dist: {r['distance']:.4f})")
+
+    assert isinstance(results, list)
+    if len(results) > 0:
+        assert "source" in results[0]
+        assert "target" in results[0]
+    print("Retrieval system verified.")
+
+    # ==========================================
+    # 4. Data Loading Pipeline
+    # ==========================================
+    print("\n--- Step 4: Validating Data Loaders ---")
+
+    # Create dataloaders (this will use the tokenizer and index we just built/saved)
+    train_loader, val_loader, test_loader, tokenizer = create_dataloaders(
+        load_cached_data=True
+    )
+
+    # Inspect one batch
+    batch = next(iter(train_loader))
+    input_ids = batch["input_ids"]
+    target_ids = batch["target_ids"]
+
+    print(f"Batch Input Shape: {input_ids.shape}")
+    print(f"Batch Target Shape: {target_ids.shape}")
+
+    assert input_ids.shape[0] == Config.BATCH_SIZE
+    assert target_ids.shape[0] == Config.BATCH_SIZE
+    # Check for separator token in input (RAG structure)
+    assert (input_ids == tokenizer.sep_token_id).any()
+    print("Data loading pipeline verified.")
+
+    # ==========================================
+    # 5. Neural Model & Training
+    # ==========================================
+    print("\n--- Step 5: Validating Neural Training ---")
+
+    trainer = ModelTrainer(tokenizer)
+
+    # Run training for the configured 1 epoch
+    trainer.fit(train_loader, val_loader, epochs=Config.EPOCHS)
+
+    # Check if model file was created
+    assert os.path.exists(Config.MODEL_CHECKPOINT_PATH)
+    print("Model training and checkpointing verified.")
+
+    # ==========================================
+    # 6. Inference Pipeline (Cascade Solver)
+    # ==========================================
+    print("\n--- Step 6: Validating Cascade Inference ---")
+
+    # Create a dummy test set
+    # We include:
+    # 1. A simple alpha word (handled by Gate)
+    # 2. A complex token (handled by Neural/Retrieval)
+    # 3. A token likely in symbolic memory (if we were using full stats, here just for flow)
+    df_test_mock = pd.DataFrame(
+        {
+            "sentence_id": [0, 0, 1],
+            "token_id": [0, 1, 0],
+            "before": ["Hello", "$5.00", "world"],
+            "id": ["0_0", "0_1", "1_0"],
+        }
+    )
+
+    solver = CascadeSolver()
+
+    # Run inference
+    submission = solver.solve(df_test_mock)
+
+    print("\nInference Results:")
+    print(submission)
+
+    # Validations
+    assert len(submission) == 3
+    assert "id" in submission.columns
+    assert "after" in submission.columns
+
+    # Check Heuristic Gate (Hello -> Hello)
+    hello_row = submission[submission["id"] == "0_0"].iloc[0]
+    assert hello_row["after"] == "Hello", "Heuristic gate failed for 'Hello'"
+
+    # Check Neural/Retrieval flow (should produce *something* string-like for $5.00)
+    money_row = submission[submission["id"] == "0_1"].iloc[0]
+    assert isinstance(money_row["after"], str)
+    assert (
+        len(money_row["after"]) > 0
+    ), "Neural model returned empty string (likely tokenizer issue)"
+
+    print("Cascade inference pipeline verified.")
+
+    print("\n=== Demo Completed Successfully ===")
+
+
+if __name__ == "__main__":
+    run_demo()
+=======
+import os
+import shutil
+import random
+import numpy as np
+import pandas as pd
+import torch
+import warnings
+
+# Import library components
+from library.config import Config
+from library.text_utils import CharTokenizer, is_hard_token, get_context_window
+from library.symbolic_layer import SymbolicMemory
+from library.retrieval_system import SimilarityIndex
+from library.dataset_factory import create_dataloaders, RAGDataset
+from library.neural_architecture import RAGTransformer
+from library.trainer import ModelTrainer
+from library.inference_pipeline import CascadeSolver, generate_submission
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def configure_paths(working_dir):
+    """
+    Updates Config paths to point to a specific working directory.
+    Required because Config paths are initialized at class definition time.
+    """
+    Config.WORKING_DIR = working_dir
+    Config.STATS_DIR = os.path.join(Config.WORKING_DIR, "stats")
+    Config.PROCESSED_DIR = os.path.join(Config.WORKING_DIR, "processed")
+    # Note: We keep SUBMISSION_DIR as default "./submission" for the full run,
+    # but for demo we might want it inside working dir.
+    
+    # Update derived paths
+    Config.TRIGRAM_STATS_PATH = os.path.join(Config.STATS_DIR, "trigram_stats.parquet")
+    Config.BIGRAM_LEFT_STATS_PATH = os.path.join(Config.STATS_DIR, "bigram_left_stats.parquet")
+    Config.BIGRAM_RIGHT_STATS_PATH = os.path.join(Config.STATS_DIR, "bigram_right_stats.parquet")
+    Config.UNIGRAM_STATS_PATH = os.path.join(Config.STATS_DIR, "unigram_stats.parquet")
+
+    Config.TFIDF_MODEL_PATH = os.path.join(Config.WORKING_DIR, "tfidf_vectorizer.joblib")
+    Config.KNN_INDEX_PATH = os.path.join(Config.WORKING_DIR, "knn_index.bin")
+    Config.HARD_SAMPLES_PATH = os.path.join(Config.PROCESSED_DIR, "hard_samples.parquet")
+
+    Config.TOKENIZER_PATH = os.path.join(Config.WORKING_DIR, "tokenizer.json")
+    Config.MODEL_CHECKPOINT_PATH = os.path.join(Config.WORKING_DIR, "model_best.pt")
+    
+    # Re-run setup to create directories
+    Config.setup()
+
+
+def run_demo():
+    print("=== Starting Text Normalization Library Demo ===\n")
+
+    # ==========================================
+    # 0. Configuration & Setup
+    # ==========================================
+    print("--- Step 0: Configuring for Speed ---")
+
+    # Override Config for fast execution
+    demo_dir = "./working/demo_execution"
+    
+    # Cite debug_lesson_3: Purge Stale Artifacts
+    # We must remove previous artifacts to prevent loading a stale/toy tokenizer
+    if os.path.exists(demo_dir):
+        print(f"Cleaning up stale demo directory: {demo_dir}")
+        shutil.rmtree(demo_dir)
+
+    configure_paths(demo_dir)
+    Config.SUBMISSION_DIR = os.path.join(demo_dir, "submission")
+    Config.SUBMISSION_PATH = os.path.join(Config.SUBMISSION_DIR, "submission.csv")
+
+    # Limit data and model size
+    Config.MAX_TRAIN_SAMPLES = 5000
+    Config.EPOCHS = 1
+    Config.BATCH_SIZE = 16
+    Config.EMBED_DIM = 32
+    Config.HIDDEN_DIM = 64
+    Config.N_HEADS = 2
+    Config.N_ENCODER_LAYERS = 1
+    Config.N_DECODER_LAYERS = 1
+    Config.MAX_SEQ_LEN = 64
+
+    set_seed(Config.SEED)
+    print("Configuration updated for demo run.")
+
+    # ==========================================
+    # 1. Text Utilities & Tokenizer
+    # ==========================================
+    print("\n--- Step 1: Validating Text Utilities ---")
+
+    # Test is_hard_token
+    assert is_hard_token("DATE", "2023") is True
+    assert is_hard_token("PLAIN", "hello") is False
+    assert is_hard_token("VERBATIM", "hello") is False  # Alpha is handled by heuristic
+    assert is_hard_token("MONEY", "$5") is True
+    print("is_hard_token logic verified.")
+
+    # Test Tokenizer
+    tokenizer = CharTokenizer()
+    sample_texts = ["hello", "world", "$123", "cat"]
+    tokenizer.train(sample_texts)
+
+    encoded = tokenizer.encode("cat", add_special_tokens=True)
+    decoded = tokenizer.decode(encoded, skip_special_tokens=True)
+
+    print(f"Vocab Size: {tokenizer.vocab_size}")
+    print(f"Encoded 'cat': {encoded}")
+    print(f"Decoded: '{decoded}'")
+
+    assert decoded == "cat"
+    assert tokenizer.sos_token_id in encoded
+    assert tokenizer.eos_token_id in encoded
+
+    # Save/Load check - USE TEMP PATH TO AVOID POLLUTING PIPELINE
+    temp_tokenizer_path = Config.TOKENIZER_PATH + ".test"
+    tokenizer.save(temp_tokenizer_path)
+    tokenizer_loaded = CharTokenizer()
+    tokenizer_loaded.load(temp_tokenizer_path)
+    assert tokenizer_loaded.char2id == tokenizer.char2id
+    print("Tokenizer save/load verified.")
+
+    # ==========================================
+    # 2. Symbolic Memory Layer
+    # ==========================================
+    print("\n--- Step 2: Validating Symbolic Memory ---")
+
+    symbolic_mem = SymbolicMemory()
+    # Force build from scratch using the small MAX_TRAIN_SAMPLES
+    symbolic_mem.build_stats(load_cached_data=False)
+
+    # Verify internal state
+    print(f"Stats built. Unigrams: {len(symbolic_mem.unigram_stats)}")
+
+    # Test Query (Mocking a known entry if possible, or just checking return type)
+    res = symbolic_mem.query("unknown_token_xyz", None, None)
+    assert res is None
+    print("Symbolic memory query API verified.")
+
+    # ==========================================
+    # 3. Retrieval System
+    # ==========================================
+    print("\n--- Step 3: Validating Retrieval System ---")
+
+    sim_index = SimilarityIndex()
+    # Build index from scratch
+    sim_index.build_index(load_cached_data=False)
+
+    # Test Retrieval
+    query = "$100"
+    results = sim_index.retrieve(query, k=2)
+    print(f"Query: '{query}'")
+    for r in results:
+        print(f"  -> Found: '{r['source']}' (Dist: {r['distance']:.4f})")
+
+    assert isinstance(results, list)
+    if len(results) > 0:
+        assert "source" in results[0]
+        assert "target" in results[0]
+    print("Retrieval system verified.")
+
+    # ==========================================
+    # 4. Data Loading Pipeline
+    # ==========================================
+    print("\n--- Step 4: Validating Data Loaders ---")
+
+    # Cite debug_lesson_3: Force regeneration to ensure we use a fresh tokenizer
+    # derived from the actual data (Config.MAX_TRAIN_SAMPLES), not the toy one from Step 1.
+    train_loader, val_loader, test_loader, tokenizer = create_dataloaders(
+        load_cached_data=False
+    )
+
+    # Inspect one batch
+    batch = next(iter(train_loader))
+    input_ids = batch["input_ids"]
+    target_ids = batch["target_ids"]
+
+    print(f"Batch Input Shape: {input_ids.shape}")
+    print(f"Batch Target Shape: {target_ids.shape}")
+
+    assert input_ids.shape[0] == Config.BATCH_SIZE
+    assert target_ids.shape[0] == Config.BATCH_SIZE
+    # Check for separator token in input (RAG structure)
+    assert (input_ids == tokenizer.sep_token_id).any()
+    print("Data loading pipeline verified.")
+
+    # ==========================================
+    # 5. Neural Model & Training
+    # ==========================================
+    print("\n--- Step 5: Validating Neural Training ---")
+
+    trainer = ModelTrainer(tokenizer)
+
+    # Run training for the configured 1 epoch
+    trainer.fit(train_loader, val_loader, epochs=Config.EPOCHS)
+
+    # Check if model file was created
+    assert os.path.exists(Config.MODEL_CHECKPOINT_PATH)
+    print("Model training and checkpointing verified.")
+
+    # ==========================================
+    # 6. Inference Pipeline (Cascade Solver)
+    # ==========================================
+    print("\n--- Step 6: Validating Cascade Inference ---")
+
+    # Create a dummy test set
+    df_test_mock = pd.DataFrame(
+        {
+            "sentence_id": [0, 0, 1],
+            "token_id": [0, 1, 0],
+            "before": ["Hello", "$5.00", "world"],
+            "id": ["0_0", "0_1", "1_0"],
+        }
+    )
+
+    solver = CascadeSolver()
+
+    # Run inference
+    submission = solver.solve(df_test_mock)
+
+    print("\nInference Results:")
+    print(submission)
+
+    # Validations
+    assert len(submission) == 3
+    assert "id" in submission.columns
+    assert "after" in submission.columns
+
+    # Check Heuristic Gate (Hello -> Hello)
+    hello_row = submission[submission["id"] == "0_0"].iloc[0]
+    assert hello_row["after"] == "Hello", "Heuristic gate failed for 'Hello'"
+
+    # Check Neural/Retrieval flow (should produce *something* string-like for $5.00)
+    money_row = submission[submission["id"] == "0_1"].iloc[0]
+    assert isinstance(money_row["after"], str)
+    assert (
+        len(money_row["after"]) > 0
+    ), "Neural model returned empty string (likely tokenizer issue)"
+
+    print("Cascade inference pipeline verified.")
+
+    print("\n=== Demo Completed Successfully ===")
+
+
+def run_full_task():
+    print("\n\n==============================================")
+    print("=== Starting Full Training & Submission ===")
+    print("==============================================\n")
+    
+    # 1. Configure for Full Run
+    full_run_dir = "./working/full_run"
+    
+    # Cite debug_lesson_3: Purge Stale Artifacts
+    if os.path.exists(full_run_dir):
+        print(f"Cleaning up previous run directory: {full_run_dir}")
+        shutil.rmtree(full_run_dir)
+        
+    configure_paths(full_run_dir)
+    
+    # Reset Hyperparameters to defaults (from Config class definition)
+    Config.MAX_TRAIN_SAMPLES = None  # Use full dataset
+    Config.EPOCHS = 15
+    Config.BATCH_SIZE = 128
+    Config.EMBED_DIM = 256
+    Config.HIDDEN_DIM = 512
+    Config.N_HEADS = 4
+    Config.N_ENCODER_LAYERS = 4
+    Config.N_DECODER_LAYERS = 4
+    Config.MAX_SEQ_LEN = 128
+    
+    set_seed(Config.SEED)
+    
+    # 2. Build Components (Force fresh build)
+    print("--- Building Symbolic Memory ---")
+    sym = SymbolicMemory()
+    sym.build_stats(load_cached_data=False)
+    
+    print("\n--- Building Retrieval Index ---")
+    idx = SimilarityIndex()
+    idx.build_index(load_cached_data=False)
+    
+    print("\n--- Preparing Data & Tokenizer ---")
+    # This will train the tokenizer on the full dataset
+    train_loader, val_loader, test_loader, tokenizer = create_dataloaders(load_cached_data=False)
+    
+    # 3. Train Model
+    print("\n--- Training Neural Model ---")
+    trainer = ModelTrainer(tokenizer)
+    trainer.fit(train_loader, val_loader, epochs=Config.EPOCHS)
+    
+    # 4. Generate Submission
+    print("\n--- Generating Submission ---")
+    # generate_submission uses Config paths, so it will pick up the model we just trained
+    generate_submission()
+    print(f"Submission saved to {Config.SUBMISSION_PATH}")
+
+
+if __name__ == "__main__":
+    # 1. Run Demo to verify integrity (fast)
+    run_demo()
+    
+    # 2. Run Full Task to generate submission
+    run_full_task()
+>>>>>>> REPLACE
+```

@@ -1,0 +1,316 @@
+To optimize performance, I will implement the architecture and training strategy that yielded the best historical result (Validation MAE ~0.3096, referred to as "Idea 6" in the lessons).
+
+**Strategy:**
+1.  **Architecture Upgrade (SE-Residual-LSTM)**: I will replace the current `PhysicsInjectedNet` (Idea 9) with the `SE-Residual-LSTM` architecture. This architecture features a Multi-Scale CNN stem followed by a deep Bidirectional LSTM backbone where each layer is augmented with a **Squeeze-and-Excitation (SE) block** (Cite solution_lesson_node_00030). The SE block provides global context aggregation, which outperformed the pointwise gating of Idea 9.
+2.  **Residual & Dropout Configuration**: I will implement **additive residual connections** with **projection shortcuts** to handle dimension mismatches (Cite solution_lesson_node_00027, solution_lesson_node_00033) and ensure **Dropout is applied only to the residual branch** to preserve the gradient highway (Cite solution_lesson_node_00024).
+3.  **Capacity Increase**: I will increase `LSTM_HIDDEN_DIM` from 256 to 512 to match the capacity of the best-performing model (Cite solution_lesson_node_00023).
+4.  **Optimization Horizon**: I will increase the training duration from 15 to 30 epochs. The previous solution (Idea 9) converged fast but plateaued, while the best solution (Idea 6) required a longer horizon for the `OneCycleLR` scheduler to fully optimize the deeper, higher-capacity network (Cite solution_lesson_node_00028).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Backbone: Residual Bi-LSTM
+    LSTM_HIDDEN_DIM = 256
+    LSTM_LAYERS = 4
+    BIDIRECTIONAL = True
+
+    # Regularization
+    DROPOUT = 0.1
+
+    # ==============================
+    # 4. Training Hyperparameters
+    # ==============================
+    SEED = 42
+    EPOCHS = 35
+=======
+    # Backbone: Residual Bi-LSTM
+    LSTM_HIDDEN_DIM = 512
+    LSTM_LAYERS = 4
+    BIDIRECTIONAL = True
+
+    # Regularization
+    DROPOUT = 0.1
+
+    # ==============================
+    # 4. Training Hyperparameters
+    # ==============================
+    SEED = 42
+    EPOCHS = 30
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class PhysicsInjectedNet(nn.Module):
+    """
+    Physics-Injected Residual Multi-Scale CNN-LSTM.
+    Injects physical context (R, C, interactions) at every layer of the LSTM backbone
+    to preserve physical constraints throughout the network depth.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.config = Config
+
+        # 1. Resolve Feature Indices for Context Injection
+        # We need to know which columns in the input tensor correspond to the context features.
+        self.feature_cols = self.config.FEATURE_COLS
+        self.context_cols = self.config.CONTEXT_FEATURES
+
+        # Create a list of indices for slicing
+        self.context_indices = [self.feature_cols.index(c) for c in self.context_cols]
+        self.context_dim = len(self.context_cols)
+
+        # Total input dimension
+        input_dim = len(self.feature_cols)
+
+        # 2. Stem: Multi-Scale CNN
+        self.stem = MultiScaleCNN(
+            input_dim=input_dim,
+            filters=self.config.CNN_FILTERS,
+            kernels=self.config.CNN_KERNELS,
+        )
+        self.stem_act = nn.GELU()
+
+        # Calculate output dimension of the stem
+        # filters * number of kernels
+        stem_out_dim = self.config.CNN_FILTERS * len(self.config.CNN_KERNELS)
+
+        # 3. Backbone: Deep Context-Injected Bi-LSTM
+        self.lstm_layers = nn.ModuleList()
+        self.projections = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        current_dim = stem_out_dim
+        hidden_dim = self.config.LSTM_HIDDEN_DIM
+        bidirectional = self.config.BIDIRECTIONAL
+        num_directions = 2 if bidirectional else 1
+        lstm_out_dim = hidden_dim * num_directions
+
+        for _ in range(self.config.LSTM_LAYERS):
+            # The input to the LSTM is the previous hidden state + context features
+            lstm_input_dim = current_dim + self.context_dim
+
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=lstm_input_dim,
+                    hidden_size=hidden_dim,
+                    batch_first=True,
+                    bidirectional=bidirectional,
+                )
+            )
+
+            # Residual Projection:
+            # If the input dimension (current_dim) doesn't match the LSTM output dimension,
+            # we project the residual path to match.
+            if current_dim != lstm_out_dim:
+                self.projections.append(nn.Linear(current_dim, lstm_out_dim))
+            else:
+                self.projections.append(nn.Identity())
+
+            # Dropout applied to the residual branch
+            self.dropouts.append(nn.Dropout(self.config.DROPOUT))
+
+            # Update current dimension for the next layer
+            current_dim = lstm_out_dim
+
+        # 4. Head
+        self.head = nn.Linear(current_dim, 1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (Batch, Seq_Len, N_Features)
+        Returns:
+            Tensor of shape (Batch, Seq_Len)
+        """
+        # Extract Static/Physical Context Features
+        # Shape: (Batch, Seq_Len, Context_Dim)
+        context = x[:, :, self.context_indices]
+
+        # --- Stem ---
+        # Permute for Conv1d: (Batch, Feat, Seq)
+        h = x.transpose(1, 2)
+        h = self.stem(h)
+        h = self.stem_act(h)
+        # Permute back: (Batch, Seq, Feat)
+        h = h.transpose(1, 2)
+
+        # --- Backbone ---
+        for i in range(len(self.lstm_layers)):
+            # 1. Context Injection
+            # Concatenate current hidden state with context features
+            # h: (B, S, H_curr), context: (B, S, C) -> (B, S, H_curr + C)
+            lstm_in = torch.cat([h, context], dim=2)
+
+            # 2. LSTM Processing
+            # out: (B, S, H_next)
+            out, _ = self.lstm_layers[i](lstm_in)
+
+            # 3. Residual Connection
+            # Path A: Project previous hidden state to match dimensions
+            res_path = self.projections[i](h)
+
+            # Path B: Dropout on the computed features
+            out_path = self.dropouts[i](out)
+
+            # Add
+            h = res_path + out_path
+
+        # --- Head ---
+        # h: (Batch, Seq, Hidden_Final)
+        preds = self.head(h)
+
+        # Squeeze last dimension: (Batch, Seq, 1) -> (Batch, Seq)
+        return preds.squeeze(-1)
+=======
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block for Sequence Data.
+    Performs Global Average Pooling over the time dimension to capture
+    global context and recalibrate channel weights.
+    Cite solution_lesson_node_00030
+    """
+
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Seq, Channels)
+        b, s, c = x.size()
+        # Permute to (Batch, Channels, Seq) for pooling
+        y = x.permute(0, 2, 1)
+        y = self.avg_pool(y).view(b, c)
+        y = self.fc(y).view(b, 1, c)
+        return x * y
+
+
+class PhysicsInjectedNet(nn.Module):
+    """
+    Residual Multi-Scale CNN-LSTM with Squeeze-and-Excitation (SE) Blocks.
+    Implements the 'Idea 6' architecture which achieved ~0.31 MAE.
+    Includes:
+    - Multi-Scale CNN Stem (Cite solution_lesson_node_00015)
+    - Deep Residual Bi-LSTM Backbone (Cite solution_lesson_node_00023)
+    - Projection Shortcuts for Dimension Mismatch (Cite solution_lesson_node_00027)
+    - SE Blocks for Global Context (Cite solution_lesson_node_00030)
+    - Dropout on Residual Branch (Cite solution_lesson_node_00024)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.config = Config
+
+        input_dim = len(self.config.FEATURE_COLS)
+
+        # 1. Stem: Multi-Scale CNN
+        self.stem = MultiScaleCNN(
+            input_dim=input_dim,
+            filters=self.config.CNN_FILTERS,
+            kernels=self.config.CNN_KERNELS,
+        )
+        self.stem_act = nn.GELU()
+
+        # Calculate output dimension of the stem
+        stem_out_dim = self.config.CNN_FILTERS * len(self.config.CNN_KERNELS)
+
+        # 2. Backbone: Residual Bi-LSTM with SE
+        self.lstm_layers = nn.ModuleList()
+        self.se_blocks = nn.ModuleList()
+        self.projections = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        current_dim = stem_out_dim
+        hidden_dim = self.config.LSTM_HIDDEN_DIM
+        bidirectional = self.config.BIDIRECTIONAL
+        num_directions = 2 if bidirectional else 1
+        lstm_out_dim = hidden_dim * num_directions
+
+        for _ in range(self.config.LSTM_LAYERS):
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=current_dim,
+                    hidden_size=hidden_dim,
+                    batch_first=True,
+                    bidirectional=bidirectional,
+                )
+            )
+
+            self.se_blocks.append(SEBlock(lstm_out_dim))
+
+            # Residual Projection
+            if current_dim != lstm_out_dim:
+                self.projections.append(nn.Linear(current_dim, lstm_out_dim))
+            else:
+                self.projections.append(nn.Identity())
+
+            self.dropouts.append(nn.Dropout(self.config.DROPOUT))
+
+            current_dim = lstm_out_dim
+
+        # 3. Head
+        self.head = nn.Linear(current_dim, 1)
+
+    def forward(self, x):
+        # x: (Batch, Seq, Features)
+        
+        # --- Stem ---
+        h = x.transpose(1, 2)
+        h = self.stem(h)
+        h = self.stem_act(h)
+        h = h.transpose(1, 2)
+
+        # --- Backbone ---
+        for i in range(len(self.lstm_layers)):
+            # LSTM
+            out, _ = self.lstm_layers[i](h)
+            
+            # SE Block
+            out = self.se_blocks[i](out)
+
+            # Residual Connection
+            # Path A: Projection of input
+            res_path = self.projections[i](h)
+            
+            # Path B: Dropout on transformed output
+            out_path = self.dropouts[i](out)
+
+            # Additive Residual (Cite solution_lesson_node_00033)
+            h = res_path + out_path
+
+        # --- Head ---
+        preds = self.head(h)
+        return preds.squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# ==========================================
+# 1. Configuration Overrides for Fast Baseline
+# ==========================================
+# Reduce epochs to ensure execution completes within the time limit (Fast Baseline)
+Config.EPOCHS = 15
+# Ensure we use the full dataset for valid metric calculation, so DEBUG must be False
+Config.DEBUG = False
+# Ensure working directory is consistent
+=======
+# ==========================================
+# 1. Configuration Overrides
+# ==========================================
+# Use 30 epochs as per Lesson 00028 (Optimization Horizon)
+Config.EPOCHS = 30
+# Ensure we use the full dataset for valid metric calculation, so DEBUG must be False
+Config.DEBUG = False
+# Ensure working directory is consistent
+>>>>>>> REPLACE
+```

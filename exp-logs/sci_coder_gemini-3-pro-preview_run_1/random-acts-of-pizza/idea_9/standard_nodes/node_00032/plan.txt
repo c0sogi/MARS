@@ -1,0 +1,266 @@
+My strategy involves three targeted optimizations based on the provided lessons and failure analysis:
+
+1.  **Feature Engineering (RAOP Ratios):** The failure analysis identified `requester_number_of_comments_in_raop_at_request` as the top source of error. To address this, I will explicitly engineer "RAOP Activity Ratios" (e.g., proportion of comments/posts made in RAOP vs. total Reddit activity). This helps the model distinguish between dedicated community members and casual users, addressing the limitations of raw counts (Cite solution_lesson_node_00021).
+
+2.  **MLP Architecture (Mean Pooling vs. Attention):** I will simplify the Subreddit History processing in the MLP by replacing the parameter-free Attention mechanism with **Mean Pooling**. Previous lessons indicated that while Attention is theoretically superior, it can lead to instability or overfitting on this small dataset, whereas averaged dense embeddings provide a robust "center of mass" representation of user interests (Cite solution_lesson_node_00028, solution_lesson_node_00031).
+
+3.  **Regularization:** I will increase the MLP dropout rate from 0.3 to 0.4 to mitigate the overfitting observed in the previous run (where validation AUC plateaued while training loss continued to decrease).
+
+I will also update the `WORKING_DIR` to ensure the new features are generated and cached fresh (Cite solution_lesson_node_00014).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for caching processed features (Stream A & B data)
+    WORKING_DIR = "./working/idea_9"
+
+    # Submission directory
+=======
+    # Working directory for caching processed features (Stream A & B data)
+    WORKING_DIR = "./working/idea_10"
+
+    # Submission directory
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Stream B: Attention-Gated MLP
+    MLP_PARAMS = {
+        "hidden_dim": 256,
+        "attention_dim": 128,
+        "dropout_rate": 0.3,
+        "metadata_dropout_rate": 0.0,  # Low dropout for dense metadata features
+    }
+=======
+    # Stream B: Attention-Gated MLP
+    MLP_PARAMS = {
+        "hidden_dim": 256,
+        "attention_dim": 128,
+        "dropout_rate": 0.4,
+        "metadata_dropout_rate": 0.0,  # Low dropout for dense metadata features
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+            # Ratio = Upvotes / Total Votes (add epsilon)
+            meta["upvote_ratio"] = upvotes / (sum_votes + 1e-5)
+
+            return meta
+=======
+            # Ratio = Upvotes / Total Votes (add epsilon)
+            meta["upvote_ratio"] = upvotes / (sum_votes + 1e-5)
+
+            # C. RAOP Activity Ratios
+            # Helps distinguish community regulars from drive-by requesters
+            raop_comments = df.get("requester_number_of_comments_in_raop_at_request", pd.Series(0, index=df.index)).fillna(0)
+            total_comments = df.get("requester_number_of_comments_at_request", pd.Series(0, index=df.index)).fillna(0)
+            # Add 1.0 to denominator to smooth and avoid div/0
+            meta["raop_comment_ratio"] = raop_comments / (total_comments + 1.0)
+
+            raop_posts = df.get("requester_number_of_posts_on_raop_at_request", pd.Series(0, index=df.index)).fillna(0)
+            total_posts = df.get("requester_number_of_posts_at_request", pd.Series(0, index=df.index)).fillna(0)
+            meta["raop_post_ratio"] = raop_posts / (total_posts + 1.0)
+
+            return meta
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_mlp.py
+<<<<<<< SEARCH
+class SubredditAttention(nn.Module):
+    """
+    Parameter-Free Dot-Product Attention Mechanism.
+    Computes importance of historical subreddits based on current request semantics.
+    """
+
+    def __init__(self):
+        super(SubredditAttention, self).__init__()
+
+    def forward(self, query, keys, mask=None):
+        """
+        Args:
+            query: Request embedding (Batch, Dim)
+            keys: Subreddit history embeddings (Batch, Seq_Len, Dim)
+            mask: Boolean mask indicating valid history entries (Batch, Seq_Len)
+
+        Returns:
+            context: Weighted sum of keys (Batch, Dim)
+            weights: Attention weights (Batch, Seq_Len)
+        """
+        # Dot product attention: (Batch, Seq_Len)
+        # query.unsqueeze(1) -> (Batch, 1, Dim)
+        # keys -> (Batch, Seq_Len, Dim)
+        # Element-wise mult -> sum over dim -> dot product
+        scores = (query.unsqueeze(1) * keys).sum(dim=-1)
+
+        if mask is not None:
+            # Mask padding with very large negative number
+            scores = scores.masked_fill(~mask, -1e9)
+
+        weights = torch.softmax(scores, dim=-1)
+
+        # Weighted sum
+        # weights.unsqueeze(-1) -> (Batch, Seq_Len, 1)
+        context = (weights.unsqueeze(-1) * keys).sum(dim=1)
+
+        return context, weights
+
+
+class GatedFusionMLP(nn.Module):
+    """
+    Hybrid Neural Network with:
+    1. Attention-weighted Semantic Branch
+    2. Metadata Branch
+    3. Credibility Gating Mechanism
+    """
+
+    def __init__(self, meta_input_dim, params):
+        super(GatedFusionMLP, self).__init__()
+
+        emb_dim = Config.SBERT_EMBEDDING_DIM
+        hidden_dim = params["hidden_dim"]
+        dropout_rate = params["dropout_rate"]
+        meta_dropout = params["metadata_dropout_rate"]
+
+        # --- Branch 1: Semantics (Request + Attention Context) ---
+        self.attention = SubredditAttention()
+        self.sem_dropout = nn.Dropout(dropout_rate)
+
+        # Combined semantic dimension (Request + Context)
+        self.sem_dim = emb_dim * 2
+
+        # --- Branch 2: Metadata ---
+        self.meta_encoder = nn.Sequential(
+            nn.Linear(meta_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(meta_dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+        )
+
+        # --- Gating Mechanism ---
+        # "Credibility Gate": Uses metadata to gate the semantic information
+        self.gate_proj = nn.Sequential(
+            nn.Linear(hidden_dim, self.sem_dim), nn.Sigmoid()
+        )
+
+        # --- Final Classification Head ---
+        # Input: Gated Semantics + Encoded Metadata
+        final_input_dim = self.sem_dim + hidden_dim
+
+        self.classifier = nn.Sequential(
+            nn.Linear(final_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, text_emb, sub_emb, metadata):
+        # 1. Semantic Processing
+        # Create mask for subreddit history (assuming zero-vectors are padding)
+        # Check if sum of absolute values in embedding dim is > 0
+        sub_mask = sub_emb.abs().sum(dim=-1) > 1e-6
+
+        context_emb, _ = self.attention(text_emb, sub_emb, sub_mask)
+
+        # Concatenate Request + Context
+        sem_feat = torch.cat([text_emb, context_emb], dim=1)
+        sem_feat = self.sem_dropout(sem_feat)
+
+        # 2. Metadata Processing
+        meta_feat = self.meta_encoder(metadata)
+
+        # 3. Gated Fusion
+        gate = self.gate_proj(meta_feat)
+        gated_sem_feat = sem_feat * gate
+
+        # 4. Classification
+        combined = torch.cat([gated_sem_feat, meta_feat], dim=1)
+        logits = self.classifier(combined)
+
+        return torch.sigmoid(logits).squeeze(-1)
+=======
+class GatedFusionMLP(nn.Module):
+    """
+    Hybrid Neural Network with:
+    1. Mean-Pooled Semantic Branch (Request + History)
+    2. Metadata Branch
+    3. Credibility Gating Mechanism
+    """
+
+    def __init__(self, meta_input_dim, params):
+        super(GatedFusionMLP, self).__init__()
+
+        emb_dim = Config.SBERT_EMBEDDING_DIM
+        hidden_dim = params["hidden_dim"]
+        dropout_rate = params["dropout_rate"]
+        meta_dropout = params["metadata_dropout_rate"]
+
+        # --- Branch 1: Semantics (Request + Mean History) ---
+        self.sem_dropout = nn.Dropout(dropout_rate)
+
+        # Combined semantic dimension (Request + Context)
+        self.sem_dim = emb_dim * 2
+
+        # --- Branch 2: Metadata ---
+        self.meta_encoder = nn.Sequential(
+            nn.Linear(meta_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(meta_dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+        )
+
+        # --- Gating Mechanism ---
+        # "Credibility Gate": Uses metadata to gate the semantic information
+        self.gate_proj = nn.Sequential(
+            nn.Linear(hidden_dim, self.sem_dim), nn.Sigmoid()
+        )
+
+        # --- Final Classification Head ---
+        # Input: Gated Semantics + Encoded Metadata
+        final_input_dim = self.sem_dim + hidden_dim
+
+        self.classifier = nn.Sequential(
+            nn.Linear(final_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, text_emb, sub_emb, metadata):
+        # 1. Semantic Processing
+        # Create mask for subreddit history (assuming zero-vectors are padding)
+        # Check if sum of absolute values in embedding dim is > 0
+        sub_mask = sub_emb.abs().sum(dim=-1) > 1e-6
+        
+        # Mean Pooling of Subreddit History
+        # Avoid division by zero with clamp
+        sub_count = sub_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        sub_sum = (sub_emb * sub_mask.unsqueeze(-1)).sum(dim=1)
+        context_emb = sub_sum / sub_count
+
+        # Concatenate Request + Context
+        sem_feat = torch.cat([text_emb, context_emb], dim=1)
+        sem_feat = self.sem_dropout(sem_feat)
+
+        # 2. Metadata Processing
+        meta_feat = self.meta_encoder(metadata)
+
+        # 3. Gated Fusion
+        gate = self.gate_proj(meta_feat)
+        gated_sem_feat = sem_feat * gate
+
+        # 4. Classification
+        combined = torch.cat([gated_sem_feat, meta_feat], dim=1)
+        logits = self.classifier(combined)
+
+        return torch.sigmoid(logits).squeeze(-1)
+>>>>>>> REPLACE
+```

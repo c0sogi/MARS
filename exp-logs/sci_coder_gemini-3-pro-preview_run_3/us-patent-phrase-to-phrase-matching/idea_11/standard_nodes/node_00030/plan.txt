@@ -1,0 +1,251 @@
+The `torch.OutOfMemoryError` indicates that the 16GB VRAM is insufficient for training the DeBERTa-v3-large model in full FP32 precision. I will resolve this by implementing **Gradient Checkpointing** (Cite debug_lesson_8) and **Mixed Precision Training (AMP)** (Cite debug_lesson_8). 
+
+To ensure stability and correctness with these memory optimizations, I will:
+1.  Explicitly set `use_reentrant=False` when enabling gradient checkpointing to prevent graph traversal errors during the backward pass (Cite debug_lesson_7).
+2.  Disable `use_cache` in the model configuration before initialization to ensure compatibility with checkpointing (Cite debug_lesson_6).
+3.  Reduce `max_grad_norm` from 1000 to 1.0 to prevent exploding gradients, which are common when combining large models with AMP (Cite debug_lesson_10).
+4.  Use a safe masking value (`-1e4`) instead of `-1e9` in `AttentionPooling` to avoid overflow in FP16 (Cite debug_lesson_9).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    weight_decay = 0.01
+    gradient_checkpointing = False
+    max_grad_norm = 1000
+
+    # Scheduler
+=======
+    weight_decay = 0.01
+    gradient_checkpointing = True
+    max_grad_norm = 1.0
+
+    # Scheduler
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Mask padding tokens (set to very small value so softmax -> 0)
+        mask = attention_mask.unsqueeze(-1)  # (Batch, Seq, 1)
+        w = w.masked_fill(mask == 0, -1e9)
+
+        # Normalize weights across sequence length
+=======
+        # Mask padding tokens (set to very small value so softmax -> 0)
+        mask = attention_mask.unsqueeze(-1)  # (Batch, Seq, 1)
+        w = w.masked_fill(mask == 0, -1e4)
+
+        # Normalize weights across sequence length
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        self.config = AutoConfig.from_pretrained(model_name, output_hidden_states=True)
+
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        # Enable Gradient Checkpointing for memory efficiency if configured
+        if CFG.gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable()
+
+        # Determine number of layers (Embeddings + Encoder Layers)
+=======
+        self.config = AutoConfig.from_pretrained(model_name, output_hidden_states=True)
+        self.config.use_cache = False
+
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        # Enable Gradient Checkpointing for memory efficiency if configured
+        if CFG.gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        # Determine number of layers (Embeddings + Encoder Layers)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    pearson_losses = AverageMeter()
+
+    # --- Two-Stage Warmup Logic ---
+=======
+    pearson_losses = AverageMeter()
+
+    scaler = torch.amp.GradScaler('cuda')
+
+    # --- Two-Stage Warmup Logic ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Forward pass
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            token_type_ids=inputs["token_type_ids"],
+        )
+
+        # Calculate Loss
+        loss, loss_dict = criterion(outputs, labels, labels_cls)
+
+        # Backward pass
+        loss.backward()
+
+        # --- Adversarial Weight Perturbation (AWP) ---
+        if awp is not None and epoch >= CFG.awp_start_epoch:
+            # 1. Perturb weights based on gradients
+            awp.attack_step()
+
+            # 2. Forward pass with perturbed weights
+            adv_outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                token_type_ids=inputs["token_type_ids"],
+            )
+
+            # 3. Calculate adversarial loss
+            adv_loss, _ = criterion(adv_outputs, labels, labels_cls)
+
+            # 4. Backward pass for adversarial loss
+            adv_loss.backward()
+
+            # 5. Restore original weights
+            awp.restore()
+
+        # Gradient Clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), CFG.max_grad_norm
+        )
+
+        # Optimizer Step
+        optimizer.step()
+        optimizer.zero_grad()
+=======
+        # Forward pass
+        with torch.amp.autocast('cuda'):
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                token_type_ids=inputs["token_type_ids"],
+            )
+
+            # Calculate Loss
+            loss, loss_dict = criterion(outputs, labels, labels_cls)
+
+        # Backward pass
+        scaler.scale(loss).backward()
+
+        # --- Adversarial Weight Perturbation (AWP) ---
+        if awp is not None and epoch >= CFG.awp_start_epoch:
+            scaler.unscale_(optimizer)
+            # 1. Perturb weights based on gradients
+            awp.attack_step()
+
+            # 2. Forward pass with perturbed weights
+            with torch.amp.autocast('cuda'):
+                adv_outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    token_type_ids=inputs["token_type_ids"],
+                )
+
+                # 3. Calculate adversarial loss
+                adv_loss, _ = criterion(adv_outputs, labels, labels_cls)
+
+            # 4. Backward pass for adversarial loss
+            scaler.scale(adv_loss).backward()
+
+            # 5. Restore original weights
+            awp.restore()
+        else:
+            scaler.unscale_(optimizer)
+
+        # Gradient Clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), CFG.max_grad_norm
+        )
+
+        # Optimizer Step
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                token_type_ids=inputs["token_type_ids"],
+            )
+
+            # Calculate Loss
+            loss, loss_dict = criterion(outputs, labels, labels_cls)
+            losses.update(loss.item(), batch_size)
+
+            # Collect predictions (Regression output)
+            # Clip predictions to [0, 1] range as per task spec
+            batch_preds = (
+                outputs["logits"].sigmoid().cpu().numpy()
+                if CFG.target_size == 1 and False
+                else outputs["logits"].cpu().numpy()
+            )
+=======
+            with torch.amp.autocast('cuda'):
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    token_type_ids=inputs["token_type_ids"],
+                )
+
+                # Calculate Loss
+                loss, loss_dict = criterion(outputs, labels, labels_cls)
+            losses.update(loss.item(), batch_size)
+
+            # Collect predictions (Regression output)
+            # Clip predictions to [0, 1] range as per task spec
+            batch_preds = (
+                outputs["logits"].sigmoid().float().cpu().numpy()
+                if CFG.target_size == 1 and False
+                else outputs["logits"].float().cpu().numpy()
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                token_type_ids=inputs["token_type_ids"],
+            )
+
+            batch_preds = outputs["logits"].cpu().numpy()
+            preds.append(batch_preds)
+=======
+            with torch.amp.autocast('cuda'):
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    token_type_ids=inputs["token_type_ids"],
+                )
+
+            batch_preds = outputs["logits"].float().cpu().numpy()
+            preds.append(batch_preds)
+>>>>>>> REPLACE
+```

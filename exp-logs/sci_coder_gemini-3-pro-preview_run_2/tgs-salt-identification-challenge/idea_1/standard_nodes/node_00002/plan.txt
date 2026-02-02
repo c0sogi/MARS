@@ -1,0 +1,478 @@
+To optimize the solution, I will upgrade the model architecture to use a pretrained ResNet34 encoder using `timm`, leveraging transfer learning while maintaining the depth injection strategy at the bottleneck (Cite solution_lesson_node_00001). I will also enhance the training process by introducing robust augmentations via `albumentations`, increasing the training duration to 100 epochs, and implementing Test Time Augmentation (TTA) during inference. Finally, I will add the required conditional logic to only generate a submission if the validation metric exceeds the previous best.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+        self.BATCH_SIZE = 32
+        self.EPOCHS = 50
+        self.LEARNING_RATE = 1e-3
+=======
+        self.BATCH_SIZE = 64
+        self.EPOCHS = 100
+        self.LEARNING_RATE = 1e-3
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+=======
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+import albumentations as A
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        if not data_loaded:
+            self._process_and_cache()
+
+    def _try_load_cache(self):
+=======
+        if not data_loaded:
+            self._process_and_cache()
+
+        # Define Augmentations
+        self.transform = None
+        if self.mode == "train":
+            self.transform = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5),
+                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
+            ])
+
+    def _try_load_cache(self):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        mask = self.masks[idx]
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (1, 128, 128)
+
+        # Apply Augmentations (Train Only)
+        if self.mode == "train":
+            # Horizontal Flip
+            if torch.rand(1).item() > 0.5:
+                image_tensor = torch.flip(image_tensor, [2])
+                mask_tensor = torch.flip(mask_tensor, [2])
+
+        return image_tensor, depth_tensor, mask_tensor
+=======
+        mask = self.masks[idx]
+
+        # Apply Augmentations (Train Only)
+        if self.mode == "train" and self.transform:
+            # Albumentations expects HWC, but we have HW.
+            # It works fine with HW for grayscale if passed correctly.
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]
+
+        # Convert to Tensor (Add Channel Dimension)
+        image_tensor = torch.from_numpy(image).unsqueeze(0)  # (1, 128, 128)
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)    # (1, 128, 128)
+
+        return image_tensor, depth_tensor, mask_tensor
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Convert to Tensor (Add Channel Dimension)
+        image_tensor = torch.from_numpy(image).unsqueeze(0)  # (1, 128, 128)
+        depth_tensor = torch.tensor([depth], dtype=torch.float32)
+
+        if self.mode == "test":
+            return image_tensor, depth_tensor, str(self.ids[idx])
+=======
+        # Convert to Tensor (Add Channel Dimension)
+        # For test set, we just need the tensor
+        image_tensor = torch.from_numpy(image).unsqueeze(0)  # (1, 128, 128)
+        depth_tensor = torch.tensor([depth], dtype=torch.float32)
+
+        if self.mode == "test":
+            return image_tensor, depth_tensor, str(self.ids[idx])
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from library.config import Config
+from library.utils import set_seed, rle_encode, metric_iou
+=======
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import timm
+from library.config import Config
+from library.utils import set_seed, rle_encode, metric_iou
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class EncoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, 3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, 3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # LinkNet Decoder style: 1x1 (reduce) -> Deconv (upsample) -> 1x1 (expand/restore)
+        # We adapt slightly: 1x1 -> Deconv -> 1x1 to match output channels
+        mid_channels = in_channels // 4
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.deconv = nn.ConvTranspose2d(
+            mid_channels,
+            mid_channels,
+            3,
+            stride=2,
+            padding=1,
+            output_padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.deconv(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        return x
+
+
+class DepthLinkNet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=1):
+        super().__init__()
+
+        # Initial Block
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Encoder (ResNet-like)
+        self.enc1 = EncoderBlock(32, 64, stride=2)  # 128 -> 64
+        self.enc2 = EncoderBlock(64, 128, stride=2)  # 64 -> 32
+        self.enc3 = EncoderBlock(128, 256, stride=2)  # 32 -> 16
+        self.enc4 = EncoderBlock(256, 512, stride=2)  # 16 -> 8
+
+        # Depth Injection
+        self.depth_channels = 32
+        self.depth_fc = nn.Sequential(
+            nn.Linear(1, self.depth_channels), nn.ReLU(inplace=True)
+        )
+
+        # Decoder
+        # Input to Dec4 is Enc4_out + Depth
+        self.dec4 = DecoderBlock(512 + self.depth_channels, 256)
+        self.dec3 = DecoderBlock(256, 128)
+        self.dec2 = DecoderBlock(128, 64)
+        self.dec1 = DecoderBlock(64, 32)
+
+        # Final Head
+        self.final_conv = nn.Conv2d(32, num_classes, 1)
+
+    def forward(self, x, z):
+        # Encoder
+        x0 = self.init_conv(x)  # 32, 128, 128
+        e1 = self.enc1(x0)  # 64, 64, 64
+        e2 = self.enc2(e1)  # 128, 32, 32
+        e3 = self.enc3(e2)  # 256, 16, 16
+        e4 = self.enc4(e3)  # 512, 8, 8
+
+        # Depth Injection
+        # z: (B, 1) -> (B, depth_ch)
+        d = self.depth_fc(z)
+        # Expand to (B, depth_ch, 8, 8)
+        d = d.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, e4.size(2), e4.size(3))
+
+        bottleneck = torch.cat([e4, d], dim=1)  # 544, 8, 8
+
+        # Decoder with LinkNet Skip Connections (Addition)
+        d4 = self.dec4(bottleneck)  # -> 256, 16, 16
+        d4 = d4 + e3
+
+        d3 = self.dec3(d4)  # -> 128, 32, 32
+        d3 = d3 + e2
+
+        d2 = self.dec2(d3)  # -> 64, 64, 64
+        d2 = d2 + e1
+
+        d1 = self.dec1(d2)  # -> 32, 128, 128
+        d1 = d1 + x0
+
+        out = self.final_conv(d1)
+        return out
+=======
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # LinkNet-style decoder block
+        mid_channels = in_channels // 4
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.deconv = nn.ConvTranspose2d(
+            mid_channels,
+            mid_channels,
+            3,
+            stride=2,
+            padding=1,
+            output_padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.deconv(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        return x
+
+
+class DepthLinkNet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=1):
+        super().__init__()
+        
+        # Use timm to create a ResNet34 encoder
+        # features_only=True returns a list of feature maps
+        # in_chans=1 allows us to use grayscale input directly
+        try:
+            self.encoder = timm.create_model(
+                'resnet34', 
+                pretrained=True, 
+                in_chans=in_channels, 
+                features_only=True
+            )
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}. Loading random weights.")
+            self.encoder = timm.create_model(
+                'resnet34', 
+                pretrained=False, 
+                in_chans=in_channels, 
+                features_only=True
+            )
+
+        # ResNet34 feature channels:
+        # layer0: 64 (stride 2)
+        # layer1: 64 (stride 4)
+        # layer2: 128 (stride 8)
+        # layer3: 256 (stride 16)
+        # layer4: 512 (stride 32)
+        
+        # Depth Injection (Cite solution_lesson_node_00001)
+        # We inject depth at the bottleneck (layer4)
+        self.depth_channels = 32
+        self.depth_fc = nn.Sequential(
+            nn.Linear(1, self.depth_channels), nn.ReLU(inplace=True)
+        )
+
+        # Decoder
+        # Bottleneck: 512 (layer4) + 32 (depth) -> Upsample to match layer3 (256)
+        self.dec4 = DecoderBlock(512 + self.depth_channels, 256)
+        
+        # Layer3 (256) + Skip (256) -> Upsample to match layer2 (128)
+        self.dec3 = DecoderBlock(256, 128)
+        
+        # Layer2 (128) + Skip (128) -> Upsample to match layer1 (64)
+        self.dec2 = DecoderBlock(128, 64)
+        
+        # Layer1 (64) + Skip (64) -> Upsample to match layer0 (64)
+        self.dec1 = DecoderBlock(64, 64)
+        
+        # Final upsample from layer0 (stride 2) to original size (stride 1)
+        # We can use a simple Deconv or PixelShuffle. Here we use a final block.
+        self.final_deconv = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+
+        self.final_conv = nn.Conv2d(32, num_classes, 1)
+
+    def forward(self, x, z):
+        # Encoder
+        features = self.encoder(x)
+        e0 = features[0]  # 64, H/2, W/2
+        e1 = features[1]  # 64, H/4, W/4
+        e2 = features[2]  # 128, H/8, W/8
+        e3 = features[3]  # 256, H/16, W/16
+        e4 = features[4]  # 512, H/32, W/32
+
+        # Depth Injection (Cite solution_lesson_node_00001)
+        # Inject global scalar at the bottleneck
+        d = self.depth_fc(z)
+        d = d.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, e4.size(2), e4.size(3))
+        bottleneck = torch.cat([e4, d], dim=1)
+
+        # Decoder with Additive Skip Connections (LinkNet style)
+        d4 = self.dec4(bottleneck)
+        d4 = d4 + e3
+
+        d3 = self.dec3(d4)
+        d3 = d3 + e2
+
+        d2 = self.dec2(d3)
+        d2 = d2 + e1
+        
+        d1 = self.dec1(d2)
+        d1 = d1 + e0
+        
+        # Final upsample to original resolution
+        out = self.final_deconv(d1)
+        out = self.final_conv(out)
+        
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+    # Inference Loop
+    with torch.no_grad():
+        for images, depths, ids in test_loader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # Forward pass
+            outputs = model(images, depths)
+
+            # Sigmoid to get probabilities
+            probs = torch.sigmoid(outputs)
+
+            # Move to CPU for post-processing
+            probs = probs.cpu().numpy()
+
+            # Iterate through batch
+            for i, img_id in enumerate(ids):
+                # Extract single probability map (C, H, W) -> (H, W)
+                # Shape is (1, 128, 128) -> (128, 128)
+                prob_map = probs[i, 0, :, :]
+=======
+    # Inference Loop
+    with torch.no_grad():
+        for images, depths, ids in test_loader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # TTA: Standard
+            outputs = model(images, depths)
+            probs = torch.sigmoid(outputs)
+
+            # TTA: Horizontal Flip
+            images_flip = torch.flip(images, [3])
+            outputs_flip = model(images_flip, depths)
+            probs_flip = torch.sigmoid(outputs_flip)
+            probs_flip = torch.flip(probs_flip, [3])
+
+            # Average
+            probs = (probs + probs_flip) / 2.0
+
+            # Move to CPU for post-processing
+            probs = probs.cpu().numpy()
+
+            # Iterate through batch
+            for i, img_id in enumerate(ids):
+                # Extract single probability map (C, H, W) -> (H, W)
+                # Shape is (1, 128, 128) -> (128, 128)
+                prob_map = probs[i, 0, :, :]
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Submission Generation
+    print("Generating submission file...")
+    generate_submission(config)
+    print("Pipeline complete.")
+=======
+    # 5. Submission Generation
+    # Conditional submission based on validation metric
+    THRESHOLD_METRIC = 0.6548333333333333
+    
+    if final_metric > THRESHOLD_METRIC:
+        print(f"Validation metric {final_metric:.6f} > {THRESHOLD_METRIC:.6f}. Generating submission file...")
+        generate_submission(config)
+    else:
+        print(f"Validation metric {final_metric:.6f} <= {THRESHOLD_METRIC:.6f}. Skipping submission generation.")
+        
+    print("Pipeline complete.")
+>>>>>>> REPLACE
+```

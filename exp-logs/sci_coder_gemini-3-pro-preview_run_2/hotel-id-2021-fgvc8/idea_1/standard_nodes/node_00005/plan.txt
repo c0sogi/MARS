@@ -1,0 +1,259 @@
+I will implement an ArcFace (Additive Angular Margin) based solution to address the high-cardinality and long-tail nature of the Hotel ID dataset, as recommended in the lesson (Cite solution_lesson_node_00001). Standard Softmax struggles with 7,770 classes given few samples per class; ArcFace enforces a geometric margin in the embedding space to improve intra-class compactness and inter-class separability.
+
+My strategy involves:
+1.  **Configuration**: Updating `library/config.py` to include ArcFace hyperparameters (`s=30.0`, `m=0.50`) and increasing `NUM_EPOCHS` to 15 to allow sufficient convergence for the metric learning objective.
+2.  **Model Architecture**: Modifying `library/model.py` to replace the standard linear head with an `ArcMarginProduct` head. The backbone will output a 512-dimensional embedding (normalized), which is then processed by the ArcFace layer.
+3.  **Training Logic**: Updating `library/engine.py` to pass ground-truth labels to the model during the forward pass (required for ArcFace margin calculation).
+4.  **Submission Logic**: Updating `runfile.py` to strictly enforce the requirement of only generating a submission if the validation MAP@5 exceeds the previous baseline of ~0.0042.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    NUM_EPOCHS = 15  # Max epochs (subject to early stopping)
+    LABEL_SMOOTHING = 0.1  # Helps with high cardinality classification
+    PATIENCE = 3  # Early stopping patience
+
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    MODEL_NAME = "resnet18"
+    PRETRAINED = True
+    DROPOUT = 0.2  # Dropout rate for the final layer
+=======
+    NUM_EPOCHS = 15  # Max epochs (subject to early stopping)
+    LABEL_SMOOTHING = 0.1  # Helps with high cardinality classification
+    PATIENCE = 5  # Early stopping patience
+
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    MODEL_NAME = "resnet18"
+    PRETRAINED = True
+    DROPOUT = 0.2  # Dropout rate for the final layer
+
+    # ArcFace Parameters
+    EMBEDDING_SIZE = 512
+    ARCFACE_S = 30.0
+    ARCFACE_M = 0.50
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights
+from library.config import Config
+
+
+class HotelClassifier(nn.Module):
+    """
+    Hotel ID Classifier using a ResNet-18 backbone.
+
+    The architecture consists of a pre-trained ResNet-18 model where the
+    final fully connected layer is replaced to map the 512-dimensional
+    feature vector to the specific number of hotel classes.
+    """
+
+    def __init__(
+        self,
+        n_classes: int = Config.NUM_CLASSES,
+        pretrained: bool = Config.PRETRAINED,
+        dropout: float = Config.DROPOUT,
+    ):
+        """
+        Initialize the HotelClassifier.
+
+        Args:
+            n_classes (int): Number of target classes (hotels). Defaults to Config.NUM_CLASSES.
+            pretrained (bool): Whether to use ImageNet pre-trained weights. Defaults to Config.PRETRAINED.
+            dropout (float): Dropout probability for the final layer. Defaults to Config.DROPOUT.
+        """
+        super(HotelClassifier, self).__init__()
+
+        # Select weights based on pretrained flag
+        if pretrained:
+            weights = ResNet18_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        # Load the ResNet-18 backbone
+        self.backbone = resnet18(weights=weights)
+
+        # Get the input dimension of the original fully connected layer (usually 512 for ResNet18)
+        in_features = self.backbone.fc.in_features
+
+        # Replace the final fully connected layer
+        # We include Dropout for regularization as specified in the configuration strategy
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(p=dropout), nn.Linear(in_features, n_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the network.
+
+        Args:
+            x (torch.Tensor): Input batch of images. Shape (B, C, H, W).
+
+        Returns:
+            torch.Tensor: Raw logits for each class. Shape (B, n_classes).
+        """
+        return self.backbone(x)
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torchvision.models import resnet18, ResNet18_Weights
+from library.config import Config
+
+
+class ArcMarginProduct(nn.Module):
+    """
+    ArcFace (Additive Angular Margin Loss) layer.
+    Cite solution_lesson_node_00001: Pivot to Metric Learning for high-cardinality.
+    """
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input, label=None):
+        # --------------------------- cos(theta) & phi(theta) ---------------------------
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        
+        # If inference (no label), return scaled cosine similarity
+        if label is None:
+            return cosine * self.s
+            
+        # --------------------------- Training with Margin ---------------------------
+        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+            
+        # --------------------------- convert label to one-hot ---------------------------
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+
+        return output
+
+
+class HotelClassifier(nn.Module):
+    """
+    Hotel ID Classifier using a ResNet-18 backbone with ArcFace head.
+    """
+
+    def __init__(
+        self,
+        n_classes: int = Config.NUM_CLASSES,
+        pretrained: bool = Config.PRETRAINED,
+        dropout: float = Config.DROPOUT,
+    ):
+        super(HotelClassifier, self).__init__()
+
+        # Select weights based on pretrained flag
+        if pretrained:
+            weights = ResNet18_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        # Load the ResNet-18 backbone
+        self.backbone = resnet18(weights=weights)
+        in_features = self.backbone.fc.in_features
+
+        # Remove original fc
+        self.backbone.fc = nn.Identity()
+
+        # Embedding layer
+        self.bn1 = nn.BatchNorm1d(in_features)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(in_features, Config.EMBEDDING_SIZE)
+        self.bn2 = nn.BatchNorm1d(Config.EMBEDDING_SIZE)
+
+        # ArcFace Head
+        self.arcface = ArcMarginProduct(
+            in_features=Config.EMBEDDING_SIZE,
+            out_features=n_classes,
+            s=Config.ARCFACE_S,
+            m=Config.ARCFACE_M
+        )
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass.
+        Args:
+            x: Input images
+            labels: Ground truth labels (optional, for training)
+        """
+        x = self.backbone(x)
+        x = self.bn1(x)
+        x = self.dropout(x)
+        x = self.fc1(x)
+        x = self.bn2(x)
+        
+        return self.arcface(x, labels)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+=======
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Pass labels to model for ArcFace margin calculation
+        logits = model(images, labels)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 8. Submission
+    predict_and_submit(model, test_loader, classes, device)
+=======
+    # 8. Submission
+    if final_map > 0.004247584426088712:
+        predict_and_submit(model, test_loader, classes, device)
+    else:
+        print(f"Metric {final_map} did not beat threshold. Skipping submission.")
+>>>>>>> REPLACE
+```

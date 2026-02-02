@@ -1,0 +1,247 @@
+The implementation strategy focuses on reverting the detrimental changes introduced in the previous solution (`idea_15`) while retaining the robust architectural components. Specifically, we will:
+
+1.  **Disable Explicit Boundary Supervision**: Set `BND_LOSS_WEIGHT` to 0.0. This aligns with **Lesson 00077** and **Lesson 00087**, which suggest that forcing the model to predict exact frame-wise boundaries (which are often ambiguous) can degrade performance. Instead, the boundary channel will act as a latent variable, implicitly learning transition signals to guide the refinement stages (as per **Lesson 00075**).
+
+2.  **Unclamp and Strengthen Temporal Smoothing**: Remove the truncation (clamping) from the Temporal Mean Squared Error (TMSE) loss and increase its weight to 1.0. **Lesson 00087** highlights that clamping the smoothing loss allows high-frequency "chatter" (jitter) to persist because the penalty for spurious transitions is capped. Unbounded TMSE with a high weight (**Lesson 00068**) is critical for suppressing over-segmentation.
+
+3.  **Stabilize TCN Architecture**: Replace the `GatedTCNBlock` (Tanh/Sigmoid) with a standard `DilatedResidualBlock` (ReLU). **Lesson 00082** and **Lesson 00084** indicate that Gated TCNs can be unstable or difficult to train without precise normalization and supervision. Reverting to the simpler, proven ReLU-based residual block ensures robust convergence.
+
+4.  **Extend Training**: Increase epochs to 45 to allow the model to fully converge with the stricter smoothing constraints.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Loss Component Weights
+    CLS_LOSS_WEIGHT = 1.0  # Classification Loss
+    BND_LOSS_WEIGHT = 1.0  # Boundary Regression Loss
+    SMOOTH_LOSS_WEIGHT = 0.15  # Truncated MSE (Smoothing) Loss
+=======
+    # Loss Component Weights
+    CLS_LOSS_WEIGHT = 1.0  # Classification Loss
+    BND_LOSS_WEIGHT = 0.0  # Boundary Regression Loss (Disabled for implicit learning - Cite Lesson 00077, 00087)
+    SMOOTH_LOSS_WEIGHT = 1.0  # Unbounded MSE (Smoothing) Loss (Cite Lesson 00068)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GatedTCNBlock(nn.Module):
+    """
+    Gated Activation Unit for Temporal Convolutional Networks.
+    Computes Z = tanh(W_f * X) * sigmoid(W_g * X).
+    Includes a residual connection.
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(GatedTCNBlock, self).__init__()
+        # Calculate padding to maintain temporal dimension
+        # For kernel_size 3: padding = dilation
+        self.padding = (kernel_size - 1) * dilation // 2
+
+        # Filter convolution (W_f)
+        self.filter_conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=self.padding,
+        )
+
+        # Gate convolution (W_g)
+        self.gate_conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=self.padding,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Channels, Time)
+
+        # Filter: tanh(W_f * x)
+        f = torch.tanh(self.filter_conv(x))
+
+        # Gate: sigmoid(W_g * x)
+        g = torch.sigmoid(self.gate_conv(x))
+
+        # Element-wise multiplication (Gating)
+        out = f * g
+
+        out = self.dropout(out)
+
+        # Residual connection
+        return x + out
+=======
+class DilatedResidualBlock(nn.Module):
+    """
+    Standard Dilated Residual Block for TCN.
+    Conv1d(dilated) -> ReLU -> Dropout -> Conv1d(1x1) -> Residual
+    Replaces GatedTCNBlock to improve stability (Cite Lesson 00082).
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(DilatedResidualBlock, self).__init__()
+        self.padding = (kernel_size - 1) * dilation // 2
+
+        self.conv1 = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=self.padding,
+        )
+        
+        self.conv2 = nn.Conv1d(channels, channels, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = F.relu(self.conv1(x))
+        out = self.conv2(out)
+        out = self.dropout(out)
+        return x + out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Stack of Gated TCN Blocks with increasing dilation
+        self.layers = nn.ModuleList(
+            [
+                GatedTCNBlock(
+                    channels=hidden_channels,
+                    kernel_size=kernel_size,
+                    dilation=2**i,
+                    dropout=dropout,
+                )
+                for i in range(num_layers)
+            ]
+        )
+=======
+        # Stack of Dilated Residual Blocks with increasing dilation
+        self.layers = nn.ModuleList(
+            [
+                DilatedResidualBlock(
+                    channels=hidden_channels,
+                    kernel_size=kernel_size,
+                    dilation=2**i,
+                    dropout=dropout,
+                )
+                for i in range(num_layers)
+            ]
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def compute_tmse_loss(self, probs, mask, threshold=0.04):
+        """
+        Truncated Mean Squared Error for smoothing.
+        probs: (B, T, C) - Softmax probabilities
+        mask: (B, T)
+        threshold: Clamp value for squared error (default 0.2^2 = 0.04).
+        """
+        # Calculate diff: P_t - P_{t-1}
+        # Shape: (B, T-1, C)
+        diff = probs[:, 1:, :] - probs[:, :-1, :]
+
+        # Squared Error
+        sq_diff = diff**2
+
+        # Clamp (Truncate) to prevent penalizing sharp, genuine transitions too heavily
+        sq_diff = torch.clamp(sq_diff, max=threshold)
+
+        # Mask alignment (T-1)
+        # Only consider transition valid if both t and t-1 are valid
+        mask_t = mask[:, 1:] * mask[:, :-1]
+
+        # Mean over valid transitions
+        # Sum over features (C), then average over time and batch
+        loss = (sq_diff.mean(dim=-1) * mask_t).sum() / (mask_t.sum() + 1e-8)
+
+        return loss
+=======
+    def compute_tmse_loss(self, probs, mask):
+        """
+        Mean Squared Error for smoothing (Unbounded).
+        probs: (B, T, C) - Softmax probabilities
+        mask: (B, T)
+        Removed clamping to strictly penalize jitter (Cite Lesson 00087).
+        """
+        # Calculate diff: P_t - P_{t-1}
+        # Shape: (B, T-1, C)
+        diff = probs[:, 1:, :] - probs[:, :-1, :]
+
+        # Squared Error
+        sq_diff = diff**2
+
+        # Mask alignment (T-1)
+        # Only consider transition valid if both t and t-1 are valid
+        mask_t = mask[:, 1:] * mask[:, :-1]
+
+        # Mean over valid transitions
+        # Sum over features (C), then average over time and batch
+        loss = (sq_diff.mean(dim=-1) * mask_t).sum() / (mask_t.sum() + 1e-8)
+
+        return loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # 3. Smoothing Loss
+            # Apply to softmax probabilities
+            probs_cls = F.softmax(logits_cls, dim=2)
+            smooth_loss = self.compute_tmse_loss(probs_cls, mask)
+=======
+            # 3. Smoothing Loss
+            # Apply to softmax probabilities
+            probs_cls = F.softmax(logits_cls, dim=2)
+            # Use unbounded TMSE (Cite Lesson 00087)
+            smooth_loss = self.compute_tmse_loss(probs_cls, mask)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Weighted Sum for this stage
+            stage_loss = (
+                Config.CLS_LOSS_WEIGHT * ce_loss
+                + Config.BND_LOSS_WEIGHT * bnd_loss
+                + Config.SMOOTH_LOSS_WEIGHT * smooth_loss
+            )
+=======
+            # Weighted Sum for this stage
+            # BND_LOSS_WEIGHT is 0.0, enabling implicit boundary learning (Cite Lesson 00077)
+            stage_loss = (
+                Config.CLS_LOSS_WEIGHT * ce_loss
+                + Config.BND_LOSS_WEIGHT * bnd_loss
+                + Config.SMOOTH_LOSS_WEIGHT * smooth_loss
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Train for a limited number of epochs to ensure completion within time limits.
+    # The SG-CRCN architecture is efficient, so 35 epochs should be sufficient
+    # for a strong baseline while keeping runtime low.
+    print("Starting training...")
+    trainer.fit(num_epochs=35)
+=======
+    # Train for a limited number of epochs to ensure completion within time limits.
+    # The SG-CRCN architecture is efficient, so 35 epochs should be sufficient
+    # for a strong baseline while keeping runtime low.
+    print("Starting training...")
+    trainer.fit(num_epochs=45)
+>>>>>>> REPLACE
+```

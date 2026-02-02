@@ -1,0 +1,702 @@
+The following implementation strategy optimizes the solution by addressing the critical data pipeline failure and switching to a more robust model architecture, based on the provided lessons.
+
+### Implementation Strategy
+
+1.  **Data Processing Repair (Cite `solution_lesson_node_00015`)**:
+    -   The previous "vertical expansion" strategy failed because of type mismatches during merging, leading to zero-filled features and a model that couldn't learn.
+    -   I will fix the `DataProcessor` to ensure strict type casting for `game_play` (string) and `nfl_player_id` (int) before merging.
+    -   I will implement the "Wide" feature format by flattening the temporal window `(Batch, Window, Features)` into `(Batch, Window * Features)`, which allows the MLP to learn time-specific weights (e.g., $t=0$ is more important than $t=-5$).
+
+2.  **Feature Engineering (Cite `solution_lesson_node_00005`, `solution_lesson_node_00007`)**:
+    -   I will implement **Physics-based Closing Speed** derived from velocity vectors ($V_{rel} \cdot P_{rel}$) rather than simple finite differences.
+    -   I will use **Clamped Division** (`max(dist, 1e-6)`) for the closing speed calculation to prevent numerical instability near contact events.
+    -   I will retain `log_distance` as a key non-linear feature.
+
+3.  **Model Architecture (Cite `solution_lesson_node_00002`, `solution_lesson_node_00011`)**:
+    -   I will replace the `TRGCN` with a **Kinematic MLP (K-MLP)**. The TRGCN's global pooling destroyed temporal alignment, whereas the K-MLP preserves the exact position of features in the flattened vector.
+    -   The MLP will have a structure of `[Input -> 512 -> 256 -> 128 -> 1]`.
+
+4.  **Training Configuration (Cite `solution_lesson_node_00008`)**:
+    -   I will maintain the **Weighted Binary Cross Entropy** loss with a positive weight of ~72.0, as it outperformed Focal Loss for this specific class imbalance.
+    -   I will increase the batch size to 512 and epochs to 15 to take advantage of the faster MLP training.
+
+### Code Changes
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Derived features calculated during processing
+    # distance, log_distance, closing_speed, etc.
+    # This constant is used to determine input dimension size
+    # Structure per timestep: [P1_feats, P2_feats, dist, log_dist, closing_speed, is_ground]
+    # len(PLAYER_FEATURES)*2 + 4
+    NUM_FEATURES_PER_TIMESTEP = len(PLAYER_FEATURES) * 2 + 4
+
+    # =========================================================================
+    # Model Hyperparameters
+    # =========================================================================
+    # Training
+    BATCH_SIZE = 256
+    LEARNING_RATE = 1e-3
+    EPOCHS = 10
+
+    # Class Imbalance Handling
+    # Based on data analysis: Ratio of No-Contact to Contact is approx 72.5:1
+    POS_WEIGHT = 72.5
+
+    # Architecture (TR-GCN)
+    CNN_FILTERS = 64
+    CNN_KERNEL_SIZE = 3
+    HIDDEN_DIM = 128
+    DROPOUT = 0.3
+=======
+    # Derived features calculated during processing
+    # distance, log_distance, closing_speed, etc.
+    # This constant is used to determine input dimension size
+    # Structure per timestep: [P1_feats, P2_feats, dist, log_dist, closing_speed, is_ground]
+    # len(PLAYER_FEATURES)*2 + 4
+    NUM_FEATURES_PER_TIMESTEP = len(PLAYER_FEATURES) * 2 + 4
+    
+    # Input dimension for the Kinematic MLP (Flattened Window)
+    INPUT_DIM = NUM_FEATURES_PER_TIMESTEP * WINDOW_SIZE
+
+    # =========================================================================
+    # Model Hyperparameters
+    # =========================================================================
+    # Training
+    BATCH_SIZE = 512
+    LEARNING_RATE = 2e-4
+    EPOCHS = 15
+
+    # Class Imbalance Handling
+    # Based on data analysis: Ratio of No-Contact to Contact is approx 72.5:1
+    # Cite solution_lesson_node_00002: Weighted BCE with weight ~72.0
+    POS_WEIGHT = 72.0
+
+    # Architecture (Kinematic MLP)
+    HIDDEN_LAYERS = [512, 256, 128]
+    DROPOUT = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TRGCN(nn.Module):
+    """
+    Time-Resolved Gated Convolutional Network (TR-GCN).
+
+    This architecture combines a 1D Convolutional encoder (without pooling) to capture
+    temporal patterns while preserving resolution, with a gated dual-head output
+    that applies specific logic for Ground vs. Player contacts.
+    """
+
+    def __init__(
+        self,
+        input_dim=Config.NUM_FEATURES_PER_TIMESTEP,
+        window_size=Config.WINDOW_SIZE,
+        cnn_filters=Config.CNN_FILTERS,
+        kernel_size=Config.CNN_KERNEL_SIZE,
+        hidden_dim=Config.HIDDEN_DIM,
+        dropout=Config.DROPOUT,
+    ):
+        """
+        Args:
+            input_dim (int): Number of features per timestep.
+            window_size (int): Temporal window size (number of frames).
+            cnn_filters (int): Number of filters in Conv1d layers.
+            kernel_size (int): Kernel size for Conv1d layers.
+            hidden_dim (int): Dimension of the shared dense layer.
+            dropout (float): Dropout probability.
+        """
+        super(TRGCN, self).__init__()
+
+        self.window_size = window_size
+
+        # 1D Convolutional Encoder
+        # We use padding to preserve the temporal dimension (Same Padding)
+        # No Global Pooling is used to retain temporal position information
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv1d(
+            in_channels=input_dim,
+            out_channels=cnn_filters,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+        self.bn1 = nn.BatchNorm1d(cnn_filters)
+
+        self.conv2 = nn.Conv1d(
+            in_channels=cnn_filters,
+            out_channels=cnn_filters,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+        self.bn2 = nn.BatchNorm1d(cnn_filters)
+
+        # Flattening
+        # The output of convs is (Batch, Filters, Window_Size)
+        # We flatten this to preserve the structure: "Feature F at Time T"
+        self.flatten_dim = cnn_filters * window_size
+
+        # Shared Dense Section
+        self.fc_shared = nn.Linear(self.flatten_dim, hidden_dim)
+        self.dropout_layer = nn.Dropout(dropout)
+
+        # Dual-Head Output
+        # Head 1: Specialized for Player-to-Player contact
+        self.head_player = nn.Linear(hidden_dim, 1)
+
+        # Head 2: Specialized for Player-to-Ground contact
+        self.head_ground = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        """
+        Forward pass with Gating Mechanism.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, Window_Size, Features).
+                              The last feature is expected to be 'is_ground'.
+
+        Returns:
+            torch.Tensor: Probability of contact (Batch, 1).
+        """
+        # 1. Extract Gating Signal
+        # is_ground is the last feature. We take the value from the center frame.
+        # Shape: (Batch, 1)
+        center_idx = self.window_size // 2
+        is_ground = x[:, center_idx, -1].unsqueeze(1)
+
+        # 2. Permute for Conv1d
+        # Input: (Batch, Window, Features) -> Output: (Batch, Features, Window)
+        x = x.permute(0, 2, 1)
+
+        # 3. Convolutional Encoder
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+
+        # 4. Flatten
+        # (Batch, Filters, Window) -> (Batch, Filters * Window)
+        x = x.view(x.size(0), -1)
+
+        # 5. Shared Dense Layer
+        x = self.fc_shared(x)
+        x = F.relu(x)
+        x = self.dropout_layer(x)
+
+        # 6. Dual Heads (Probabilities)
+        # We use Sigmoid here to generate probabilities for the gating logic
+        prob_player = torch.sigmoid(self.head_player(x))
+        prob_ground = torch.sigmoid(self.head_ground(x))
+
+        # 7. Gating Mechanism
+        # Deterministically select the output based on the physics type (Ground vs Player)
+        # P_final = P_ground * I_ground + P_player * (1 - I_ground)
+        final_prob = prob_ground * is_ground + prob_player * (1.0 - is_ground)
+
+        return final_prob
+=======
+class KinematicMLP(nn.Module):
+    """
+    Kinematic Multi-Layer Perceptron (K-MLP).
+    
+    Cite solution_lesson_node_00015: "Vectorized Lag-Shifting Outperforms Vertical Window Expansion".
+    This model takes a flattened vector of windowed features (Wide Format) and processes it
+    through a series of dense layers.
+    """
+
+    def __init__(
+        self,
+        input_dim=Config.INPUT_DIM,
+        hidden_layers=Config.HIDDEN_LAYERS,
+        dropout=Config.DROPOUT,
+    ):
+        super(KinematicMLP, self).__init__()
+        
+        layers = []
+        in_dim = input_dim
+        
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = h_dim
+            
+        self.features = nn.Sequential(*layers)
+        self.classifier = nn.Linear(in_dim, 1)
+
+    def forward(self, x):
+        # x shape: (Batch, Window, Features) or (Batch, Window * Features)
+        # We flatten if necessary
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+            
+        x = self.features(x)
+        return torch.sigmoid(self.classifier(x))
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processor.py
+<<<<<<< SEARCH
+    def _compute_derived_features(self, df):
+        """
+        Computes distance, log_distance, and closing_speed.
+        Assumes df is sorted by sample and time window.
+        """
+        # 1. Euclidean Distance
+        dx = df["x_position_1"] - df["x_position_2"]
+        dy = df["y_position_1"] - df["y_position_2"]
+        dist = np.sqrt(dx**2 + dy**2)
+
+        # Force distance to 0 for Ground contacts (where P2 is 'G')
+        # This aligns with the logic that 'G' features are 0.
+        is_ground = df["is_ground"] == 1
+        dist[is_ground] = 0.0
+
+        # 2. Log Distance (Feature Engineering for Neural Nets)
+        log_dist = np.log1p(dist)
+
+        # 3. Closing Speed
+        # Calculated as change in distance per timestep (0.1s)
+        # We rely on the dataframe being ordered by window step.
+        # The first element of each window will be invalid (diff with prev sample),
+        # so we mask it out.
+
+        dist_diff = dist.diff().fillna(0)
+
+        # Mask the start of each window
+        # Since we expanded using a fixed list of offsets, every WINDOW_SIZE rows is a new sample.
+        mask_start = (np.arange(len(df)) % Config.WINDOW_SIZE) == 0
+        dist_diff[mask_start] = 0.0
+
+        # Speed = distance / time. Timestep is 0.1s.
+        closing_speed = dist_diff / 0.1
+
+        return dist, log_dist, closing_speed
+
+    def process_data(self, split="train", load_cached_data=True):
+        """
+        Main processing pipeline.
+
+        Args:
+            split (str): 'train', 'validation', or 'test'.
+            load_cached_data (bool): Whether to attempt loading from cache.
+
+        Returns:
+            tuple: (X, y, ids)
+                X: np.ndarray (N, Window, Features)
+                y: np.ndarray (N,)
+                ids: np.ndarray (N,)
+        """
+        # --- 1. Cache Check ---
+        X_path = os.path.join(self.cache_dir, f"{split}_X.npy")
+        y_path = os.path.join(self.cache_dir, f"{split}_y.npy")
+        ids_path = os.path.join(self.cache_dir, f"{split}_ids.npy")
+
+        if (
+            load_cached_data
+            and os.path.exists(X_path)
+            and os.path.exists(y_path)
+            and os.path.exists(ids_path)
+        ):
+            print(f"Loading {split} data from cache...")
+            X = np.load(X_path)
+            y = np.load(y_path)
+            ids = np.load(ids_path, allow_pickle=True)
+            return X, y, ids
+
+        print(f"Processing {split} data from scratch...")
+
+        # --- 2. Load Raw Data ---
+        df_meta = self._load_metadata(split)
+        unique_gps = df_meta["game_play"].unique()
+        df_trk = self._load_tracking(split, unique_gps)
+
+        # --- 3. Window Expansion ---
+        # We need to create a window of steps centered on the target step.
+        half_window = Config.WINDOW_SIZE // 2
+        offsets = np.arange(-half_window, half_window + 1)  # e.g., [-5, -4, ..., 5]
+
+        # Repeat metadata rows for each offset
+        # We keep track of the original index to preserve order and grouping
+        df_meta["orig_index"] = df_meta.index
+
+        # Efficient cross-join simulation
+        n_repeats = len(offsets)
+        df_expanded = df_meta.loc[df_meta.index.repeat(n_repeats)].copy()
+
+        # Assign offsets and calculate actual steps
+        df_expanded["offset"] = np.tile(offsets, len(df_meta))
+        df_expanded["step_window"] = df_expanded["step"] + df_expanded["offset"]
+
+        # --- 4. Merge Tracking Data ---
+        # Prepare Player 1 ID (ensure numeric)
+        df_expanded["nfl_player_id_1"] = pd.to_numeric(
+            df_expanded["nfl_player_id_1"], errors="coerce"
+        )
+
+        # Prepare Player 2 ID (handle 'G' for ground)
+        df_expanded["nfl_player_id_2_num"] = pd.to_numeric(
+            df_expanded["nfl_player_id_2"], errors="coerce"
+        )
+
+        # Merge Player 1 Tracking
+        # We merge on (game_play, step, player_id)
+        df_merged = df_expanded.merge(
+            df_trk,
+            left_on=["game_play", "step_window", "nfl_player_id_1"],
+            right_on=["game_play", "step", "nfl_player_id"],
+            how="left",
+        )
+
+        # Rename P1 features
+        rename_p1 = {c: f"{c}_1" for c in Config.PLAYER_FEATURES}
+        df_merged.rename(columns=rename_p1, inplace=True)
+        # Cleanup merge columns
+        df_merged.drop(
+            columns=["nfl_player_id", "step_y"], inplace=True, errors="ignore"
+        )
+        df_merged.rename(columns={"step_x": "step"}, inplace=True)
+
+        # Merge Player 2 Tracking
+        df_merged = df_merged.merge(
+            df_trk,
+            left_on=["game_play", "step_window", "nfl_player_id_2_num"],
+            right_on=["game_play", "step", "nfl_player_id"],
+            how="left",
+            suffixes=("", "_2"),
+        )
+
+        # Rename P2 features
+        rename_p2 = {c: f"{c}_2" for c in Config.PLAYER_FEATURES}
+        df_merged.rename(columns=rename_p2, inplace=True)
+        df_merged.drop(columns=["nfl_player_id", "step"], inplace=True, errors="ignore")
+
+        # Fill Missing Tracking Data with 0
+        # This handles both 'Ground' (where ID is NaN) and missing player tracking
+        feat_cols_1 = [f"{c}_1" for c in Config.PLAYER_FEATURES]
+        feat_cols_2 = [f"{c}_2" for c in Config.PLAYER_FEATURES]
+
+        df_merged[feat_cols_1] = df_merged[feat_cols_1].fillna(0.0)
+        df_merged[feat_cols_2] = df_merged[feat_cols_2].fillna(0.0)
+
+        # --- 5. Feature Engineering ---
+        # Sort to ensure correct window order for diff calculations and reshaping
+        df_merged.sort_values(by=["orig_index", "offset"], inplace=True)
+
+        # Ground Flag
+        df_merged["is_ground"] = (df_merged["nfl_player_id_2"] == "G").astype(float)
+
+        # Compute Derived Features
+        dist, log_dist, closing_speed = self._compute_derived_features(df_merged)
+
+        df_merged["distance"] = dist
+        df_merged["log_distance"] = log_dist
+        df_merged["closing_speed"] = closing_speed
+
+        # --- 6. Normalization ---
+        # Define feature vector order
+        # [P1_feats, P2_feats, dist, log_dist, closing_speed, is_ground]
+        feature_order = (
+            feat_cols_1
+            + feat_cols_2
+            + ["distance", "log_distance", "closing_speed", "is_ground"]
+        )
+
+        X_raw = df_merged[feature_order].values.astype(np.float32)
+
+        # Indices to normalize (all except 'is_ground' which is the last one)
+        norm_indices = list(range(len(feature_order) - 1))
+
+        if split == "train":
+            # Compute stats on training set
+            mean = np.mean(X_raw[:, norm_indices], axis=0)
+            scale = np.std(X_raw[:, norm_indices], axis=0)
+            # Prevent division by zero
+            scale[scale < 1e-6] = 1.0
+
+            # Save stats
+            np.save(self.scaler_mean_path, mean)
+            np.save(self.scaler_scale_path, scale)
+        else:
+            # Load stats
+            if os.path.exists(self.scaler_mean_path):
+                mean = np.load(self.scaler_mean_path)
+                scale = np.load(self.scaler_scale_path)
+            else:
+                # Fallback (should not happen in proper pipeline)
+                mean = 0.0
+                scale = 1.0
+
+        # Apply Normalization
+        X_raw[:, norm_indices] = (X_raw[:, norm_indices] - mean) / scale
+
+        # --- 7. Reshape and Finalize ---
+        num_samples = len(df_meta)
+        num_features = len(feature_order)
+
+        # Reshape to (N, Window, Features)
+        X_final = X_raw.reshape(num_samples, Config.WINDOW_SIZE, num_features)
+
+        # Extract targets and IDs
+        y_final = df_meta["contact"].values.astype(np.float32)
+        ids_final = df_meta["contact_id"].values
+
+        # --- 8. Save to Cache ---
+        np.save(X_path, X_final)
+        np.save(y_path, y_final)
+        np.save(ids_path, ids_final)
+
+        print(f"Processed data shape: {X_final.shape}")
+        return X_final, y_final, ids_final
+=======
+    def _compute_derived_features(self, df):
+        """
+        Computes distance, log_distance, and closing_speed.
+        Cite solution_lesson_node_00007: "Clamping the denominator... to prevent gradient noise".
+        Cite solution_lesson_node_00005: "Expanding Decision Boundaries via Non-Linear Feature Transformation".
+        """
+        # 1. Euclidean Distance
+        dx = df["x_position_1"] - df["x_position_2"]
+        dy = df["y_position_1"] - df["y_position_2"]
+        dist = np.sqrt(dx**2 + dy**2)
+
+        # Force distance to 0 for Ground contacts
+        is_ground = df["is_ground"] == 1
+        dist[is_ground] = 0.0
+
+        # 2. Log Distance
+        log_dist = np.log1p(dist)
+
+        # 3. Physics-based Closing Speed
+        # V_rel = V1 - V2
+        # P_rel = P1 - P2
+        # Closing Speed = -(V_rel . P_rel) / |P_rel|
+        
+        # Convert Direction (deg) to Radians. NFL 0=Y, 90=X?
+        # Standard: 0=N(Y), 90=E(X). 
+        # Vx = Speed * sin(dir), Vy = Speed * cos(dir)
+        dir1_rad = np.radians(df["direction_1"])
+        dir2_rad = np.radians(df["direction_2"])
+        
+        vx1 = df["speed_1"] * np.sin(dir1_rad)
+        vy1 = df["speed_1"] * np.cos(dir1_rad)
+        vx2 = df["speed_2"] * np.sin(dir2_rad)
+        vy2 = df["speed_2"] * np.cos(dir2_rad)
+        
+        dvx = vx1 - vx2
+        dvy = vy1 - vy2
+        
+        # Dot product
+        dot_prod = dvx * dx + dvy * dy
+        
+        # Clamped division (Lesson 00007)
+        denom = np.maximum(dist, 1e-6)
+        closing_speed = -(dot_prod / denom)
+        
+        # For ground, V2 is 0, P2 is 0? No, P2 is G.
+        # If is_ground, we want closing speed to ground.
+        # P2 is effectively (x1, y1) so dist=0.
+        # This singularity is handled by clamping, but physically
+        # closing speed to ground is just vertical speed?
+        # We don't have Z. We assume 0 for ground cases to avoid noise.
+        closing_speed[is_ground] = 0.0
+
+        return dist, log_dist, closing_speed
+
+    def process_data(self, split="train", load_cached_data=True):
+        """
+        Main processing pipeline.
+        Cite solution_lesson_node_00015: "Vectorized Lag-Shifting Outperforms Vertical Window Expansion".
+        We use the expansion method to ensure alignment but fix the merge logic.
+        """
+        # --- 1. Cache Check ---
+        X_path = os.path.join(self.cache_dir, f"{split}_X.npy")
+        y_path = os.path.join(self.cache_dir, f"{split}_y.npy")
+        ids_path = os.path.join(self.cache_dir, f"{split}_ids.npy")
+
+        if (
+            load_cached_data
+            and os.path.exists(X_path)
+            and os.path.exists(y_path)
+            and os.path.exists(ids_path)
+        ):
+            print(f"Loading {split} data from cache...")
+            X = np.load(X_path)
+            y = np.load(y_path)
+            ids = np.load(ids_path, allow_pickle=True)
+            return X, y, ids
+
+        print(f"Processing {split} data from scratch...")
+
+        # --- 2. Load Raw Data ---
+        df_meta = self._load_metadata(split)
+        unique_gps = df_meta["game_play"].unique()
+        df_trk = self._load_tracking(split, unique_gps)
+
+        # --- 3. Window Expansion ---
+        half_window = Config.WINDOW_SIZE // 2
+        offsets = np.arange(-half_window, half_window + 1)
+
+        # Keep track of original index
+        df_meta["orig_index"] = df_meta.index
+
+        # Expand
+        n_repeats = len(offsets)
+        df_expanded = df_meta.loc[df_meta.index.repeat(n_repeats)].copy()
+        df_expanded["offset"] = np.tile(offsets, len(df_meta))
+        df_expanded["step_window"] = df_expanded["step"] + df_expanded["offset"]
+
+        # --- 4. Merge Tracking Data ---
+        # Ensure Types match for Merge Keys
+        df_expanded["game_play"] = df_expanded["game_play"].astype(str)
+        df_trk["game_play"] = df_trk["game_play"].astype(str)
+        
+        df_expanded["step_window"] = df_expanded["step_window"].astype(int)
+        df_trk["step"] = df_trk["step"].astype(int)
+        
+        df_expanded["nfl_player_id_1"] = pd.to_numeric(df_expanded["nfl_player_id_1"], errors="coerce").fillna(-1).astype(int)
+        df_expanded["nfl_player_id_2_num"] = pd.to_numeric(df_expanded["nfl_player_id_2"], errors="coerce").fillna(-1).astype(int)
+        df_trk["nfl_player_id"] = pd.to_numeric(df_trk["nfl_player_id"], errors="coerce").fillna(-1).astype(int)
+
+        # Merge P1
+        df_merged = df_expanded.merge(
+            df_trk,
+            left_on=["game_play", "step_window", "nfl_player_id_1"],
+            right_on=["game_play", "step", "nfl_player_id"],
+            how="left",
+        )
+        rename_p1 = {c: f"{c}_1" for c in Config.PLAYER_FEATURES}
+        df_merged.rename(columns=rename_p1, inplace=True)
+        df_merged.drop(columns=["nfl_player_id", "step_y"], inplace=True, errors="ignore")
+        df_merged.rename(columns={"step_x": "step"}, inplace=True)
+
+        # Merge P2
+        df_merged = df_merged.merge(
+            df_trk,
+            left_on=["game_play", "step_window", "nfl_player_id_2_num"],
+            right_on=["game_play", "step", "nfl_player_id"],
+            how="left",
+            suffixes=("", "_2"),
+        )
+        rename_p2 = {c: f"{c}_2" for c in Config.PLAYER_FEATURES}
+        df_merged.rename(columns=rename_p2, inplace=True)
+        df_merged.drop(columns=["nfl_player_id", "step"], inplace=True, errors="ignore")
+
+        # Fill Missing
+        feat_cols_1 = [f"{c}_1" for c in Config.PLAYER_FEATURES]
+        feat_cols_2 = [f"{c}_2" for c in Config.PLAYER_FEATURES]
+        df_merged[feat_cols_1] = df_merged[feat_cols_1].fillna(0.0)
+        df_merged[feat_cols_2] = df_merged[feat_cols_2].fillna(0.0)
+
+        # --- 5. Feature Engineering ---
+        df_merged.sort_values(by=["orig_index", "offset"], inplace=True)
+        df_merged["is_ground"] = (df_merged["nfl_player_id_2"] == "G").astype(float)
+        
+        dist, log_dist, closing_speed = self._compute_derived_features(df_merged)
+        df_merged["distance"] = dist
+        df_merged["log_distance"] = log_dist
+        df_merged["closing_speed"] = closing_speed
+
+        # --- 6. Normalization ---
+        feature_order = (
+            feat_cols_1
+            + feat_cols_2
+            + ["distance", "log_distance", "closing_speed", "is_ground"]
+        )
+        X_raw = df_merged[feature_order].values.astype(np.float32)
+        norm_indices = list(range(len(feature_order) - 1))
+
+        if split == "train":
+            mean = np.mean(X_raw[:, norm_indices], axis=0)
+            scale = np.std(X_raw[:, norm_indices], axis=0)
+            scale[scale < 1e-6] = 1.0
+            np.save(self.scaler_mean_path, mean)
+            np.save(self.scaler_scale_path, scale)
+        else:
+            if os.path.exists(self.scaler_mean_path):
+                mean = np.load(self.scaler_mean_path)
+                scale = np.load(self.scaler_scale_path)
+            else:
+                mean = 0.0
+                scale = 1.0
+
+        X_raw[:, norm_indices] = (X_raw[:, norm_indices] - mean) / scale
+
+        # --- 7. Reshape (Flattened) ---
+        # Cite solution_lesson_node_00015: "Wide" feature vectors.
+        # We reshape to (N, Window * Features)
+        num_samples = len(df_meta)
+        num_features = len(feature_order)
+        
+        # First reshape to (N, Window, Features)
+        X_3d = X_raw.reshape(num_samples, Config.WINDOW_SIZE, num_features)
+        
+        # Then flatten to (N, Window * Features)
+        X_final = X_3d.reshape(num_samples, -1)
+
+        y_final = df_meta["contact"].values.astype(np.float32)
+        ids_final = df_meta["contact_id"].values
+
+        # --- 8. Save ---
+        np.save(X_path, X_final)
+        np.save(y_path, y_final)
+        np.save(ids_path, ids_final)
+
+        print(f"Processed data shape: {X_final.shape}")
+        return X_final, y_final, ids_final
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = TRGCN(
+        input_dim=Config.NUM_FEATURES_PER_TIMESTEP, window_size=Config.WINDOW_SIZE
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+=======
+    # 3. Model Initialization
+    # Cite solution_lesson_node_00015: Switching to Kinematic MLP
+    model = KinematicMLP(
+        input_dim=Config.INPUT_DIM
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Weighted Loss Formula:
+        # Loss = - [ (pos_weight * y * log(p)) + ((1-y) * log(1-p)) ]
+
+        pos_term = self.pos_weight * y_true * torch.log(y_pred)
+        neg_term = (1.0 - y_true) * torch.log(1.0 - y_pred)
+
+        loss = -(pos_term + neg_term)
+
+        return torch.mean(loss)
+=======
+        # Weighted Loss Formula:
+        # Loss = - [ (pos_weight * y * log(p)) + ((1-y) * log(1-p)) ]
+        # Cite solution_lesson_node_00008: Weighted BCE preferred over Focal Loss for this imbalance.
+
+        pos_term = self.pos_weight * y_true * torch.log(y_pred)
+        neg_term = (1.0 - y_true) * torch.log(1.0 - y_pred)
+
+        loss = -(pos_term + neg_term)
+
+        return torch.mean(loss)
+>>>>>>> REPLACE
+```

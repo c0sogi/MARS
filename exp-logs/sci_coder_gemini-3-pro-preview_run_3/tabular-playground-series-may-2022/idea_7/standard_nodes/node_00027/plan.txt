@@ -1,0 +1,284 @@
+I will optimize the solution by simplifying the model architecture and adjusting hyperparameters based on the provided lessons.
+
+**Strategy:**
+1.  **Simplify Architecture (Cite solution_lesson_node_00006, solution_lesson_node_00019):** I will replace the complex `DualStreamGatedNetwork` (which uses GLUs and separate streams) with a standard **Funnel MLP** (`ManufacturingMLP`). Lessons indicate that for this dataset, standard MLPs with Entity Embeddings generalize better than complex gated or cross-network architectures. The new architecture will simply concatenate categorical embeddings and continuous features, followed by a sequence of `Linear -> ReLU -> Dropout` layers.
+2.  **Optimize Batch Size (Cite solution_lesson_node_00024):** I will reduce the batch size from 2048 to **1024**. The lessons highlight that moderate batch sizes (512-1024) provide better implicit regularization and generalization than larger batches for tabular deep learning.
+3.  **Adjust Regularization:** I will set the dropout rate to **0.2** (down from 0.25) to match the "Current Best" configuration described in Lesson 00019.
+
+**Modifications:**
+-   `library/config.py`: Update default `DROPOUT_RATE` to 0.2.
+-   `library/model.py`: Replace `DualStreamGatedNetwork` with `ManufacturingMLP`.
+-   `library/engine.py`: Update imports and model instantiation.
+-   `runfile.py`: Set `Config.BATCH_SIZE = 1024`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Hyperparameters (Dual-Stream Gated Funnel Network)
+    # =========================================================================
+    EMBEDDING_DIM = 32
+    HIDDEN_LAYERS = [512, 256, 128]
+    DROPOUT_RATE = 0.25
+    OUTPUT_DIM = 1
+=======
+    # =========================================================================
+    # Model Hyperparameters (Standard Funnel MLP)
+    # =========================================================================
+    EMBEDDING_DIM = 32
+    HIDDEN_LAYERS = [512, 256, 128]
+    DROPOUT_RATE = 0.2
+    OUTPUT_DIM = 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GatedBlock(nn.Module):
+    """
+    A Gated Linear Unit block consisting of:
+    LayerNorm -> Linear (projection to 2x width) -> GLU -> Dropout.
+
+    This block serves as the fundamental building unit for the Dual-Stream network,
+    providing gated feature selection and non-linear processing with stable gradients.
+    """
+
+    def __init__(self, in_features, out_features, dropout_rate):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(in_features)
+        # GLU requires the input to be split in half, so we project to 2 * out_features
+        self.linear = nn.Linear(in_features, out_features * 2)
+        self.glu = nn.GLU(dim=-1)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = self.linear(x)
+        x = self.glu(x)
+        x = self.dropout(x)
+        return x
+
+
+class DualStreamGatedNetwork(nn.Module):
+    """
+    Dual-Stream Gated Funnel Network Architecture.
+
+    Structure:
+    1. Categorical Stream: Embeddings -> Flatten -> Gated Feature Selection
+    2. Continuous Stream: Raw Features -> Gated Noise Filtering
+    3. Fusion: Concatenation of both streams
+    4. Backbone: Funnel MLP (decreasing widths) using GatedBlocks
+    5. Head: Linear projection to output logits
+    """
+
+    def __init__(self, vocab_sizes):
+        """
+        Args:
+            vocab_sizes (list[int]): A list of integers representing the vocabulary size
+                                     for each categorical feature. Order must match Config.CAT_FEATURES.
+        """
+        super().__init__()
+
+        # Hyperparameters from Config
+        embedding_dim = Config.EMBEDDING_DIM
+        dropout_rate = Config.DROPOUT_RATE
+        hidden_layers = Config.HIDDEN_LAYERS  # e.g., [512, 256, 128]
+        num_cont_features = Config.NUM_CONT_FEATURES
+
+        # ---------------------------------------------------------------------
+        # Stream 1: Categorical Processing
+        # ---------------------------------------------------------------------
+        # Create embedding layers for each categorical feature
+        self.embeddings = nn.ModuleList(
+            [
+                nn.Embedding(num_embeddings=size, embedding_dim=embedding_dim)
+                for size in vocab_sizes
+            ]
+        )
+
+        # Calculate size after flattening all embeddings
+        self.cat_flatten_dim = len(vocab_sizes) * embedding_dim
+
+        # Gated Feature Selection for categorical data
+        # Keeps dimension constant, acts as a filter
+        self.cat_gate = GatedBlock(
+            in_features=self.cat_flatten_dim,
+            out_features=self.cat_flatten_dim,
+            dropout_rate=dropout_rate,
+        )
+
+        # ---------------------------------------------------------------------
+        # Stream 2: Continuous Processing
+        # ---------------------------------------------------------------------
+        # Gated Noise Filtering for continuous data
+        # Keeps dimension constant
+        self.cont_gate = GatedBlock(
+            in_features=num_cont_features,
+            out_features=num_cont_features,
+            dropout_rate=dropout_rate,
+        )
+
+        # ---------------------------------------------------------------------
+        # Fusion & Funnel Backbone
+        # ---------------------------------------------------------------------
+        # Input dimension to the funnel is the sum of both streams
+        current_dim = self.cat_flatten_dim + num_cont_features
+
+        funnel_layers = []
+        for hidden_dim in hidden_layers:
+            funnel_layers.append(
+                GatedBlock(
+                    in_features=current_dim,
+                    out_features=hidden_dim,
+                    dropout_rate=dropout_rate,
+                )
+            )
+            current_dim = hidden_dim
+
+        self.funnel = nn.Sequential(*funnel_layers)
+
+        # ---------------------------------------------------------------------
+        # Output Head
+        # ---------------------------------------------------------------------
+        # Direct linear projection from the final funnel layer to the target
+        self.head = nn.Linear(current_dim, Config.OUTPUT_DIM)
+
+    def forward(self, x_cat, x_cont):
+        """
+        Args:
+            x_cat (torch.Tensor): Categorical indices [Batch, Num_Cat_Features]
+            x_cont (torch.Tensor): Continuous values [Batch, Num_Cont_Features]
+        """
+
+        # --- Stream 1: Categorical ---
+        # 1. Lookup embeddings for each feature
+        # x_cat is [Batch, Num_Features], we iterate over columns
+        emb_list = []
+        for i, emb_layer in enumerate(self.embeddings):
+            # Select column i, result is [Batch, Emb_Dim]
+            emb_list.append(emb_layer(x_cat[:, i]))
+
+        # 2. Flatten/Concatenate embeddings -> [Batch, Num_Features * Emb_Dim]
+        cat_emb = torch.cat(emb_list, dim=1)
+
+        # 3. Apply Gated Feature Selection
+        cat_stream_out = self.cat_gate(cat_emb)
+
+        # --- Stream 2: Continuous ---
+        # 1. Apply Gated Noise Filtering -> [Batch, Num_Cont_Features]
+        cont_stream_out = self.cont_gate(x_cont)
+
+        # --- Fusion ---
+        # Concatenate processed streams
+        fusion = torch.cat([cat_stream_out, cont_stream_out], dim=1)
+
+        # --- Funnel Backbone ---
+        features = self.funnel(fusion)
+
+        # --- Output ---
+        logits = self.head(features)
+
+        return logits
+=======
+class ManufacturingMLP(nn.Module):
+    """
+    Standard Funnel MLP Architecture with Entity Embeddings.
+    Cite solution_lesson_node_00004: Funnel MLP preferred over ResNets.
+    Cite solution_lesson_node_00019: Standard MLP preferred over Gated/GLU.
+    
+    Structure:
+    1. Embeddings for categorical features.
+    2. Concatenation with continuous features.
+    3. Funnel MLP (Linear -> ReLU -> Dropout).
+    """
+
+    def __init__(self, vocab_sizes):
+        super().__init__()
+
+        # Hyperparameters from Config
+        embedding_dim = Config.EMBEDDING_DIM
+        dropout_rate = Config.DROPOUT_RATE
+        hidden_layers = Config.HIDDEN_LAYERS
+        num_cont_features = Config.NUM_CONT_FEATURES
+
+        # Embeddings
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=size, embedding_dim=embedding_dim)
+            for size in vocab_sizes
+        ])
+        
+        # Calculate input dimension
+        cat_dim = len(vocab_sizes) * embedding_dim
+        input_dim = cat_dim + num_cont_features
+
+        # Build MLP
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = hidden_dim
+            
+        self.mlp = nn.Sequential(*layers)
+        
+        # Output Head
+        self.head = nn.Linear(current_dim, Config.OUTPUT_DIM)
+
+    def forward(self, x_cat, x_cont):
+        # Embeddings
+        emb_list = []
+        for i, emb_layer in enumerate(self.embeddings):
+            emb_list.append(emb_layer(x_cat[:, i]))
+        
+        cat_emb = torch.cat(emb_list, dim=1)
+        
+        # Concatenate
+        x = torch.cat([cat_emb, x_cont], dim=1)
+        
+        # Forward pass
+        x = self.mlp(x)
+        logits = self.head(x)
+        
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import DualStreamGatedNetwork
+=======
+from library.model import ManufacturingMLP
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # 2. Initialize Model
+    model = DualStreamGatedNetwork(vocab_sizes).to(device)
+=======
+    # 2. Initialize Model
+    model = ManufacturingMLP(vocab_sizes).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Optimize configuration for A100 GPU and time constraints
+    # Increasing batch size speeds up training significantly on A100
+    Config.BATCH_SIZE = 2048
+    # We keep epochs at 30 to ensure convergence to the high AUC threshold
+    # With BS=2048, this will still be very fast (< 20 mins)
+    Config.EPOCHS = 30
+=======
+    # Optimize configuration
+    # Use moderate batch size for better generalization (Cite solution_lesson_node_00024)
+    Config.BATCH_SIZE = 1024
+    Config.EPOCHS = 30
+>>>>>>> REPLACE
+```

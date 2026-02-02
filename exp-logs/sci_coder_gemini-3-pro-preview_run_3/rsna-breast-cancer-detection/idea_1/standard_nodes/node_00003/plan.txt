@@ -1,0 +1,350 @@
+I will implement a probability calibration strategy to address the low pF1 score caused by the mismatch between the balanced training distribution (50/50) and the natural test distribution (~2% positive). This directly applies the provided lesson "Impact of Balanced Sampling on Probabilistic Calibration" (Cite solution_lesson_node_00001).
+
+Here is the plan:
+1.  **Configuration**: Update `Config` to include `NATURAL_PREVALENCE` (0.02) and optimize training hyperparameters (`BATCH_SIZE=64`, `NUM_EPOCHS=8`) for better efficiency.
+2.  **Model**: Modify `ResNet18Baseline` to output raw logits instead of probabilities (remove Sigmoid). This allows for numerically stable loss calculation and easier logit-based calibration.
+3.  **Trainer**: 
+    *   Switch loss function to `nn.BCEWithLogitsLoss`.
+    *   Implement calibration in `validate_epoch` and `generate_submission` by adjusting logits based on the ratio of test/train priors.
+4.  **Runfile**: 
+    *   Apply the same calibration during the final metric calculation.
+    *   Add the conditional check to only submit if the score improves.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 10
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+
+    # Balanced Sampling: Target ratio of positive samples in a batch
+    # 0.5 ensures equal representation of cancer/non-cancer in every batch
+    POSITIVE_SAMPLING_RATIO = 0.5
+
+    # Early Stopping settings
+=======
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 64
+    NUM_EPOCHS = 8
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+
+    # Balanced Sampling: Target ratio of positive samples in a batch
+    # 0.5 ensures equal representation of cancer/non-cancer in every batch
+    POSITIVE_SAMPLING_RATIO = 0.5
+    
+    # Natural prevalence of cancer in the dataset (approx 2%)
+    # Used for calibrating model outputs during inference
+    NATURAL_PREVALENCE = 0.02
+
+    # Early Stopping settings
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Sigmoid activation to convert logit to probability [0, 1]
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, 3, Height, Width).
+                              The input is expected to be normalized and have 3 channels.
+
+        Returns:
+            torch.Tensor: Output probabilities of shape (Batch, 1).
+        """
+        # Pass input through the ResNet backbone and modified FC layer
+        x = self.model(x)
+
+        # Apply Sigmoid activation to get probability
+        x = self.sigmoid(x)
+
+        return x
+=======
+        # Note: We removed the Sigmoid layer to output raw logits.
+        # This allows for more stable loss calculation (BCEWithLogitsLoss)
+        # and easier probability calibration during inference.
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, 3, Height, Width).
+                              The input is expected to be normalized and have 3 channels.
+
+        Returns:
+            torch.Tensor: Output logits of shape (Batch, 1).
+        """
+        # Pass input through the ResNet backbone and modified FC layer
+        x = self.model(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Binary Cross Entropy Loss for probability output (Sigmoid is in the model)
+        self.criterion = nn.BCELoss()
+
+        # AdamW Optimizer
+=======
+        # Binary Cross Entropy Loss with Logits
+        # Handles numerical stability and expects logits from the model
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        # AdamW Optimizer
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def validate_epoch(self, val_loader, max_batches=None):
+        """
+        Evaluates the model on the validation set.
+
+        Args:
+            val_loader (DataLoader): DataLoader for validation data.
+            max_batches (int, optional): Limit number of batches for debugging.
+
+        Returns:
+            float: Average validation loss for the epoch.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for i, (images, labels) in enumerate(val_loader):
+                if max_batches is not None and i >= max_batches:
+                    break
+
+                images = images.to(self.device)
+                labels = labels.to(self.device).unsqueeze(1)
+
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
+
+                batch_size = images.size(0)
+                running_loss += loss.item() * batch_size
+                total_samples += batch_size
+
+        return running_loss / total_samples if total_samples > 0 else 0.0
+=======
+    def validate_epoch(self, val_loader, max_batches=None):
+        """
+        Evaluates the model on the validation set.
+        Applies probability calibration to logits before loss calculation.
+        Cite solution_lesson_node_00001: Impact of Balanced Sampling on Probabilistic Calibration.
+
+        Args:
+            val_loader (DataLoader): DataLoader for validation data.
+            max_batches (int, optional): Limit number of batches for debugging.
+
+        Returns:
+            float: Average validation loss for the epoch.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        total_samples = 0
+
+        # Calculate calibration offset
+        # Shift logits by log(odds_test) - log(odds_train)
+        # odds = p / (1 - p)
+        prob_train = Config.POSITIVE_SAMPLING_RATIO
+        prob_test = Config.NATURAL_PREVALENCE
+        
+        logit_offset = np.log(prob_test / (1 - prob_test)) - np.log(prob_train / (1 - prob_train))
+        logit_offset = torch.tensor(logit_offset, device=self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for i, (images, labels) in enumerate(val_loader):
+                if max_batches is not None and i >= max_batches:
+                    break
+
+                images = images.to(self.device)
+                labels = labels.to(self.device).unsqueeze(1)
+
+                # Get raw logits
+                logits = self.model(images)
+                
+                # Apply calibration
+                corrected_logits = logits + logit_offset
+                
+                # Compute loss on corrected logits against natural distribution labels
+                loss = self.criterion(corrected_logits, labels)
+
+                batch_size = images.size(0)
+                running_loss += loss.item() * batch_size
+                total_samples += batch_size
+
+        return running_loss / total_samples if total_samples > 0 else 0.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        print("Generating predictions...")
+        with torch.no_grad():
+            for images, pred_ids in test_loader:
+                images = images.to(self.device)
+
+                # Forward pass
+                outputs = self.model(images)
+
+                # Convert to numpy
+                probs = outputs.cpu().numpy().flatten()
+
+                all_probs.extend(probs)
+                all_ids.extend(pred_ids)
+=======
+        print("Generating predictions...")
+        
+        # Calculate calibration offset
+        # Cite solution_lesson_node_00001
+        prob_train = Config.POSITIVE_SAMPLING_RATIO
+        prob_test = Config.NATURAL_PREVALENCE
+        logit_offset = np.log(prob_test / (1 - prob_test)) - np.log(prob_train / (1 - prob_train))
+        logit_offset = torch.tensor(logit_offset, device=self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for images, pred_ids in test_loader:
+                images = images.to(self.device)
+
+                # Forward pass (returns logits)
+                logits = self.model(images)
+                
+                # Apply calibration
+                corrected_logits = logits + logit_offset
+                
+                # Sigmoid to get probabilities
+                probs = torch.sigmoid(corrected_logits).cpu().numpy().flatten()
+
+                all_probs.extend(probs)
+                all_ids.extend(pred_ids)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Fast Baseline Config: 5 Epochs, Max 150 batches per epoch
+    # This ensures quick execution while seeing enough data.
+    print("Starting training (Fast Baseline Mode)...")
+    trainer.fit(train_loader, val_loader, epochs=5, max_batches=150)
+
+    # 4. Validation & Metric Calculation
+    print("\nRunning validation inference for metric calculation...")
+
+    # Load best model weights
+    if os.path.exists(Config.MODEL_CHECKPOINT_PATH):
+        trainer.model.load_state_dict(
+            torch.load(Config.MODEL_CHECKPOINT_PATH, map_location=Config.DEVICE)
+        )
+
+    trainer.model.eval()
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(val_loader):
+            images = images.to(Config.DEVICE)
+
+            # Forward pass
+            outputs = trainer.model(images)
+            probs = outputs.cpu().numpy().flatten()
+
+            all_preds.extend(probs)
+            all_targets.extend(labels.numpy().flatten())
+
+    # Calculate Metric
+    pf1_score = calculate_pf1(all_targets, all_preds)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {pf1_score}")
+
+    # 5. Failure Analysis
+    perform_failure_analysis(np.array(all_targets), np.array(all_preds))
+
+    # 6. Submission
+    print("\nGenerating submission file...")
+    # run_inference handles the test loader and submission generation internally
+    run_inference(output_path=Config.SUBMISSION_PATH)
+    print("Pipeline completed successfully.")
+=======
+    # Use Config settings for full training run
+    print("Starting training...")
+    trainer.fit(train_loader, val_loader, epochs=Config.NUM_EPOCHS)
+
+    # 4. Validation & Metric Calculation
+    print("\nRunning validation inference for metric calculation...")
+
+    # Load best model weights
+    if os.path.exists(Config.MODEL_CHECKPOINT_PATH):
+        trainer.model.load_state_dict(
+            torch.load(Config.MODEL_CHECKPOINT_PATH, map_location=Config.DEVICE)
+        )
+
+    trainer.model.eval()
+
+    all_preds = []
+    all_targets = []
+    
+    # Calculate calibration offset
+    # Cite solution_lesson_node_00001
+    prob_train = Config.POSITIVE_SAMPLING_RATIO
+    prob_test = Config.NATURAL_PREVALENCE
+    logit_offset = np.log(prob_test / (1 - prob_test)) - np.log(prob_train / (1 - prob_train))
+    logit_offset = torch.tensor(logit_offset, device=Config.DEVICE, dtype=torch.float32)
+
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(val_loader):
+            images = images.to(Config.DEVICE)
+
+            # Forward pass (returns logits)
+            logits = trainer.model(images)
+            
+            # Apply calibration
+            corrected_logits = logits + logit_offset
+            
+            # Sigmoid to get probabilities
+            probs = torch.sigmoid(corrected_logits).cpu().numpy().flatten()
+
+            all_preds.extend(probs)
+            all_targets.extend(labels.numpy().flatten())
+
+    # Calculate Metric
+    pf1_score = calculate_pf1(all_targets, all_preds)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {pf1_score}")
+
+    # 5. Failure Analysis
+    perform_failure_analysis(np.array(all_targets), np.array(all_preds))
+
+    # 6. Submission
+    # Only submit if score is better than baseline (0.0631)
+    BASELINE_SCORE = 0.06310755014419556
+    if pf1_score > BASELINE_SCORE:
+        print(f"\nScore ({pf1_score:.4f}) improved over baseline ({BASELINE_SCORE:.4f}). Generating submission...")
+        run_inference(output_path=Config.SUBMISSION_PATH)
+    else:
+        print(f"\nScore ({pf1_score:.4f}) did not improve over baseline ({BASELINE_SCORE:.4f}). Skipping submission generation.")
+    
+    print("Pipeline completed successfully.")
+>>>>>>> REPLACE
+```

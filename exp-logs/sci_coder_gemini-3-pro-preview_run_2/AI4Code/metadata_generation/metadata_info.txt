@@ -1,0 +1,305 @@
+# Python Script for Metadata Generation
+```
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GroupShuffleSplit
+import random
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+VAL_SIZE = 0.2
+
+
+def generate_metadata():
+    print("Starting metadata generation...")
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # 1. Load Data
+    # ---------------------------------------------------------
+    print("Loading source CSVs...")
+    train_orders_path = os.path.join(INPUT_DIR, "train_orders.csv")
+    train_ancestors_path = os.path.join(INPUT_DIR, "train_ancestors.csv")
+    sample_submission_path = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    df_orders = pd.read_csv(train_orders_path)
+    df_ancestors = pd.read_csv(train_ancestors_path)
+    df_test = pd.read_csv(sample_submission_path)
+
+    # ---------------------------------------------------------
+    # 2. Prepare Training Data
+    # ---------------------------------------------------------
+    print("Processing training data...")
+    # Merge orders with ancestors
+    # Not all notebooks might have ancestor info, so we use a left join
+    df_train_full = df_orders.merge(df_ancestors, on="id", how="left")
+
+    # Fill missing ancestor_ids with the notebook id itself (treat as its own group)
+    df_train_full["ancestor_id"] = df_train_full["ancestor_id"].fillna(
+        df_train_full["id"]
+    )
+
+    # Add relative filepath
+    # Files are in input/train/{id}.json
+    df_train_full["filepath"] = df_train_full["id"].apply(lambda x: f"train/{x}.json")
+
+    # ---------------------------------------------------------
+    # 3. Split Training Data (Group Shuffle Split)
+    # ---------------------------------------------------------
+    print(
+        f"Splitting data with GroupShuffleSplit (test_size={VAL_SIZE}, groups='ancestor_id')..."
+    )
+    splitter = GroupShuffleSplit(
+        n_splits=1, test_size=VAL_SIZE, random_state=RANDOM_STATE
+    )
+
+    groups = df_train_full["ancestor_id"]
+    train_idx, val_idx = next(splitter.split(df_train_full, groups=groups))
+
+    df_train = df_train_full.iloc[train_idx].copy()
+    df_val = df_train_full.iloc[val_idx].copy()
+
+    # ---------------------------------------------------------
+    # 4. Prepare Test Data
+    # ---------------------------------------------------------
+    print("Processing test data...")
+    # The sample submission contains the test IDs
+    # We only need 'id' and 'filepath' for test metadata usually,
+    # but we can keep the structure consistent or minimal.
+    df_test_meta = df_test[["id"]].copy()
+    df_test_meta["filepath"] = df_test_meta["id"].apply(lambda x: f"test/{x}.json")
+
+    # ---------------------------------------------------------
+    # 5. Save Metadata
+    # ---------------------------------------------------------
+    print("Saving metadata files...")
+    train_meta_path = os.path.join(METADATA_DIR, "train_metadata.csv")
+    val_meta_path = os.path.join(METADATA_DIR, "val_metadata.csv")
+    test_meta_path = os.path.join(METADATA_DIR, "test_metadata.csv")
+
+    df_train.to_csv(train_meta_path, index=False)
+    df_val.to_csv(val_meta_path, index=False)
+    df_test_meta.to_csv(test_meta_path, index=False)
+
+    print(f"Saved {train_meta_path}")
+    print(f"Saved {val_meta_path}")
+    print(f"Saved {test_meta_path}")
+
+    return df_train, df_val, df_test_meta
+
+
+def validate_metadata(df_train, df_val, df_test):
+    print("\nRunning validation checks...")
+
+    # ---------------------------------------------------------
+    # Check 1: Summary Statistics
+    # ---------------------------------------------------------
+    print("\n--- Summary Statistics ---")
+    print(f"Train samples: {len(df_train)}")
+    print(f"Val samples:   {len(df_val)}")
+    print(f"Test samples:  {len(df_test)}")
+
+    n_train_groups = df_train["ancestor_id"].nunique()
+    n_val_groups = df_val["ancestor_id"].nunique()
+    print(f"Train unique ancestor groups: {n_train_groups}")
+    print(f"Val unique ancestor groups:   {n_val_groups}")
+
+    # ---------------------------------------------------------
+    # Check 2: File Path Existence
+    # ---------------------------------------------------------
+    print("\n--- Checking File Paths ---")
+
+    def check_paths(df, name):
+        if len(df) == 0:
+            return
+
+        # Select up to 1000 random paths
+        sample_size = min(1000, len(df))
+        sample_paths = (
+            df["filepath"].sample(n=sample_size, random_state=RANDOM_STATE).tolist()
+        )
+
+        missing_count = 0
+        missing_samples = []
+
+        for p in sample_paths:
+            full_path = os.path.join(INPUT_DIR, p)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(p)
+
+        missing_ratio = missing_count / sample_size
+        print(
+            f"[{name}] Missing file ratio: {missing_ratio:.4f} ({missing_count}/{sample_size})"
+        )
+
+        if missing_samples:
+            print(f"Sample missing paths in {name}: {missing_samples}")
+
+        if missing_ratio > 0.5:
+            raise FileNotFoundError(
+                f"More than 50% of files missing in {name} dataset."
+            )
+
+    check_paths(df_train, "Train")
+    check_paths(df_val, "Validation")
+    check_paths(df_test, "Test")
+
+    # ---------------------------------------------------------
+    # Check 3: Validation Split Integrity (Group Leakage)
+    # ---------------------------------------------------------
+    print("\n--- Verifying Split Integrity ---")
+
+    # Check ratio
+    total_train_val = len(df_train) + len(df_val)
+    actual_val_ratio = len(df_val) / total_train_val
+    print(f"Actual validation ratio: {actual_val_ratio:.4f} (Target: {VAL_SIZE})")
+
+    # Allow small deviation due to group sizes
+    if not (0.15 <= actual_val_ratio <= 0.25):
+        raise AssertionError(
+            f"Validation split ratio {actual_val_ratio:.4f} is too far from target {VAL_SIZE}"
+        )
+
+    # Check Group Leakage
+    train_ancestors = set(df_train["ancestor_id"].unique())
+    val_ancestors = set(df_val["ancestor_id"].unique())
+
+    overlap = train_ancestors.intersection(val_ancestors)
+    if overlap:
+        raise AssertionError(
+            f"Data Leakage detected! {len(overlap)} ancestor_ids found in both train and validation sets."
+        )
+    else:
+        print("Success: No ancestor overlap between train and validation sets.")
+
+    print("\nAll checks passed successfully.")
+
+
+if __name__ == "__main__":
+    try:
+        df_train, df_val, df_test = generate_metadata()
+        validate_metadata(df_train, df_val, df_test)
+    except Exception as e:
+        print(f"\nERROR: Script failed with exception: {e}")
+        exit(1)
+
+```
+
+# Script Execution Output:
+Starting metadata generation...
+Loading source CSVs...
+Processing training data...
+Splitting data with GroupShuffleSplit (test_size=0.2, groups='ancestor_id')...
+Processing test data...
+Saving metadata files...
+Saved ./metadata/train_metadata.csv
+Saved ./metadata/val_metadata.csv
+Saved ./metadata/test_metadata.csv
+
+Running validation checks...
+
+--- Summary Statistics ---
+Train samples: 95313
+Val samples:   23943
+Test samples:  20000
+Train unique ancestor groups: 89146
+Val unique ancestor groups:   22287
+
+--- Checking File Paths ---
+[Train] Missing file ratio: 0.0000 (0/1000)
+[Validation] Missing file ratio: 0.0000 (0/1000)
+[Test] Missing file ratio: 0.0000 (0/1000)
+
+--- Verifying Split Integrity ---
+Actual validation ratio: 0.2008 (Target: 0.2)
+Success: No ancestor overlap between train and validation sets.
+
+All checks passed successfully.
+Execution time: 5 seconds (time limit is an hour).
+
+# Document
+Based on the provided Python script and its execution output, here is the documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train_metadata.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the metadata for the **training split** of the dataset (approximately 80% of the original training data).
+    *   It links the notebook `id` to its ground truth `cell_order`, its `ancestor_id` (used to prevent data leakage), and the relative `filepath` to the JSON notebook file.
+    *   **Purpose:** It is used by the data loader to access the training notebooks, their correct cell orders (labels), and to group samples during training if necessary. The split ensures that no notebooks sharing an `ancestor_id` are shared with the validation set.
+
+*   **Schema / Structure:**
+    *   **Columns:**
+        *   `id` (string): The unique identifier for the notebook.
+        *   `cell_order` (string): A space-delimited list of cell IDs representing the correct order.
+        *   `ancestor_id` (string): The ID of the notebook's origin. If the notebook had no ancestor in the original CSV, this defaults to the notebook's own `id`.
+        *   `parent_id` (string/float): The ID of the direct parent notebook (may be missing/NaN).
+        *   `filepath` (string): The relative path to the JSON file within the input directory.
+    *   **Example Row:**
+        ```csv
+        id,cell_order,ancestor_id,parent_id,filepath
+        00001756c60be8,"1862f0a6 2a9e43d6 ...",00001756c60be8,,train/00001756c60be8.json
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_train = pd.read_csv("./metadata/train_metadata.csv")
+    ```
+
+---
+
+### 2. `./metadata/val_metadata.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the metadata for the **validation split** of the dataset (approximately 20% of the original training data).
+    *   It contains the same columns as the training metadata.
+    *   **Purpose:** It is used to evaluate the model's performance on unseen data during the training process. Crucially, this split was generated using `GroupShuffleSplit` on `ancestor_id`, ensuring that the validation set is completely independent of the training set regarding notebook forking history.
+
+*   **Schema / Structure:**
+    *   **Columns:** Identical to `train_metadata.csv`.
+        *   `id` (string)
+        *   `cell_order` (string)
+        *   `ancestor_id` (string)
+        *   `parent_id` (string/float)
+        *   `filepath` (string)
+    *   **Example Row:**
+        ```csv
+        id,cell_order,ancestor_id,parent_id,filepath
+        0002115f48f982,"... cell ids ...",0002115f48f982,,train/0002115f48f982.json
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_val = pd.read_csv("./metadata/val_metadata.csv")
+    ```
+
+---
+
+### 3. `./metadata/test_metadata.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the metadata for the **test set**.
+    *   Unlike the training/validation metadata, this file does not contain `cell_order` (as that is the target to predict) or ancestor information (as it is not provided for the test set).
+    *   **Purpose:** It is used by the inference pipeline to locate the test notebook JSON files (`filepath`) associated with each `id` to generate predictions.
+
+*   **Schema / Structure:**
+    *   **Columns:**
+        *   `id` (string): The unique identifier for the test notebook.
+        *   `filepath` (string): The relative path to the JSON file within the input directory.
+    *   **Example Row:**
+        ```csv
+        id,filepath
+        00015c83e2717b,test/00015c83e2717b.json
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_test = pd.read_csv("./metadata/test_metadata.csv")
+    ```

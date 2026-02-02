@@ -1,0 +1,822 @@
+Based on the lessons learned, specifically **Lesson ID: solution_lesson_node_00096** (Absolute vs. Relative Positional Embeddings) and **Lesson ID: solution_lesson_node_00095** (Normalization Placement), the previous attempt to use RoPE and RMSNorm caused a catastrophic regression in performance for this short, fixed-length sequence task.
+
+My optimization strategy is to revert to the robust components of the previous best-performing architecture while retaining the SwiGLU activation and decoupled weight decay which showed promise (Lesson ID: solution_lesson_node_00090).
+
+**Specific Changes:**
+1.  **Revert to Absolute Positional Embeddings**: I will replace RoPE with learnable absolute positional embeddings initialized with low variance (`std=0.02`), as fixed indices carry strong semantic meaning in this dataset (Cite solution_lesson_node_00081).
+2.  **Restore LayerNorm**: I will replace `RMSNorm` with standard `nn.LayerNorm` throughout the backbone and transformer to ensure stability (Cite solution_lesson_node_00096).
+3.  **Shallow Post-Norm Transformer**: I will configure the Transformer encoder to use **Post-Normalization** (`norm_first=False`) and explicit **GELU** activations, as this setup is superior for shallow networks (Cite solution_lesson_node_00095, solution_lesson_node_00068).
+4.  **SwiGLU Backbone**: I will maintain the SwiGLU activation in the residual backbone but pair it with LayerNorm and Stochastic Depth (Cite solution_lesson_node_00086).
+5.  **Decoupled Weight Decay**: I will continue using the optimizer strategy that applies weight decay only to weights (not biases/norms) (Cite solution_lesson_node_00090).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Specific directory for this experimental idea (Idea 30)
+    IDEA_DIR = os.path.join(WORKING_DIR, "idea_30")
+
+    # Raw Data Paths
+=======
+    # Specific directory for this experimental idea (Idea 31)
+    IDEA_DIR = os.path.join(WORKING_DIR, "idea_31")
+
+    # Raw Data Paths
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Stream 1: Categorical Sequence (RoPE-Transformer)
+    EMBED_DIM = 32
+    TRANSFORMER_LAYERS = 2
+    TRANSFORMER_HEADS = 4
+    TRANSFORMER_DROPOUT = 0.1
+    TRANSFORMER_ACTIVATION = "gelu"
+    TRANSFORMER_NORM_FIRST = False  # Post-Normalization for shallow encoder
+    USE_ROPE = True  # Rotary Positional Embeddings
+
+    # Stream 2 & Fusion
+    # Linear Stem maps concatenated features to this dimension
+    BACKBONE_INPUT_DIM = 512
+
+    # Backbone: RMSNorm-SwiGLU Funnel
+    # Stages: 512 -> 256 -> 128
+    BACKBONE_STAGES = [512, 256, 128]
+    BLOCKS_PER_STAGE = 3
+
+    # Backbone Regularization
+    BACKBONE_DROPOUT = 0.35
+    STOCHASTIC_DEPTH_MIN = 0.0
+    STOCHASTIC_DEPTH_MAX = 0.2
+
+    # Backbone Components
+    ACTIVATION = "swiglu"
+    NORM_TYPE = "rmsnorm"
+=======
+    # Stream 1: Categorical Sequence (Absolute Positional Embeddings)
+    EMBED_DIM = 32
+    TRANSFORMER_LAYERS = 2
+    TRANSFORMER_HEADS = 4
+    TRANSFORMER_DROPOUT = 0.1
+    TRANSFORMER_ACTIVATION = "gelu"
+    TRANSFORMER_NORM_FIRST = False  # Post-Normalization for shallow encoder (Cite solution_lesson_node_00095)
+
+    # Stream 2 & Fusion
+    # Linear Stem maps concatenated features to this dimension
+    BACKBONE_INPUT_DIM = 512
+
+    # Backbone: LayerNorm-SwiGLU Funnel
+    # Stages: 512 -> 256 -> 128
+    BACKBONE_STAGES = [512, 256, 128]
+    BLOCKS_PER_STAGE = 3
+
+    # Backbone Regularization
+    BACKBONE_DROPOUT = 0.35
+    STOCHASTIC_DEPTH_MIN = 0.0
+    STOCHASTIC_DEPTH_MAX = 0.2
+
+    # Backbone Components
+    ACTIVATION = "swiglu"
+    NORM_TYPE = "layernorm"  # Cite solution_lesson_node_00096
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Weight Decay Groups
+    # Group 1: Weights (Linear, Embeddings)
+    WEIGHT_DECAY_WEIGHTS = 1e-2
+    # Group 2: Biases, Norm parameters (Critical for Pre-Norm/RMSNorm stability)
+    WEIGHT_DECAY_BIASES = 0.0
+=======
+    # Weight Decay Groups
+    # Group 1: Weights (Linear, Embeddings)
+    WEIGHT_DECAY_WEIGHTS = 1e-2
+    # Group 2: Biases, Norm parameters
+    WEIGHT_DECAY_BIASES = 0.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Normalization (RMSNorm).
+    Normalizes the input by the root mean square of its values, then scales it.
+    Does not apply mean centering, making it computationally efficient and
+    preserving sign/magnitude information.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # x shape: (..., dim)
+        # Calculate RMS: sqrt(mean(x^2) + eps)
+        var = torch.mean(x**2, dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(var + self.eps)
+        return self.weight * x_normed
+
+
+class SwiGLU(nn.Module):
+    """
+    Swish-Gated Linear Unit (SwiGLU) activation function.
+    Expects the input tensor to have a size of 2 * hidden_dim in the last dimension.
+    It splits the input into two halves (a, b), applies Swish (SiLU) to a,
+    and returns swish(a) * b.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        # Split the input into two equal halves along the last dimension
+        x1, x2 = x.chunk(2, dim=-1)
+        return F.silu(x1) * x2
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Computes Rotary Positional Embeddings (RoPE) frequencies.
+    """
+
+    def __init__(self, dim, max_seq_len=1024, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        # Precompute inverse frequencies
+        # dim must be even for RoPE
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # Cache for cos and sin
+        self.cached_cos = None
+        self.cached_sin = None
+
+    def forward(self, x, seq_len=None):
+        if seq_len is None:
+            seq_len = x.shape[1]
+
+        # Check if we need to recompute or extend the cache
+        if self.cached_cos is None or self.cached_cos.shape[0] < seq_len:
+            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # Concatenate to match the dimension of the head (repeat frequencies for real/imag parts logic)
+            # This matches the rotate_half implementation [-x2, x1]
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.cached_cos = emb.cos()
+            self.cached_sin = emb.sin()
+
+        return self.cached_cos[:seq_len, :], self.cached_sin[:seq_len, :]
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Applies RoPE to query and key tensors."""
+    # q, k: (batch, seq_len, num_heads, head_dim)
+    # cos, sin: (seq_len, head_dim)
+
+    # Reshape cos/sin for broadcasting: (1, seq_len, 1, head_dim)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class RoPEAttention(nn.Module):
+    """
+    Self-Attention mechanism with Rotary Positional Embeddings applied to Query and Key.
+    """
+
+    def __init__(self, embed_dim, num_heads, dropout=0.0, max_seq_len=1024):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        if self.head_dim * num_heads != embed_dim:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len)
+
+    def forward(self, x, mask=None):
+        # x: (batch, seq_len, embed_dim)
+        batch_size, seq_len, _ = x.shape
+
+        # Project and reshape to (batch, seq_len, num_heads, head_dim)
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # Get RoPE embeddings
+        cos, sin = self.rope(v, seq_len)
+
+        # Apply RoPE to Q and K
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Transpose for attention computation: (batch, num_heads, seq_len, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Scaled Dot Product Attention
+        # Scores: (batch, num_heads, seq_len, seq_len)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if mask is not None:
+            # mask expected shape: (batch, 1, 1, seq_len) or (batch, 1, seq_len, seq_len)
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Output: (batch, num_heads, seq_len, head_dim)
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Transpose back and flatten: (batch, seq_len, embed_dim)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.embed_dim)
+        )
+
+        output = self.out_proj(attn_output)
+        return output
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """
+    Transformer Encoder Layer that uses RoPEAttention.
+    Supports both Pre-Norm and Post-Norm configurations.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="gelu",
+        norm_first=False,
+    ):
+        super().__init__()
+        self.self_attn = RoPEAttention(d_model, nhead, dropout=dropout)
+
+        # Feed Forward Network
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # Normalization Layers
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.norm_first = norm_first
+
+        # Activation
+        if activation == "relu":
+            self.activation = F.relu
+        elif activation == "gelu":
+            self.activation = F.gelu
+        elif activation == "silu" or activation == "swish":
+            self.activation = F.silu
+        else:
+            raise ValueError(f"Activation {activation} not supported")
+
+    def forward(self, src, src_mask=None):
+        x = src
+        if self.norm_first:
+            # Pre-Norm: x = x + sublayer(norm(x))
+            x = x + self._sa_block(self.norm1(x), src_mask)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            # Post-Norm: x = norm(x + sublayer(x))
+            x = self.norm1(x + self._sa_block(x, src_mask))
+            x = self.norm2(x + self._ff_block(x))
+        return x
+
+    def _sa_block(self, x, mask):
+        x = self.self_attn(x, mask=mask)
+        return self.dropout1(x)
+
+    def _ff_block(self, x):
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout2(x)
+=======
+class SwiGLU(nn.Module):
+    """
+    Swish-Gated Linear Unit (SwiGLU) activation function.
+    Expects the input tensor to have a size of 2 * hidden_dim in the last dimension.
+    It splits the input into two halves (a, b), applies Swish (SiLU) to a,
+    and returns swish(a) * b.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        # Split the input into two equal halves along the last dimension
+        x1, x2 = x.chunk(2, dim=-1)
+        return F.silu(x1) * x2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.layers import RMSNorm, SwiGLU, RoPETransformerEncoderLayer
+
+
+class StochasticDepth(nn.Module):
+    """
+    Stochastic Depth (DropPath) layer.
+    Randomly drops residual paths during training to regularize the network.
+    """
+
+    def __init__(self, prob: float):
+        super().__init__()
+        self.prob = prob
+
+    def forward(self, x):
+        if not self.training or self.prob == 0.0:
+            return x
+
+        keep_prob = 1.0 - self.prob
+        # Compute shape for broadcasting: (batch_size, 1, 1, ...)
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+
+        # Scale by keep_prob to maintain expected value
+        return x.div(keep_prob) * random_tensor
+
+
+class SwiGLUBlock(nn.Module):
+    """
+    Pre-RMSNorm Direct SwiGLU Residual Block.
+    Structure: x + DropPath(Dropout(SwiGLU(Linear(RMSNorm(x)))))
+
+    Note: SwiGLU splits the input in half. To maintain dimension 'dim',
+    the inner Linear layer projects from 'dim' to '2 * dim'.
+    """
+
+    def __init__(self, dim, dropout=0.0, drop_path=0.0):
+        super().__init__()
+        self.norm = RMSNorm(dim)
+        # Project to 2*dim because SwiGLU will slice it back to dim
+        self.linear = nn.Linear(dim, 2 * dim)
+        self.act = SwiGLU()
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = (
+            StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.linear(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.drop_path(x)
+        return residual + x
+
+
+class RoPESwiGLURMSNet(nn.Module):
+    """
+    RoPE-Enhanced SwiGLU-RMS Network.
+
+    Stream 1: Categorical Sequence -> Embedding -> RoPE Transformer -> Flatten
+    Stream 2: Continuous Features -> Raw
+    Fusion: Concatenation -> Linear Stem
+    Backbone: Stacked SwiGLUBlocks with RMSNorm and Stochastic Depth
+    Head: Linear -> Logits
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # ----------------------------------------------------------------------
+        # Stream 1: Categorical Sequence (RoPE-Transformer)
+        # ----------------------------------------------------------------------
+        # +1 for potential unknown/padding if needed, though data is clean 0-25
+        self.embedding = nn.Embedding(Config.VOCAB_SIZE + 1, Config.EMBED_DIM)
+
+        self.transformer_layers = nn.ModuleList(
+            [
+                RoPETransformerEncoderLayer(
+                    d_model=Config.EMBED_DIM,
+                    nhead=Config.TRANSFORMER_HEADS,
+                    # Feedforward dim usually 4x d_model in standard transformers
+                    dim_feedforward=Config.EMBED_DIM * 4,
+                    dropout=Config.TRANSFORMER_DROPOUT,
+                    activation=Config.TRANSFORMER_ACTIVATION,
+                    norm_first=Config.TRANSFORMER_NORM_FIRST,
+                )
+                for _ in range(Config.TRANSFORMER_LAYERS)
+            ]
+        )
+
+        # ----------------------------------------------------------------------
+        # Fusion Layer
+        # ----------------------------------------------------------------------
+        # Flattened transformer output size
+        transformer_out_dim = Config.SEQUENCE_LENGTH * Config.EMBED_DIM
+
+        # Total input to stem
+        fusion_input_dim = transformer_out_dim + Config.NUM_CONT_FEATURES
+
+        # Linear Stem
+        self.stem = nn.Linear(fusion_input_dim, Config.BACKBONE_INPUT_DIM)
+
+        # ----------------------------------------------------------------------
+        # Backbone: RMSNorm-SwiGLU Funnel
+        # ----------------------------------------------------------------------
+        self.backbone = nn.ModuleList()
+
+        # Calculate stochastic depth schedule
+        # Total blocks = stages * blocks_per_stage
+        total_blocks = len(Config.BACKBONE_STAGES) * Config.BLOCKS_PER_STAGE
+        dpr = [
+            x.item()
+            for x in torch.linspace(
+                Config.STOCHASTIC_DEPTH_MIN, Config.STOCHASTIC_DEPTH_MAX, total_blocks
+            )
+        ]
+
+        current_dim = Config.BACKBONE_INPUT_DIM
+        block_idx = 0
+
+        for i, stage_dim in enumerate(Config.BACKBONE_STAGES):
+            # If current dim doesn't match stage dim (transition needed)
+            # Or if it's the first stage, we might need to align if stem != stage[0]
+            # In this design, stem maps to BACKBONE_INPUT_DIM which is usually equal to stage[0]
+            if current_dim != stage_dim:
+                # Pre-RMSNorm Transition
+                self.backbone.append(RMSNorm(current_dim))
+                self.backbone.append(nn.Linear(current_dim, stage_dim))
+                current_dim = stage_dim
+
+            # Stack Blocks
+            for _ in range(Config.BLOCKS_PER_STAGE):
+                self.backbone.append(
+                    SwiGLUBlock(
+                        dim=current_dim,
+                        dropout=Config.BACKBONE_DROPOUT,
+                        drop_path=dpr[block_idx],
+                    )
+                )
+                block_idx += 1
+
+        # ----------------------------------------------------------------------
+        # Output Head
+        # ----------------------------------------------------------------------
+        self.head_norm = RMSNorm(current_dim)
+        self.head = nn.Linear(current_dim, 1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Custom weight initialization:
+        - SwiGLU Blocks: Kaiming Uniform
+        - Transformer: Xavier (Glorot)
+        - Linear/Embeddings: Normal/Xavier
+        - Biases: 0
+        - RMSNorm weights: 1
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # He initialization for layers followed by Swish/ReLU-like activations
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, (nn.LayerNorm, RMSNorm)):
+                nn.init.ones_(m.weight)
+                # RMSNorm doesn't have bias, but LayerNorm does
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Specific initialization for Transformer layers (Xavier)
+        for layer in self.transformer_layers:
+            for p in layer.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+
+    def forward(self, x_cat, x_cont):
+        """
+        Args:
+            x_cat: LongTensor of shape (batch, sequence_length)
+            x_cont: FloatTensor of shape (batch, num_cont_features)
+        """
+        # ----------------------------------------------------------------------
+        # Stream 1: Categorical
+        # ----------------------------------------------------------------------
+        # (batch, seq_len) -> (batch, seq_len, embed_dim)
+        x_seq = self.embedding(x_cat)
+
+        # Pass through RoPE Transformer Encoder
+        for layer in self.transformer_layers:
+            x_seq = layer(x_seq)
+
+        # Flatten: (batch, seq_len, embed_dim) -> (batch, seq_len * embed_dim)
+        batch_size = x_seq.size(0)
+        x_seq_flat = x_seq.reshape(batch_size, -1)
+
+        # ----------------------------------------------------------------------
+        # Fusion
+        # ----------------------------------------------------------------------
+        # Concatenate with continuous features
+        x_fused = torch.cat([x_seq_flat, x_cont], dim=1)
+
+        # Linear Stem
+        x = self.stem(x_fused)
+
+        # ----------------------------------------------------------------------
+        # Backbone
+        # ----------------------------------------------------------------------
+        for layer in self.backbone:
+            x = layer(x)
+
+        # ----------------------------------------------------------------------
+        # Head
+        # ----------------------------------------------------------------------
+        x = self.head_norm(x)
+        out = self.head(x)
+
+        return out
+=======
+from library.layers import SwiGLU
+
+
+class StochasticDepth(nn.Module):
+    """
+    Stochastic Depth (DropPath) layer.
+    Randomly drops residual paths during training to regularize the network.
+    """
+
+    def __init__(self, prob: float):
+        super().__init__()
+        self.prob = prob
+
+    def forward(self, x):
+        if not self.training or self.prob == 0.0:
+            return x
+
+        keep_prob = 1.0 - self.prob
+        # Compute shape for broadcasting: (batch_size, 1, 1, ...)
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+
+        # Scale by keep_prob to maintain expected value
+        return x.div(keep_prob) * random_tensor
+
+
+class SwiGLUBlock(nn.Module):
+    """
+    Pre-LayerNorm Direct SwiGLU Residual Block.
+    Structure: x + DropPath(Dropout(SwiGLU(Linear(LayerNorm(x)))))
+    """
+
+    def __init__(self, dim, dropout=0.0, drop_path=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        # Project to 2*dim because SwiGLU will slice it back to dim
+        self.linear = nn.Linear(dim, 2 * dim)
+        self.act = SwiGLU()
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = (
+            StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.linear(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.drop_path(x)
+        return residual + x
+
+
+class HybridSwiGLUNet(nn.Module):
+    """
+    Hybrid SwiGLU Network with Absolute Positional Embeddings and LayerNorm.
+
+    Stream 1: Categorical Sequence -> Embedding + PosEmb -> Transformer -> Flatten
+    Stream 2: Continuous Features -> Raw
+    Fusion: Concatenation -> Linear Stem
+    Backbone: Stacked SwiGLUBlocks with LayerNorm and Stochastic Depth
+    Head: Linear -> Logits
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # ----------------------------------------------------------------------
+        # Stream 1: Categorical Sequence (Transformer)
+        # ----------------------------------------------------------------------
+        self.embedding = nn.Embedding(Config.VOCAB_SIZE + 1, Config.EMBED_DIM)
+        
+        # Absolute Positional Embeddings (Cite solution_lesson_node_00096)
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(1, Config.SEQUENCE_LENGTH, Config.EMBED_DIM)
+        )
+
+        # Standard Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=Config.EMBED_DIM,
+            nhead=Config.TRANSFORMER_HEADS,
+            dim_feedforward=Config.EMBED_DIM * 4,
+            dropout=Config.TRANSFORMER_DROPOUT,
+            activation=Config.TRANSFORMER_ACTIVATION, # Explicit GELU (Cite solution_lesson_node_00068)
+            batch_first=True,
+            norm_first=Config.TRANSFORMER_NORM_FIRST, # Post-Norm (Cite solution_lesson_node_00095)
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=Config.TRANSFORMER_LAYERS
+        )
+
+        # ----------------------------------------------------------------------
+        # Fusion Layer
+        # ----------------------------------------------------------------------
+        # Flattened transformer output size
+        transformer_out_dim = Config.SEQUENCE_LENGTH * Config.EMBED_DIM
+
+        # Total input to stem
+        fusion_input_dim = transformer_out_dim + Config.NUM_CONT_FEATURES
+
+        # Linear Stem
+        self.stem = nn.Linear(fusion_input_dim, Config.BACKBONE_INPUT_DIM)
+
+        # ----------------------------------------------------------------------
+        # Backbone: LayerNorm-SwiGLU Funnel
+        # ----------------------------------------------------------------------
+        self.backbone = nn.ModuleList()
+
+        # Calculate stochastic depth schedule
+        total_blocks = len(Config.BACKBONE_STAGES) * Config.BLOCKS_PER_STAGE
+        dpr = [
+            x.item()
+            for x in torch.linspace(
+                Config.STOCHASTIC_DEPTH_MIN, Config.STOCHASTIC_DEPTH_MAX, total_blocks
+            )
+        ]
+
+        current_dim = Config.BACKBONE_INPUT_DIM
+        block_idx = 0
+
+        for i, stage_dim in enumerate(Config.BACKBONE_STAGES):
+            # Transition
+            if current_dim != stage_dim:
+                # Pre-Norm Transition (Cite solution_lesson_node_00088)
+                self.backbone.append(nn.LayerNorm(current_dim))
+                self.backbone.append(nn.Linear(current_dim, stage_dim))
+                current_dim = stage_dim
+
+            # Stack Blocks
+            for _ in range(Config.BLOCKS_PER_STAGE):
+                self.backbone.append(
+                    SwiGLUBlock(
+                        dim=current_dim,
+                        dropout=Config.BACKBONE_DROPOUT,
+                        drop_path=dpr[block_idx],
+                    )
+                )
+                block_idx += 1
+
+        # ----------------------------------------------------------------------
+        # Output Head
+        # ----------------------------------------------------------------------
+        self.head_norm = nn.LayerNorm(current_dim)
+        self.head = nn.Linear(current_dim, 1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Custom weight initialization.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # He initialization for SwiGLU/ReLU
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Initialize Positional Embeddings with low variance (Cite solution_lesson_node_00081)
+        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
+        
+        # Transformer initialization is handled by PyTorch defaults (Xavier) or can be explicit
+        # PyTorch defaults are generally fine, but we can enforce Xavier for attention
+        for p in self.transformer.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x_cat, x_cont):
+        # Stream 1: Categorical
+        x_seq = self.embedding(x_cat)
+        # Add positional embeddings
+        x_seq = x_seq + self.pos_embedding
+        
+        x_seq = self.transformer(x_seq)
+
+        batch_size = x_seq.size(0)
+        x_seq_flat = x_seq.reshape(batch_size, -1)
+
+        # Fusion
+        x_fused = torch.cat([x_seq_flat, x_cont], dim=1)
+        x = self.stem(x_fused)
+
+        # Backbone
+        for layer in self.backbone:
+            x = layer(x)
+
+        # Head
+        x = self.head_norm(x)
+        out = self.head(x)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import RoPESwiGLURMSNet
+=======
+from library.model import HybridSwiGLUNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Model
+    model = RoPESwiGLURMSNet()
+    model.to(device)
+=======
+    # 3. Model
+    model = HybridSwiGLUNet()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import RoPESwiGLURMSNet
+=======
+from library.model import HybridSwiGLUNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Load Model
+    model = RoPESwiGLURMSNet()
+    model.to(device)
+=======
+    # 4. Load Model
+    model = HybridSwiGLUNet()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RoPESwiGLURMSNet
+=======
+from library.model import HybridSwiGLUNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Initialize model and load the best weights saved during training
+    model = RoPESwiGLURMSNet()
+    model.to(device)
+=======
+    # Initialize model and load the best weights saved during training
+    model = HybridSwiGLUNet()
+    model.to(device)
+>>>>>>> REPLACE
+```

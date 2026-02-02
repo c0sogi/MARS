@@ -1,0 +1,392 @@
+To optimize the solution, I will focus on improving the "Tail" handling (the neural fallback) as identified in the hybrid architecture strategy (Cite solution_lesson_node_00008). The current GRU-based Seq2Seq model is simple and trained on a small subset (100k samples) of the "hard" data.
+
+My strategy involves:
+1.  **Scaling Up Training**: I will utilize the powerful A100 GPU by increasing the `BATCH_SIZE` to 2048 and training on the **full** filtered dataset (removing the 100k sample limit). This ensures the model sees all complex patterns.
+2.  **Architectural Enhancement**: I will upgrade the Seq2Seq model to use **Attention (Bahdanau/Additive)**. Attention allows the decoder to focus on specific input characters (like digits) when generating the output, which is crucial for accurate text normalization where alignment is strict.
+3.  **Hyperparameter Tuning**: I will increase the `HIDDEN_DIM` to 512 to provide more capacity for the larger dataset and complex patterns.
+
+These changes target the ~0.7% error rate remaining from the symbolic head by making the neural tail more robust and precise.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Hyperparameters (Seq2Seq)
+    # ==========================================
+    EMBED_DIM = 128
+    HIDDEN_DIM = 256
+    NUM_LAYERS = 2  # Number of GRU/LSTM layers
+    DROPOUT = 0.2
+
+    # ==========================================
+    # Training Settings
+    # ==========================================
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    BATCH_SIZE = 512
+    LEARNING_RATE = 1e-3
+=======
+    # ==========================================
+    # Model Hyperparameters (Seq2Seq)
+    # ==========================================
+    EMBED_DIM = 128
+    HIDDEN_DIM = 512
+    NUM_LAYERS = 2  # Number of GRU/LSTM layers
+    DROPOUT = 0.2
+
+    # ==========================================
+    # Training Settings
+    # ==========================================
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    BATCH_SIZE = 2048
+    LEARNING_RATE = 1e-3
+>>>>>>> REPLACE
+```
+
+```diff
+library/neural_model.py
+<<<<<<< SEARCH
+    def forward(self, src):
+        # src: [batch_size, src_len]
+        embedded = self.dropout(self.embedding(src))
+        # embedded: [batch_size, src_len, emb_dim]
+
+        outputs, hidden = self.rnn(embedded)
+        # outputs: [batch_size, src_len, hid_dim]
+        # hidden: [n_layers, batch_size, hid_dim]
+
+        return hidden
+
+
+class Decoder(nn.Module):
+    """
+    Decoder module using GRU.
+    Decodes the context vector into the target sequence.
+    """
+
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
+        self.output_dim = output_dim
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+
+        self.embedding = nn.Embedding(output_dim, emb_dim, padding_idx=Config.PAD_IDX)
+        self.rnn = nn.GRU(emb_dim, hid_dim, n_layers, dropout=dropout, batch_first=True)
+        self.fc_out = nn.Linear(hid_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden):
+        # input: [batch_size] (single token indices)
+        # hidden: [n_layers, batch_size, hid_dim]
+
+        input = input.unsqueeze(1)
+        # input: [batch_size, 1]
+
+        embedded = self.dropout(self.embedding(input))
+        # embedded: [batch_size, 1, emb_dim]
+
+        output, hidden = self.rnn(embedded, hidden)
+        # output: [batch_size, 1, hid_dim]
+        # hidden: [n_layers, batch_size, hid_dim]
+
+        prediction = self.fc_out(output.squeeze(1))
+        # prediction: [batch_size, output_dim]
+
+        return prediction, hidden
+=======
+    def forward(self, src):
+        # src: [batch_size, src_len]
+        embedded = self.dropout(self.embedding(src))
+        # embedded: [batch_size, src_len, emb_dim]
+
+        outputs, hidden = self.rnn(embedded)
+        # outputs: [batch_size, src_len, hid_dim]
+        # hidden: [n_layers, batch_size, hid_dim]
+
+        return outputs, hidden
+
+
+class Attention(nn.Module):
+    """
+    Bahdanau Attention mechanism.
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        # hidden: [batch_size, hid_dim] (last layer hidden state)
+        # encoder_outputs: [batch_size, src_len, hid_dim]
+
+        src_len = encoder_outputs.shape[1]
+
+        # Repeat hidden state src_len times
+        # hidden: [batch_size, src_len, hid_dim]
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+
+        # Calculate energy
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+
+        # Calculate attention weights
+        attention = self.v(energy).squeeze(2)
+
+        return torch.softmax(attention, dim=1)
+
+
+class Decoder(nn.Module):
+    """
+    Decoder module using GRU with Attention.
+    """
+
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
+        self.output_dim = output_dim
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+
+        self.embedding = nn.Embedding(output_dim, emb_dim, padding_idx=Config.PAD_IDX)
+        self.attention = Attention(hid_dim)
+        
+        # GRU input size is emb_dim + hid_dim (context vector)
+        self.rnn = nn.GRU(emb_dim + hid_dim, hid_dim, n_layers, dropout=dropout, batch_first=True)
+        
+        self.fc_out = nn.Linear(hid_dim * 2 + emb_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, encoder_outputs):
+        # input: [batch_size]
+        # hidden: [n_layers, batch_size, hid_dim]
+        # encoder_outputs: [batch_size, src_len, hid_dim]
+
+        input = input.unsqueeze(1)
+        # input: [batch_size, 1]
+
+        embedded = self.dropout(self.embedding(input))
+        # embedded: [batch_size, 1, emb_dim]
+
+        # Calculate attention weights using the last layer of hidden state
+        # hidden[-1]: [batch_size, hid_dim]
+        a = self.attention(hidden[-1], encoder_outputs)
+        # a: [batch_size, src_len]
+
+        a = a.unsqueeze(1)
+        # a: [batch_size, 1, src_len]
+
+        # Weighted sum of encoder outputs
+        weighted = torch.bmm(a, encoder_outputs)
+        # weighted: [batch_size, 1, hid_dim]
+
+        # Concatenate embedding and context vector
+        rnn_input = torch.cat((embedded, weighted), dim=2)
+        # rnn_input: [batch_size, 1, emb_dim + hid_dim]
+
+        output, hidden = self.rnn(rnn_input, hidden)
+        # output: [batch_size, 1, hid_dim]
+        
+        # Prediction based on embedding, output, and context
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=2).squeeze(1))
+        
+        return prediction, hidden
+>>>>>>> REPLACE
+```
+
+```diff
+library/neural_model.py
+<<<<<<< SEARCH
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        # src: [batch_size, src_len]
+        # trg: [batch_size, trg_len]
+
+        batch_size = src.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.decoder.output_dim
+
+        # Tensor to store decoder outputs
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
+
+        # Encode
+        hidden = self.encoder(src)
+
+        # First input to the decoder is the <SOS> token
+        input = trg[:, 0]
+
+        for t in range(1, trg_len):
+            # Decode
+            output, hidden = self.decoder(input, hidden)
+
+            # Store prediction
+            outputs[:, t, :] = output
+
+            # Get the highest predicted token
+            top1 = output.argmax(1)
+
+            # Teacher forcing: use actual next token or predicted token
+            teacher_force = random.random() < teacher_forcing_ratio
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
+=======
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        # src: [batch_size, src_len]
+        # trg: [batch_size, trg_len]
+
+        batch_size = src.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.decoder.output_dim
+
+        # Tensor to store decoder outputs
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
+
+        # Encode
+        encoder_outputs, hidden = self.encoder(src)
+
+        # First input to the decoder is the <SOS> token
+        input = trg[:, 0]
+
+        for t in range(1, trg_len):
+            # Decode
+            output, hidden = self.decoder(input, hidden, encoder_outputs)
+
+            # Store prediction
+            outputs[:, t, :] = output
+
+            # Get the highest predicted token
+            top1 = output.argmax(1)
+
+            # Teacher forcing: use actual next token or predicted token
+            teacher_force = random.random() < teacher_forcing_ratio
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
+>>>>>>> REPLACE
+```
+
+```diff
+library/neural_model.py
+<<<<<<< SEARCH
+    def predict(self, loader):
+        """
+        Generates predictions for the given loader using greedy decoding.
+
+        Returns:
+            list: List of predicted strings.
+        """
+        # Load best model if available
+        if os.path.exists(Config.MODEL_SAVE_PATH):
+            self.model.load_state_dict(
+                torch.load(Config.MODEL_SAVE_PATH, map_location=self.device)
+            )
+            self.model.eval()
+        else:
+            print("Warning: No checkpoint found. Predicting with current weights.")
+
+        predictions = []
+
+        with torch.no_grad():
+            for batch in loader:
+                src = batch["input_ids"].to(self.device)
+                batch_size = src.shape[0]
+
+                # Encode
+                hidden = self.model.encoder(src)
+
+                # Initialize decoder input with SOS
+                input_token = torch.tensor([Config.SOS_IDX] * batch_size).to(
+                    self.device
+                )
+
+                # Store decoded indices
+                decoded_indices = torch.zeros(
+                    batch_size, Config.MAX_SEQ_LEN, dtype=torch.long
+                ).to(self.device)
+
+                for t in range(Config.MAX_SEQ_LEN):
+                    output, hidden = self.model.decoder(input_token, hidden)
+                    pred_token = output.argmax(1)
+
+                    decoded_indices[:, t] = pred_token
+                    input_token = pred_token
+
+                # Convert indices to strings
+                # We do this batch-wise on CPU
+                decoded_indices = decoded_indices.cpu().tolist()
+                for seq in decoded_indices:
+                    pred_str = self.tokenizer.decode(seq, remove_special_tokens=True)
+                    predictions.append(pred_str)
+
+        return predictions
+=======
+    def predict(self, loader):
+        """
+        Generates predictions for the given loader using greedy decoding.
+
+        Returns:
+            list: List of predicted strings.
+        """
+        # Load best model if available
+        if os.path.exists(Config.MODEL_SAVE_PATH):
+            self.model.load_state_dict(
+                torch.load(Config.MODEL_SAVE_PATH, map_location=self.device)
+            )
+            self.model.eval()
+        else:
+            print("Warning: No checkpoint found. Predicting with current weights.")
+
+        predictions = []
+
+        with torch.no_grad():
+            for batch in loader:
+                src = batch["input_ids"].to(self.device)
+                batch_size = src.shape[0]
+
+                # Encode
+                encoder_outputs, hidden = self.model.encoder(src)
+
+                # Initialize decoder input with SOS
+                input_token = torch.tensor([Config.SOS_IDX] * batch_size).to(
+                    self.device
+                )
+
+                # Store decoded indices
+                decoded_indices = torch.zeros(
+                    batch_size, Config.MAX_SEQ_LEN, dtype=torch.long
+                ).to(self.device)
+
+                for t in range(Config.MAX_SEQ_LEN):
+                    output, hidden = self.model.decoder(input_token, hidden, encoder_outputs)
+                    pred_token = output.argmax(1)
+
+                    decoded_indices[:, t] = pred_token
+                    input_token = pred_token
+
+                # Convert indices to strings
+                # We do this batch-wise on CPU
+                decoded_indices = decoded_indices.cpu().tolist()
+                for seq in decoded_indices:
+                    pred_str = self.tokenizer.decode(seq, remove_special_tokens=True)
+                    predictions.append(pred_str)
+
+        return predictions
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("=== Step 1: Training Neural Model ===")
+    # Train the neural model on a subset of the 'hard' (filtered) data for speed.
+    # The filtered dataset focuses on complex cases (dates, numbers, etc.).
+    # We use 100,000 samples to ensure the baseline training completes quickly.
+    run_training(debug_sample_size=100000, load_cached_data=True)
+
+    print("\n=== Step 2: Initializing Hybrid Normalizer ===")
+=======
+    print("=== Step 1: Training Neural Model ===")
+    # Train the neural model on the full 'hard' (filtered) data.
+    # The filtered dataset focuses on complex cases (dates, numbers, etc.).
+    # We utilize the full dataset and larger batch size for optimal performance.
+    run_training(debug_sample_size=None, load_cached_data=True)
+
+    print("\n=== Step 2: Initializing Hybrid Normalizer ===")
+>>>>>>> REPLACE
+```

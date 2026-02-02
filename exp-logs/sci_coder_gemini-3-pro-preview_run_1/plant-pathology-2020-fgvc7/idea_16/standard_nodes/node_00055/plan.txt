@@ -1,0 +1,363 @@
+I will optimize the solution by replacing the "Decoupled Calibration" strategy with a **Seed Averaging Ensemble with Early Stopping** (Cite `solution_lesson_node_00032`, `solution_lesson_node_00054`). The previous approach of estimating an optimal epoch on a subset of data and applying it blindly to the full dataset led to under-training. Instead, I will train 5 independent models on the training set, using the validation set to monitor performance and save the best checkpoint for each seed. This ensures each model in the ensemble is optimally converged. Additionally, I will increase the rotation augmentation to +/- 45 degrees (Cite `solution_lesson_node_00030`) to better match the rotational invariance of leaf images, and strictly synchronize the scheduler's `T_0` parameter with `MAX_EPOCHS` (Cite `solution_lesson_node_00015`).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Strategy: Decoupled Calibration
+    # Stage 1: Calibration (5-Fold CV) to find optimal epoch (E_opt)
+    # Stage 2: Production (Full Data) using E_opt
+
+    N_FOLDS = 5
+    MAX_EPOCHS = 15  # Sufficient budget for small dataset convergence
+
+    # Optimization
+    LEARNING_RATE = 1e-4  # Uniform LR
+=======
+    # Strategy: Seed Averaging Ensemble with Early Stopping
+    # Train multiple seeds on Train, Validate on Val, Pick Best Checkpoint
+
+    MAX_EPOCHS = 15  # Sufficient budget for small dataset convergence
+
+    # Optimization
+    LEARNING_RATE = 1e-4  # Uniform LR
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5
+                ),
+                A.RandomBrightnessContrast(p=0.5),
+=======
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                # Cite solution_lesson_node_00030: Match augmentation to domain invariance (leaves are rotation invariant)
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=45, p=0.5
+                ),
+                A.RandomBrightnessContrast(p=0.5),
+>>>>>>> REPLACE
+```
+
+```diff
+library/production.py
+<<<<<<< SEARCH
+from library.engine import train_one_epoch
+
+# Initialize logger for this module
+logger = get_logger(name="production")
+
+
+def run_production_phase(optimal_epoch: int, load_cached_data: bool = True) -> list:
+    """
+    Executes Stage 2: Production.
+    Trains multiple models (Seed Ensemble) on the full dataset for the determined optimal epoch.
+
+    Args:
+        optimal_epoch (int): The stopping epoch determined by the calibration phase.
+        load_cached_data (bool): Whether to use cached data/weights.
+
+    Returns:
+        list: A list of file paths to the saved model checkpoints.
+    """
+    device = get_device()
+    saved_model_paths = []
+
+    logger.info(
+        f"Starting Production Phase: Full Data Training for {optimal_epoch} Epochs"
+    )
+    logger.info(f"Ensemble Seeds: {Config.SEEDS}")
+
+    # Calculate class weights once (cached) to handle imbalance
+    class_weights = calculate_class_weights(load_cached_data=load_cached_data)
+    logger.info(f"Using Class Weights: {class_weights}")
+
+    # Loss function (weighted)
+    criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
+
+    # Iterate through seeds to build the ensemble
+    for seed in Config.SEEDS:
+        logger.info(f"--- Training Production Model (Seed {seed}) ---")
+
+        # 1. Reproducibility
+        seed_everything(seed)
+
+        # 2. Data Loading (Full Data)
+        # mode='production' returns (train_loader, None)
+        train_loader, _ = get_loaders(
+            mode="production", load_cached_data=load_cached_data
+        )
+
+        # 3. Model Initialization
+        model = AppleResNet34(pretrained=Config.PRETRAINED)
+        model.to(device)
+
+        # 4. Safety Check
+        # Verify loss is reasonable before starting long training
+        verify_initial_loss(model, train_loader, criterion, device)
+
+        # 5. Optimization Setup
+        # Must match Calibration phase settings to ensure E_opt validity
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler
+        # We use the same T_0 as calibration to maintain the same LR curve dynamics
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.T_0, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+
+        # 6. Training Loop
+        # Train strictly for optimal_epoch
+        for epoch in range(optimal_epoch):
+            avg_loss = train_one_epoch(
+                model, train_loader, criterion, optimizer, device
+            )
+
+            # Step scheduler
+            scheduler.step()
+
+            logger.info(
+                f"Seed {seed} | Epoch {epoch + 1}/{optimal_epoch} | Train Loss: {avg_loss}"
+            )
+
+        # 7. Save Model
+        model_filename = f"production_seed_{seed}.pth"
+        save_path = os.path.join(Config.WORKING_DIR, "models", model_filename)
+        save_model(model, save_path)
+        saved_model_paths.append(save_path)
+
+        logger.info(f"Model saved to {save_path}")
+
+        # 8. Cleanup
+        # Free memory for the next seed
+        del model, optimizer, scheduler, train_loader
+        torch.cuda.empty_cache()
+
+    logger.info("Production Phase Completed.")
+    logger.info(f"Generated {len(saved_model_paths)} models.")
+
+    return saved_model_paths
+=======
+from library.engine import train_model
+
+# Initialize logger for this module
+logger = get_logger(name="production")
+
+
+def run_production_phase(val_loader, load_cached_data: bool = True) -> list:
+    """
+    Executes Stage 2: Production (Seed Ensemble).
+    Trains multiple models on the training set, using the validation set for Early Stopping.
+    
+    Cite solution_lesson_node_00032: Using Best Checkpoint (Early Stopping) is superior to fixed-epoch training.
+    Cite solution_lesson_node_00009: Using an ensemble of models to reduce variance.
+
+    Args:
+        val_loader (DataLoader): Validation data loader for Early Stopping.
+        load_cached_data (bool): Whether to use cached data/weights.
+
+    Returns:
+        list: A list of file paths to the saved model checkpoints.
+    """
+    device = get_device()
+    saved_model_paths = []
+
+    logger.info("Starting Production Phase: Seed Averaging Ensemble with Early Stopping")
+    logger.info(f"Ensemble Seeds: {Config.SEEDS}")
+
+    # Calculate class weights once (cached) to handle imbalance
+    class_weights = calculate_class_weights(load_cached_data=load_cached_data)
+    logger.info(f"Using Class Weights: {class_weights}")
+
+    # Loss function (weighted)
+    criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
+
+    # Iterate through seeds to build the ensemble
+    for seed in Config.SEEDS:
+        logger.info(f"--- Training Production Model (Seed {seed}) ---")
+
+        # 1. Reproducibility
+        seed_everything(seed)
+
+        # 2. Data Loading (Full Data)
+        # mode='production' returns (train_loader, None)
+        train_loader, _ = get_loaders(
+            mode="production", load_cached_data=load_cached_data
+        )
+
+        # 3. Model Initialization
+        model = AppleResNet34(pretrained=Config.PRETRAINED)
+        model.to(device)
+
+        # 4. Safety Check
+        verify_initial_loss(model, train_loader, criterion, device)
+
+        # 5. Optimization Setup
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler
+        # Cite solution_lesson_node_00015: Synchronize T_0 with MAX_EPOCHS
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.MAX_EPOCHS, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+
+        # 6. Training Loop with Early Stopping
+        model_filename = f"production_seed_{seed}.pth"
+        save_path = os.path.join(Config.WORKING_DIR, "models", model_filename)
+        
+        train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            num_epochs=Config.MAX_EPOCHS,
+            patience=5,
+            save_path=save_path
+        )
+
+        saved_model_paths.append(save_path)
+
+        # 7. Cleanup
+        del model, optimizer, scheduler, train_loader
+        torch.cuda.empty_cache()
+
+    logger.info("Production Phase Completed.")
+    logger.info(f"Generated {len(saved_model_paths)} models.")
+
+    return saved_model_paths
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.calibration import run_calibration_phase
+from library.production import run_production_phase
+from library.engine import predict
+
+# Initialize Logger
+logger = get_logger(name="main")
+
+
+def load_validation_data():
+    """Loads the hold-out validation dataset based on metadata."""
+    logger.info(f"Loading validation metadata from {Config.VAL_METADATA_PATH}")
+    df_val = pd.read_csv(Config.VAL_METADATA_PATH)
+
+    # We use mode='test' to get (image, image_id) compatible with engine.predict
+    # We will retrieve labels from the dataframe directly for metric calculation
+    val_dataset = AppleDataset(
+        df_val, transforms=get_transforms(data="valid"), mode="test"
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return df_val, val_loader
+=======
+from library.production import run_production_phase
+from library.engine import predict
+
+# Initialize Logger
+logger = get_logger(name="main")
+
+
+def load_validation_data(mode="test"):
+    """
+    Loads the hold-out validation dataset based on metadata.
+    mode='test' returns (image, image_id) for inference.
+    mode='train' returns (image, label) for validation during training.
+    """
+    logger.info(f"Loading validation metadata from {Config.VAL_METADATA_PATH}")
+    df_val = pd.read_csv(Config.VAL_METADATA_PATH)
+
+    val_dataset = AppleDataset(
+        df_val, transforms=get_transforms(data="valid"), mode=mode
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return df_val, val_loader
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Setup
+    seed_everything(Config.SEEDS[0])
+    device = get_device()
+    logger.info(f"Device: {device}")
+
+    # 2. Calibration Phase
+    # Run fast calibration (limited epochs) to find optimal epoch
+    logger.info("=== Stage 1: Calibration ===")
+    optimal_epoch = run_calibration_phase(max_epochs=6, load_cached_data=True)
+
+    # 3. Production Phase
+    # Train ensemble on full data using optimal epoch
+    logger.info("=== Stage 2: Production ===")
+    model_paths = run_production_phase(
+        optimal_epoch=optimal_epoch, load_cached_data=True
+    )
+
+    # 4. Validation Assessment
+    logger.info("=== Stage 3: Validation Assessment ===")
+    df_val, val_loader = load_validation_data()
+
+    # Generate Ensemble Predictions on Validation Set
+    _, val_preds = ensemble_predict(model_paths, val_loader, device)
+=======
+def main():
+    # 1. Setup
+    seed_everything(Config.SEEDS[0])
+    device = get_device()
+    logger.info(f"Device: {device}")
+
+    # 2. Production Phase (Ensemble with Early Stopping)
+    logger.info("=== Stage 1: Production (Seed Ensemble) ===")
+    
+    # Load validation data for Early Stopping (returns images and labels)
+    _, val_loader_train = load_validation_data(mode="train")
+    
+    # Train ensemble
+    model_paths = run_production_phase(
+        val_loader=val_loader_train, load_cached_data=True
+    )
+
+    # 3. Validation Assessment
+    logger.info("=== Stage 2: Validation Assessment ===")
+    # Load validation data for Inference (returns images and IDs)
+    df_val, val_loader_test = load_validation_data(mode="test")
+
+    # Generate Ensemble Predictions on Validation Set
+    _, val_preds = ensemble_predict(model_paths, val_loader_test, device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,471 @@
+My implementation strategy focuses on replacing the Strip Pooling mechanism with Atrous Spatial Pyramid Pooling (ASPP) and increasing the training duration, based on the provided lessons.
+
+1.  **Architecture Upgrade (Cite solution_lesson_node_00025, solution_lesson_node_00021)**: The previous solution used Strip Pooling, which is suboptimal for non-axis-aligned features like contrails. I will replace the `StripPooling` module and `StripPoolingResNet18UNet` class in `library/model.py` with an `ASPP` module and a `ContextEnhancedResNet18UNet` class. ASPP provides isotropic context aggregation, which is more effective for this task. The decoder will retain the SCSE modules which improve data efficiency.
+2.  **Training Schedule (Cite solution_lesson_node_00024, solution_lesson_node_00007)**: I will increase the number of epochs from 10 to 30 in `library/config.py` and remove the override in `runfile.py`. Lesson 24 indicates that 30 epochs with TTA yielded the best results (0.5676), and Lesson 7 highlights the importance of sufficient training steps when optimizing for sparse targets.
+3.  **Code Consistency**: I will update `library/train.py`, `library/inference.py`, and `runfile.py` to instantiate the new `ContextEnhancedResNet18UNet` model.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    EPOCHS = 30
+
+    # Optimizer (AdamW)
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    EPOCHS = 30
+
+    # Optimizer (AdamW)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "StripPoolingResNet18UNet"
+    BACKBONE = "resnet18"
+    ENCODER_WEIGHTS = "imagenet"
+=======
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    MODEL_NAME = "ContextEnhancedResNet18UNet"
+    BACKBONE = "resnet18"
+    ENCODER_WEIGHTS = "imagenet"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StripPooling(nn.Module):
+    """
+    Strip Pooling Module (SPM).
+    Captures long-range dependencies using horizontal and vertical strip pooling.
+    This is critical for identifying long, linear structures like contrails that
+    may span across the entire image or be disconnected.
+    """
+
+    def __init__(self, in_channels, norm_layer=nn.BatchNorm2d):
+        super(StripPooling, self).__init__()
+        self.pool1 = nn.AdaptiveAvgPool2d((1, None))  # 1xW pooling
+        self.pool2 = nn.AdaptiveAvgPool2d((None, 1))  # Hx1 pooling
+
+        inter_channels = int(in_channels / 2)
+
+        # 1x1 convolutions to reduce channels before expansion
+        self.conv1 = nn.Conv2d(in_channels, inter_channels, 1, bias=False)
+        self.conv1_bn = norm_layer(inter_channels)
+
+        self.conv2 = nn.Conv2d(in_channels, inter_channels, 1, bias=False)
+        self.conv2_bn = norm_layer(inter_channels)
+
+        # 1x1 convolution to fuse features
+        self.conv3 = nn.Conv2d(inter_channels, in_channels, 1, bias=False)
+        self.conv3_bn = norm_layer(in_channels)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        _, _, h, w = x.size()
+
+        # Horizontal path
+        x1 = self.pool1(x)
+        x1 = self.conv1(x1)
+        x1 = self.conv1_bn(x1)
+        x1 = self.relu(x1)
+        x1 = F.interpolate(x1, (h, w), mode="bilinear", align_corners=False)
+
+        # Vertical path
+        x2 = self.pool2(x)
+        x2 = self.conv2(x2)
+        x2 = self.conv2_bn(x2)
+        x2 = self.relu(x2)
+        x2 = F.interpolate(x2, (h, w), mode="bilinear", align_corners=False)
+
+        # Fusion
+        out = self.conv3(x1 + x2)
+        out = self.conv3_bn(out)
+        out = torch.sigmoid(out)
+
+        # Attention-like scaling of input features
+        return x * out
+=======
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling (ASPP).
+    Captures multi-scale context using dilated convolutions.
+    Preferred over Strip Pooling for non-axis-aligned features.
+    """
+
+    def __init__(self, in_channels, out_channels=256, rates=[6, 12, 18]):
+        super(ASPP, self).__init__()
+        modules = []
+        # 1x1 conv
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+        )
+        # Dilated convolutions
+        for rate in rates:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        3,
+                        padding=rate,
+                        dilation=rate,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True),
+                )
+            )
+        # Global Average Pooling
+        modules.append(
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+        )
+
+        self.convs = nn.ModuleList(modules)
+
+        # Project after concatenation
+        self.project = nn.Sequential(
+            nn.Conv2d(len(modules) * out_channels, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+        )
+
+    def forward(self, x):
+        res = []
+        for conv in self.convs:
+            out = conv(x)
+            # Handle Global Pooling branch upsampling
+            if out.size(2) != x.size(2):
+                out = F.interpolate(
+                    out, size=x.shape[2:], mode="bilinear", align_corners=False
+                )
+            res.append(out)
+        res = torch.cat(res, dim=1)
+        return self.project(res)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StripPoolingResNet18UNet(nn.Module):
+    """
+    U-Net architecture with ResNet18 encoder and Strip Pooling bottleneck.
+    Designed for contrail segmentation.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(StripPoolingResNet18UNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first layer to accept 6 channels (3 Ash + 3 Temporal)
+        # ResNet18 conv1: 7x7, stride 2, padding 3
+        if in_channels != 3:
+            original_conv1 = self.encoder.conv1
+            self.encoder.conv1 = nn.Conv2d(
+                in_channels,
+                original_conv1.out_channels,
+                kernel_size=original_conv1.kernel_size,
+                stride=original_conv1.stride,
+                padding=original_conv1.padding,
+                bias=original_conv1.bias,
+            )
+
+            # Initialize new weights
+            if pretrained:
+                with torch.no_grad():
+                    # Copy RGB weights to the first 3 channels
+                    self.encoder.conv1.weight[:, :3] = original_conv1.weight
+                    # For channels 3-6 (Temporal), we leave them with default init
+                    # or could initialize them similarly. Default Kaiming is acceptable.
+
+        # ===========================
+        # Bottleneck (Strip Pooling)
+        # ===========================
+        # ResNet18 Layer 4 output channels: 512
+        self.bottleneck_spm = StripPooling(512)
+        # Post-SPM convolution to mix features
+        self.bottleneck_conv = nn.Sequential(
+            nn.Conv2d(512, 512, 3, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # ===========================
+        # Decoder
+        # ===========================
+        # Layer 4 (512) -> Dec4 -> 256. Skip: Layer 3 (256)
+        self.dec4 = DecoderBlock(in_channels=512, skip_channels=256, out_channels=256)
+
+        # Layer 3 (256) -> Dec3 -> 128. Skip: Layer 2 (128)
+        self.dec3 = DecoderBlock(in_channels=256, skip_channels=128, out_channels=128)
+
+        # Layer 2 (128) -> Dec2 -> 64. Skip: Layer 1 (64)
+        self.dec2 = DecoderBlock(in_channels=128, skip_channels=64, out_channels=64)
+
+        # Layer 1 (64) -> Dec1 -> 64. Skip: Layer 0 (64, before MaxPool)
+        self.dec1 = DecoderBlock(in_channels=64, skip_channels=64, out_channels=64)
+
+        # Final Upsampling and Head
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+        )
+
+    def forward(self, x):
+        # ===========================
+        # Encoder
+        # ===========================
+        # Input: B x 6 x 256 x 256
+        x0 = self.encoder.conv1(x)  # -> 128x128, 64ch
+        x0 = self.encoder.bn1(x0)
+        x0 = self.encoder.relu(x0)  # Skip for Dec1
+
+        x1 = self.encoder.maxpool(x0)  # -> 64x64, 64ch
+        x1 = self.encoder.layer1(x1)  # -> 64x64, 64ch (Skip for Dec2)
+
+        x2 = self.encoder.layer2(x1)  # -> 32x32, 128ch (Skip for Dec3)
+
+        x3 = self.encoder.layer3(x2)  # -> 16x16, 256ch (Skip for Dec4)
+
+        x4 = self.encoder.layer4(x3)  # -> 8x8, 512ch
+
+        # ===========================
+        # Bottleneck
+        # ===========================
+        b = self.bottleneck_spm(x4)
+        b = self.bottleneck_conv(b)
+
+        # ===========================
+        # Decoder
+        # ===========================
+        d4 = self.dec4(b, x3)  # 8->16
+        d3 = self.dec3(d4, x2)  # 16->32
+        d2 = self.dec2(d3, x1)  # 32->64
+        d1 = self.dec1(d2, x0)  # 64->128
+
+        # ===========================
+        # Head
+        # ===========================
+        out = self.final_conv(d1)  # 128->256
+
+        return out
+=======
+class ContextEnhancedResNet18UNet(nn.Module):
+    """
+    U-Net architecture with ResNet18 encoder and ASPP bottleneck.
+    Includes SCSE attention in decoder.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, pretrained=True):
+        super(ContextEnhancedResNet18UNet, self).__init__()
+
+        # ===========================
+        # Encoder (ResNet18)
+        # ===========================
+        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        self.encoder = models.resnet18(weights=weights)
+
+        # Modify first layer to accept 6 channels
+        if in_channels != 3:
+            original_conv1 = self.encoder.conv1
+            self.encoder.conv1 = nn.Conv2d(
+                in_channels,
+                original_conv1.out_channels,
+                kernel_size=original_conv1.kernel_size,
+                stride=original_conv1.stride,
+                padding=original_conv1.padding,
+                bias=original_conv1.bias,
+            )
+
+            if pretrained:
+                with torch.no_grad():
+                    self.encoder.conv1.weight[:, :3] = original_conv1.weight
+
+        # ===========================
+        # Bottleneck (ASPP)
+        # ===========================
+        # ResNet18 Layer 4 output channels: 512
+        self.bottleneck_aspp = ASPP(512)
+
+        # ===========================
+        # Decoder
+        # ===========================
+        self.dec4 = DecoderBlock(in_channels=512, skip_channels=256, out_channels=256)
+        self.dec3 = DecoderBlock(in_channels=256, skip_channels=128, out_channels=128)
+        self.dec2 = DecoderBlock(in_channels=128, skip_channels=64, out_channels=64)
+        self.dec1 = DecoderBlock(in_channels=64, skip_channels=64, out_channels=64)
+
+        # Final Upsampling and Head
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+        )
+
+    def forward(self, x):
+        # Encoder
+        x0 = self.encoder.conv1(x)
+        x0 = self.encoder.bn1(x0)
+        x0 = self.encoder.relu(x0)
+
+        x1 = self.encoder.maxpool(x0)
+        x1 = self.encoder.layer1(x1)
+        x2 = self.encoder.layer2(x1)
+        x3 = self.encoder.layer3(x2)
+        x4 = self.encoder.layer4(x3)
+
+        # Bottleneck
+        b = self.bottleneck_aspp(x4)
+
+        # Decoder
+        d4 = self.dec4(b, x3)
+        d3 = self.dec3(d4, x2)
+        d2 = self.dec2(d3, x1)
+        d1 = self.dec1(d2, x0)
+
+        # Head
+        out = self.final_conv(d1)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import StripPoolingResNet18UNet
+from library.loss import HybridLoss
+=======
+from library.model import ContextEnhancedResNet18UNet
+from library.loss import HybridLoss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = StripPoolingResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=True)
+    model = model.to(device)
+=======
+    # Initialize Model
+    model = ContextEnhancedResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=True)
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.dataset import ContrailDataset, get_transforms
+from library.model import StripPoolingResNet18UNet
+
+
+def predict_tta(model, images, device):
+=======
+from library.dataset import ContrailDataset, get_transforms
+from library.model import ContextEnhancedResNet18UNet
+
+
+def predict_tta(model, images, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = StripPoolingResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model = model.to(device)
+=======
+    # Initialize Model
+    model = ContextEnhancedResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import run_training
+from library.inference import generate_submission
+from library.model import StripPoolingResNet18UNet
+from library.dataset import ContrailDataset, get_transforms
+=======
+from library.train import run_training
+from library.inference import generate_submission
+from library.model import ContextEnhancedResNet18UNet
+from library.dataset import ContrailDataset, get_transforms
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline within 2 hours
+    # 10 epochs on ~18k images with ResNet18 is estimated to take ~40-50 mins on A100
+    Config.EPOCHS = 10
+    Config.NUM_WORKERS = 4  # Utilize more vCPUs
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Batch Size={Config.BATCH_SIZE}, Device={Config.DEVICE}"
+    )
+=======
+    # Increase workers for faster data loading
+    Config.NUM_WORKERS = 4
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Batch Size={Config.BATCH_SIZE}, Device={Config.DEVICE}"
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Best Model
+    model = StripPoolingResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    if not os.path.exists(Config.BEST_MODEL_PATH):
+=======
+    # Load Best Model
+    model = ContextEnhancedResNet18UNet(in_channels=Config.IN_CHANNELS, pretrained=False)
+    if not os.path.exists(Config.BEST_MODEL_PATH):
+>>>>>>> REPLACE
+```

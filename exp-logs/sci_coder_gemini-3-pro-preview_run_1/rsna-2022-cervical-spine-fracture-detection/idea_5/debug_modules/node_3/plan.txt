@@ -1,0 +1,404 @@
+The previous implementation failed because the `SegmentationDataset` relied on `nibabel` to load NIfTI segmentation files, but `nibabel` is missing from the environment. The code attempted to handle this with a "soft import" (setting `nib = None`), which caused `process_segmentation` to return `None` for all files, resulting in an empty dataset and a `ValueError` in the DataLoader (Cite debug_lesson_10).
+
+To fix this, I will refactor the data pipeline to eliminate the dependency on `nibabel` (Cite debug_lesson_7). Instead of using NIfTI segmentations, I will modify the `SegmentationDataset` to generate proxy segmentation masks using the provided bounding box data (`train_bounding_boxes.csv`), which relies only on standard libraries like `pandas` and `numpy`. This ensures the segmentation model (Stage 1) can still be trained to localize fractures/regions of interest, fulfilling the downstream requirement for cropping coordinates in Stage 2.
+
+Here are the changes:
+1.  **`library/utils.py`**: Remove the `nibabel` import and the `process_segmentation` function.
+2.  **`library/data.py`**:
+    *   Update `SegmentationDataset` to load bounding boxes instead of NIfTI files.
+    *   Modify `get_dataloaders` to filter samples based on `has_bounding_box` instead of `has_segmentation`.
+    *   Remove the logic that loads GT masks for the classifier stage (as it also relied on `process_segmentation`), defaulting to center crops.
+3.  **`library/engine.py`**: Remove the unused import of `process_segmentation`.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+try:
+    import nibabel as nib
+except ImportError:
+    nib = None
+import cv2
+from library.config import Config
+=======
+import cv2
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def process_segmentation(path, reorient=True):
+    """
+    Loads a NIFTI segmentation file and returns the 3D volume.
+
+    Args:
+        path (str): Path to .nii file.
+        reorient (bool): If True, reorients to RAS+ canonical orientation.
+
+    Returns:
+        np.ndarray: 3D numpy array of the mask (Z, Y, X).
+    """
+    if nib is None:
+        return None
+
+    try:
+        nii = nib.load(path)
+
+        # Standardize orientation to RAS+ (Right, Anterior, Superior)
+        if reorient:
+            nii = nib.as_closest_canonical(nii)
+
+        mask = nii.get_fdata()
+
+        # nibabel loads as (X, Y, Z). Transpose to (Z, Y, X) to match DICOM stack convention
+        # (Depth, Height, Width)
+        mask = mask.transpose(2, 1, 0)
+
+        return mask
+    except Exception as e:
+        print(f"Error loading NIFTI {path}: {e}")
+        return None
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+from library.utils import read_dicom, process_segmentation, seed_everything
+=======
+from library.utils import read_dicom, seed_everything
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class SegmentationDataset(Dataset):
+    def __init__(self, df, transform=None, cache_masks=True):
+        """
+        df: DataFrame containing 'StudyInstanceUID', 'image_path', 'segmentation_path'
+        Only rows with has_segmentation=True should be passed.
+        """
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.cache_masks = cache_masks
+        self.mask_cache = {}
+        self.samples = []
+
+        self._prepare_samples()
+
+    def _prepare_samples(self):
+        """
+        Pre-loads masks into memory (if cache_masks=True) and creates a list of valid slices.
+        """
+        print(f"Preparing Segmentation Dataset with {len(self.df)} studies...")
+
+        for idx, row in self.df.iterrows():
+            uid = row["StudyInstanceUID"]
+            seg_rel_path = row["segmentation_path"]
+            img_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+            if pd.isna(seg_rel_path):
+                continue
+
+            seg_path = os.path.join(Config.INPUT_DIR, seg_rel_path)
+
+            # Load mask volume
+            mask_vol = process_segmentation(seg_path)
+            if mask_vol is None:
+                continue
+
+            if self.cache_masks:
+                self.mask_cache[uid] = mask_vol
+
+            # Add all slices for this volume
+            num_slices = mask_vol.shape[0]
+            for z in range(num_slices):
+                self.samples.append(
+                    {
+                        "StudyInstanceUID": uid,
+                        "slice_idx": z,
+                        "image_dir": img_dir,
+                        "seg_path": seg_path,
+                    }
+                )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        uid = sample["StudyInstanceUID"]
+        z = sample["slice_idx"]
+        img_dir = sample["image_dir"]
+
+        # 1. Load Image
+        # Assumption: Filenames are roughly sequential integers.
+        # We try z+1 first, then fallback to listing.
+        dcm_path = os.path.join(img_dir, f"{z+1}.dcm")
+
+        if not os.path.exists(dcm_path):
+            # Fallback: list and sort (slow, but robust)
+            files = sorted(
+                glob.glob(os.path.join(img_dir, "*.dcm")),
+                key=lambda x: int(os.path.splitext(os.path.basename(x))[0]),
+            )
+            if z < len(files):
+                dcm_path = files[z]
+            else:
+                # Out of bounds fallback
+                img = np.zeros(
+                    (Config.SEG_IMAGE_SIZE[0], Config.SEG_IMAGE_SIZE[1]),
+                    dtype=np.float32,
+                )
+                mask = np.zeros(
+                    (Config.SEG_IMAGE_SIZE[0], Config.SEG_IMAGE_SIZE[1]),
+                    dtype=np.float32,
+                )
+                if self.transform:
+                    augmented = self.transform(image=img, mask=mask)
+                    return augmented["image"], augmented["mask"].long()
+                return torch.from_numpy(img), torch.from_numpy(mask).long()
+
+        img = read_dicom(dcm_path, Config.WINDOW_CENTER, Config.WINDOW_WIDTH)
+
+        # 2. Load Mask
+        if self.cache_masks and uid in self.mask_cache:
+            mask_slice = self.mask_cache[uid][z]
+        else:
+            full_mask = process_segmentation(sample["seg_path"])
+            if full_mask is not None and z < full_mask.shape[0]:
+                mask_slice = full_mask[z]
+            else:
+                mask_slice = np.zeros_like(img)
+
+        # 3. Transform
+        if self.transform:
+            augmented = self.transform(image=img, mask=mask_slice)
+            img = augmented["image"]
+            mask = augmented["mask"]
+        else:
+            img = torch.from_numpy(img).unsqueeze(0)
+            mask = torch.from_numpy(mask_slice)
+
+        return img, mask.long()
+=======
+class SegmentationDataset(Dataset):
+    def __init__(self, df, transform=None, cache_masks=True):
+        """
+        df: DataFrame containing 'StudyInstanceUID', 'image_path'
+        Only rows with has_bounding_box=True should be passed.
+        """
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.samples = []
+        
+        # Load Bounding Boxes
+        if os.path.exists(Config.BBOX_CSV):
+            self.bbox_df = pd.read_csv(Config.BBOX_CSV)
+        else:
+            self.bbox_df = pd.DataFrame(columns=["StudyInstanceUID", "slice_number", "x", "y", "width", "height"])
+
+        self._prepare_samples()
+
+    def _prepare_samples(self):
+        """
+        Creates a list of valid slices based on DICOM counts.
+        """
+        print(f"Preparing Segmentation Dataset with {len(self.df)} studies...")
+
+        for idx, row in self.df.iterrows():
+            uid = row["StudyInstanceUID"]
+            img_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+            # Count slices by listing files
+            try:
+                # Fast count
+                files = [f for f in os.listdir(img_dir) if f.endswith('.dcm')]
+                num_slices = len(files)
+            except Exception:
+                num_slices = 0
+
+            if num_slices == 0:
+                continue
+
+            # Add all slices for this volume
+            # We add all slices, but only those with BBoxes will have positive masks.
+            for z in range(num_slices):
+                self.samples.append(
+                    {
+                        "StudyInstanceUID": uid,
+                        "slice_idx": z,
+                        "image_dir": img_dir,
+                    }
+                )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        uid = sample["StudyInstanceUID"]
+        z = sample["slice_idx"]
+        img_dir = sample["image_dir"]
+
+        # 1. Load Image
+        dcm_path = os.path.join(img_dir, f"{z+1}.dcm")
+        
+        # Fallback if file naming isn't perfect
+        if not os.path.exists(dcm_path):
+             files = sorted(
+                glob.glob(os.path.join(img_dir, "*.dcm")),
+                key=lambda x: int(os.path.splitext(os.path.basename(x))[0]),
+            )
+             if z < len(files):
+                 dcm_path = files[z]
+
+        img = read_dicom(dcm_path, Config.WINDOW_CENTER, Config.WINDOW_WIDTH)
+        h, w = img.shape
+
+        # 2. Generate Mask from BBox
+        mask = np.zeros((h, w), dtype=np.float32)
+        
+        # Filter bboxes for this slice (z+1 because slice_number is 1-based)
+        slice_bboxes = self.bbox_df[
+            (self.bbox_df["StudyInstanceUID"] == uid) & 
+            (self.bbox_df["slice_number"] == z + 1)
+        ]
+
+        for _, row in slice_bboxes.iterrows():
+            bx, by, bw, bh = row["x"], row["y"], row["width"], row["height"]
+            x1, y1 = int(bx), int(by)
+            x2, y2 = int(bx + bw), int(by + bh)
+            # Clip
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            
+            # Assign class 1 (we treat all fractures as generic "ROI")
+            mask[y1:y2, x1:x2] = 1.0
+
+        # 3. Transform
+        if self.transform:
+            augmented = self.transform(image=img, mask=mask)
+            img = augmented["image"]
+            mask = augmented["mask"]
+        else:
+            img = torch.from_numpy(img).unsqueeze(0)
+            mask = torch.from_numpy(mask)
+
+        return img, mask.long()
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    if stage == "segmentation":
+        train_seg_df = df_train[df_train["has_segmentation"]].copy()
+        val_seg_df = df_val[df_val["has_segmentation"]].copy()
+
+        train_ds = SegmentationDataset(
+            train_seg_df,
+            transform=get_transforms("segmentation", "train"),
+            cache_masks=True,
+        )
+        val_ds = SegmentationDataset(
+            val_seg_df,
+            transform=get_transforms("segmentation", "val"),
+            cache_masks=True,
+        )
+=======
+    if stage == "segmentation":
+        # Use bounding boxes instead of segmentations due to missing nibabel
+        train_seg_df = df_train[df_train["has_bounding_box"]].copy()
+        val_seg_df = df_val[df_val["has_bounding_box"]].copy()
+
+        train_ds = SegmentationDataset(
+            train_seg_df,
+            transform=get_transforms("segmentation", "train"),
+            cache_masks=False,
+        )
+        val_ds = SegmentationDataset(
+            val_seg_df,
+            transform=get_transforms("segmentation", "val"),
+            cache_masks=False,
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # Load GT masks
+        print("Loading GT masks for Classifier training...")
+        mask_dict = {}
+        all_uids = train_uids.union(val_uids)
+        meta_lookup = pd.concat([df_train, df_val]).set_index("StudyInstanceUID")
+
+        for uid in tqdm(all_uids, desc="Loading Masks"):
+            if uid in meta_lookup.index:
+                seg_rel = meta_lookup.loc[uid, "segmentation_path"]
+                if pd.isna(seg_rel):
+                    continue
+                seg_path = os.path.join(Config.INPUT_DIR, seg_rel)
+                mask_vol = process_segmentation(seg_path)
+                if mask_vol is not None:
+                    mask_dict[uid] = mask_vol
+
+        train_ds = SliceClassifierDataset(
+            train_samples,
+            transform=get_transforms("classifier", "train"),
+            mask_volume_dict=mask_dict,
+        )
+        val_ds = SliceClassifierDataset(
+            val_samples,
+            transform=get_transforms("classifier", "val"),
+            mask_volume_dict=mask_dict,
+        )
+=======
+        # GT masks loading removed due to missing nibabel. 
+        # SliceClassifierDataset will default to center crop.
+        mask_dict = {}
+
+        train_ds = SliceClassifierDataset(
+            train_samples,
+            transform=get_transforms("classifier", "train"),
+            mask_volume_dict=mask_dict,
+        )
+        val_ds = SliceClassifierDataset(
+            val_samples,
+            transform=get_transforms("classifier", "val"),
+            mask_volume_dict=mask_dict,
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.utils import (
+    AverageMeter,
+    save_checkpoint,
+    load_checkpoint,
+    weighted_log_loss,
+    read_dicom,
+    process_segmentation,
+    save_to_cache,
+    load_from_cache,
+    seed_everything,
+)
+=======
+from library.utils import (
+    AverageMeter,
+    save_checkpoint,
+    load_checkpoint,
+    weighted_log_loss,
+    read_dicom,
+    save_to_cache,
+    load_from_cache,
+    seed_everything,
+)
+>>>>>>> REPLACE
+```

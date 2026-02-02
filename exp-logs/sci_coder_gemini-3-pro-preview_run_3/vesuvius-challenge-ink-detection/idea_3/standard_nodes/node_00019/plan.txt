@@ -1,0 +1,241 @@
+To address the `InvalidMetricValueError` and the missing submission file, I will implement the following changes:
+
+1.  **Modify `library/dataset.py`**: Update the `InkDataset` class to use grid-based sampling for the validation split (similar to the test split) instead of random subsampling. This ensures the entire validation fragment is covered. Additionally, update `__getitem__` to return patch coordinates (metadata) for the validation split, enabling full image reconstruction.
+2.  **Modify `library/train.py`**: Rewrite the `validate` function to perform full-fragment inference. It will accumulate predictions from the sliding windows into a complete probability map, then calculate the F0.5 score on the full reconstructed map against the complete ground truth. This resolves the "subsampled set" metric invalidity.
+3.  **Modify `runfile.py`**: Remove the conditional check that skips submission generation if the score is low, ensuring `submission.csv` is always produced (Cite debug_lesson_1). Also, update the `run_failure_analysis` loop to unpack the extra metadata returned by the updated validation dataset.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+            elif split == "val":
+                # Deterministic sampling from valid areas
+                # np.where returns indices relative to the sliced array (original coords)
+                valid_y, valid_x = np.where(
+                    mask[self.pad_size : -self.pad_size, self.pad_size : -self.pad_size]
+                    > 0
+                )
+                self.samples.extend([(idx, y, x) for y, x in zip(valid_y, valid_x)])
+
+            elif split == "train":
+=======
+            elif split == "val":
+                # Grid sampling for validation to allow full reconstruction
+                h, w = row["height"], row["width"]
+                ys = np.arange(0, h, Config.INFERENCE_STRIDE)
+                xs = np.arange(0, w, Config.INFERENCE_STRIDE)
+
+                for y in ys:
+                    for x in xs:
+                        if mask[y + self.pad_size, x + self.pad_size] > 0:
+                            self.samples.append((idx, y, x))
+
+            elif split == "train":
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # 5. Finalize Sampling Lists
+        if split == "val":
+            # Select a fixed, deterministic subset of samples
+            rng = np.random.default_rng(Config.SEED)
+            if len(self.samples) > Config.VAL_SAMPLE_SIZE:
+                indices = rng.choice(
+                    len(self.samples), Config.VAL_SAMPLE_SIZE, replace=False
+                )
+                indices.sort()  # Sort for consistency
+                self.samples = [self.samples[i] for i in indices]
+=======
+        # 5. Finalize Sampling Lists
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Add channel dimension to label: (H, W) -> (1, H, W)
+        label_patch = np.expand_dims(label_patch, axis=0)
+
+        # Return copies to ensure memory continuity (negative strides from flips)
+        return torch.from_numpy(vol_patch.copy()), torch.from_numpy(label_patch.copy())
+=======
+        # Add channel dimension to label: (H, W) -> (1, H, W)
+        label_patch = np.expand_dims(label_patch, axis=0)
+
+        if self.split == "val":
+            # Return metadata for reconstruction
+            meta = torch.tensor([frag_idx, y, x], dtype=torch.long)
+            return torch.from_numpy(vol_patch.copy()), torch.from_numpy(label_patch.copy()), meta
+
+        # Return copies to ensure memory continuity (negative strides from flips)
+        return torch.from_numpy(vol_patch.copy()), torch.from_numpy(label_patch.copy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss, best F0.5 score, and the threshold used to achieve it.
+    """
+    model.eval()
+    running_loss = 0.0
+
+    all_probs = []
+    all_targets = []
+
+    with torch.no_grad():
+        for volumes, labels in loader:
+            volumes = volumes.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.float32)
+
+            logits = model(volumes)
+            loss = criterion(logits, labels)
+            running_loss += loss.item()
+
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(logits)
+
+            # Move to CPU for metric calculation to save GPU memory
+            all_probs.append(probs.cpu().numpy())
+            all_targets.append(labels.cpu().numpy())
+
+    avg_loss = running_loss / len(loader)
+
+    # Concatenate all batches
+    all_probs = np.concatenate(all_probs)
+    all_targets = np.concatenate(all_targets)
+
+    # Find optimal threshold for F0.5 score
+    best_threshold, best_score = find_best_threshold(all_targets, all_probs)
+
+    return avg_loss, best_score, best_threshold
+=======
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss, best F0.5 score, and the threshold used to achieve it.
+    """
+    model.eval()
+    running_loss = 0.0
+    
+    dataset = loader.dataset
+    
+    # Initialize accumulators for full fragment reconstruction
+    results = {}
+    for i, frag in enumerate(dataset.fragments):
+        h, w = frag["mask"].shape
+        results[i] = {
+            "prob": np.zeros((h, w), dtype=np.float32),
+            "count": np.zeros((h, w), dtype=np.float32)
+        }
+
+    with torch.no_grad():
+        for volumes, labels, meta in loader:
+            volumes = volumes.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.float32)
+
+            logits = model(volumes)
+            loss = criterion(logits, labels)
+            running_loss += loss.item()
+
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(logits)
+            
+            probs_np = probs.cpu().numpy()
+            meta_np = meta.numpy()
+            
+            # Accumulate predictions
+            for b in range(len(meta_np)):
+                frag_idx, y, x = meta_np[b]
+                pred_patch = probs_np[b, 0]
+                h_p, w_p = pred_patch.shape
+                
+                results[frag_idx]["prob"][y : y + h_p, x : x + w_p] += pred_patch
+                results[frag_idx]["count"][y : y + h_p, x : x + w_p] += 1.0
+
+    avg_loss = running_loss / len(loader)
+
+    # Process full fragments to calculate global metric
+    all_preds = []
+    all_targets = []
+    pad = Config.PATCH_SIZE // 2
+    
+    for i, frag in enumerate(dataset.fragments):
+        prob_map = results[i]["prob"]
+        count_map = results[i]["count"]
+        
+        # Normalize
+        count_map[count_map == 0] = 1.0
+        prob_map /= count_map
+        
+        # Retrieve metadata for cropping
+        h_orig = dataset.metadata.iloc[i]["height"]
+        w_orig = dataset.metadata.iloc[i]["width"]
+        
+        # Crop padding
+        prob_map = prob_map[pad : pad + h_orig, pad : pad + w_orig]
+        
+        # Get full ground truth (also padded in dataset, so we crop)
+        label_map = frag["label"][pad : pad + h_orig, pad : pad + w_orig]
+        mask_map = frag["mask"][pad : pad + h_orig, pad : pad + w_orig]
+        
+        # Select valid pixels
+        valid_indices = mask_map > 0
+        all_preds.append(prob_map[valid_indices])
+        all_targets.append(label_map[valid_indices])
+
+    # Concatenate all pixels from all fragments
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+
+    # Find optimal threshold for F0.5 score
+    best_threshold, best_score = find_best_threshold(all_targets, all_preds)
+
+    return avg_loss, best_score, best_threshold
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for volumes, labels in val_loader:
+            volumes = volumes.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.float32)
+
+            # Forward pass
+=======
+    with torch.no_grad():
+        for volumes, labels, _ in val_loader:
+            volumes = volumes.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.float32)
+
+            # Forward pass
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Generate Submission
+    # Condition: Metric > 0.39266693592071533
+    threshold_cutoff = 0.39266693592071533
+
+    if best_score > threshold_cutoff:
+        print(f"\nValidation score {best_score} exceeds {threshold_cutoff}.")
+        print("Generating submission file...")
+        generate_submission(threshold=best_threshold, load_cached_data=True)
+    else:
+        print(f"\nValidation score {best_score} does not exceed {threshold_cutoff}.")
+        print("Skipping submission generation.")
+=======
+    # 5. Generate Submission
+    # Always generate submission to meet output contract
+    print("Generating submission file...")
+    generate_submission(threshold=best_threshold, load_cached_data=True)
+>>>>>>> REPLACE
+```

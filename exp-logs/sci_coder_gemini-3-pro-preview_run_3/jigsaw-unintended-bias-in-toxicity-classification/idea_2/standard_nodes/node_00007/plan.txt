@@ -1,0 +1,251 @@
+I will optimize the solution by implementing Multi-Task Learning (MTL) and training on the full dataset with Automatic Mixed Precision (AMP).
+
+1.  **Multi-Task Learning (MTL):** I will modify the model to predict 6 auxiliary toxicity attributes (e.g., `identity_attack`, `severe_toxicity`) in addition to the main target. By explicitly supervising the model on "Identity Attack", we force the shared representation to distinguish between the mere mention of an identity (which shouldn't be toxic) and an attack on that identity. This directly addresses the BPSN/BNSP bias metrics, applying the principle that contextual embeddings can disentangle correlated signals (Cite solution_lesson_node_00006).
+2.  **Full Dataset & Extended Training:** I will remove the data subsampling to train on the full 1.44M example dataset and increase training to 2 epochs. Bias mitigation requires high data density to correctly learn decision boundaries for rare identity subgroups.
+3.  **Automatic Mixed Precision (AMP):** To ensure this increased workload fits within the 4-hour limit on the A100 GPU, I will implement PyTorch's `GradScaler` and `autocast`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    NUM_CLASSES = 1  # Binary classification (regression output 0.0-1.0)
+    DROPOUT = 0.2
+
+    # --- Training Hyperparameters ---
+    EPOCHS = 2
+=======
+    NUM_CLASSES = 7  # 1 Main + 6 Aux tasks
+    DROPOUT = 0.2
+
+    # --- Training Hyperparameters ---
+    EPOCHS = 2
+    AUX_LOSS_WEIGHT = 0.5
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # Handle targets: Test set might not have targets
+        if Config.TARGET_COL in df.columns:
+            self.targets = df[Config.TARGET_COL].values.astype(np.float32)
+        else:
+            self.targets = np.zeros(len(df), dtype=np.float32)
+
+        self.tokenizer = tokenizer
+=======
+        # Handle targets: Test set might not have targets
+        if Config.TARGET_COL in df.columns:
+            # Main target
+            main_target = df[Config.TARGET_COL].values.reshape(-1, 1)
+            
+            # Aux targets
+            # Check if aux columns exist (Train/Val), otherwise pad with zeros
+            if set(Config.AUX_COLUMNS).issubset(df.columns):
+                aux_targets = df[Config.AUX_COLUMNS].fillna(0.0).values
+            else:
+                aux_targets = np.zeros((len(df), len(Config.AUX_COLUMNS)))
+            
+            self.targets = np.hstack([main_target, aux_targets]).astype(np.float32)
+        else:
+            # Test set (no targets)
+            self.targets = np.zeros((len(df), 1 + len(Config.AUX_COLUMNS)), dtype=np.float32)
+
+        self.tokenizer = tokenizer
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Loss Function
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        # Metadata for evaluation (identities needed for bias metrics)
+=======
+        # Loss Function
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+        # Mixed Precision Scaler
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        # Metadata for evaluation (identities needed for bias metrics)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        for step, batch in enumerate(self.train_loader):
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            targets = batch["target"].to(self.device).unsqueeze(1)  # Shape: (batch, 1)
+
+            self.optimizer.zero_grad()
+
+            logits = self.model(input_ids, attention_mask)
+            loss = self.criterion(logits, targets)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), Config.MAX_GRAD_NORM
+            )
+
+            self.optimizer.step()
+            self.scheduler.step()
+
+            total_loss += loss.item()
+=======
+        for step, batch in enumerate(self.train_loader):
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            targets = batch["target"].to(self.device)  # Shape: (batch, 7)
+
+            self.optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                logits = self.model(input_ids, attention_mask)
+                
+                # Multi-Task Loss: Main (idx 0) + Aux (idx 1:)
+                loss_main = self.criterion(logits[:, 0], targets[:, 0])
+                loss_aux = self.criterion(logits[:, 1:], targets[:, 1:])
+                loss = loss_main + (Config.AUX_LOSS_WEIGHT * loss_aux)
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), Config.MAX_GRAD_NORM
+            )
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.scheduler.step()
+
+            total_loss += loss.item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                targets = batch["target"].to(self.device)
+
+                logits = self.model(input_ids, attention_mask)
+                probs = torch.sigmoid(logits).squeeze(1)
+
+                all_preds.append(probs.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+=======
+                targets = batch["target"].to(self.device)
+
+                logits = self.model(input_ids, attention_mask)
+                probs = torch.sigmoid(logits)
+
+                # Extract main task predictions (index 0)
+                all_preds.append(probs[:, 0].cpu().numpy())
+                
+                # Extract main task targets
+                if targets.dim() > 1:
+                    all_targets.append(targets[:, 0].cpu().numpy())
+                else:
+                    all_targets.append(targets.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def predict_and_submit(self):
+        print("Generating predictions on Test set...")
+        self.model.eval()
+        all_preds = []
+
+        with torch.no_grad():
+            for batch in self.test_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+
+                logits = self.model(input_ids, attention_mask)
+                probs = torch.sigmoid(logits).squeeze(1)
+
+                all_preds.append(probs.cpu().numpy())
+
+        all_preds = np.concatenate(all_preds)
+=======
+    def predict_and_submit(self):
+        print("Generating predictions on Test set...")
+        self.model.eval()
+        all_preds = []
+
+        with torch.no_grad():
+            for batch in self.test_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+
+                logits = self.model(input_ids, attention_mask)
+                probs = torch.sigmoid(logits)
+
+                # Extract main task predictions (index 0)
+                all_preds.append(probs[:, 0].cpu().numpy())
+
+        all_preds = np.concatenate(all_preds)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- Fast Baseline Configuration Overrides ---
+    # Limit training to 1 epoch to ensure execution < 2 hours
+    Config.EPOCHS = 1
+
+    # Create working directory
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+    # 2. Data Preparation (Subsampling)
+    print("Loading training data for subsampling...")
+    full_train_path = Config.TRAIN_PATH
+    df_train = pd.read_csv(full_train_path)
+
+    # Limit to 1,000,000 samples (approx 70% of data) to ensure execution fits within time limits
+    # while maintaining enough data to reach the high AUC threshold.
+    SAMPLE_SIZE = 1000000
+    if len(df_train) > SAMPLE_SIZE:
+        print(f"Subsampling training data from {len(df_train)} to {SAMPLE_SIZE}...")
+        df_train_subset = df_train.sample(n=SAMPLE_SIZE, random_state=Config.SEED)
+    else:
+        df_train_subset = df_train
+
+    # Save subset to working directory
+    subset_train_path = os.path.join(Config.WORKING_DIR, "train_subset.csv")
+    df_train_subset.to_csv(subset_train_path, index=False)
+
+    # Update Config to point to the subset
+    Config.TRAIN_PATH = subset_train_path
+
+    # 3. Training
+=======
+    # Create working directory
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+    # 2. Data Preparation
+    # Using full dataset as configured in Config (no subsampling)
+    print(f"Using full training data from {Config.TRAIN_PATH}")
+
+    # 3. Training
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 6. Submission
+    THRESHOLD = 0.8997695301144136
+
+    if final_score > THRESHOLD:
+=======
+    # 6. Submission
+    THRESHOLD = 0.9329466616453165
+
+    if final_score > THRESHOLD:
+>>>>>>> REPLACE
+```

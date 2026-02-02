@@ -1,0 +1,268 @@
+The execution traceback shows an `OSError: undefined symbol` when importing `torchaudio`, indicating a binary incompatibility between the installed `torch` and `torchaudio` versions. To resolve this without reinstalling system packages, I will remove the dependency on `torchaudio` entirely. I will replace it with native PyTorch implementations for Mel Spectrograms and Amplitude-to-DB conversion, and use `soundfile` for audio loading, as recommended in **Cite debug_lesson_1**.
+
+Here are the changes to `library/transforms.py`:
+
+1.  Update imports to remove `torchaudio` and add `numpy`, `soundfile`, and `torch.nn.functional`.
+2.  Add helper functions (`hz_to_mel`, `mel_to_hz`, `get_mel_basis`) and classes (`CustomMelSpectrogram`, `AmplitudeToDB`) to implement the functionality natively.
+3.  Modify `GPUNoiseInjector` to use `soundfile` for loading and `torch.nn.functional.interpolate` for resampling.
+4.  Modify `MultiResMelSpectrogram` to use the new custom classes.
+
+```diff
+library/transforms.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torchaudio
+import os
+import random
+import glob
+import math
+from typing import List
+
+from library.config import PathConfig, AudioConfig, MelConfig, TrainConfig
+=======
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import soundfile as sf
+import os
+import random
+import glob
+import math
+from typing import List
+
+from library.config import PathConfig, AudioConfig, MelConfig, TrainConfig
+>>>>>>> REPLACE
+```
+
+```diff
+library/transforms.py
+<<<<<<< SEARCH
+class GPUNoiseInjector(nn.Module):
+=======
+# --- Helper Functions for Mel Filterbank (Replacing torchaudio) ---
+
+def hz_to_mel(f):
+    return 2595.0 * np.log10(1.0 + f / 700.0)
+
+def mel_to_hz(m):
+    return 700.0 * (10.0**(m / 2595.0) - 1.0)
+
+def get_mel_basis(sr, n_fft, n_mels, fmin, fmax):
+    """
+    Creates a Mel filterbank matrix using NumPy.
+    Returns: (n_mels, n_freqs)
+    """
+    if fmax is None:
+        fmax = sr / 2.0
+    
+    n_freqs = n_fft // 2 + 1
+    
+    # Create Mel scale points
+    m_min = hz_to_mel(fmin)
+    m_max = hz_to_mel(fmax)
+    m_pts = np.linspace(m_min, m_max, n_mels + 2)
+    f_pts = mel_to_hz(m_pts)
+    
+    # Map to FFT bins
+    bins = np.floor((n_fft + 1) * f_pts / sr).astype(int)
+    
+    weights = np.zeros((n_mels, n_freqs))
+    
+    for i in range(n_mels):
+        b_prev = bins[i]
+        b_curr = bins[i+1]
+        b_next = bins[i+2]
+        
+        # Up slope
+        for j in range(b_prev, b_curr):
+            weights[i, j] = (j - b_prev) / (b_curr - b_prev)
+            
+        # Down slope
+        for j in range(b_curr, b_next):
+            # Avoid index out of bounds if b_next exceeds n_freqs
+            if j < n_freqs:
+                weights[i, j] = (b_next - j) / (b_next - b_curr)
+                
+    return weights
+
+
+class CustomMelSpectrogram(nn.Module):
+    """
+    Native PyTorch implementation of MelSpectrogram to avoid torchaudio dependency.
+    """
+    def __init__(self, sample_rate, n_fft, win_length, hop_length, n_mels, f_min, f_max):
+        super().__init__()
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.hop_length = hop_length
+        
+        # Create Mel Basis
+        mel_basis_np = get_mel_basis(sample_rate, n_fft, n_mels, f_min, f_max)
+        self.register_buffer('mel_basis', torch.from_numpy(mel_basis_np).float())
+        
+        # Window function (Hann)
+        window = torch.hann_window(win_length)
+        self.register_buffer('window', window)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 1, T) waveform
+        Returns:
+            mel_spec: (B, 1, n_mels, T_frames)
+        """
+        # Remove channel dim for STFT: (B, T)
+        x_squeezed = x.squeeze(1)
+        
+        # STFT
+        # center=True pads the input so that the t-th frame is centered at time t * hop_length
+        stft = torch.stft(
+            x_squeezed, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length, 
+            win_length=self.win_length, 
+            window=self.window, 
+            center=True, 
+            return_complex=True
+        )
+        
+        # Power Spectrogram: |STFT|^2
+        power_spec = stft.abs().pow(2.0) # (B, n_freqs, T_frames)
+        
+        # Apply Mel Basis
+        # (n_mels, n_freqs) @ (B, n_freqs, T_frames) -> (B, n_mels, T_frames)
+        mel_spec = torch.matmul(self.mel_basis, power_spec)
+        
+        # Add channel dim back
+        return mel_spec.unsqueeze(1)
+
+
+class AmplitudeToDB(nn.Module):
+    """
+    Native PyTorch implementation of AmplitudeToDB.
+    """
+    def __init__(self, top_db=80.0):
+        super().__init__()
+        self.top_db = top_db
+
+    def forward(self, x):
+        # x is power spectrogram
+        # 10 * log10(x)
+        x_db = 10.0 * torch.log10(torch.clamp(x, min=1e-10))
+        
+        # Peak normalization
+        max_val = x_db.amax(dim=(1, 2, 3), keepdim=True)
+        return torch.clamp(x_db, min=max_val - self.top_db)
+
+
+class GPUNoiseInjector(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/transforms.py
+<<<<<<< SEARCH
+    def _load_noises(self):
+        """Loads all background noise files into a list of tensors."""
+        if not os.path.exists(self.noise_dir):
+            print(f"Warning: Noise directory {self.noise_dir} not found.")
+            return
+
+        noise_files = glob.glob(os.path.join(self.noise_dir, "*.wav"))
+        for f in noise_files:
+            try:
+                # Load noise file
+                waveform, sr = torchaudio.load(f)
+                # Resample if necessary
+                if sr != self.sample_rate:
+                    resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                    waveform = resampler(waveform)
+
+                # Store on CPU to conserve GPU memory; move to GPU only when used
+                self.noises.append(waveform)
+            except Exception as e:
+                print(f"Error loading noise file {f}: {e}")
+=======
+    def _load_noises(self):
+        """Loads all background noise files into a list of tensors using soundfile."""
+        if not os.path.exists(self.noise_dir):
+            print(f"Warning: Noise directory {self.noise_dir} not found.")
+            return
+
+        noise_files = glob.glob(os.path.join(self.noise_dir, "*.wav"))
+        for f in noise_files:
+            try:
+                # Load noise file using soundfile
+                # sf.read returns (samples, channels) or (samples,)
+                data, sr = sf.read(f, dtype='float32')
+                
+                # Convert to Tensor (Channels, Time)
+                if data.ndim == 1:
+                    waveform = torch.from_numpy(data).unsqueeze(0) # (1, T)
+                else:
+                    waveform = torch.from_numpy(data).t() # (C, T)
+
+                # Resample if necessary using native torch interpolation
+                if sr != self.sample_rate:
+                    # Interpolate expects (B, C, T)
+                    waveform = waveform.unsqueeze(0)
+                    new_len = int(waveform.shape[-1] * (self.sample_rate / sr))
+                    waveform = F.interpolate(waveform, size=new_len, mode='linear', align_corners=False)
+                    waveform = waveform.squeeze(0)
+
+                # Store on CPU to conserve GPU memory; move to GPU only when used
+                self.noises.append(waveform)
+            except Exception as e:
+                print(f"Error loading noise file {f}: {e}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/transforms.py
+<<<<<<< SEARCH
+    def __init__(self, mel_config: MelConfig, audio_config: AudioConfig):
+        super().__init__()
+
+        self.transforms = nn.ModuleList()
+
+        # Create a MelSpectrogram transform for each resolution defined in config
+        for win_len, n_fft in zip(mel_config.win_lengths, mel_config.n_ffts):
+            # center=True ensures the number of time frames is consistent across resolutions
+            transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=audio_config.sample_rate,
+                n_fft=n_fft,
+                win_length=win_len,
+                hop_length=mel_config.hop_length,
+                n_mels=mel_config.n_mels,
+                f_min=mel_config.f_min,
+                f_max=mel_config.f_max,
+                center=True,
+                power=2.0,
+            )
+            self.transforms.append(transform)
+
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
+=======
+    def __init__(self, mel_config: MelConfig, audio_config: AudioConfig):
+        super().__init__()
+
+        self.transforms = nn.ModuleList()
+
+        # Create a MelSpectrogram transform for each resolution defined in config
+        for win_len, n_fft in zip(mel_config.win_lengths, mel_config.n_ffts):
+            transform = CustomMelSpectrogram(
+                sample_rate=audio_config.sample_rate,
+                n_fft=n_fft,
+                win_length=win_len,
+                hop_length=mel_config.hop_length,
+                n_mels=mel_config.n_mels,
+                f_min=mel_config.f_min,
+                f_max=mel_config.f_max,
+            )
+            self.transforms.append(transform)
+
+        self.amp_to_db = AmplitudeToDB(top_db=80)
+>>>>>>> REPLACE
+```

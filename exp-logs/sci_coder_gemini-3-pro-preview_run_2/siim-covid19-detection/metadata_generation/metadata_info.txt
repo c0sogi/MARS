@@ -1,0 +1,311 @@
+# Python Script for Metadata Generation
+```
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Configuration
+RANDOM_STATE = 42
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_DIR = os.path.join(INPUT_DIR, "train")
+TEST_DIR = os.path.join(INPUT_DIR, "test")
+
+
+def get_file_map(root_dir):
+    """
+    Walks through the directory and returns a dictionary mapping
+    image_id (filename without extension) to its relative path from INPUT_DIR.
+    """
+    file_map = {}
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if file.lower().endswith(".dcm"):
+                image_id = os.path.splitext(file)[0]
+                abs_path = os.path.join(root, file)
+                # We want the path relative to ./input
+                rel_path = os.path.relpath(abs_path, INPUT_DIR)
+                file_map[image_id] = rel_path
+    return file_map
+
+
+def generate_metadata():
+    print("Initializing metadata generation...")
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # 1. Index Files
+    print("Indexing DICOM files...")
+    train_file_map = get_file_map(TRAIN_DIR)
+    test_file_map = get_file_map(TEST_DIR)
+    print(
+        f"Indexed {len(train_file_map)} training images and {len(test_file_map)} test images."
+    )
+
+    # 2. Load Raw Metadata
+    print("Loading CSV files...")
+    study_df = pd.read_csv(os.path.join(INPUT_DIR, "train_study_level.csv"))
+    image_df = pd.read_csv(os.path.join(INPUT_DIR, "train_image_level.csv"))
+
+    # 3. Preprocess and Merge
+    # Clean IDs to match DICOM filenames and link tables
+    study_df["StudyInstanceUID"] = study_df["id"].str.replace("_study", "")
+    image_df["image_id"] = image_df["id"].str.replace("_image", "")
+
+    # Merge image data with study labels
+    # We use left join to attach study labels to each image
+    merged_df = pd.merge(image_df, study_df, on="StudyInstanceUID", how="left")
+
+    # Attach file paths
+    merged_df["file_path"] = merged_df["image_id"].map(train_file_map)
+
+    # Filter out any metadata entries that don't have corresponding files
+    missing_mask = merged_df["file_path"].isna()
+    if missing_mask.sum() > 0:
+        print(
+            f"Warning: {missing_mask.sum()} entries in training metadata have no corresponding files. Removing them."
+        )
+        merged_df = merged_df[~missing_mask]
+
+    # 4. Stratified Group Split
+    print("Performing stratified group split...")
+
+    # Define class columns
+    class_cols = [
+        "Negative for Pneumonia",
+        "Typical Appearance",
+        "Indeterminate Appearance",
+        "Atypical Appearance",
+    ]
+
+    # Helper to get a single label for stratification
+    def get_stratify_label(row):
+        for col in class_cols:
+            if row[col] == 1:
+                return col
+        return "Unknown"
+
+    # Group by Study to ensure we split by patient/study (Group Split)
+    # We take the first entry per study to determine its label
+    unique_studies = merged_df.groupby("StudyInstanceUID").first().reset_index()
+    unique_studies["stratify_label"] = unique_studies.apply(get_stratify_label, axis=1)
+
+    # Split studies into train and val
+    train_studies, val_studies = train_test_split(
+        unique_studies["StudyInstanceUID"],
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=unique_studies["stratify_label"],
+    )
+
+    train_studies_set = set(train_studies)
+    val_studies_set = set(val_studies)
+
+    # Create final DataFrames based on the study split
+    train_df = merged_df[merged_df["StudyInstanceUID"].isin(train_studies_set)].copy()
+    val_df = merged_df[merged_df["StudyInstanceUID"].isin(val_studies_set)].copy()
+
+    # 5. Process Test Data
+    print("Processing test metadata...")
+    test_data = []
+    for image_id, rel_path in test_file_map.items():
+        # Path structure: test/study_id/series_id/image_id.dcm
+        # rel_path is relative to input/, so it looks like 'test/...'
+        parts = rel_path.split(os.sep)
+        if len(parts) >= 4:
+            study_id = parts[-3]
+        else:
+            study_id = "unknown"
+
+        test_data.append(
+            {"image_id": image_id, "StudyInstanceUID": study_id, "file_path": rel_path}
+        )
+    test_df = pd.DataFrame(test_data)
+
+    # 6. Save Metadata
+    print("Saving metadata files...")
+    train_df.to_csv(os.path.join(METADATA_DIR, "train.csv"), index=False)
+    val_df.to_csv(os.path.join(METADATA_DIR, "val.csv"), index=False)
+    test_df.to_csv(os.path.join(METADATA_DIR, "test.csv"), index=False)
+
+    return train_df, val_df, test_df
+
+
+def verify_metadata(train_df, val_df, test_df):
+    print("\n=== Verifying Datasets ===")
+
+    # 1. Summary Statistics
+    print(
+        f"Train Set: {len(train_df)} images, {train_df['StudyInstanceUID'].nunique()} studies"
+    )
+    print(
+        f"Val Set:   {len(val_df)} images, {val_df['StudyInstanceUID'].nunique()} studies"
+    )
+    print(f"Test Set:  {len(test_df)} images")
+
+    # Check Class Distribution
+    class_cols = [
+        "Negative for Pneumonia",
+        "Typical Appearance",
+        "Indeterminate Appearance",
+        "Atypical Appearance",
+    ]
+
+    print("\nClass Distribution (Study Level) - Validation Set:")
+    val_studies_unique = val_df.groupby("StudyInstanceUID").first()
+    for col in class_cols:
+        count = val_studies_unique[col].sum()
+        total = len(val_studies_unique)
+        print(f"  {col}: {count} ({count/total:.2%})")
+
+    # 2. Check File Paths
+    print("\nChecking file path validity (Random Sample of 1000)...")
+
+    def check_files(df, name):
+        if df.empty:
+            return
+        sample = df.sample(n=min(1000, len(df)), random_state=RANDOM_STATE)
+        missing_count = 0
+        missing_examples = []
+
+        for _, row in sample.iterrows():
+            # file_path is relative to input directory
+            full_path = os.path.join(INPUT_DIR, row["file_path"])
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(full_path)
+
+        ratio = missing_count / len(sample)
+        print(f"  {name}: Missing Ratio = {ratio:.4f}")
+
+        if ratio > 0.5:
+            print("  Examples of missing files:")
+            for ex in missing_examples:
+                print(f"    {ex}")
+            raise FileNotFoundError(
+                f"Error: More than 50% of file paths in {name} are invalid."
+            )
+
+    check_files(train_df, "Train")
+    check_files(val_df, "Val")
+    check_files(test_df, "Test")
+
+    # 3. Verify Split Logic
+    print("\nVerifying split constraints...")
+    train_studies = set(train_df["StudyInstanceUID"].unique())
+    val_studies = set(val_df["StudyInstanceUID"].unique())
+
+    # Assert no leakage
+    intersection = train_studies.intersection(val_studies)
+    if len(intersection) > 0:
+        raise AssertionError(
+            f"Data Leakage Detected: {len(intersection)} studies are in both Train and Val sets."
+        )
+
+    # Assert split ratio
+    total_studies = len(train_studies) + len(val_studies)
+    val_ratio = len(val_studies) / total_studies
+    print(f"  Validation Split Ratio: {val_ratio:.4f}")
+
+    if not (0.18 <= val_ratio <= 0.22):
+        raise AssertionError(
+            f"Split ratio {val_ratio:.4f} is outside the acceptable range (0.18-0.22)."
+        )
+
+    print("Verification Passed Successfully.")
+
+
+if __name__ == "__main__":
+    train_df, val_df, test_df = generate_metadata()
+    verify_metadata(train_df, val_df, test_df)
+
+```
+
+# Script Execution Output:
+Initializing metadata generation...
+Indexing DICOM files...
+Indexed 5696 training images and 638 test images.
+Loading CSV files...
+Performing stratified group split...
+Processing test metadata...
+Saving metadata files...
+
+=== Verifying Datasets ===
+Train Set: 4561 images, 4358 studies
+Val Set:   1135 images, 1090 studies
+Test Set:  638 images
+
+Class Distribution (Study Level) - Validation Set:
+  Negative for Pneumonia: 299 (27.43%)
+  Typical Appearance: 513 (47.06%)
+  Indeterminate Appearance: 190 (17.43%)
+  Atypical Appearance: 88 (8.07%)
+
+Checking file path validity (Random Sample of 1000)...
+  Train: Missing Ratio = 0.0000
+  Val: Missing Ratio = 0.0000
+  Test: Missing Ratio = 0.0000
+
+Verifying split constraints...
+  Validation Split Ratio: 0.2001
+Verification Passed Successfully.
+Execution time: 21 seconds (time limit is an hour).
+
+# Document
+Based on the analysis of the provided Python script and its execution output, here is the documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for the **training set** (approximately 80% of the study data). It merges information from the original `train_image_level.csv` (bounding boxes, image IDs) and `train_study_level.csv` (study-level diagnosis labels) and appends the relative file path for the DICOM image.
+    *   **Purpose:** This file is the primary manifest used to train the machine learning model. It maps specific image files to their ground-truth bounding boxes and classification labels.
+*   **Schema / Structure:**
+    *   **Format:** CSV (Comma Separated Values)
+    *   **Key Columns:**
+        *   `image_id`: The unique identifier for the image (cleaned, without `_image` suffix).
+        *   `StudyInstanceUID`: The unique identifier for the study (cleaned, without `_study` suffix).
+        *   `file_path`: The relative path to the `.dcm` file (e.g., `train/00086460a852/9e8302230c91/65761e66de9f.dcm`).
+        *   `boxes`: A string or dictionary representation of the bounding boxes for opacities.
+        *   `label`: The original prediction string format (class ID, confidence, bounding box).
+        *   `Negative for Pneumonia`: Binary (0 or 1) indicating the presence of this class.
+        *   `Typical Appearance`: Binary (0 or 1).
+        *   `Indeterminate Appearance`: Binary (0 or 1).
+        *   `Atypical Appearance`: Binary (0 or 1).
+        *   `id_x` / `id_y`: (Optional artifacts of the merge) Original raw IDs from the source CSVs.
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df = pd.read_csv("./metadata/train.csv")
+    ```
+
+### 2. `./metadata/val.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for the **validation set** (approximately 20% of the study data). It contains the exact same columns and data structure as `train.csv`.
+    *   **Purpose:** This file is used to evaluate the model's performance during training. The split was performed using a stratified group split to ensure no patient/study leakage occurs between training and validation, while maintaining class balance.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Key Columns:** Identical to `train.csv` (see above).
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df = pd.read_csv("./metadata/val.csv")
+    ```
+
+### 3. `./metadata/test.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains metadata for the **test set** images found in the `./input/test` directory. Unlike the train/val files, this does **not** contain ground truth labels or bounding boxes.
+    *   **Purpose:** This file is used to generate predictions. It provides the file paths required for the model to load the unseen test images.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Columns:**
+        *   `image_id`: The filename of the image without the extension.
+        *   `StudyInstanceUID`: The study identifier extracted from the directory structure.
+        *   `file_path`: The relative path to the `.dcm` file (e.g., `test/000c9c05fd14/e555410bd2cd/51759b5579bc.dcm`).
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df = pd.read_csv("./metadata/test.csv")
+    ```

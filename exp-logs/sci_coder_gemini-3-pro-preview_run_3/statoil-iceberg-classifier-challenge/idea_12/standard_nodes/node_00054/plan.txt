@@ -1,0 +1,434 @@
+The previous solution failed because it employed a complex SE-ResNet architecture that likely overfitted the small, noisy dataset. Based on **Lesson 00031** and **Lesson 00046**, I will replace this with a `SimpleCNN` architecture. This model features aggressive spatial reduction (downsampling to 4x4 before pooling) and global max pooling, which acts as a strong inductive bias for detecting high-intensity point targets (icebergs) in radar clutter.
+
+I will also update the configuration to ensure the correct hyperparameter settings derived from the lessons:
+-   **Architecture**: 4-layer CNN with channels `[64, 128, 128, 128]` (**Lesson 00050**).
+-   **Epochs**: Reset to 50 to allow the model to fully converge with early stopping.
+-   **Regularization**: Ensure L2 weight decay is active (**Lesson 00036**) and Dropout is applied correctly after the dense layer activation (**Lesson 00017**).
+
+Here are the code changes:
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block.
+    Recalibrates channel-wise feature responses by explicitly modelling interdependencies between channels.
+    """
+
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class ResidualBlock(nn.Module):
+    """
+    Standard Residual Block with Squeeze-and-Excitation.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1, reduction=16):
+        super(ResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.se = SEBlock(out_channels, reduction)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = self.se(out)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class IcebergSEResNet(nn.Module):
+    """
+    4-Stage Residual Network with SE Attention and Aggressive Downsampling.
+    Includes Late Fusion with Incidence Angle.
+    """
+
+    def __init__(self):
+        super(IcebergSEResNet, self).__init__()
+
+        # Load configuration
+        self.in_channels = Config.IN_CHANNELS
+        self.stem_channels = Config.STEM_CHANNELS
+        self.stage_channels = Config.STAGE_CHANNELS
+        self.se_reduction = Config.SE_REDUCTION
+        self.head_dropout = Config.HEAD_DROPOUT
+
+        # Initial Stem: 75x75 -> 75x75 (Stride 1)
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels,
+                self.stem_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(self.stem_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 1: 64 -> 64, Stride 2 (75 -> 38)
+        self.stage1 = self._make_layer(
+            self.stem_channels, self.stage_channels[0], stride=2
+        )
+
+        # Stage 2: 64 -> 128, Stride 2 (38 -> 19) - Early Expansion
+        self.stage2 = self._make_layer(
+            self.stage_channels[0], self.stage_channels[1], stride=2
+        )
+
+        # Stage 3: 128 -> 128, Stride 2 (19 -> 10)
+        self.stage3 = self._make_layer(
+            self.stage_channels[1], self.stage_channels[2], stride=2
+        )
+
+        # Stage 4: 128 -> 128, Stride 2 (10 -> 5)
+        self.stage4 = self._make_layer(
+            self.stage_channels[2], self.stage_channels[3], stride=2
+        )
+
+        # Global Max Pooling: 5x5 -> 1x1
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classification Head with Late Fusion
+        # Concatenate flattened features (128) + incidence angle (1)
+        cnn_out_dim = self.stage_channels[3]
+        total_in_features = cnn_out_dim + 1
+
+        # Hidden dimension for the head (matching max width of CNN)
+        hidden_dim = 128
+
+        self.head = nn.Sequential(
+            nn.Linear(total_in_features, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=self.head_dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self._initialize_weights()
+
+    def _make_layer(self, in_channels, out_channels, stride):
+        return ResidualBlock(
+            in_channels, out_channels, stride=stride, reduction=self.se_reduction
+        )
+
+    def _initialize_weights(self):
+        # Kaiming Uniform Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, angle):
+        """
+        Args:
+            x (torch.Tensor): Image input [Batch, 3, 75, 75]
+            angle (torch.Tensor): Incidence angle input [Batch]
+        """
+        # Feature Extraction
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        # Pooling
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)  # Flatten
+
+        # Late Fusion
+        angle = angle.view(-1, 1)  # Ensure shape [Batch, 1]
+        x = torch.cat([x, angle], dim=1)
+
+        # Classification
+        x = self.head(x)
+
+        return x
+=======
+class SimpleCNN(nn.Module):
+    """
+    A simple 4-layer CNN with Global Max Pooling and Late Fusion.
+    Cite {solution_lesson_node_00031}: Simplicity and Inductive Bias in Low-Resource Radar Classification.
+    Cite {solution_lesson_node_00046}: Prefer Aggressive Spatial Reduction.
+    Cite {solution_lesson_node_00050}: Early Channel Expansion.
+    """
+
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+
+        # Block 1: 75x75 -> 37x37
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Block 2: 37x37 -> 18x18
+        # Early expansion to 128 channels (Cite {solution_lesson_node_00050})
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Block 3: 18x18 -> 9x9
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Block 4: 9x9 -> 4x4
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Global Max Pooling: 4x4 -> 1x1
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classification Head
+        # 128 features from CNN + 1 incidence angle
+        self.classifier = nn.Sequential(
+            nn.Linear(128 + 1, 512),
+            nn.ReLU(inplace=True),
+            # Dropout after activation (Cite {solution_lesson_node_00017})
+            nn.Dropout(0.2),
+            nn.Linear(512, 1),
+        )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Kaiming Uniform Initialization (Default for PyTorch, but explicit here)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, angle):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)  # Flatten
+
+        # Late Fusion
+        angle = angle.view(-1, 1)
+        x = torch.cat([x, angle], dim=1)
+
+        x = self.classifier(x)
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Model Architecture Parameters
+    # --------------------------------------------------------------------------
+    # Architecture: 4-Stage ResNet with SE Blocks
+    # Downsampling strategy: 75 -> 38 -> 19 -> 10 -> 5 (approx)
+
+    # Initial Stem Channels
+    STEM_CHANNELS = 64
+
+    # Channels for each of the 4 residual stages
+    # Note: Early expansion to 128 in stage 2, capped at 128
+    STAGE_CHANNELS = [64, 128, 128, 128]
+
+    # Squeeze-and-Excitation Reduction Ratio
+    SE_REDUCTION = 16
+
+    # Dropout applied in the classification head
+    HEAD_DROPOUT = 0.2
+
+    # --------------------------------------------------------------------------
+    # Training Parameters
+    # --------------------------------------------------------------------------
+    SEED = 42
+    NUM_FOLDS = 5
+
+    # Optimization
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 50
+=======
+    # --------------------------------------------------------------------------
+    # Model Architecture Parameters
+    # --------------------------------------------------------------------------
+    # Architecture: SimpleCNN
+
+    # --------------------------------------------------------------------------
+    # Training Parameters
+    # --------------------------------------------------------------------------
+    SEED = 42
+    NUM_FOLDS = 5
+
+    # Optimization
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 50
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.utils import AverageMeter, save_checkpoint
+from library.model import IcebergSEResNet
+
+
+def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device):
+=======
+from library.config import Config
+from library.utils import AverageMeter, save_checkpoint
+from library.model import SimpleCNN
+
+
+def train_one_epoch(train_loader, model, criterion, optimizer, epoch, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    device = torch.device(Config.DEVICE)
+
+    # Initialize Model
+    model = IcebergSEResNet().to(device)
+
+    # Initialize Optimizer (Adam with constant LR as per Config)
+=======
+    device = torch.device(Config.DEVICE)
+
+    # Initialize Model
+    model = SimpleCNN().to(device)
+
+    # Initialize Optimizer (Adam with constant LR as per Config)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.utils import set_seed, save_submission, load_checkpoint
+from library.data_loader import process_and_cache_data, get_cv_loaders, get_test_loader
+from library.train_eval import fit_fold
+from library.model import IcebergSEResNet
+
+
+def main():
+    # --------------------------------------------------------------------------
+    # 1. Configuration and Setup
+    # --------------------------------------------------------------------------
+    # Override Config for Fast Baseline Execution while maintaining performance.
+    # 30 epochs is sufficient for this small dataset (~1600 samples) on A100.
+    Config.NUM_EPOCHS = 30
+    Config.MAX_SAMPLES = None  # Use full dataset to ensure metric quality
+
+    set_seed(Config.SEED)
+=======
+from library.config import Config
+from library.utils import set_seed, save_submission, load_checkpoint
+from library.data_loader import process_and_cache_data, get_cv_loaders, get_test_loader
+from library.train_eval import fit_fold
+from library.model import SimpleCNN
+
+
+def main():
+    # --------------------------------------------------------------------------
+    # 1. Configuration and Setup
+    # --------------------------------------------------------------------------
+    Config.MAX_SAMPLES = None  # Use full dataset to ensure metric quality
+
+    set_seed(Config.SEED)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Load Best Model
+        model = IcebergSEResNet().to(device)
+        ckpt_path = os.path.join(Config.WORKING_DIR, f"model_best_fold_{fold}.pth")
+        load_checkpoint(ckpt_path, model)
+=======
+        # Load Best Model
+        model = SimpleCNN().to(device)
+        ckpt_path = os.path.join(Config.WORKING_DIR, f"model_best_fold_{fold}.pth")
+        load_checkpoint(ckpt_path, model)
+>>>>>>> REPLACE
+```

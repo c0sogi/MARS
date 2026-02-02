@@ -1,0 +1,522 @@
+My optimization strategy focuses on simplifying the training pipeline to align with best practices for small datasets, as highlighted in the provided lessons. Specifically, I will:
+
+1.  **Simplify the Optimizer**: Replace the complex Lookahead + Layer-Wise Learning Rate Decay (LLRD) optimizer with a standard `AdamW` optimizer. Lesson 00022 suggests that on micro-datasets, standard fine-tuning with moderate learning rates often outperforms complex optimization schedules which may fail to converge properly given limited steps.
+2.  **Increase Training Epochs & Relax Early Stopping**: Increase `NUM_EPOCHS` from 12 to 50 and set `PATIENCE` to 15. Lesson 00040 emphasizes that when using strong regularization like Mixup (which is active in the code), the model requires more epochs to converge, and early stopping constraints must be relaxed.
+3.  **Prioritize Best Checkpoint Selection**: Revert from "Top-3 Checkpoint Averaging" to saving only the single best checkpoint based on validation AUC. Lesson 00055 and Lesson 00057 warn that averaging checkpoints on unstable, small-data training trajectories can degrade performance compared to selecting the single best minimizer.
+4.  **Maintain Robust Baseline**: Retain the 5-fold cross-validation, heterogeneous ensemble (ResNet18, EfficientNet-B0, DenseNet121), and Test-Time Augmentation (TTA), as these were components of the high-performing baseline (Idea 12).
+
+```diff
+library/optimization.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import defaultdict
+
+
+class Lookahead(optim.Optimizer):
+    """
+    Implements Lookahead Optimizer.
+    Reference: https://arxiv.org/abs/1907.08610
+    """
+
+    def __init__(self, optimizer, k=5, alpha=0.5):
+        """
+        Args:
+            optimizer (torch.optim.Optimizer): The inner optimizer (e.g., AdamW).
+            k (int): Number of steps before synchronizing slow and fast weights.
+            alpha (float): Interpolation factor (0 < alpha < 1).
+        """
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"Invalid alpha value: {alpha}")
+        if not isinstance(k, int) or k < 1:
+            raise ValueError(f"Invalid k value: {k}")
+
+        self.optimizer = optimizer
+        self.k = k
+        self.alpha = alpha
+
+        defaults = dict(k=k, alpha=alpha, **optimizer.defaults)
+        super().__init__(optimizer.param_groups, defaults)
+
+        # Initialize slow weights
+        for group in self.param_groups:
+            group["counter"] = 0
+
+    def update(self, group):
+        for fast in group["params"]:
+            param_state = self.state[fast]
+            if "slow_param" not in param_state:
+                param_state["slow_param"] = torch.zeros_like(fast.data)
+                param_state["slow_param"].copy_(fast.data)
+
+            slow = param_state["slow_param"]
+            # slow = slow + alpha * (fast - slow)
+            slow += (fast.data - slow) * self.alpha
+            fast.data.copy_(slow)
+
+    def update_lookahead(self):
+        for group in self.param_groups:
+            self.update(group)
+
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
+
+        for group in self.param_groups:
+            if group["counter"] == 0:
+                # Initialize slow params on first step if needed
+                for p in group["params"]:
+                    param_state = self.state[p]
+                    if "slow_param" not in param_state:
+                        param_state["slow_param"] = torch.zeros_like(p.data)
+                        param_state["slow_param"].copy_(p.data)
+
+            group["counter"] += 1
+            if group["counter"] >= self.k:
+                group["counter"] = 0
+                self.update(group)
+
+        return loss
+
+    def state_dict(self):
+        fast_state_dict = self.optimizer.state_dict()
+        slow_state = {
+            (id(k) if isinstance(k, torch.Tensor) else k): v
+            for k, v in self.state.items()
+        }
+        fast_state = fast_state_dict["state"]
+        param_groups = fast_state_dict["param_groups"]
+        return {
+            "fast_state": fast_state,
+            "slow_state": slow_state,
+            "param_groups": param_groups,
+        }
+
+    def load_state_dict(self, state_dict):
+        slow_state_dict = state_dict["slow_state"]
+        fast_state_dict = {
+            "state": state_dict["fast_state"],
+            "param_groups": state_dict["param_groups"],
+        }
+        self.optimizer.load_state_dict(fast_state_dict)
+
+        # Restore slow state
+        # We need to map params from optimizer to the slow state dict
+        # This is a simplified loading mechanism assuming structure matches
+        current_param_map = {
+            id(p): p for group in self.param_groups for p in group["params"]
+        }
+
+        # Note: In a robust implementation, we would need to handle mapping carefully.
+        # For this competition context, we assume state_dict is loaded onto the same model structure.
+        self.state = defaultdict(dict)
+        # Re-link slow params
+        # This part is tricky because id() changes.
+        # Usually Lookahead state loading requires iterating groups similar to optimizer.load_state_dict
+        # For simplicity in this script, we reset slow params to current params if loading fails,
+        # or rely on the fact that we usually load checkpoints for inference (where optimizer state matters less)
+        # or resume training where we pass the object.
+        pass
+
+
+def get_optimizer_with_llrd(
+    model, model_name, lr=1e-3, weight_decay=1e-2, layer_decay=0.9
+):
+    """
+    Constructs an AdamW optimizer with Layer-Wise Learning Rate Decay (LLRD) wrapped in Lookahead.
+
+    Args:
+        model (nn.Module): The model to optimize.
+        model_name (str): Name of the architecture (e.g., 'resnet18', 'efficientnet_b0').
+        lr (float): Base learning rate for the head/classifier.
+        weight_decay (float): Weight decay coefficient.
+        layer_decay (float): Decay factor for lower layers (0 < layer_decay <= 1).
+
+    Returns:
+        optim.Optimizer: Lookahead(AdamW) with parameter groups.
+    """
+
+    # 1. Define Parameter Groups based on Architecture
+    param_groups = []
+
+    # Helper to clean parameter names
+    def get_layer_id(name):
+        return name
+
+    # We will assign a "depth index" to each parameter.
+    # Higher index = closer to output = higher LR.
+    # Max index gets base LR.
+
+    named_params = list(model.named_parameters())
+
+    # Grouping logic
+    # We map parameter names to a "stage" index.
+
+    if "resnet" in model_name:
+        # ResNet stages: stem (0), layer1 (1), layer2 (2), layer3 (3), layer4 (4), fc (5)
+        # Total stages = 6
+        num_stages = 6
+
+        def get_stage(name):
+            if "fc" in name:
+                return 5
+            if "layer4" in name:
+                return 4
+            if "layer3" in name:
+                return 3
+            if "layer2" in name:
+                return 2
+            if "layer1" in name:
+                return 1
+            return 0  # Stem (conv1, bn1)
+
+    elif "efficientnet" in model_name:
+        # EfficientNet-B0 has 7 blocks usually.
+        # Structure: conv_stem, bn1, blocks.0 ... blocks.6, conv_head, bn2, classifier
+        # Let's map roughly:
+        # Classifier/Head -> 4
+        # Blocks 5-6 -> 3
+        # Blocks 3-4 -> 2
+        # Blocks 1-2 -> 1
+        # Stem/Block 0 -> 0
+        num_stages = 5
+
+        def get_stage(name):
+            if "classifier" in name:
+                return 4
+            if "conv_head" in name or "bn2" in name:
+                return 3  # Top convs
+
+            if "blocks" in name:
+                # Extract block index
+                try:
+                    # name format: blocks.0.0...
+                    parts = name.split(".")
+                    block_idx = int(parts[1])
+                    if block_idx >= 5:
+                        return 3
+                    if block_idx >= 3:
+                        return 2
+                    if block_idx >= 1:
+                        return 1
+                    return 0
+                except:
+                    return 0
+
+            if "conv_stem" in name or "bn1" in name:
+                return 0
+            return 0
+
+    elif "densenet" in model_name:
+        # DenseNet121: features.conv0, features.denseblock1...4, classifier
+        # Stages:
+        # Classifier -> 5
+        # Denseblock4 -> 4
+        # Denseblock3 -> 3
+        # Denseblock2 -> 2
+        # Denseblock1 -> 1
+        # Stem -> 0
+        num_stages = 6
+
+        def get_stage(name):
+            if "classifier" in name:
+                return 5
+            if "norm5" in name:
+                return 4  # Final norm before classifier
+            if "denseblock4" in name or "transition3" in name:
+                return 4
+            if "denseblock3" in name or "transition2" in name:
+                return 3
+            if "denseblock2" in name or "transition1" in name:
+                return 2
+            if "denseblock1" in name:
+                return 1
+            return 0  # Stem (conv0, norm0)
+
+    else:
+        # Fallback for unknown architectures: Head vs Body
+        num_stages = 2
+
+        def get_stage(name):
+            # Common head names
+            if any(x in name for x in ["fc", "classifier", "head"]):
+                return 1
+            return 0
+
+    # 2. Assign Parameters to Groups
+    # We create a list of lists for params
+    stage_params = defaultdict(list)
+
+    for n, p in named_params:
+        if not p.requires_grad:
+            continue
+        stage_idx = get_stage(n)
+        stage_params[stage_idx].append(p)
+
+    # 3. Create Optimizer Param Groups with Decayed LR
+    # Formula: lr_stage = lr_base * (layer_decay ** (num_stages - 1 - stage_idx))
+    # Example ResNet (num_stages=6):
+    # FC (5): lr * (0.9 ** 0) = lr
+    # Layer4 (4): lr * (0.9 ** 1)
+    # ...
+    # Stem (0): lr * (0.9 ** 5)
+
+    opt_groups = []
+
+    # Sort keys to ensure order
+    for stage_idx in sorted(stage_params.keys(), reverse=True):
+        # Calculate decay power
+        # The head (highest index) should have power 0
+        # The lowest index should have power (max_stage - stage_idx)
+        # However, we defined num_stages somewhat arbitrarily.
+        # Let's anchor to the max stage found.
+        max_stage = max(stage_params.keys())
+        decay_power = max_stage - stage_idx
+
+        cur_lr = lr * (layer_decay**decay_power)
+
+        opt_groups.append(
+            {
+                "params": stage_params[stage_idx],
+                "lr": cur_lr,
+                "weight_decay": weight_decay,
+            }
+        )
+
+    # 4. Initialize AdamW
+    base_optimizer = optim.AdamW(opt_groups, lr=lr, weight_decay=weight_decay)
+
+    # 5. Wrap with Lookahead
+    optimizer = Lookahead(base_optimizer, k=5, alpha=0.5)
+
+    return optimizer
+=======
+import torch.optim as optim
+
+
+def get_optimizer(model, lr=1e-3, weight_decay=1e-2):
+    """
+    Constructs a standard AdamW optimizer.
+    Cite solution_lesson_node_00022: Prefer standard fine-tuning with moderate learning rate
+    over complex schedules/optimizers on micro-datasets.
+    """
+    return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.optimization import get_optimizer_with_llrd
+from library.training import train_one_epoch, validate_one_epoch
+from library.inference import (
+    predict_with_tta,
+    save_submission,
+    load_and_average_checkpoints,
+)
+
+# Constants
+BATCH_SIZE = 32
+NUM_EPOCHS = 12  # Fast baseline configuration
+FOLDS = 5
+MODELS = ["resnet18", "efficientnet_b0", "densenet121"]
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+THRESHOLD = 0.9479806884980326
+CHECKPOINT_DIR = "./working/checkpoints"
+SUBMISSION_PATH = "./submission/submission.csv"
+=======
+from library.optimization import get_optimizer
+from library.training import train_one_epoch, validate_one_epoch
+from library.inference import (
+    predict_with_tta,
+    save_submission,
+    load_and_average_checkpoints,
+)
+
+# Constants
+BATCH_SIZE = 32
+NUM_EPOCHS = 50  # Cite solution_lesson_node_00040: Relax early stopping/increase epochs for Mixup
+FOLDS = 5
+MODELS = ["resnet18", "efficientnet_b0", "densenet121"]
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+THRESHOLD = 0.9479806884980326
+CHECKPOINT_DIR = "./working/checkpoints"
+SUBMISSION_PATH = "./submission/submission.csv"
+PATIENCE = 15  # Cite solution_lesson_node_00040: Increase patience for Mixup
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        for model_name in MODELS:
+            print(f"Training {model_name}...")
+
+            # Initialize Model
+            model = get_bird_model(model_name, num_classes=19).to(DEVICE)
+
+            # Initialize Optimizer (LLRD)
+            optimizer = get_optimizer_with_llrd(
+                model, model_name, lr=1e-3, weight_decay=1e-2, layer_decay=0.9
+            )
+
+            # Initialize Scheduler
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=NUM_EPOCHS
+            )
+
+            # Track Top-3 Checkpoints
+            top3_checkpoints = []  # List of (auc, path)
+
+            for epoch in range(1, NUM_EPOCHS + 1):
+                # Train
+                train_loss = train_one_epoch(
+                    model, train_loader, optimizer, DEVICE, epoch
+                )
+
+                # Validate
+                val_loss, val_auc = validate_one_epoch(model, val_loader, DEVICE)
+
+                # Step Scheduler
+                scheduler.step()
+
+                # Save Checkpoint
+                ckpt_path = os.path.join(
+                    CHECKPOINT_DIR, f"{model_name}_fold{fold_idx}_ep{epoch}.pth"
+                )
+                torch.save(model.state_dict(), ckpt_path)
+
+                # Update Top-3
+                top3_checkpoints.append((val_auc, ckpt_path))
+                top3_checkpoints.sort(key=lambda x: x[0], reverse=True)
+
+                # Prune if > 3
+                if len(top3_checkpoints) > 3:
+                    to_remove = top3_checkpoints.pop()
+                    if os.path.exists(to_remove[1]):
+                        os.remove(to_remove[1])
+
+            # Generate OOF predictions for this architecture using Top-3 Ensemble
+            print(f"Generating OOF for {model_name} using Top-3 snapshots...")
+            arch_oof_preds = np.zeros((len(val_idx), 19))
+
+            for _, ckpt_path in top3_checkpoints:
+                # Load weights
+                model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+                # Predict with TTA
+                probs, _ = predict_with_tta(model, val_loader, DEVICE)
+                arch_oof_preds += probs
+
+            # Average over snapshots
+            arch_oof_preds /= len(top3_checkpoints)
+            fold_arch_preds.append(arch_oof_preds)
+
+            # Cleanup
+            del model, optimizer, scheduler
+            torch.cuda.empty_cache()
+=======
+        for model_name in MODELS:
+            print(f"Training {model_name}...")
+
+            # Initialize Model
+            model = get_bird_model(model_name, num_classes=19).to(DEVICE)
+
+            # Initialize Optimizer (Standard AdamW)
+            # Cite solution_lesson_node_00022: Use standard optimizer
+            optimizer = get_optimizer(model, lr=1e-3, weight_decay=1e-2)
+
+            # Initialize Scheduler
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=NUM_EPOCHS
+            )
+
+            # Early Stopping & Checkpointing
+            best_auc = 0.0
+            patience_counter = 0
+            best_ckpt_path = os.path.join(
+                CHECKPOINT_DIR, f"{model_name}_fold{fold_idx}_best.pth"
+            )
+
+            for epoch in range(1, NUM_EPOCHS + 1):
+                # Train
+                train_loss = train_one_epoch(
+                    model, train_loader, optimizer, DEVICE, epoch
+                )
+
+                # Validate
+                val_loss, val_auc = validate_one_epoch(model, val_loader, DEVICE)
+
+                # Step Scheduler
+                scheduler.step()
+
+                # Cite solution_lesson_node_00055: Validation-Guided Checkpointing
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                    patience_counter = 0
+                    torch.save(model.state_dict(), best_ckpt_path)
+                    print(f"New best model saved with AUC: {best_auc}")
+                else:
+                    patience_counter += 1
+                    print(f"No improvement. Patience: {patience_counter}/{PATIENCE}")
+                
+                if patience_counter >= PATIENCE:
+                    print("Early stopping triggered.")
+                    break
+
+            # Generate OOF predictions for this architecture using Best Checkpoint
+            print(f"Generating OOF for {model_name} using Best Checkpoint...")
+            
+            # Load best weights
+            if os.path.exists(best_ckpt_path):
+                model.load_state_dict(torch.load(best_ckpt_path, map_location=DEVICE))
+            
+            # Predict with TTA
+            probs, _ = predict_with_tta(model, val_loader, DEVICE)
+            fold_arch_preds.append(probs)
+
+            # Cleanup
+            del model, optimizer, scheduler
+            torch.cuda.empty_cache()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        for model_name in MODELS:
+            # Gather all checkpoints for this model (all folds, all top-3 snapshots)
+            # Pattern: {model_name}_fold*_ep*.pth
+            pattern = os.path.join(CHECKPOINT_DIR, f"{model_name}_fold*_ep*.pth")
+            checkpoints = glob.glob(pattern)
+
+            if not checkpoints:
+                print(f"Warning: No checkpoints found for {model_name}")
+                continue
+
+            # Use library function to average predictions for this architecture
+            # This function handles model instantiation, loading, TTA, and averaging
+            probs, rec_ids = load_and_average_checkpoints(
+                model_name, checkpoints, test_loader, DEVICE
+            )
+
+            final_test_probs += probs
+=======
+        for model_name in MODELS:
+            # Gather all checkpoints for this model (all folds, best snapshots)
+            # Pattern: {model_name}_fold*_best.pth
+            pattern = os.path.join(CHECKPOINT_DIR, f"{model_name}_fold*_best.pth")
+            checkpoints = glob.glob(pattern)
+
+            if not checkpoints:
+                print(f"Warning: No checkpoints found for {model_name}")
+                continue
+
+            # Use library function to average predictions for this architecture
+            # This function handles model instantiation, loading, TTA, and averaging
+            probs, rec_ids = load_and_average_checkpoints(
+                model_name, checkpoints, test_loader, DEVICE
+            )
+
+            final_test_probs += probs
+>>>>>>> REPLACE
+```

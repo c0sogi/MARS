@@ -1,0 +1,235 @@
+The issue is that `runfile.py` calculates evaluation metrics on individual 2D slices, whereas the task requires metrics (specifically Hausdorff distance) to be calculated on 3D volumes constructed from the slices. The original code iterates through the validation loader and treats each slice as an independent sample, ignoring the `metadata` provided by the dataset that allows for volume reconstruction. This leads to mathematically invalid metrics for the task.
+
+To fix this, I will update `runfile.py` to:
+1.  Import `hausdorff_distance_3d` instead of the 2D version.
+2.  Modify the validation loop to unpack the `metadata` from the dataloader (Cite debug_lesson_1).
+3.  Accumulate predictions, ground truth masks, and image statistics into a dictionary keyed by `(case, day)` to reconstruct the patient volumes.
+4.  After the loop, iterate through the reconstructed volumes to calculate the 3D Dice coefficient and 3D Hausdorff distance (Cite debug_lesson_2).
+5.  Update the failure analysis to operate on these volume-level metrics and features.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.utils import set_seed, dice_coefficient, hausdorff_distance
+from library.dataset import UWMadisonDataset
+=======
+from library.utils import set_seed, dice_coefficient, hausdorff_distance_3d
+from library.dataset import UWMadisonDataset
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print(f"Evaluating on {len(val_dataset)} validation samples...")
+
+    dice_scores = []
+    hd_scores = []
+    combined_scores = []
+
+    # Lists for failure analysis
+    error_magnitudes = []
+    feat_mask_areas = []
+    feat_img_intensities = []
+
+    with torch.no_grad():
+        # Dataset returns (images, masks, metadata), so we unpack 3 values
+        for images, masks, _ in val_loader:
+            images = images.to(DEVICE)
+            masks = masks.to(DEVICE)
+
+            # Forward pass
+            outputs = model(images)
+            preds = (outputs > 0.5).float()
+
+            # Calculate metrics per sample
+            for i in range(images.size(0)):
+                d_sample = 0
+                h_sample = 0
+                mask_area_sample = 0
+
+                # Feature: Mean image intensity
+                img_mean = images[i].mean().item()
+
+                # Average metrics across the 3 classes
+                for c in range(3):
+                    y_true = masks[i, c]
+                    y_pred = preds[i, c]
+
+                    # Move to CPU/Numpy for metric calculation
+                    y_true_np = y_true.detach().cpu().numpy()
+                    y_pred_np = y_pred.detach().cpu().numpy()
+
+                    d_c = dice_coefficient(y_true_np, y_pred_np)
+                    h_c = hausdorff_distance(y_true_np, y_pred_np)
+
+                    d_sample += d_c
+                    h_sample += h_c
+                    mask_area_sample += y_true.sum().item()
+
+                d_sample /= 3.0
+                h_sample /= 3.0
+
+                # Competition Metric: 0.4 * Dice + 0.6 * (1 - HD)
+                # Note: HD is a distance (lower is better), so we invert it for the score.
+                # We clip HD at 1.0 to ensure the score doesn't go negative if distance is large.
+                h_score_component = max(0.0, 1.0 - h_sample)
+                score = 0.4 * d_sample + 0.6 * h_score_component
+
+                dice_scores.append(d_sample)
+                hd_scores.append(h_sample)
+                combined_scores.append(score)
+
+                # Failure Analysis Data
+                # Error magnitude = 1.0 - Score (Higher means worse performance)
+                error_magnitudes.append(1.0 - score)
+                feat_mask_areas.append(mask_area_sample)
+                feat_img_intensities.append(img_mean)
+
+    # Compute and Print Final Metrics
+    final_metric = np.mean(combined_scores)
+    final_dice = np.mean(dice_scores)
+    final_hd = np.mean(hd_scores)
+
+    print(f"Final Validation Metric: {final_metric:.10f}")
+    print(
+        f"Breakdown -> Mean Dice: {final_dice:.5f}, Mean Hausdorff Dist: {final_hd:.5f}"
+    )
+
+    # Failure Analysis: Correlations
+    if len(error_magnitudes) > 1:
+        corr_area, _ = pearsonr(error_magnitudes, feat_mask_areas)
+        corr_intensity, _ = pearsonr(error_magnitudes, feat_img_intensities)
+
+        print("\n--- Failure Analysis Correlations ---")
+        print(f"Correlation (Error vs Mask Area): {corr_area:.4f}")
+        print(f"Correlation (Error vs Image Intensity): {corr_intensity:.4f}")
+
+        if abs(corr_area) > 0.2:
+            print(
+                "Insight: Model performance is sensitive to the size of the segmentation mask."
+            )
+        if abs(corr_intensity) > 0.2:
+            print(
+                "Insight: Model performance is sensitive to image brightness/contrast."
+            )
+=======
+    print(f"Evaluating on {len(val_dataset)} validation samples...")
+
+    # Storage for 3D reconstruction
+    volume_data = {}
+
+    with torch.no_grad():
+        # Dataset returns (images, masks, metadata), so we unpack 3 values
+        # Cite debug_lesson_1: Correctly unpacking metadata to handle interface change
+        for images, masks, metadata in val_loader:
+            images = images.to(DEVICE)
+            masks = masks.to(DEVICE)
+
+            # Forward pass
+            outputs = model(images)
+            preds = (outputs > 0.5).float()
+
+            # Move to CPU/Numpy for storage
+            # Cite debug_lesson_2: Explicitly moving to CPU before numpy conversion
+            preds_np = preds.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            images_np = images.cpu().numpy()
+            meta_np = metadata.numpy()
+
+            for i in range(images.size(0)):
+                case_id = int(meta_np[i, 0])
+                day_id = int(meta_np[i, 1])
+                slice_id = int(meta_np[i, 2])
+
+                key = (case_id, day_id)
+                if key not in volume_data:
+                    volume_data[key] = []
+
+                # Store slice data for volume reconstruction
+                volume_data[key].append({
+                    "slice": slice_id,
+                    "pred": preds_np[i],
+                    "true": masks_np[i],
+                    "img_mean": np.mean(images_np[i])
+                })
+
+    # Compute 3D Metrics
+    dice_scores = []
+    hd_scores = []
+    combined_scores = []
+
+    # Lists for failure analysis (Volume level)
+    error_magnitudes = []
+    feat_mask_areas = []
+    feat_img_intensities = []
+
+    for key, slices in volume_data.items():
+        # Sort by slice index to form proper volume
+        slices.sort(key=lambda x: x["slice"])
+
+        # Stack to create volumes: (D, 3, H, W)
+        pred_vol = np.stack([s["pred"] for s in slices], axis=0)
+        true_vol = np.stack([s["true"] for s in slices], axis=0)
+
+        # Calculate features for analysis
+        vol_mean_intensity = np.mean([s["img_mean"] for s in slices])
+        vol_mask_area = np.sum(true_vol)
+
+        # Calculate metric per class
+        case_dice = 0
+        case_hd = 0
+
+        for c in range(3):
+            p_c = pred_vol[:, c, :, :]  # (D, H, W)
+            t_c = true_vol[:, c, :, :]  # (D, H, W)
+
+            case_dice += dice_coefficient(t_c, p_c)
+            case_hd += hausdorff_distance_3d(t_c, p_c)
+
+        case_dice /= 3.0
+        case_hd /= 3.0
+
+        # Competition Metric: 0.4 * Dice + 0.6 * (1 - HD)
+        # HD is normalized [0,1], so (1-HD) is similarity
+        h_score_component = max(0.0, 1.0 - case_hd)
+        score = 0.4 * case_dice + 0.6 * h_score_component
+
+        dice_scores.append(case_dice)
+        hd_scores.append(case_hd)
+        combined_scores.append(score)
+
+        # Failure Analysis Data
+        error_magnitudes.append(1.0 - score)
+        feat_mask_areas.append(vol_mask_area)
+        feat_img_intensities.append(vol_mean_intensity)
+
+    # Compute and Print Final Metrics
+    final_metric = np.mean(combined_scores)
+    final_dice = np.mean(dice_scores)
+    final_hd = np.mean(hd_scores)
+
+    print(f"Final Validation Metric: {final_metric:.10f}")
+    print(
+        f"Breakdown -> Mean Dice: {final_dice:.5f}, Mean Hausdorff Dist: {final_hd:.5f}"
+    )
+
+    # Failure Analysis: Correlations
+    if len(error_magnitudes) > 1:
+        corr_area, _ = pearsonr(error_magnitudes, feat_mask_areas)
+        corr_intensity, _ = pearsonr(error_magnitudes, feat_img_intensities)
+
+        print("\n--- Failure Analysis Correlations ---")
+        print(f"Correlation (Error vs Mask Volume): {corr_area:.4f}")
+        print(f"Correlation (Error vs Volume Intensity): {corr_intensity:.4f}")
+
+        if abs(corr_area) > 0.2:
+            print(
+                "Insight: Model performance is sensitive to the size of the segmentation mask."
+            )
+        if abs(corr_intensity) > 0.2:
+            print(
+                "Insight: Model performance is sensitive to image brightness/contrast."
+            )
+>>>>>>> REPLACE
+```

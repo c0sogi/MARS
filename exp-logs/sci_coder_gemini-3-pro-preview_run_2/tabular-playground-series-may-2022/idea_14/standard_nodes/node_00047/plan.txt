@@ -1,0 +1,262 @@
+To improve the model's performance, I will implement the following changes based on the provided lessons:
+
+1.  **Replace Conformer with Transformer (Cite Lesson 00046, 00029)**: The previous solution used `ConformerBlock` (Convolution + Attention), which Lesson 00046 identified as inferior to standard Transformers for this specific task of short discrete sequence modeling. I will replace the Conformer blocks with a standard `nn.TransformerEncoder` to better capture the sequence structure without the inductive bias of convolutions that led to overfitting.
+2.  **Positional Embeddings (Cite Lesson 00030)**: I will ensure the new Transformer implementation explicitly adds learnable positional embeddings to the input tokens, as this was found to be critical for the model to distinguish character positions in the `f_27` feature.
+3.  **Hyperparameter Tuning (Cite Lesson 00044, 00016)**: I will maintain the Batch Size at 1024 and the Scheduler Gamma at 0.1 (Lesson 00044) but adjust the Dropout to 0.3 (Lesson 00016) to balance regularization. I will also align the architecture to use 2 Transformer layers and 4 heads.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Model Hyperparameters
+    EMBED_DIM = 32
+    SEQ_LEN = 10
+    CONFORMER_BLOCKS = 2
+    RESFUNNEL_STAGES = [512, 256, 128]
+    DROPOUT = 0.35
+=======
+    # Model Hyperparameters
+    EMBED_DIM = 32
+    SEQ_LEN = 10
+    TRANSFORMER_LAYERS = 2
+    TRANSFORMER_HEADS = 4
+    RESFUNNEL_STAGES = [512, 256, 128]
+    DROPOUT = 0.3
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# ==========================================
+# Model Architecture
+# ==========================================
+class ConformerBlock(nn.Module):
+    def __init__(self, embed_dim, dropout=0.1):
+        super().__init__()
+        # Sub-module 1: MHSA
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Sub-module 2: Convolution
+        self.norm2 = nn.LayerNorm(embed_dim)
+        # Conv1d: (B, C, L) -> (B, C, L)
+        self.conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1)
+        self.act = nn.SiLU()  # Swish activation
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, L, D)
+
+        # MHSA Branch
+        res = x
+        x_norm = self.norm1(x)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        x = res + self.dropout1(x_attn)
+
+        # Conv Branch
+        res = x
+        x_norm = self.norm2(x)
+        # Transpose for Conv1d: (B, L, D) -> (B, D, L)
+        x_conv = x_norm.transpose(1, 2)
+        x_conv = self.conv(x_conv)
+        x_conv = self.act(x_conv)
+        # Transpose back: (B, D, L) -> (B, L, D)
+        x_conv = x_conv.transpose(1, 2)
+        x = res + self.dropout2(x_conv)
+
+        return x
+
+
+class GLUBlock(nn.Module):
+=======
+# ==========================================
+# Model Architecture
+# ==========================================
+class GLUBlock(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+class HybridResFunnel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        # Stream 1: Categorical (Conformer)
+        # Vocab size 27 (1-26 for A-Z, 0 for padding/unknown)
+        self.embedding = nn.Embedding(27, config.EMBED_DIM)
+        self.pos_encoder = nn.Parameter(
+            torch.zeros(1, config.SEQ_LEN, config.EMBED_DIM)
+        )
+        self.conformer_blocks = nn.ModuleList(
+            [
+                ConformerBlock(config.EMBED_DIM, config.DROPOUT)
+                for _ in range(config.CONFORMER_BLOCKS)
+            ]
+        )
+
+        # Stream 1 Output Dimension
+        s1_dim = config.SEQ_LEN * config.EMBED_DIM
+
+        # Stream 2: Continuous (Raw)
+        # f_00 to f_30 excluding f_27 -> 30 features
+        s2_dim = 30
+
+        # Fusion
+        fusion_dim = s1_dim + s2_dim
+
+        # Backbone: ResFunnel
+        self.stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+
+        # Projection to first stage width
+        self.input_proj = nn.Sequential(
+            nn.Linear(fusion_dim, config.RESFUNNEL_STAGES[0]),
+            nn.BatchNorm1d(config.RESFUNNEL_STAGES[0]),
+            nn.SiLU(),
+        )
+
+        for i, width in enumerate(config.RESFUNNEL_STAGES):
+            # Stack Residual Gated Blocks (2 per stage)
+            stage_blocks = nn.Sequential(
+                GLUBlock(width, config.DROPOUT), GLUBlock(width, config.DROPOUT)
+            )
+            self.stages.append(stage_blocks)
+
+            # Downsample logic
+            if i < len(config.RESFUNNEL_STAGES) - 1:
+                next_width = config.RESFUNNEL_STAGES[i + 1]
+                ds = nn.Sequential(
+                    nn.Linear(width, next_width), nn.BatchNorm1d(next_width), nn.SiLU()
+                )
+                self.downsamples.append(ds)
+            else:
+                self.downsamples.append(nn.Identity())
+
+        # Output Head
+        self.head = nn.Linear(config.RESFUNNEL_STAGES[-1], 1)
+
+    def forward(self, x_cat, x_cont):
+        # Stream 1 Processing
+        x_c = self.embedding(x_cat)  # (B, L, D)
+        x_c = x_c + self.pos_encoder
+        for blk in self.conformer_blocks:
+            x_c = blk(x_c)
+        x_c = x_c.flatten(1)  # (B, L*D)
+
+        # Fusion
+        x = torch.cat([x_c, x_cont], dim=1)
+
+        # Backbone Processing
+        x = self.input_proj(x)
+
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if i < len(self.stages) - 1:
+                x = self.downsamples[i](x)
+
+        # Head
+        logits = self.head(x)
+        return logits
+=======
+class HybridResFunnel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        # Stream 1: Categorical (Transformer)
+        # Vocab size 27 (1-26 for A-Z, 0 for padding/unknown)
+        self.embedding = nn.Embedding(27, config.EMBED_DIM)
+        self.pos_encoder = nn.Parameter(
+            torch.zeros(1, config.SEQ_LEN, config.EMBED_DIM)
+        )
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.EMBED_DIM,
+            nhead=config.TRANSFORMER_HEADS,
+            dim_feedforward=config.EMBED_DIM * 4,
+            dropout=config.DROPOUT,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.TRANSFORMER_LAYERS
+        )
+
+        # Stream 1 Output Dimension
+        s1_dim = config.SEQ_LEN * config.EMBED_DIM
+
+        # Stream 2: Continuous (Raw)
+        # f_00 to f_30 excluding f_27 -> 30 features
+        s2_dim = 30
+
+        # Fusion
+        fusion_dim = s1_dim + s2_dim
+
+        # Backbone: ResFunnel
+        self.stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+
+        # Projection to first stage width
+        self.input_proj = nn.Sequential(
+            nn.Linear(fusion_dim, config.RESFUNNEL_STAGES[0]),
+            nn.BatchNorm1d(config.RESFUNNEL_STAGES[0]),
+            nn.SiLU(),
+        )
+
+        for i, width in enumerate(config.RESFUNNEL_STAGES):
+            # Stack Residual Gated Blocks (2 per stage)
+            stage_blocks = nn.Sequential(
+                GLUBlock(width, config.DROPOUT), GLUBlock(width, config.DROPOUT)
+            )
+            self.stages.append(stage_blocks)
+
+            # Downsample logic
+            if i < len(config.RESFUNNEL_STAGES) - 1:
+                next_width = config.RESFUNNEL_STAGES[i + 1]
+                ds = nn.Sequential(
+                    nn.Linear(width, next_width), nn.BatchNorm1d(next_width), nn.SiLU()
+                )
+                self.downsamples.append(ds)
+            else:
+                self.downsamples.append(nn.Identity())
+
+        # Output Head
+        self.head = nn.Linear(config.RESFUNNEL_STAGES[-1], 1)
+
+    def forward(self, x_cat, x_cont):
+        # Stream 1 Processing
+        x_c = self.embedding(x_cat)  # (B, L, D)
+        x_c = x_c + self.pos_encoder
+        x_c = self.transformer_encoder(x_c)
+        x_c = x_c.flatten(1)  # (B, L*D)
+
+        # Fusion
+        x = torch.cat([x_c, x_cont], dim=1)
+
+        # Backbone Processing
+        x = self.input_proj(x)
+
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if i < len(self.stages) - 1:
+                x = self.downsamples[i](x)
+
+        # Head
+        logits = self.head(x)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import Config, HybridResFunnel, ConformerBlock, GLUBlock, set_seed
+=======
+from library.config import Config, HybridResFunnel, GLUBlock, set_seed
+>>>>>>> REPLACE
+```

@@ -1,0 +1,566 @@
+My strategy to improve performance focuses on adhering to the provided lessons to mitigate overfitting and improve data quality:
+
+1.  **Refine ROI Selection (Cite Lesson 00053, 00038)**: I will replace the "Hybrid-Integral" selection (FLAIR + T1wCE) with a **FLAIR-Only Integral** selection. Lesson 00053 emphasizes using a single dominant reference modality to ensure spatial consistency, and FLAIR is the standard for defining tumor extent. Lesson 00038 supports using integral statistics (sum) over extremal ones.
+2.  **Optimize Augmentation (Cite Lesson 00048)**: I will change the rotation padding mode from `BORDER_CONSTANT` (zero-padding) to `BORDER_REFLECT`. Lesson 00048 indicates that zero-padding can lead to stagnant performance, while reflection padding (used in the previous best solution) introduces noise that may act as beneficial regularization.
+3.  **Hierarchical Data Ingestion (Cite Lesson 00039)**: I will modify `read_dicom_image` to attempt reading with `cv2` *before* falling back to the raw binary heuristic. While `cv2` may fail on this dataset, this strictly follows the recommended hierarchy of "Library -> Generic Reader -> Heuristic".
+4.  **Regularization**: To combat the rapid overfitting observed (Training AUC rising while Validation AUC drops), I will increase the classifier `dropout_rate` from 0.2 to 0.5.
+
+I will create a new working directory `working/idea_opt` to ensure fresh caching.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def read_dicom_image(path):
+    """
+    Reads a DICOM file using a robust raw binary tail-read strategy to bypass header parsing issues.
+    Falls back to OpenCV if the raw read heuristic assumes incorrect dimensions.
+
+    Args:
+        path (str): Path to the .dcm file.
+
+    Returns:
+        np.ndarray: Image data as float32. Returns a black image if reading fails.
+    """
+    if not os.path.exists(path):
+        return np.zeros((224, 224), dtype=np.float32)
+
+    try:
+        file_size = os.path.getsize(path)
+
+        # Heuristic: DICOM images in this dataset are typically 512x512 or 256x256 uint16
+        # 512 * 512 * 2 bytes = 524,288 bytes
+        # 256 * 256 * 2 bytes = 131,072 bytes
+
+        shape = None
+        bytes_to_read = 0
+
+        if file_size >= 524288:
+            # Likely 512x512
+            shape = (512, 512)
+            bytes_to_read = 524288
+        elif file_size >= 131072:
+            # Likely 256x256
+            shape = (256, 256)
+            bytes_to_read = 131072
+
+        if shape and bytes_to_read > 0:
+            with open(path, "rb") as f:
+                f.seek(-bytes_to_read, 2)
+                data = f.read(bytes_to_read)
+
+            img = np.frombuffer(data, dtype=np.uint16).astype(np.float32)
+            if img.size == shape[0] * shape[1]:
+                img = img.reshape(shape)
+                return img
+
+        # Fallback to OpenCV (unlikely to work for DICOM but included per spec)
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            return img.astype(np.float32)
+
+    except Exception:
+        pass
+
+    # Final fallback: return zeros
+    return np.zeros((224, 224), dtype=np.float32)
+=======
+def read_dicom_image(path):
+    """
+    Reads a DICOM file. Prioritizes standard libraries (OpenCV) before falling back
+    to raw binary heuristics, as per Lesson 00039.
+
+    Args:
+        path (str): Path to the .dcm file.
+
+    Returns:
+        np.ndarray: Image data as float32. Returns a black image if reading fails.
+    """
+    if not os.path.exists(path):
+        return np.zeros((224, 224), dtype=np.float32)
+
+    # 1. Attempt Generic Media Reader (Cite Lesson 00039)
+    try:
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            return img.astype(np.float32)
+    except Exception:
+        pass
+
+    # 2. Fallback to Raw Binary Tail-Read (Cite Lesson 00032)
+    try:
+        file_size = os.path.getsize(path)
+
+        # Heuristic: DICOM images in this dataset are typically 512x512 or 256x256 uint16
+        # 512 * 512 * 2 bytes = 524,288 bytes
+        # 256 * 256 * 2 bytes = 131,072 bytes
+
+        shape = None
+        bytes_to_read = 0
+
+        if file_size >= 524288:
+            # Likely 512x512
+            shape = (512, 512)
+            bytes_to_read = 524288
+        elif file_size >= 131072:
+            # Likely 256x256
+            shape = (256, 256)
+            bytes_to_read = 131072
+
+        if shape and bytes_to_read > 0:
+            with open(path, "rb") as f:
+                f.seek(-bytes_to_read, 2)
+                data = f.read(bytes_to_read)
+
+            img = np.frombuffer(data, dtype=np.uint16).astype(np.float32)
+            if img.size == shape[0] * shape[1]:
+                img = img.reshape(shape)
+                return img
+
+    except Exception:
+        pass
+
+    # Final fallback: return zeros
+    return np.zeros((224, 224), dtype=np.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+CACHE_DIR = "./working/idea_30"
+ROI_CACHE_FILE = os.path.join(CACHE_DIR, "roi_cache.parquet")
+MODALITIES = ["FLAIR", "T1w", "T1wCE", "T2w"]
+
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+def extract_id(filename):
+    """Extracts the integer ID from a filename like 'Image-123.dcm'."""
+    match = re.search(r"(\d+)", filename)
+    if match:
+        return int(match.group(1))
+    return -1
+
+
+def get_image_ids(directory):
+    """Returns a sorted list of integer Image IDs found in the directory."""
+    if not os.path.exists(directory):
+        return []
+    files = os.listdir(directory)
+    ids = [extract_id(f) for f in files if f.endswith(".dcm")]
+    return sorted([i for i in ids if i != -1])
+
+
+# -----------------------------------------------------------------------------
+# ROI Calculation Logic
+# -----------------------------------------------------------------------------
+def compute_hybrid_integral_roi(metadata_dfs, load_cached_data=True):
+    """
+    Computes the anchor slice index for each subject using Hybrid-Integral Consensus.
+
+    Args:
+        metadata_dfs (list): List of pandas DataFrames (train, val, test).
+        load_cached_data (bool): Whether to attempt loading from cache.
+
+    Returns:
+        pd.DataFrame: DataFrame containing 'BraTS21ID', 'anchor_id', 'sorted_ids'.
+    """
+    # 1. Try Load Cache
+    if load_cached_data:
+        cached_df = load_cache(ROI_CACHE_FILE)
+        if cached_df is not None:
+            print(f"Loaded ROI cache from {ROI_CACHE_FILE}")
+            return cached_df
+
+    print("Computing Hybrid-Integral ROI cache (this may take a few minutes)...")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # 2. Consolidate Subject List
+    all_subjects = []
+    seen_ids = set()
+
+    for df in metadata_dfs:
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            bid = row["BraTS21ID"]
+            if bid not in seen_ids:
+                seen_ids.add(bid)
+                all_subjects.append(row)
+
+    results = []
+
+    # 3. Process Each Subject
+    for row in all_subjects:
+        bid = row["BraTS21ID"]
+
+        # Define paths for ROI modalities (FLAIR + T1wCE)
+        path_flair = os.path.join(INPUT_DIR, row["path_FLAIR"])
+        path_t1wce = os.path.join(INPUT_DIR, row["path_T1wCE"])
+
+        # Get all available IDs to define the common Z-axis
+        ids_flair = set(get_image_ids(path_flair))
+        ids_t1wce = set(get_image_ids(path_t1wce))
+
+        # Union of IDs defines the coordinate system
+        all_ids = sorted(list(ids_flair.union(ids_t1wce)))
+
+        if not all_ids:
+            # Fallback for empty folders
+            results.append({"BraTS21ID": bid, "anchor_id": 1, "sorted_ids": [1]})
+            continue
+
+        # Compute Integral Profiles
+        profile_flair = []
+        profile_t1wce = []
+
+        for i in all_ids:
+            # FLAIR
+            val_f = 0.0
+            if i in ids_flair:
+                p = os.path.join(path_flair, f"Image-{i}.dcm")
+                img = read_dicom_image(p)
+                val_f = np.sum(img)
+            profile_flair.append(val_f)
+
+            # T1wCE
+            val_t = 0.0
+            if i in ids_t1wce:
+                p = os.path.join(path_t1wce, f"Image-{i}.dcm")
+                img = read_dicom_image(p)
+                val_t = np.sum(img)
+            profile_t1wce.append(val_t)
+
+        # Normalize Profiles [0, 1]
+        p_f = np.array(profile_flair)
+        p_t = np.array(profile_t1wce)
+
+        if p_f.max() > 0:
+            p_f = p_f / p_f.max()
+        if p_t.max() > 0:
+            p_t = p_t / p_t.max()
+
+        # Consensus
+        consensus = p_f + p_t
+
+        # Restrict to 15% - 85% depth
+        n = len(all_ids)
+        start = int(n * 0.15)
+        end = int(n * 0.85)
+
+        # Handle edge case where range is invalid
+        if start >= end:
+            start = 0
+            end = n
+
+        subset = consensus[start:end]
+
+        if len(subset) > 0:
+            argmax_rel = np.argmax(subset)
+            argmax_abs = start + argmax_rel
+            anchor_id = all_ids[argmax_abs]
+        else:
+            # Fallback to middle
+            anchor_id = all_ids[n // 2]
+
+        results.append(
+            {"BraTS21ID": bid, "anchor_id": anchor_id, "sorted_ids": all_ids}
+        )
+
+    # 4. Save Cache
+    df_cache = pd.DataFrame(results)
+    save_cache(df_cache, ROI_CACHE_FILE)
+    print("ROI cache computation complete.")
+    return df_cache
+=======
+CACHE_DIR = "./working/idea_opt"
+ROI_CACHE_FILE = os.path.join(CACHE_DIR, "roi_cache.parquet")
+MODALITIES = ["FLAIR", "T1w", "T1wCE", "T2w"]
+
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+def extract_id(filename):
+    """Extracts the integer ID from a filename like 'Image-123.dcm'."""
+    match = re.search(r"(\d+)", filename)
+    if match:
+        return int(match.group(1))
+    return -1
+
+
+def get_image_ids(directory):
+    """Returns a sorted list of integer Image IDs found in the directory."""
+    if not os.path.exists(directory):
+        return []
+    files = os.listdir(directory)
+    ids = [extract_id(f) for f in files if f.endswith(".dcm")]
+    return sorted([i for i in ids if i != -1])
+
+
+# -----------------------------------------------------------------------------
+# ROI Calculation Logic
+# -----------------------------------------------------------------------------
+def compute_flair_integral_roi(metadata_dfs, load_cached_data=True):
+    """
+    Computes the anchor slice index using FLAIR Integral Consensus.
+    Cite Lesson 00053: Derive slice selection from a single dominant reference modality.
+    Cite Lesson 00038: Use integral statistics (Sum) over extremal ones.
+
+    Args:
+        metadata_dfs (list): List of pandas DataFrames (train, val, test).
+        load_cached_data (bool): Whether to attempt loading from cache.
+
+    Returns:
+        pd.DataFrame: DataFrame containing 'BraTS21ID', 'anchor_id', 'sorted_ids'.
+    """
+    # 1. Try Load Cache
+    if load_cached_data:
+        cached_df = load_cache(ROI_CACHE_FILE)
+        if cached_df is not None:
+            print(f"Loaded ROI cache from {ROI_CACHE_FILE}")
+            return cached_df
+
+    print("Computing FLAIR-Integral ROI cache (this may take a few minutes)...")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # 2. Consolidate Subject List
+    all_subjects = []
+    seen_ids = set()
+
+    for df in metadata_dfs:
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            bid = row["BraTS21ID"]
+            if bid not in seen_ids:
+                seen_ids.add(bid)
+                all_subjects.append(row)
+
+    results = []
+
+    # 3. Process Each Subject
+    for row in all_subjects:
+        bid = row["BraTS21ID"]
+
+        # Define path for ROI modality (FLAIR Only)
+        path_flair = os.path.join(INPUT_DIR, row["path_FLAIR"])
+
+        # Get all available IDs
+        ids_flair = get_image_ids(path_flair)
+
+        if not ids_flair:
+            # Fallback for empty folders
+            results.append({"BraTS21ID": bid, "anchor_id": 1, "sorted_ids": [1]})
+            continue
+
+        # Compute Integral Profiles for FLAIR
+        profile_flair = []
+
+        for i in ids_flair:
+            p = os.path.join(path_flair, f"Image-{i}.dcm")
+            img = read_dicom_image(p)
+            val_f = np.sum(img)
+            profile_flair.append(val_f)
+
+        # Use raw sum profile (no normalization needed for single modality)
+        consensus = np.array(profile_flair)
+
+        # Restrict to 15% - 85% depth (Cite Lesson 00080)
+        n = len(ids_flair)
+        start = int(n * 0.15)
+        end = int(n * 0.85)
+
+        # Handle edge case where range is invalid
+        if start >= end:
+            start = 0
+            end = n
+
+        subset = consensus[start:end]
+
+        if len(subset) > 0:
+            argmax_rel = np.argmax(subset)
+            argmax_abs = start + argmax_rel
+            anchor_id = ids_flair[argmax_abs]
+        else:
+            # Fallback to middle
+            anchor_id = ids_flair[n // 2]
+
+        results.append(
+            {"BraTS21ID": bid, "anchor_id": anchor_id, "sorted_ids": ids_flair}
+        )
+
+    # 4. Save Cache
+    df_cache = pd.DataFrame(results)
+    save_cache(df_cache, ROI_CACHE_FILE)
+    print("ROI cache computation complete.")
+    return df_cache
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # Compute/Load ROIs
+    roi_cache = compute_hybrid_integral_roi(
+        [df_train, df_val, df_test], load_cached_data=load_cached_roi
+    )
+
+    # Define Transforms
+    # Training: HFlip, VFlip, Rotate +/- 15 deg with zero padding
+    train_transform = A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.Rotate(limit=15, border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),
+        ]
+    )
+=======
+    # Compute/Load ROIs
+    roi_cache = compute_flair_integral_roi(
+        [df_train, df_val, df_test], load_cached_data=load_cached_roi
+    )
+
+    # Define Transforms
+    # Training: HFlip, VFlip, Rotate +/- 15 deg with Reflection Padding
+    # Cite Lesson 00048: Reflection padding prevents stagnation compared to zero padding
+    train_transform = A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT, p=0.5),
+        ]
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def __init__(self, pretrained=True, dropout_rate=0.2):
+        super(AsymmetricEfficientNet, self).__init__()
+
+        # Load the backbone with ImageNet weights
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        self.backbone = efficientnet_b0(weights=weights)
+
+        # Modify the first layer (Stem) for 12-channel input with Grouped Convolutions
+        self._modify_stem()
+
+        # Reconstruct the classifier head
+        # EfficientNet B0 final feature map depth is 1280
+        in_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=True), nn.Linear(in_features, 1)
+        )
+=======
+    def __init__(self, pretrained=True, dropout_rate=0.5):
+        super(AsymmetricEfficientNet, self).__init__()
+
+        # Load the backbone with ImageNet weights
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        self.backbone = efficientnet_b0(weights=weights)
+
+        # Modify the first layer (Stem) for 12-channel input with Grouped Convolutions
+        self._modify_stem()
+
+        # Reconstruct the classifier head
+        # EfficientNet B0 final feature map depth is 1280
+        in_features = self.backbone.classifier[1].in_features
+        # Increased dropout to 0.5 to combat overfitting
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate, inplace=True), nn.Linear(in_features, 1)
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+WORKING_DIR = "./working/idea_30"
+=======
+WORKING_DIR = "./working/idea_opt"
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Model Initialization
+    model = AsymmetricEfficientNet(pretrained=True, dropout_rate=0.2)
+    model = model.to(DEVICE)
+=======
+    # 2. Model Initialization
+    model = AsymmetricEfficientNet(pretrained=True, dropout_rate=0.5)
+    model = model.to(DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Import from provided library files
+from library.utils import load_cache
+from library.data import get_dataloaders, compute_hybrid_integral_roi
+from library.train import run_training, DEVICE, WORKING_DIR, BEST_MODEL_PATH
+from library.model import AsymmetricEfficientNet
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+SEED = 42
+BATCH_SIZE = 32
+MAX_EPOCHS = 10  # Fast baseline
+PATIENCE = 3
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-2
+NUM_WORKERS = 4
+THRESHOLD_METRIC = 0.6303636363636363
+
+METADATA_DIR = "./metadata"
+SUBMISSION_DIR = "./submission"
+SUBMISSION_FILE = os.path.join(SUBMISSION_DIR, "submission.csv")
+ROI_CACHE_FILE = "./working/idea_30/roi_cache.parquet"
+=======
+# Import from provided library files
+from library.utils import load_cache
+from library.data import get_dataloaders, compute_flair_integral_roi
+from library.train import run_training, DEVICE, WORKING_DIR, BEST_MODEL_PATH
+from library.model import AsymmetricEfficientNet
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+SEED = 42
+BATCH_SIZE = 32
+MAX_EPOCHS = 10  # Fast baseline
+PATIENCE = 3
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-2
+NUM_WORKERS = 4
+THRESHOLD_METRIC = 0.6303636363636363
+
+METADATA_DIR = "./metadata"
+SUBMISSION_DIR = "./submission"
+SUBMISSION_FILE = os.path.join(SUBMISSION_DIR, "submission.csv")
+ROI_CACHE_FILE = "./working/idea_opt/roi_cache.parquet"
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Load Best Model for Validation
+    print(f"Loading best model from {BEST_MODEL_PATH}...")
+    model = AsymmetricEfficientNet(pretrained=False, dropout_rate=0.2)
+    model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+    model = model.to(DEVICE)
+=======
+    # 2. Load Best Model for Validation
+    print(f"Loading best model from {BEST_MODEL_PATH}...")
+    model = AsymmetricEfficientNet(pretrained=False, dropout_rate=0.5)
+    model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+    model = model.to(DEVICE)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,147 @@
+import sys
+import os
+import numpy as np
+
+# Append the library directory to system path to allow importing config
+sys.path.append(os.path.abspath("./library"))
+from config import Config
+
+
+def set_seed(seed=None):
+    """
+    Sets the random seed for reproducibility by delegating to the Config class.
+
+    Args:
+        seed (int, optional): The seed value to use. If None, uses Config.SEED.
+    """
+    Config.set_seed(seed)
+
+
+def run_length_encoding(frame_predictions):
+    """
+    Converts a sequence of frame-wise class labels into an ordered list of gesture IDs.
+    It collapses consecutive identical labels and removes the background class (0).
+
+    Args:
+        frame_predictions (list or np.ndarray): Sequence of integer class labels.
+
+    Returns:
+        list: A list of integer gesture IDs representing the recognized sequence.
+    """
+    if len(frame_predictions) == 0:
+        return []
+
+    # Collapse consecutive duplicates
+    collapsed_sequence = [frame_predictions[0]]
+    for i in range(1, len(frame_predictions)):
+        if frame_predictions[i] != frame_predictions[i - 1]:
+            collapsed_sequence.append(frame_predictions[i])
+
+    # Filter out the background class (0)
+    # Assuming class 0 is background/silence as per Config
+    final_sequence = [label for label in collapsed_sequence if label != 0]
+
+    return final_sequence
+
+
+def levenshtein_distance(seq1, seq2):
+    """
+    Computes the Levenshtein distance between two sequences of integers.
+
+    Args:
+        seq1 (list): The first sequence.
+        seq2 (list): The second sequence.
+
+    Returns:
+        int: The edit distance (insertions + deletions + substitutions).
+    """
+    len_1 = len(seq1) + 1
+    len_2 = len(seq2) + 1
+
+    # Initialize DP matrix
+    matrix = np.zeros((len_1, len_2), dtype=int)
+
+    for x in range(len_1):
+        matrix[x, 0] = x
+    for y in range(len_2):
+        matrix[0, y] = y
+
+    for x in range(1, len_1):
+        for y in range(1, len_2):
+            if seq1[x - 1] == seq2[y - 1]:
+                cost = 0
+            else:
+                cost = 1
+
+            matrix[x, y] = min(
+                matrix[x - 1, y] + 1,  # Deletion
+                matrix[x, y - 1] + 1,  # Insertion
+                matrix[x - 1, y - 1] + cost,  # Substitution
+            )
+
+    return matrix[len_1 - 1, len_2 - 1]
+
+
+def compute_levenshtein_score(predictions, ground_truth):
+    """
+    Computes the normalized Levenshtein distance metric (Error Rate).
+
+    Metric = (Sum of Levenshtein distances) / (Total number of gestures in ground truth)
+
+    Args:
+        predictions (dict): A dictionary mapping sample_id (str) to a list of predicted gesture IDs.
+        ground_truth (dict): A dictionary mapping sample_id (str) to a list of true gesture IDs.
+
+    Returns:
+        float: The calculated error rate.
+    """
+    total_distance = 0
+    total_true_gestures = 0
+
+    for sample_id, true_seq in ground_truth.items():
+        # Get prediction for this sample, default to empty list if missing
+        pred_seq = predictions.get(sample_id, [])
+
+        # Ensure inputs are lists of integers
+        true_seq_int = [int(x) for x in true_seq]
+        pred_seq_int = [int(x) for x in pred_seq]
+
+        dist = levenshtein_distance(pred_seq_int, true_seq_int)
+
+        total_distance += dist
+        total_true_gestures += len(true_seq_int)
+
+    if total_true_gestures == 0:
+        return 0.0
+
+    return total_distance / total_true_gestures
+
+
+def save_submission(predictions, output_path):
+    """
+    Saves the predictions to a CSV file in the required submission format.
+
+    Format:
+    SessionID,Label1,Label2,Label3
+
+    Args:
+        predictions (dict): A dictionary mapping sample_id (str) to a list of predicted gesture IDs.
+        output_path (str): The file path where the CSV will be saved.
+    """
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with open(output_path, "w") as f:
+        # Sort by sample_id for consistent output
+        for sample_id in sorted(predictions.keys()):
+            seq = predictions[sample_id]
+            # Convert sequence to comma-separated string
+            seq_str = ",".join(map(str, seq))
+
+            # Construct line: SessionID,Label1,Label2...
+            if seq_str:
+                line = f"{sample_id},{seq_str}\n"
+            else:
+                line = f"{sample_id},\n"
+
+            f.write(line)

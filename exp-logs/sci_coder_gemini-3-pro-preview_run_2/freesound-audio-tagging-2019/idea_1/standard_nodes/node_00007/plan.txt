@@ -1,0 +1,367 @@
+Based on the lessons learned from previous iterations, I will optimize the solution by implementing Cross-Modal Transfer Learning and Mixup augmentation, while adjusting training hyperparameters for robust convergence.
+
+**Strategy:**
+1.  **Transfer Learning (Cite `solution_lesson_node_00006`):** Replace the scratch-trained MobileNetV2 with a `torchvision` MobileNetV2 pre-trained on ImageNet. I will adapt the first convolutional layer to accept 1-channel audio input by summing the pre-trained RGB weights, preserving the spatial structure of the learned filters.
+2.  **Mixup Augmentation (Cite `solution_lesson_node_00006`):** Implement Mixup in the training loop (`library/engine.py`) to improve generalization and robustness against label noise.
+3.  **Hyperparameter Optimization (Cite `solution_lesson_node_00004`, `solution_lesson_node_00005`):** Increase `MAX_EPOCHS` to 50 and Early Stopping `PATIENCE` to 7 to ensure the model has sufficient time to converge after learning rate decay, avoiding premature termination.
+4.  **Signal Preservation (Cite `solution_lesson_node_00002`):** Retain the Global Max Pooling strategy in the model architecture to prevent signal dilution caused by zero-padding in variable-length audio clips.
+5.  **Conditional Submission:** Modify the execution flow to generate the submission file only if the validation LWLRAP exceeds the specified threshold (0.7983677688266535).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==== Training Hyperparameters ====
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    MAX_EPOCHS = 50
+    PATIENCE = 7  # Early stopping patience
+=======
+    # ==== Training Hyperparameters ====
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    MAX_EPOCHS = 50
+    PATIENCE = 7  # Early stopping patience (Cite solution_lesson_node_00004)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+def _make_divisible(v, divisor, min_value=None):
+    """
+    Ensures that all layers have a channel number that is divisible by 8.
+    This is important for optimizing performance on hardware accelerators.
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+class ConvBNReLU(nn.Sequential):
+    """
+    Standard block: Conv2d -> BatchNorm2d -> ReLU6
+    """
+
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1):
+        padding = (kernel_size - 1) // 2
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU6(inplace=True),
+        )
+
+
+class InvertedResidual(nn.Module):
+    """
+    Inverted Residual Block (MobileNetV2 Block).
+    Structure: Pointwise (Expansion) -> Depthwise -> Pointwise (Projection)
+    """
+
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super(InvertedResidual, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2]
+
+        hidden_dim = int(round(inp * expand_ratio))
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        if expand_ratio != 1:
+            # Pointwise Convolution (Expansion)
+            layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1))
+
+        layers.extend(
+            [
+                # Depthwise Convolution
+                ConvBNReLU(hidden_dim, hidden_dim, stride=stride, groups=hidden_dim),
+                # Pointwise Convolution (Projection) - No non-linearity
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            ]
+        )
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class AudioMobileNet(nn.Module):
+    """
+    Lightweight 2D CNN based on MobileNetV2 architecture.
+    Adapted for Audio Spectrogram inputs.
+    """
+
+    def __init__(self, width_mult=1.0):
+        super(AudioMobileNet, self).__init__()
+
+        input_channel = 32
+        last_channel = 1280
+        num_classes = Config.NUM_CLASSES
+
+        # MobileNetV2 Configuration:
+        # t: expansion factor, c: output channels, n: number of blocks, s: stride
+        inverted_residual_setting = [
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        # Build first layer
+        input_channel = _make_divisible(input_channel * width_mult, 8)
+        self.last_channel = (
+            _make_divisible(last_channel * width_mult, 8)
+            if width_mult > 1.0
+            else last_channel
+        )
+
+        # Initial Feature Extraction
+        # Input channels defined in Config (1 for Log-Mel Spectrogram)
+        self.features = [ConvBNReLU(Config.IN_CHANNELS, input_channel, stride=2)]
+
+        # Build Inverted Residual Blocks
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c * width_mult, 8)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                self.features.append(
+                    InvertedResidual(
+                        input_channel, output_channel, stride, expand_ratio=t
+                    )
+                )
+                input_channel = output_channel
+
+        # Build Last Convolutional Layer
+        self.features.append(
+            ConvBNReLU(input_channel, self.last_channel, kernel_size=1)
+        )
+
+        self.features = nn.Sequential(*self.features)
+
+        # Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(self.last_channel, num_classes),
+        )
+
+        # Weight Initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram of shape (Batch, 1, Freq, Time)
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes)
+        """
+        # Feature Extraction
+        x = self.features(x)
+
+        # Global Max Pooling
+        # Collapses spatial dimensions (Freq, Time) to (1, 1)
+        # Allows handling of variable length inputs
+        # Using Max Pooling to avoid signal dilution from zero-padding (Cite solution_lesson_node_00002)
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+=======
+import torch
+import torch.nn as nn
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from library.config import Config
+
+
+class AudioMobileNet(nn.Module):
+    """
+    Lightweight 2D CNN based on MobileNetV2 architecture.
+    Uses Transfer Learning from ImageNet (Cite solution_lesson_node_00006).
+    """
+
+    def __init__(self):
+        super(AudioMobileNet, self).__init__()
+
+        # Load pre-trained MobileNetV2
+        # Cite solution_lesson_node_00006
+        weights = MobileNet_V2_Weights.DEFAULT
+        base_model = mobilenet_v2(weights=weights)
+
+        # Modify first layer for 1 channel input (Log-Mel Spectrogram)
+        # Cite solution_lesson_node_00006: Sum weights along channel dimension
+        original_first_layer = base_model.features[0][0]
+        new_first_layer = nn.Conv2d(
+            in_channels=Config.IN_CHANNELS,  # 1
+            out_channels=original_first_layer.out_channels,
+            kernel_size=original_first_layer.kernel_size,
+            stride=original_first_layer.stride,
+            padding=original_first_layer.padding,
+            bias=False,
+        )
+
+        with torch.no_grad():
+            new_first_layer.weight.data = original_first_layer.weight.data.sum(
+                dim=1, keepdim=True
+            )
+
+        base_model.features[0][0] = new_first_layer
+
+        self.features = base_model.features
+
+        # Classifier Head
+        # MobileNetV2 last channel is 1280
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(1280, Config.NUM_CLASSES),
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram of shape (Batch, 1, Freq, Time)
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes)
+        """
+        # Feature Extraction
+        x = self.features(x)
+
+        # Global Max Pooling
+        # Collapses spatial dimensions (Freq, Time) to (1, 1)
+        # Allows handling of variable length inputs
+        # Using Max Pooling to avoid signal dilution from zero-padding (Cite solution_lesson_node_00002)
+        x = nn.functional.adaptive_max_pool2d(x, (1, 1))
+
+        # Flatten
+        x = torch.flatten(x, 1)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+=======
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        # Mixup Augmentation (Cite solution_lesson_node_00006)
+        alpha = 1.0
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+
+        index = torch.randperm(images.size(0)).to(device)
+        mixed_images = lam * images + (1 - lam) * images[index]
+        mixed_targets = lam * targets + (1 - lam) * targets[index]
+
+        optimizer.zero_grad()
+        outputs = model(mixed_images)
+        
+        # Calculate loss with mixed targets
+        loss = criterion(outputs, mixed_targets)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # Generate Submission
+    print("Generating submission...")
+    predict(model, test_loader, device, Config.SUBMISSION_PATH)
+=======
+    # Generate Submission if threshold met
+    if best_score > 0.7983677688266535:
+        print(f"Validation score {best_score} exceeds threshold. Generating submission...")
+        predict(model, test_loader, device, Config.SUBMISSION_PATH)
+    else:
+        print(f"Validation score {best_score} did not exceed threshold. Skipping submission.")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    run(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        Config.MAX_EPOCHS,
+        device,
+        patience=3,
+    )
+=======
+    run(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        Config.MAX_EPOCHS,
+        device,
+        patience=Config.PATIENCE, # Cite solution_lesson_node_00004
+    )
+>>>>>>> REPLACE
+```

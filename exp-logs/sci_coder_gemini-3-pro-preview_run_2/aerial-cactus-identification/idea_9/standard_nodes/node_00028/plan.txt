@@ -1,0 +1,577 @@
+I will optimize the solution by simplifying the architecture and enabling robust training settings, guided by the provided lessons.
+
+1.  **Architecture Optimization**: I will replace the `DeeplySupervisedUNet` with a `MultiScaleNarrowResNet`. **Cite solution_lesson_node_00027** advises avoiding U-Net architectures for global classification as the decoder adds unnecessary overhead. Instead, I will implement Multi-Scale Feature Aggregation (**Cite solution_lesson_node_00016**) by concatenating the Global Average Pooled outputs from the intermediate (16x16) and final (8x8) stages of the `NarrowResNetEncoder`. This preserves the efficiency of the narrow encoder (**Cite solution_lesson_node_00019**) while capturing multi-level details.
+2.  **Hyperparameter Optimization**: I will update `library/config.py` to use 5 seeds for averaging (**Cite solution_lesson_node_00007**) to maximize metric stability and performance. I will set `MAX_EPOCHS` to 20, which balances convergence with the runtime constraints.
+3.  **Code Adaptation**: I will modify `library/train.py`, `library/inference.py`, and `runfile.py` to support the single-output architecture (removing deep supervision logic) and remove the "Fast Baseline" overrides in `runfile.py` to allow the full ensemble training.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Deep Supervision Settings
+    USE_DEEP_SUPERVISION = True
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    # Homogeneous Seed Averaging
+    SEEDS = [0, 1, 2, 3, 4]
+
+    BATCH_SIZE = 128
+    MAX_EPOCHS = 30
+
+    # Optimizer (AdamW) & Scheduler (Cosine Annealing)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+    ETA_MIN = 1e-6
+
+    # Early Stopping
+    PATIENCE = 7
+
+    # Loss Function Weights
+    # L_total = 0.5 * L_semantic + 0.5 * L_detail
+    LOSS_WEIGHT_SEMANTIC = 0.5
+    LOSS_WEIGHT_DETAIL = 0.5
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    # Homogeneous Seed Averaging (Cite solution_lesson_node_00007)
+    SEEDS = [0, 1, 2, 3, 4]
+
+    BATCH_SIZE = 128
+    MAX_EPOCHS = 20
+
+    # Optimizer (AdamW) & Scheduler (Cosine Annealing)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+    ETA_MIN = 1e-6
+
+    # Early Stopping
+    PATIENCE = 7
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DecoderBlock(nn.Module):
+    """
+    Decoder block that upsamples features and merges with lateral skip connections.
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+
+        # Convolutional block to process concatenated features
+        # Input channels = upsampled channels (in_channels) + skip channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels + skip_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x, skip):
+        # Upsample x to match skip spatial dimensions using bilinear interpolation
+        x_up = F.interpolate(
+            x, size=skip.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        # Concatenate along channel dimension
+        combined = torch.cat([x_up, skip], dim=1)
+
+        # Refine features
+        out = self.conv(combined)
+        return out
+
+
+class DeeplySupervisedUNet(nn.Module):
+    """
+    Custom Deeply Supervised Narrow ResNet-UNet.
+    Features a dual-head architecture for deep supervision:
+    1. Semantic Head on the bottleneck (high-level abstraction).
+    2. Detail Head on the decoder output (fine-grained spatial recovery).
+    """
+
+    def __init__(self):
+        super(DeeplySupervisedUNet, self).__init__()
+
+        self.encoder = NarrowResNetEncoder()
+        enc_ch = Config.ENCODER_CHANNELS  # [16, 32, 64]
+        num_classes = Config.NUM_CLASSES
+
+        # Decoder Pathway
+        # Decoder 1: Upsample 8x8 (64ch) -> 16x16. Merge with 32ch skip. Output 32ch.
+        self.decoder1 = DecoderBlock(
+            in_channels=enc_ch[2], skip_channels=enc_ch[1], out_channels=enc_ch[1]
+        )
+
+        # Decoder 2: Upsample 16x16 (32ch) -> 32x32. Merge with 16ch skip. Output 16ch.
+        self.decoder2 = DecoderBlock(
+            in_channels=enc_ch[1], skip_channels=enc_ch[0], out_channels=enc_ch[0]
+        )
+
+        # Classification Heads
+        # Semantic Head: Attached to Bottleneck (8x8, 64ch)
+        self.semantic_head = nn.Linear(enc_ch[2], num_classes)
+
+        # Detail Head: Attached to Final Decoder Output (32x32, 16ch)
+        self.detail_head = nn.Linear(enc_ch[0], num_classes)
+
+    def forward(self, x):
+        # --- Encoder Pass ---
+        # f1: 32x32, 16ch
+        # f2: 16x16, 32ch
+        # f3: 8x8, 64ch (Bottleneck)
+        features = self.encoder(x)
+        f1, f2, f3 = features[0], features[1], features[2]
+
+        # --- Semantic Head (Deep Supervision) ---
+        # Global Average Pooling on Bottleneck features
+        semantic_feat = F.adaptive_avg_pool2d(f3, (1, 1)).flatten(1)
+        semantic_logits = self.semantic_head(semantic_feat)
+
+        # --- Decoder Pass ---
+        # Recover spatial details
+        d1 = self.decoder1(f3, f2)  # 16x16
+        d2 = self.decoder2(d1, f1)  # 32x32
+
+        # --- Detail Head (Final Output) ---
+        # Global Average Pooling on recovered spatial features
+        detail_feat = F.adaptive_avg_pool2d(d2, (1, 1)).flatten(1)
+        detail_logits = self.detail_head(detail_feat)
+
+        return semantic_logits, detail_logits
+=======
+class MultiScaleNarrowResNet(nn.Module):
+    """
+    Multi-Scale Narrow ResNet.
+    Aggregates features from Stage 2 (16x16) and Stage 3 (8x8) of the encoder.
+    Cite solution_lesson_node_00016 (Multi-Scale Aggregation)
+    Cite solution_lesson_node_00027 (Avoid U-Net)
+    """
+
+    def __init__(self):
+        super(MultiScaleNarrowResNet, self).__init__()
+        self.encoder = NarrowResNetEncoder()
+        # Encoder channels: [16, 32, 64]
+        # Stage 2 output (f2): 32 channels
+        # Stage 3 output (f3): 64 channels
+        self.classifier = nn.Linear(32 + 64, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        # features = [f1, f2, f3]
+        f2 = features[1]
+        f3 = features[2]
+
+        # Global Average Pooling
+        f2_pooled = F.adaptive_avg_pool2d(f2, (1, 1)).flatten(1)
+        f3_pooled = F.adaptive_avg_pool2d(f3, (1, 1)).flatten(1)
+
+        # Concatenate
+        combined = torch.cat([f2_pooled, f3_pooled], dim=1)
+
+        return self.classifier(combined)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DeeplySupervisedUNet
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (N, 1)
+
+        optimizer.zero_grad()
+
+        # Forward pass: Get logits from both heads
+        semantic_logits, detail_logits = model(images)
+
+        # Compute joint loss
+        loss_semantic = criterion(semantic_logits, labels)
+        loss_detail = criterion(detail_logits, labels)
+
+        loss = (Config.LOSS_WEIGHT_SEMANTIC * loss_semantic) + (
+            Config.LOSS_WEIGHT_DETAIL * loss_detail
+        )
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def evaluate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss and ROC AUC.
+    """
+    model.eval()
+    running_loss = 0.0
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            # Forward pass
+            semantic_logits, detail_logits = model(images)
+
+            # Compute loss
+            loss_semantic = criterion(semantic_logits, labels)
+            loss_detail = criterion(detail_logits, labels)
+            loss = (Config.LOSS_WEIGHT_SEMANTIC * loss_semantic) + (
+                Config.LOSS_WEIGHT_DETAIL * loss_detail
+            )
+
+            running_loss += loss.item() * images.size(0)
+
+            # Aggregate predictions: Average probabilities from both heads
+            prob_semantic = torch.sigmoid(semantic_logits)
+            prob_detail = torch.sigmoid(detail_logits)
+            avg_prob = (prob_semantic + prob_detail) / 2.0
+
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(avg_prob.cpu().numpy())
+=======
+from library.model import MultiScaleNarrowResNet
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (N, 1)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(images)
+
+        # Compute loss
+        loss = criterion(logits, labels)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def evaluate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss and ROC AUC.
+    """
+    model.eval()
+    running_loss = 0.0
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            # Forward pass
+            logits = model(images)
+
+            # Compute loss
+            loss = criterion(logits, labels)
+
+            running_loss += loss.item() * images.size(0)
+
+            # Predictions
+            avg_prob = torch.sigmoid(logits)
+
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(avg_prob.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # 2. Initialize Model
+        model = DeeplySupervisedUNet().to(device)
+=======
+        # 2. Initialize Model
+        model = MultiScaleNarrowResNet().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import DeeplySupervisedUNet
+
+
+def predict_with_tta(model, loader, device):
+    """
+    Generates predictions using Test Time Augmentation (TTA).
+    TTA Strategy: Original + Horizontal Flip + Vertical Flip.
+
+    Args:
+        model (nn.Module): The trained model.
+        loader (DataLoader): Test data loader.
+        device (torch.device): Computation device.
+
+    Returns:
+        tuple: (predictions numpy array, ids list)
+    """
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, ids in loader:
+            images = images.to(device)
+
+            # 1. Original Prediction
+            # Forward pass returns (semantic_logits, detail_logits)
+            sem_logits, det_logits = model(images)
+            # Average heads: (Sigmoid(Sem) + Sigmoid(Det)) / 2
+            prob_orig = (torch.sigmoid(sem_logits) + torch.sigmoid(det_logits)) / 2.0
+
+            # 2. Horizontal Flip Prediction
+            # Image shape: (N, C, H, W). Flip along W (dim 3).
+            images_h = torch.flip(images, dims=[3])
+            sem_h, det_h = model(images_h)
+            prob_h = (torch.sigmoid(sem_h) + torch.sigmoid(det_h)) / 2.0
+
+            # 3. Vertical Flip Prediction
+            # Flip along H (dim 2).
+            images_v = torch.flip(images, dims=[2])
+            sem_v, det_v = model(images_v)
+            prob_v = (torch.sigmoid(sem_v) + torch.sigmoid(det_v)) / 2.0
+
+            # Average TTA predictions
+            avg_prob = (prob_orig + prob_h + prob_v) / 3.0
+
+            all_preds.append(avg_prob.cpu().numpy())
+            all_ids.extend(ids)
+=======
+from library.model import MultiScaleNarrowResNet
+
+
+def predict_with_tta(model, loader, device):
+    """
+    Generates predictions using Test Time Augmentation (TTA).
+    TTA Strategy: Original + Horizontal Flip + Vertical Flip.
+
+    Args:
+        model (nn.Module): The trained model.
+        loader (DataLoader): Test data loader.
+        device (torch.device): Computation device.
+
+    Returns:
+        tuple: (predictions numpy array, ids list)
+    """
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, ids in loader:
+            images = images.to(device)
+
+            # 1. Original Prediction
+            logits = model(images)
+            prob_orig = torch.sigmoid(logits)
+
+            # 2. Horizontal Flip Prediction
+            images_h = torch.flip(images, dims=[3])
+            logits_h = model(images_h)
+            prob_h = torch.sigmoid(logits_h)
+
+            # 3. Vertical Flip Prediction
+            images_v = torch.flip(images, dims=[2])
+            logits_v = model(images_v)
+            prob_v = torch.sigmoid(logits_v)
+
+            # Average TTA predictions
+            avg_prob = (prob_orig + prob_h + prob_v) / 3.0
+
+            all_preds.append(avg_prob.cpu().numpy())
+            all_ids.extend(ids)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        # Initialize model
+        model = DeeplySupervisedUNet().to(device)
+=======
+        # Initialize model
+        model = MultiScaleNarrowResNet().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DeeplySupervisedUNet
+from library.train import run_training
+from library.inference import generate_submission
+
+
+def analyze_failures(model, val_loader, device):
+    """
+    Performs failure analysis by correlating prediction error with image meta-features.
+    """
+    print("\n--- Failure Analysis ---")
+    model.eval()
+
+    all_errors = []
+    # Meta-feature accumulators
+    meta_brightness = []
+    meta_contrast = []
+    meta_red = []
+    meta_green = []
+    meta_blue = []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            # Forward pass
+            sem_logits, det_logits = model(images)
+            # Average probabilities from both heads
+            prob_sem = torch.sigmoid(sem_logits)
+            prob_det = torch.sigmoid(det_logits)
+            preds = (prob_sem + prob_det) / 2.0
+
+            # Calculate absolute error magnitude
+            errors = torch.abs(preds - labels).cpu().numpy().flatten()
+=======
+from library.model import MultiScaleNarrowResNet
+from library.train import run_training
+from library.inference import generate_submission
+
+
+def analyze_failures(model, val_loader, device):
+    """
+    Performs failure analysis by correlating prediction error with image meta-features.
+    """
+    print("\n--- Failure Analysis ---")
+    model.eval()
+
+    all_errors = []
+    # Meta-feature accumulators
+    meta_brightness = []
+    meta_contrast = []
+    meta_red = []
+    meta_green = []
+    meta_blue = []
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            # Forward pass
+            logits = model(images)
+            preds = torch.sigmoid(logits)
+
+            # Calculate absolute error magnitude
+            errors = torch.abs(preds - labels).cpu().numpy().flatten()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Setup & Configuration Override
+    # We override Config attributes to create a fast baseline execution.
+    Config.MAX_EPOCHS = 10  # Reduced to ensure quick turnaround
+    Config.SEEDS = [42]  # Single seed for baseline speed
+
+    Config.setup()
+    set_seed(42)
+
+    print("Starting Fast Baseline Run...")
+    print(f"Configuration: Epochs={Config.MAX_EPOCHS}, Seeds={Config.SEEDS}")
+=======
+def main():
+    # 1. Setup
+    Config.setup()
+    set_seed(42)
+
+    print("Starting Optimized Run...")
+    print(f"Configuration: Epochs={Config.MAX_EPOCHS}, Seeds={Config.SEEDS}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load the trained model
+    model = DeeplySupervisedUNet().to(device)
+    checkpoint_path = f"model_seed_{Config.SEEDS[0]}.pth"
+=======
+    # Load the trained model
+    model = MultiScaleNarrowResNet().to(device)
+    checkpoint_path = f"model_seed_{Config.SEEDS[0]}.pth"
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            # Forward
+            sem_logits, det_logits = model(images)
+            prob = (torch.sigmoid(sem_logits) + torch.sigmoid(det_logits)) / 2.0
+
+            all_labels.append(labels.numpy())
+            all_preds.append(prob.cpu().numpy().flatten())
+=======
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            # Forward
+            logits = model(images)
+            prob = torch.sigmoid(logits)
+
+            all_labels.append(labels.numpy())
+            all_preds.append(prob.cpu().numpy().flatten())
+>>>>>>> REPLACE
+```

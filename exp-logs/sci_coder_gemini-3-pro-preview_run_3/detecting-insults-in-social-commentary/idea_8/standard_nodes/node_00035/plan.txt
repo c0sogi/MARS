@@ -1,0 +1,394 @@
+The strategy involves optimizing the solution through two main avenues: **Heterogeneous Ensembling** improvements and **Pseudo-Labeling**.
+
+1.  **Ensemble Optimization**: The previous solution showed that the `microsoft/deberta-v3-large` models were under-trained (2 epochs) compared to `roberta-large` (3 epochs). I will increase the training epochs for both architectures to 4 to ensure full convergence, particularly for DeBERTa which was still improving at the end of training. This addresses the performance gap observed in the previous run.
+
+2.  **Pseudo-Labeling (Self-Training)**: To leverage the unlabeled test data (which is comparable in size to the training set), I will implement a two-stage training process.
+    *   **Stage 1**: Train the initial ensemble on the labeled training data.
+    *   **Pseudo-Label Generation**: Use the Stage 1 ensemble to predict on the test set. Samples with high confidence (probability > 0.95 or < 0.05) will be assigned their predicted labels and added to the training set.
+    *   **Stage 2**: Retrain the ensemble on this augmented dataset. This allows the models to learn from the structure of the test data, potentially sharpening the decision boundary in low-density regions.
+
+This approach directly applies **Lesson `solution_lesson_node_00034`** (Heterogeneous Ensembling) and **Lesson `solution_lesson_node_00027`** (Pseudo-Labeling), while ensuring that the batch size remains consistent to avoid the stability issues noted in previous lessons.
+
+```diff
+library/configuration.py
+<<<<<<< SEARCH
+    # Heterogeneous Ensemble: RoBERTa-Large + DeBERTa-v3-Large
+    MODEL_CONFIGS = [
+        {
+            "model_name": "roberta-large",
+            "tokenizer_path": "roberta-large",
+            "epochs": 3,
+            "freeze_layers": 6,  # Freeze embeddings + bottom 6 layers
+            "dropout": 0.2,
+        },
+        {
+            "model_name": "microsoft/deberta-v3-large",
+            "tokenizer_path": "microsoft/deberta-v3-large",
+            "epochs": 2,
+            "freeze_layers": 6,  # Freeze embeddings + bottom 6 layers
+            "dropout": 0.2,
+        },
+    ]
+=======
+    # Heterogeneous Ensemble: RoBERTa-Large + DeBERTa-v3-Large
+    # Cite solution_lesson_node_00034: Heterogeneous Ensembling with Diverse Architectures
+    # Cite solution_lesson_node_00010: Efficiency and Stability via Partial Layer Freezing
+    MODEL_CONFIGS = [
+        {
+            "model_name": "roberta-large",
+            "tokenizer_path": "roberta-large",
+            "epochs": 4,  # Increased epochs for better convergence
+            "freeze_layers": 6,
+            "dropout": 0.2,
+        },
+        {
+            "model_name": "microsoft/deberta-v3-large",
+            "tokenizer_path": "microsoft/deberta-v3-large",
+            "epochs": 4,  # Increased epochs (previously 2 was under-trained)
+            "freeze_layers": 6,
+            "dropout": 0.2,
+        },
+    ]
+    
+    # Pseudo-Labeling Thresholds
+    PSEUDO_LABEL_CONF_HIGH = 0.95
+    PSEUDO_LABEL_CONF_LOW = 0.05
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Setup and Initialization
+    set_seed(42)
+    device = Config.DEVICE
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    # Load processed dataframes (decoding is handled by load_data)
+    print("Loading datasets...")
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+
+    print(f"Train size: {len(df_train)}")
+    print(f"Val size: {len(df_val)}")
+    print(f"Test size: {len(df_test)}")
+
+    # 3. Ensemble Training
+    # We iterate over the model configurations (RoBERTa, DeBERTa) and seeds defined in Config.
+    # Total models: 2 architectures * 3 seeds = 6 models.
+
+    trained_models_info = []
+
+    for config in Config.MODEL_CONFIGS:
+        for seed in Config.SEEDS:
+            model_name_clean = config["model_name"].replace("/", "_")
+            save_name = f"{model_name_clean}_seed_{seed}.bin"
+            save_path = os.path.join(Config.MODEL_DIR, save_name)
+
+            print(f"\n--- Training {config['model_name']} (Seed {seed}) ---")
+
+            # Execute training using the engine's run_training function
+            # This handles the training loop, validation monitoring, and saving the best model.
+            run_training(
+                df_train=df_train,
+                df_val=df_val,
+                model_config=config,
+                seed=seed,
+                save_name=save_name,
+            )
+
+            trained_models_info.append({"path": save_path, "config": config})
+
+    # 4. Validation Inference & Aggregation
+    print("\n--- Running Validation Inference ---")
+    val_preds_accum = np.zeros(len(df_val))
+
+    # Iterate through all trained models to generate predictions
+    for info in trained_models_info:
+        config = info["config"]
+        path = info["path"]
+
+        # Re-initialize tokenizer and loader for the specific model architecture
+        tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
+        val_loader = get_dataloader(
+            df_val,
+            tokenizer,
+            batch_size=Config.VALID_BATCH_SIZE,
+            is_test=False,  # We have labels, but predict() ignores them
+            shuffle=False,
+        )
+
+        # Load Model
+        model = TransformerModel(
+            model_name=config["model_name"],
+            dropout=config["dropout"],
+            freeze_layers=config["freeze_layers"],
+        )
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        # Generate predictions
+        preds = predict(val_loader, model, device)
+        val_preds_accum += np.array(preds)
+
+        # Cleanup to save memory
+        del model, tokenizer, val_loader
+        torch.cuda.empty_cache()
+
+    # Compute Ensemble Average
+    avg_val_preds = val_preds_accum / len(trained_models_info)
+
+    # 5. Validation Metric
+    val_targets = df_val["Insult"].values
+    final_auc = roc_auc_score(val_targets, avg_val_preds)
+
+    # REQUIRED OUTPUT: Print the final validation metric
+    print(f"Final Validation Metric: {final_auc}")
+
+    # 6. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate error magnitude
+    errors = np.abs(val_targets - avg_val_preds)
+
+    # Feature: Text Length (Comment is already decoded by load_data)
+    # We check if longer/shorter comments are harder to classify
+    text_lengths = df_val["Comment"].str.len().values
+
+    # Calculate correlation (using numpy to avoid scipy dependency issues)
+    # Handle potential NaN or zero variance if dataset is weird, though unlikely here
+    if np.std(errors) > 0 and np.std(text_lengths) > 0:
+        corr = np.corrcoef(errors, text_lengths)[0, 1]
+    else:
+        corr = 0.0
+
+    print(f"Correlation between Error Magnitude and Text Length: {corr:.4f}")
+
+    # 7. Submission Generation
+    # Only generate submission if metric exceeds threshold
+    threshold = 0.9639490968801314
+
+    if final_auc > threshold:
+        print(f"\nMetric exceeds threshold ({threshold}). Generating submission...")
+
+        test_preds_accum = np.zeros(len(df_test))
+
+        for info in trained_models_info:
+            config = info["config"]
+            path = info["path"]
+
+            # Setup for Test Inference
+            tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
+            test_loader = get_dataloader(
+                df_test,
+                tokenizer,
+                batch_size=Config.VALID_BATCH_SIZE,
+                is_test=True,
+                shuffle=False,
+            )
+
+            # Load Model
+            model = TransformerModel(
+                model_name=config["model_name"],
+                dropout=config["dropout"],
+                freeze_layers=config["freeze_layers"],
+            )
+            model.load_state_dict(torch.load(path, map_location=device))
+            model.to(device)
+            model.eval()
+
+            # Predict
+            preds = predict(test_loader, model, device)
+            test_preds_accum += np.array(preds)
+
+            # Cleanup
+            del model, tokenizer, test_loader
+            torch.cuda.empty_cache()
+
+        # Average Test Predictions
+        avg_test_preds = test_preds_accum / len(trained_models_info)
+
+        # Create Submission DataFrame
+        # Format: Insult, Date, Comment (based on sample_submission_null.csv)
+        # Cite debug_lesson_1: Decouple Preprocessed Inference Data from Submission Templates
+        submission = pd.read_csv(Config.TEST_PATH)
+        submission["Insult"] = avg_test_preds
+
+        # Ensure column order matches requirements
+        submission = submission[["Insult", "Date", "Comment"]]
+
+        # Save
+        submission.to_csv(Config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved successfully to {Config.SUBMISSION_PATH}")
+
+    else:
+        print(
+            f"\nValidation metric {final_auc} did not meet threshold {threshold}. Submission skipped."
+        )
+=======
+def train_ensemble(df_train, df_val, suffix=""):
+    """
+    Trains the ensemble of models defined in Config.
+    Returns a list of dictionaries containing model paths and configs.
+    """
+    trained_models_info = []
+    
+    for config in Config.MODEL_CONFIGS:
+        for seed in Config.SEEDS:
+            model_name_clean = config["model_name"].replace("/", "_")
+            save_name = f"{model_name_clean}_seed_{seed}{suffix}.bin"
+            
+            print(f"\n--- Training {config['model_name']} (Seed {seed}) [{suffix}] ---")
+
+            run_training(
+                df_train=df_train,
+                df_val=df_val,
+                model_config=config,
+                seed=seed,
+                save_name=save_name,
+            )
+            
+            save_path = os.path.join(Config.MODEL_DIR, save_name)
+            trained_models_info.append({"path": save_path, "config": config})
+            
+    return trained_models_info
+
+
+def inference_ensemble(trained_models_info, df_target, is_test=False):
+    """
+    Runs inference using the provided list of models on the target dataframe.
+    Returns averaged predictions.
+    """
+    device = Config.DEVICE
+    preds_accum = np.zeros(len(df_target))
+    
+    for info in trained_models_info:
+        config = info["config"]
+        path = info["path"]
+        
+        # Setup Tokenizer and Loader
+        tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
+        loader = get_dataloader(
+            df_target,
+            tokenizer,
+            batch_size=Config.VALID_BATCH_SIZE,
+            is_test=is_test,
+            shuffle=False,
+        )
+        
+        # Load Model
+        model = TransformerModel(
+            model_name=config["model_name"],
+            dropout=config["dropout"],
+            freeze_layers=config["freeze_layers"],
+        )
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device)
+        model.eval()
+        
+        # Predict
+        preds = predict(loader, model, device)
+        preds_accum += np.array(preds)
+        
+        # Cleanup
+        del model, tokenizer, loader
+        torch.cuda.empty_cache()
+        
+    return preds_accum / len(trained_models_info)
+
+
+def main():
+    # 1. Setup and Initialization
+    set_seed(42)
+    device = Config.DEVICE
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    print("Loading datasets...")
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+
+    print(f"Train size: {len(df_train)}")
+    print(f"Val size: {len(df_val)}")
+    print(f"Test size: {len(df_test)}")
+
+    # 3. Stage 1: Initial Ensemble Training
+    print("\n=== Stage 1: Initial Ensemble Training ===")
+    models_stage1 = train_ensemble(df_train, df_val, suffix="_stage1")
+
+    # 4. Pseudo-Labeling
+    # Cite solution_lesson_node_00027: Pseudo-labeling (implemented with consistent batch size)
+    print("\n=== Generating Pseudo-Labels ===")
+    test_preds_stage1 = inference_ensemble(models_stage1, df_test, is_test=True)
+    
+    # Select high-confidence samples
+    high_conf_indices = []
+    pseudo_labels = []
+    
+    for i, pred in enumerate(test_preds_stage1):
+        if pred < Config.PSEUDO_LABEL_CONF_LOW:
+            high_conf_indices.append(i)
+            pseudo_labels.append(0) # Neutral
+        elif pred > Config.PSEUDO_LABEL_CONF_HIGH:
+            high_conf_indices.append(i)
+            pseudo_labels.append(1) # Insulting
+            
+    print(f"Selected {len(high_conf_indices)} pseudo-labeled samples from {len(df_test)} test samples.")
+    
+    if len(high_conf_indices) > 0:
+        df_pseudo = df_test.iloc[high_conf_indices].copy()
+        df_pseudo["Insult"] = pseudo_labels
+        
+        # Augment Training Data
+        df_train_aug = pd.concat([df_train, df_pseudo], axis=0, ignore_index=True)
+        print(f"Augmented Train size: {len(df_train_aug)}")
+        
+        # 5. Stage 2: Retraining on Augmented Data
+        print("\n=== Stage 2: Retraining Ensemble on Augmented Data ===")
+        # We use the augmented training set, but keep the original validation set for fair comparison
+        models_final = train_ensemble(df_train_aug, df_val, suffix="_stage2")
+    else:
+        print("No high-confidence samples found. Skipping Stage 2.")
+        models_final = models_stage1
+
+    # 6. Final Validation Inference
+    print("\n=== Final Validation Inference ===")
+    avg_val_preds = inference_ensemble(models_final, df_val, is_test=False)
+
+    # 7. Validation Metric
+    val_targets = df_val["Insult"].values
+    final_auc = roc_auc_score(val_targets, avg_val_preds)
+    print(f"Final Validation Metric: {final_auc}")
+
+    # 8. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    errors = np.abs(val_targets - avg_val_preds)
+    text_lengths = df_val["Comment"].str.len().values
+    if np.std(errors) > 0 and np.std(text_lengths) > 0:
+        corr = np.corrcoef(errors, text_lengths)[0, 1]
+    else:
+        corr = 0.0
+    print(f"Correlation between Error Magnitude and Text Length: {corr:.4f}")
+
+    # 9. Submission Generation
+    threshold = 0.9648522167487685 
+
+    if final_auc > threshold:
+        print(f"\nMetric exceeds threshold ({threshold}). Generating submission...")
+        
+        # Generate predictions on Test Set using Final Models
+        avg_test_preds = inference_ensemble(models_final, df_test, is_test=True)
+
+        submission = pd.read_csv(Config.TEST_PATH)
+        submission["Insult"] = avg_test_preds
+        submission = submission[["Insult", "Date", "Comment"]]
+        submission.to_csv(Config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved successfully to {Config.SUBMISSION_PATH}")
+    else:
+        print(f"\nValidation metric {final_auc} did not meet threshold {threshold}. Submission skipped.")
+>>>>>>> REPLACE
+```

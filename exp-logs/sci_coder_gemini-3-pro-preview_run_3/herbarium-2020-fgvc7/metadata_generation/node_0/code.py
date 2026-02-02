@@ -1,0 +1,232 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_JSON_REL = "nybg2020/train/metadata.json"
+TEST_JSON_REL = "nybg2020/test/metadata.json"
+TRAIN_IMG_ROOT_REL = "nybg2020/train"
+TEST_IMG_ROOT_REL = "nybg2020/test"
+RANDOM_STATE = 42
+VAL_SIZE = 0.2
+
+
+def main():
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # --- Process Training Data ---
+    train_json_path = os.path.join(INPUT_DIR, TRAIN_JSON_REL)
+    print(f"Loading training metadata from {train_json_path}...")
+
+    if not os.path.exists(train_json_path):
+        raise FileNotFoundError(
+            f"Training metadata file not found at {train_json_path}"
+        )
+
+    with open(train_json_path, "r") as f:
+        train_data = json.load(f)
+
+    print("Parsing training images and annotations...")
+    # Convert list of dicts to DataFrames
+    images_df = pd.DataFrame(train_data["images"])
+    annotations_df = pd.DataFrame(train_data["annotations"])
+
+    # Ensure 'id' in images is renamed to 'image_id' for merging
+    if "id" in images_df.columns:
+        images_df = images_df.rename(columns={"id": "image_id"})
+
+    # Merge annotations with images
+    # We need category_id from annotations and file_name from images
+    train_merged = pd.merge(annotations_df, images_df, on="image_id", how="inner")
+
+    # Construct full relative file path
+    # The file_name in json is relative to the train folder structure, e.g., "images/000/..."
+    # We need to prepend the root relative to input, which is "nybg2020/train"
+    train_merged["file_path"] = train_merged["file_name"].apply(
+        lambda x: os.path.join(TRAIN_IMG_ROOT_REL, x)
+    )
+
+    # Keep only necessary columns
+    train_final = train_merged[["image_id", "file_path", "category_id"]].copy()
+
+    print(f"Total training samples found: {len(train_final)}")
+
+    # --- Stratified Split (Train/Val) ---
+    print("Performing stratified split...")
+
+    # Identify classes with too few samples for stratification
+    # train_test_split requires at least 2 samples per class to stratify properly
+    class_counts = train_final["category_id"].value_counts()
+    singletons = class_counts[class_counts < 2].index
+
+    # Split data into singletons and rest
+    if len(singletons) > 0:
+        print(
+            f"Found {len(singletons)} classes with only 1 sample. These will be kept in the training set."
+        )
+        singleton_mask = train_final["category_id"].isin(singletons)
+        singleton_df = train_final[singleton_mask]
+        rest_df = train_final[~singleton_mask]
+    else:
+        singleton_df = pd.DataFrame()
+        rest_df = train_final
+
+    # Split the rest
+    if len(rest_df) > 0:
+        train_split, val_split = train_test_split(
+            rest_df,
+            test_size=VAL_SIZE,
+            stratify=rest_df["category_id"],
+            random_state=RANDOM_STATE,
+        )
+
+        # Combine singletons back into train
+        train_set = pd.concat([train_split, singleton_df], ignore_index=True)
+        val_set = val_split.reset_index(drop=True)
+    else:
+        train_set = singleton_df
+        val_set = pd.DataFrame(columns=train_final.columns)
+
+    # Shuffle train set
+    train_set = train_set.sample(frac=1, random_state=RANDOM_STATE).reset_index(
+        drop=True
+    )
+
+    print(f"Train set size: {len(train_set)}")
+    print(f"Validation set size: {len(val_set)}")
+
+    # Save to CSV
+    train_csv_path = os.path.join(METADATA_DIR, "train.csv")
+    val_csv_path = os.path.join(METADATA_DIR, "val.csv")
+
+    train_set.to_csv(train_csv_path, index=False)
+    val_set.to_csv(val_csv_path, index=False)
+
+    # Cleanup memory
+    del (
+        train_data,
+        images_df,
+        annotations_df,
+        train_merged,
+        train_final,
+        rest_df,
+        singleton_df,
+        train_split,
+        val_split,
+    )
+
+    # --- Process Test Data ---
+    test_json_path = os.path.join(INPUT_DIR, TEST_JSON_REL)
+    print(f"Loading test metadata from {test_json_path}...")
+
+    if not os.path.exists(test_json_path):
+        raise FileNotFoundError(f"Test metadata file not found at {test_json_path}")
+
+    with open(test_json_path, "r") as f:
+        test_data = json.load(f)
+
+    test_images_df = pd.DataFrame(test_data["images"])
+    if "id" in test_images_df.columns:
+        test_images_df = test_images_df.rename(columns={"id": "image_id"})
+
+    test_images_df["file_path"] = test_images_df["file_name"].apply(
+        lambda x: os.path.join(TEST_IMG_ROOT_REL, x)
+    )
+
+    test_final = test_images_df[["image_id", "file_path"]].copy()
+
+    print(f"Total test samples found: {len(test_final)}")
+
+    test_csv_path = os.path.join(METADATA_DIR, "test.csv")
+    test_final.to_csv(test_csv_path, index=False)
+
+    # --- Verification ---
+    verify_datasets(train_set, val_set, test_final)
+
+
+def verify_datasets(train_df, val_df, test_df):
+    print("\n--- Verifying Datasets ---")
+
+    # 1. Summary Statistics
+    print("Summary Statistics:")
+    print(
+        f"Train: {len(train_df)} samples, {train_df['category_id'].nunique()} classes"
+    )
+    if not val_df.empty:
+        print(
+            f"Val:   {len(val_df)} samples, {val_df['category_id'].nunique()} classes"
+        )
+    print(f"Test:  {len(test_df)} samples")
+
+    # 2. Check File Paths
+    print("\nChecking file path existence (sampling 1000 files per split)...")
+
+    def check_paths(df, name):
+        if df.empty:
+            return
+
+        sample_size = min(1000, len(df))
+        sample = df.sample(n=sample_size, random_state=RANDOM_STATE)
+
+        missing_count = 0
+        missing_examples = []
+
+        for _, row in sample.iterrows():
+            full_path = os.path.join(INPUT_DIR, row["file_path"])
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(row["file_path"])
+
+        missing_ratio = missing_count / sample_size
+        print(
+            f"{name}: Missing Ratio = {missing_ratio:.4f} ({missing_count}/{sample_size})"
+        )
+
+        if missing_count > 0:
+            print(f"  Examples of missing files in {name}: {missing_examples}")
+
+        if missing_ratio > 0.5:
+            raise AssertionError(
+                f"High missing file ratio in {name} dataset: {missing_ratio}"
+            )
+
+    check_paths(train_df, "Train")
+    check_paths(val_df, "Val")
+    check_paths(test_df, "Test")
+
+    # 3. Verify Stratification / Overlap
+    print("\nVerifying split integrity...")
+    if not val_df.empty:
+        train_ids = set(train_df["image_id"])
+        val_ids = set(val_df["image_id"])
+
+        overlap = train_ids.intersection(val_ids)
+        if overlap:
+            raise AssertionError(
+                f"Found {len(overlap)} overlapping image_ids between Train and Val sets!"
+            )
+
+        print("No overlap between Train and Val sets.")
+
+        # Check if stratification logic worked (basic check: val size is approx correct)
+        total_train_val = len(train_df) + len(val_df)
+        actual_val_ratio = len(val_df) / total_train_val
+        print(f"Actual Validation Ratio: {actual_val_ratio:.4f} (Target: {VAL_SIZE})")
+
+        # Allow some deviation due to singletons
+        if abs(actual_val_ratio - VAL_SIZE) > 0.05:
+            print(
+                "Warning: Validation ratio deviates significantly from target (likely due to many singleton classes)."
+            )
+
+    print("\nMetadata generation and verification completed successfully.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,638 @@
+I will optimize the solution by replacing the complex SASRec sequential model with a robust **SVD-based Item2Vec** approach and introducing a **Last-Item Similarity** feature.
+
+**Strategy:**
+1.  **Replace SASRec with SVD (Item2Vec):** I will modify `library/sequential_encoder.py` to replace the Transformer training with `TruncatedSVD` on the User-Item interaction matrix. This implements "Latent Behavioral Embeddings" (Cite `solution_lesson_node_00019`) and aligns with the finding that "Mean-Pooled Item Embeddings" outperform sequential encoders for this task (Cite `solution_lesson_node_00027`).
+2.  **Add Last-Item Similarity Feature:** I will update `library/feature_engineering.py` to calculate the cosine similarity between the candidate item and the *last* item purchased by the user. This recovers the immediate sequential signal lost by mean-pooling (Cite `solution_lesson_node_00021`).
+3.  **Optimize Ranker Hyperparameters:** I will adjust the LightGBM parameters in `runfile.py` to prioritize model capacity (`num_leaves=128`, `n_estimators=1200`) over speed, as suggested by `solution_lesson_node_00022`.
+
+```diff
+library/sequential_encoder.py
+<<<<<<< SEARCH
+class SASRec(nn.Module):
+    """
+    Self-Attentive Sequential Recommendation Model.
+    Uses a Transformer Encoder with Causal Masking to learn user state representations.
+    """
+
+    def __init__(self, vocab_size, params):
+        super(SASRec, self).__init__()
+        self.vocab_size = vocab_size
+        self.max_seq_len = params["max_seq_len"]
+        self.embedding_dim = params["embedding_dim"]
+        self.n_layers = params["n_layers"]
+        self.n_heads = params["n_heads"]
+        self.dropout_rate = params["dropout"]
+        self.device = config.DEVICE
+
+        # Embeddings
+        self.item_embedding = nn.Embedding(
+            self.vocab_size, self.embedding_dim, padding_idx=0
+        )
+        self.position_embedding = nn.Embedding(self.max_seq_len, self.embedding_dim)
+        self.dropout = nn.Dropout(self.dropout_rate)
+        self.layer_norm = nn.LayerNorm(self.embedding_dim)
+
+        # Transformer Encoder
+        # We use standard PyTorch TransformerEncoderLayer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embedding_dim,
+            nhead=self.n_heads,
+            dim_feedforward=self.embedding_dim * 4,
+            dropout=self.dropout_rate,
+            activation="relu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=self.n_layers
+        )
+
+        # Initialization
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    def forward(self, item_seq):
+        # item_seq: (Batch, Seq_Len)
+        seq_len = item_seq.size(1)
+
+        # Create Position Indices: [0, 1, ..., seq_len-1]
+        positions = torch.arange(seq_len, dtype=torch.long, device=self.device)
+        positions = positions.unsqueeze(0).expand(item_seq.size(0), -1)
+
+        # Embeddings
+        seq_emb = self.item_embedding(item_seq)
+        pos_emb = self.position_embedding(positions)
+        x = self.dropout(self.layer_norm(seq_emb + pos_emb))
+
+        # Causal Mask (Look-ahead mask)
+        # Prevents attending to future positions
+        # Mask shape: (Seq_Len, Seq_Len)
+        # 0 (False) = attend, -inf (True) = mask
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=self.device), diagonal=1
+        ).bool()
+
+        # Transformer Pass
+        # output: (Batch, Seq_Len, Embed_Dim)
+        output = self.transformer_encoder(x, mask=mask, is_causal=True)
+
+        return output
+
+    def predict_logits(self, item_seq):
+        """
+        Returns logits for all items in vocabulary for each step in sequence.
+        Used during training.
+        """
+        # (Batch, Seq_Len, Embed_Dim)
+        output = self.forward(item_seq)
+        # (Batch, Seq_Len, Vocab_Size)
+        logits = torch.matmul(output, self.item_embedding.weight.transpose(0, 1))
+        return logits
+
+
+# ==========================================
+# 2. DATASET
+# ==========================================
+
+
+class SequenceDataset(Dataset):
+    def __init__(self, sequences):
+        """
+        sequences: Tensor of shape (N_users, Max_Len)
+        """
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq = self.sequences[idx]
+
+        # Input: [x1, x2, ..., x_{T-1}]
+        # Target: [x2, x3, ..., x_T]
+        # We assume sequence is padded at the beginning if short,
+        # or full length.
+
+        # We strip the last item for input, and the first item for target
+        # This creates the shift.
+        input_seq = seq[:-1]
+        target_seq = seq[1:]
+
+        return input_seq, target_seq
+
+
+# ==========================================
+# 3. TRAINING FUNCTION
+# ==========================================
+
+
+def train_sequential_model(data_dict, params=None, load_cached_data=False):
+    """
+    Trains the SASRec model or loads it from cache.
+
+    Args:
+        data_dict: Output from data_loader.preprocess_sequences
+        params: Hyperparameters dict (defaults to config.SEQ_CONFIG)
+        load_cached_data: Whether to load pre-trained model
+
+    Returns:
+        Trained SASRec model
+    """
+    if params is None:
+        params = config.SEQ_CONFIG
+
+    model_path = config.SEQ_MODEL_PATH
+
+    # 1. Check Cache
+    if load_cached_data and model_path.exists():
+        print(f"Loading cached Sequential Model from {model_path}...")
+        try:
+            # We need to instantiate the model structure first
+            vocab_size = data_dict["vocab_size"]
+            model = SASRec(vocab_size, params)
+            model.load_state_dict(torch.load(model_path, map_location=config.DEVICE))
+            model.to(config.DEVICE)
+            model.eval()
+            return model
+        except Exception as e:
+            print(f"Error loading model cache: {e}. Retraining...")
+
+    # 2. Setup Data
+    print("Setting up Sequential Model training...")
+    sequences = data_dict["sequences"]
+    vocab_size = data_dict["vocab_size"]
+
+    # Split into Train/Val (internal split for monitoring)
+    # We use 90/10 split
+    n_total = len(sequences)
+    n_val = int(n_total * 0.1)
+    n_train = n_total - n_val
+
+    # Use generator for reproducibility
+    generator = torch.Generator().manual_seed(config.RANDOM_STATE)
+    train_subset, val_subset = random_split(
+        SequenceDataset(sequences), [n_train, n_val], generator=generator
+    )
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=params["batch_size"],
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=params["batch_size"],
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 3. Setup Model
+    utils.seed_everything(config.RANDOM_STATE)
+    model = SASRec(vocab_size, params).to(config.DEVICE)
+
+    optimizer = optim.Adam(
+        model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"]
+    )
+
+    # Ignore padding index 0 in loss
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+    # 4. Training Loop
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    print(f"Starting training on {config.DEVICE}...")
+    print(f"Train samples: {n_train}, Val samples: {n_val}")
+
+    for epoch in range(params["epochs"]):
+        start_time = time.time()
+
+        # --- Training ---
+        model.train()
+        total_train_loss = 0.0
+
+        for batch_idx, (input_seq, target_seq) in enumerate(train_loader):
+            input_seq = input_seq.to(config.DEVICE)
+            target_seq = target_seq.to(config.DEVICE)
+
+            optimizer.zero_grad()
+
+            # Forward
+            logits = model.predict_logits(input_seq)
+
+            # Flatten for loss: (Batch * Seq, Vocab) vs (Batch * Seq)
+            logits = logits.view(-1, vocab_size)
+            targets = target_seq.view(-1)
+
+            loss = criterion(logits, targets)
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+
+        avg_train_loss = total_train_loss / len(train_loader)
+
+        # --- Validation ---
+        model.eval()
+        total_val_loss = 0.0
+
+        with torch.no_grad():
+            for input_seq, target_seq in enumerate(val_loader):
+                # Unpack tuple correctly
+                input_seq, target_seq = target_seq  # DataLoader yields (input, target)
+
+                input_seq = input_seq.to(config.DEVICE)
+                target_seq = target_seq.to(config.DEVICE)
+
+                logits = model.predict_logits(input_seq)
+                logits = logits.view(-1, vocab_size)
+                targets = target_seq.view(-1)
+
+                loss = criterion(logits, targets)
+                total_val_loss += loss.item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+
+        elapsed = time.time() - start_time
+        print(
+            f"Epoch {epoch+1}/{params['epochs']} | "
+            f"Time: {elapsed:.1f}s | "
+            f"Train Loss: {avg_train_loss} | "
+            f"Val Loss: {avg_val_loss}"
+        )
+
+        # --- Early Stopping ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), model_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= params["early_stopping_patience"]:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
+    # Load best model state
+    model.load_state_dict(torch.load(model_path, map_location=config.DEVICE))
+    model.eval()
+    return model
+
+
+# ==========================================
+# 4. EMBEDDING EXTRACTION
+# ==========================================
+
+
+def extract_embeddings(model, data_dict, batch_size=1024):
+    """
+    Extracts user state vectors and item embedding matrix from the trained model.
+
+    Returns:
+        user_embeddings (np.ndarray): (N_users, Embed_Dim)
+        item_embeddings (np.ndarray): (Vocab_Size, Embed_Dim)
+    """
+    print("Extracting embeddings from Sequential Model...")
+
+    model.eval()
+    sequences = data_dict["sequences"]
+
+    user_embeddings_list = []
+
+    # Create a simple loader for inference
+    loader = DataLoader(
+        sequences, batch_size=batch_size, shuffle=False, num_workers=config.NUM_WORKERS
+    )
+
+    with torch.no_grad():
+        for batch_seq in loader:
+            batch_seq = batch_seq.to(config.DEVICE)
+
+            # Forward pass to get hidden states
+            # Output: (Batch, Seq_Len, Embed_Dim)
+            output = model(batch_seq)
+
+            # We want the state corresponding to the last item in the sequence
+            # Since sequences are fixed length (padded at start), the last item is always at index -1
+            # Note: If we used right-padding, we'd need to gather based on lengths.
+            # With left-padding [0, 0, A, B], the last state corresponds to B, which is correct.
+            last_state = output[:, -1, :]
+
+            user_embeddings_list.append(last_state.cpu().numpy())
+
+    user_embeddings = np.concatenate(user_embeddings_list, axis=0)
+
+    # Extract Item Embeddings directly from the layer
+    item_embeddings = model.item_embedding.weight.detach().cpu().numpy()
+
+    print(f"Extracted User Embeddings: {user_embeddings.shape}")
+    print(f"Extracted Item Embeddings: {item_embeddings.shape}")
+
+    return user_embeddings, item_embeddings
+=======
+from sklearn.decomposition import TruncatedSVD
+import scipy.sparse as sp
+
+# ==========================================
+# 1. MODEL WRAPPER
+# ==========================================
+
+class Item2VecSVD:
+    """
+    Simple wrapper for SVD-based embeddings to mimic model interface.
+    """
+    def __init__(self, item_embeddings):
+        self.item_embeddings = item_embeddings
+
+# ==========================================
+# 2. TRAINING FUNCTION (SVD)
+# ==========================================
+
+def train_sequential_model(data_dict, params=None, load_cached_data=False):
+    """
+    Trains an Item2Vec model using TruncatedSVD on the User-Item matrix.
+    Cite solution_lesson_node_00019: Latent Behavioral Embeddings.
+    Cite solution_lesson_node_00027: Prefer Mean-Pooled Item Embeddings.
+
+    Args:
+        data_dict: Output from data_loader.preprocess_sequences
+        params: Hyperparameters dict
+        load_cached_data: Whether to load pre-trained model
+
+    Returns:
+        Item2VecSVD object
+    """
+    if params is None:
+        params = config.SEQ_CONFIG
+
+    model_path = config.SEQ_MODEL_PATH
+
+    # 1. Check Cache
+    if load_cached_data and model_path.exists():
+        print(f"Loading cached SVD Model from {model_path}...")
+        try:
+            item_embeddings = np.load(model_path)
+            return Item2VecSVD(item_embeddings)
+        except Exception as e:
+            print(f"Error loading model cache: {e}. Recomputing...")
+
+    # 2. Build Sparse Matrix
+    print("Building User-Item Matrix for SVD...")
+    sequences = data_dict["sequences"].numpy() # (N_users, Max_Len)
+    vocab_size = data_dict["vocab_size"]
+    
+    # Flatten to get all interactions
+    # Rows: Users (0 to N-1), Cols: Items (1 to V-1). 0 is padding.
+    
+    n_users, seq_len = sequences.shape
+    
+    # Create row indices: [[0,0,0...], [1,1,1...]]
+    row_indices = np.repeat(np.arange(n_users), seq_len)
+    col_indices = sequences.flatten()
+    
+    # Filter padding (0)
+    mask = col_indices > 0
+    row_indices = row_indices[mask]
+    col_indices = col_indices[mask]
+    
+    # Construct CSR Matrix
+    # Shape: (N_users, Vocab_Size)
+    data = np.ones_like(row_indices)
+    
+    X_sparse = sp.csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(n_users, vocab_size)
+    )
+    
+    # 3. Perform SVD
+    print(f"Fitting TruncatedSVD (dim={params['embedding_dim']})...")
+    svd = TruncatedSVD(n_components=params['embedding_dim'], random_state=config.RANDOM_STATE)
+    svd.fit(X_sparse)
+    
+    # Extract Item Embeddings (V^T)
+    # components_ shape: (n_components, n_features) -> (dim, vocab)
+    item_embeddings = svd.components_.T
+    
+    # 4. Save
+    print(f"Saving SVD embeddings to {model_path}...")
+    np.save(model_path, item_embeddings)
+    
+    return Item2VecSVD(item_embeddings)
+
+# ==========================================
+# 3. EMBEDDING EXTRACTION
+# ==========================================
+
+def extract_embeddings(model, data_dict, batch_size=1024):
+    """
+    Extracts item embeddings and computes user embeddings via mean pooling.
+    Cite solution_lesson_node_00027: Mean-Pooled User Representation.
+
+    Returns:
+        user_embeddings (np.ndarray): (N_users, Embed_Dim)
+        item_embeddings (np.ndarray): (Vocab_Size, Embed_Dim)
+    """
+    print("Computing User Embeddings via Mean Pooling...")
+    
+    item_embeddings = model.item_embeddings
+    sequences = data_dict["sequences"].numpy()
+    
+    # We need to average item embeddings for each user
+    # sequences: (N, L) containing item indices
+    
+    n_users, seq_len = sequences.shape
+    dim = item_embeddings.shape[1]
+    
+    user_embeddings = np.zeros((n_users, dim), dtype=np.float32)
+    
+    # Process in chunks to save memory
+    chunk_size = 10000
+    
+    for i in range(0, n_users, chunk_size):
+        end = min(i + chunk_size, n_users)
+        batch_seq = sequences[i:end] # (B, L)
+        
+        # Look up embeddings
+        # (B, L, Dim)
+        batch_embs = item_embeddings[batch_seq] 
+        
+        # Mask padding (index 0)
+        mask = (batch_seq > 0).astype(np.float32) # (B, L)
+        mask = mask[:, :, np.newaxis] # (B, L, 1)
+        
+        masked_embs = batch_embs * mask
+        
+        # Sum and Count
+        sum_embs = np.sum(masked_embs, axis=1) # (B, Dim)
+        counts = np.sum(mask, axis=1) # (B, 1)
+        
+        # Avoid div by zero
+        counts[counts == 0] = 1.0
+        
+        batch_user_embs = sum_embs / counts
+        user_embeddings[i:end] = batch_user_embs
+
+    print(f"Extracted User Embeddings: {user_embeddings.shape}")
+    print(f"Extracted Item Embeddings: {item_embeddings.shape}")
+
+    return user_embeddings, item_embeddings
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+    def _add_sequential_features(self, df, seq_data, user_embeddings, item_embeddings):
+        """
+        Adds cosine similarity between User State and Item Embedding.
+        """
+        # Maps
+        user_ids_in_emb = seq_data[
+            "customer_ids"
+        ]  # Array of customer_ids corresponding to user_embeddings rows
+        article_map = seq_data["article_map"]  # article_id -> int index
+
+        # Create User Map: customer_id -> row index in user_embeddings
+        user_map = {uid: i for i, uid in enumerate(user_ids_in_emb)}
+
+        # Map indices
+        df["user_emb_idx"] = df["customer_id"].map(user_map)
+        df["item_emb_idx"] = df["article_id"].map(article_map)
+
+        # Filter valid rows (both user and item must be in the seq model)
+        valid_mask = df["user_emb_idx"].notna() & df["item_emb_idx"].notna()
+
+        # Initialize score column
+        df["seq_similarity"] = 0.0
+
+        if valid_mask.sum() > 0:
+            valid_indices = df[valid_mask].index
+
+            u_indices = df.loc[valid_indices, "user_emb_idx"].astype(int).values
+            i_indices = df.loc[valid_indices, "item_emb_idx"].astype(int).values
+
+            # Gather embeddings
+            # user_embeddings: (N_users, Dim)
+            # item_embeddings: (Vocab, Dim)
+            u_vecs = user_embeddings[u_indices]
+            i_vecs = item_embeddings[i_indices]
+
+            # Dot product (row-wise)
+            # (N, Dim) * (N, Dim) -> (N,)
+            scores = np.sum(u_vecs * i_vecs, axis=1)
+
+            df.loc[valid_indices, "seq_similarity"] = scores
+
+        # Drop temp columns
+        df = df.drop(columns=["user_emb_idx", "item_emb_idx"])
+
+        return df
+=======
+    def _add_sequential_features(self, df, seq_data, user_embeddings, item_embeddings):
+        """
+        Adds cosine similarity between User State and Item Embedding.
+        Also adds Last-Item Similarity.
+        Cite solution_lesson_node_00021: Recovering Sequential Signals via Last-Item Similarity.
+        """
+        # Maps
+        user_ids_in_emb = seq_data[
+            "customer_ids"
+        ]  # Array of customer_ids corresponding to user_embeddings rows
+        article_map = seq_data["article_map"]  # article_id -> int index
+        sequences = seq_data["sequences"].numpy() # (N_users, L)
+
+        # Create User Map: customer_id -> row index in user_embeddings
+        user_map = {uid: i for i, uid in enumerate(user_ids_in_emb)}
+
+        # Map indices
+        df["user_emb_idx"] = df["customer_id"].map(user_map)
+        df["item_emb_idx"] = df["article_id"].map(article_map)
+
+        # Filter valid rows
+        valid_mask = df["user_emb_idx"].notna() & df["item_emb_idx"].notna()
+
+        # Initialize score columns
+        df["seq_similarity"] = 0.0
+        df["last_item_similarity"] = 0.0
+
+        if valid_mask.sum() > 0:
+            valid_indices = df[valid_mask].index
+
+            u_indices = df.loc[valid_indices, "user_emb_idx"].astype(int).values
+            i_indices = df.loc[valid_indices, "item_emb_idx"].astype(int).values
+
+            # Gather embeddings
+            u_vecs = user_embeddings[u_indices]
+            i_vecs = item_embeddings[i_indices]
+
+            # 1. User Mean Similarity
+            scores = np.sum(u_vecs * i_vecs, axis=1)
+            df.loc[valid_indices, "seq_similarity"] = scores
+
+            # 2. Last Item Similarity
+            # Extract last item index for each user (vectorized)
+            # Default to 0 (padding)
+            last_item_indices_all = np.zeros(len(user_ids_in_emb), dtype=int)
+            
+            # Iterate columns to find last non-zero
+            for col in range(sequences.shape[1]):
+                vals = sequences[:, col]
+                mask = vals > 0
+                last_item_indices_all[mask] = vals[mask]
+            
+            # Gather for specific rows
+            u_last_items = last_item_indices_all[u_indices]
+            
+            # Get embeddings of last items
+            last_item_vecs = item_embeddings[u_last_items]
+            
+            # Dot product with candidate item
+            last_scores = np.sum(last_item_vecs * i_vecs, axis=1)
+            
+            # If last item was 0 (no history), score is 0
+            has_history = (u_last_items > 0)
+            df.loc[valid_indices, "last_item_similarity"] = last_scores * has_history
+
+        # Drop temp columns
+        df = df.drop(columns=["user_emb_idx", "item_emb_idx"])
+
+        return df
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Reduce epochs and increase batch size for speed
+FAST_SEQ_CONFIG = config.SEQ_CONFIG.copy()
+FAST_SEQ_CONFIG["epochs"] = 4  # Reduced from 10
+FAST_SEQ_CONFIG["batch_size"] = 128
+
+# Reduce ranker complexity slightly for speed
+FAST_LGBM_PARAMS = config.LGBM_PARAMS.copy()
+FAST_LGBM_PARAMS["n_estimators"] = 800  # Reduced from 1500
+=======
+# Reduce epochs and increase batch size for speed
+FAST_SEQ_CONFIG = config.SEQ_CONFIG.copy()
+# SVD doesn't use epochs/batch_size in the same way, but we keep structure
+FAST_SEQ_CONFIG["embedding_dim"] = 128 
+
+# Reduce ranker complexity slightly for speed but keep capacity high
+# Cite solution_lesson_node_00022: Prioritize model capacity
+FAST_LGBM_PARAMS = config.LGBM_PARAMS.copy()
+FAST_LGBM_PARAMS["n_estimators"] = 1200  # Increased to ensure convergence
+FAST_LGBM_PARAMS["learning_rate"] = 0.02 # Slightly lower for stability
+FAST_LGBM_PARAMS["num_leaves"] = 128     # High capacity
+>>>>>>> REPLACE
+```

@@ -1,0 +1,466 @@
+Implementation strategy:
+1.  **Modify `library/dataset.py`**:
+    -   Update `process_and_cache_25d_metadata` to compute robust volume-level statistics (99th percentile of the volume) for normalization. This directly addresses the lesson about inconsistent per-slice normalization (Cite solution_lesson_node_00002).
+    -   Use `concurrent.futures.ThreadPoolExecutor` to efficiently compute pixel statistics for all images during the metadata processing step.
+    -   Update `GI_MRI_Dataset.load_slice` to use the pre-computed `vol_max` for normalization instead of per-slice min-max.
+    -   Update cache filenames to `*_v2.parquet` to ensure fresh metadata generation.
+
+2.  **Modify `runfile.py`**:
+    -   Increase `Config.EPOCHS` to 10 to allow the model to converge with the new normalization scheme.
+    -   Add a condition to only generate the submission file if the validation metric exceeds the previous baseline (0.0046), ensuring we only submit improved models.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset
+
+from library.config import Config
+from library.utils import rle_decode, get_metadata
+
+
+def process_and_cache_25d_metadata(load_cached_data=True):
+    """
+    Loads metadata and processes it to include paths for previous and next slices
+    to facilitate 2.5D input. Caches the processed dataframes.
+
+    Args:
+        load_cached_data (bool): Whether to attempt loading from cache.
+
+    Returns:
+        tuple: (train_df, val_df, test_df) with added 'prev_image_path' and 'next_image_path' columns.
+    """
+    cache_dir = Config.CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    train_cache = os.path.join(cache_dir, "train_25d.parquet")
+    val_cache = os.path.join(cache_dir, "val_25d.parquet")
+    test_cache = os.path.join(cache_dir, "test_25d.parquet")
+
+    # Try loading from cache
+    if load_cached_data:
+        if (
+            os.path.exists(train_cache)
+            and os.path.exists(val_cache)
+            and os.path.exists(test_cache)
+        ):
+            try:
+                train_df = pd.read_parquet(train_cache)
+                val_df = pd.read_parquet(val_cache)
+                test_df = pd.read_parquet(test_cache)
+                return train_df, val_df, test_df
+            except Exception:
+                pass  # Fallback to processing
+
+    # Load base metadata
+    train_df, val_df, test_df = get_metadata(load_cached_data=True)
+
+    def add_neighbors(df):
+        if df.empty:
+            return df
+
+        # Ensure slice is integer for correct sorting
+        df["slice_int"] = df["slice"].astype(int)
+
+        # Sort by case, day, slice
+        df = df.sort_values(["case", "day", "slice_int"]).reset_index(drop=True)
+
+        # Group by case and day
+        grouped = df.groupby(["case", "day"])
+
+        # Shift to get prev and next paths
+        df["prev_image_path"] = grouped["image_path"].shift(1)
+        df["next_image_path"] = grouped["image_path"].shift(-1)
+
+        # Fill NaNs (boundaries) with current image path
+        df["prev_image_path"] = df["prev_image_path"].fillna(df["image_path"])
+        df["next_image_path"] = df["next_image_path"].fillna(df["image_path"])
+
+        # Drop temp column
+        df = df.drop(columns=["slice_int"])
+
+        return df
+
+    # Process each split
+    train_df = add_neighbors(train_df)
+    val_df = add_neighbors(val_df)
+    test_df = add_neighbors(test_df)
+
+    # Cache results
+    train_df.to_parquet(train_cache, index=False)
+    val_df.to_parquet(val_cache, index=False)
+    test_df.to_parquet(test_cache, index=False)
+
+    return train_df, val_df, test_df
+=======
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import concurrent.futures
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset
+
+from library.config import Config
+from library.utils import rle_decode, get_metadata
+
+
+def compute_p99(path):
+    """Helper to compute 99th percentile of an image."""
+    full_path = os.path.join(Config.INPUT_DIR, path)
+    try:
+        img = cv2.imread(full_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return 0.0
+        return np.percentile(img, 99)
+    except Exception:
+        return 0.0
+
+
+def add_volume_stats(df):
+    """
+    Computes volume-level normalization statistics (max/p99) and adds to dataframe.
+    Cite solution_lesson_node_00002: Computing normalization statistics across the entire 3D volume.
+    """
+    if df.empty:
+        return df
+
+    print("Computing volume statistics for normalization...")
+    unique_paths = df["image_path"].unique()
+    
+    # Compute p99 for all images in parallel
+    path_to_p99 = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        results = list(executor.map(compute_p99, unique_paths))
+    
+    path_to_p99 = dict(zip(unique_paths, results))
+    
+    # Map p99 to dataframe
+    df["slice_p99"] = df["image_path"].map(path_to_p99)
+    
+    # Compute Volume Max (Max of slice p99s in the volume)
+    # This is robust to single-pixel outliers but captures the dynamic range of the volume
+    vol_stats = df.groupby(["case", "day"])["slice_p99"].max().reset_index()
+    vol_stats = vol_stats.rename(columns={"slice_p99": "vol_max"})
+    
+    # Merge back
+    df = df.merge(vol_stats, on=["case", "day"], how="left")
+    
+    # Fill NaNs or zeros with a safe global default (e.g. 1000) to avoid division by zero
+    df["vol_max"] = df["vol_max"].replace(0, 1000.0).fillna(1000.0)
+    
+    return df
+
+
+def process_and_cache_25d_metadata(load_cached_data=True):
+    """
+    Loads metadata and processes it to include paths for previous and next slices
+    to facilitate 2.5D input. Caches the processed dataframes.
+
+    Args:
+        load_cached_data (bool): Whether to attempt loading from cache.
+
+    Returns:
+        tuple: (train_df, val_df, test_df) with added 'prev_image_path' and 'next_image_path' columns.
+    """
+    cache_dir = Config.CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Updated cache names to force regeneration with volume stats
+    train_cache = os.path.join(cache_dir, "train_25d_v2.parquet")
+    val_cache = os.path.join(cache_dir, "val_25d_v2.parquet")
+    test_cache = os.path.join(cache_dir, "test_25d_v2.parquet")
+
+    # Try loading from cache
+    if load_cached_data:
+        if (
+            os.path.exists(train_cache)
+            and os.path.exists(val_cache)
+            and os.path.exists(test_cache)
+        ):
+            try:
+                train_df = pd.read_parquet(train_cache)
+                val_df = pd.read_parquet(val_cache)
+                test_df = pd.read_parquet(test_cache)
+                return train_df, val_df, test_df
+            except Exception:
+                pass  # Fallback to processing
+
+    # Load base metadata
+    train_df, val_df, test_df = get_metadata(load_cached_data=True)
+
+    def add_neighbors(df):
+        if df.empty:
+            return df
+
+        # Ensure slice is integer for correct sorting
+        df["slice_int"] = df["slice"].astype(int)
+
+        # Sort by case, day, slice
+        df = df.sort_values(["case", "day", "slice_int"]).reset_index(drop=True)
+
+        # Group by case and day
+        grouped = df.groupby(["case", "day"])
+
+        # Shift to get prev and next paths
+        df["prev_image_path"] = grouped["image_path"].shift(1)
+        df["next_image_path"] = grouped["image_path"].shift(-1)
+
+        # Fill NaNs (boundaries) with current image path
+        df["prev_image_path"] = df["prev_image_path"].fillna(df["image_path"])
+        df["next_image_path"] = df["next_image_path"].fillna(df["image_path"])
+
+        # Drop temp column
+        df = df.drop(columns=["slice_int"])
+
+        return df
+
+    # Process each split
+    train_df = add_neighbors(train_df)
+    val_df = add_neighbors(val_df)
+    test_df = add_neighbors(test_df)
+
+    # Add Volume Normalization Stats
+    train_df = add_volume_stats(train_df)
+    val_df = add_volume_stats(val_df)
+    test_df = add_volume_stats(test_df)
+
+    # Cache results
+    train_df.to_parquet(train_cache, index=False)
+    val_df.to_parquet(val_cache, index=False)
+    test_df.to_parquet(test_cache, index=False)
+
+    return train_df, val_df, test_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def load_slice(self, rel_path):
+        """
+        Loads a single slice, converts to float32, and applies Min-Max normalization.
+        """
+        full_path = os.path.join(self.input_dir, rel_path)
+        img = cv2.imread(full_path, cv2.IMREAD_UNCHANGED)
+
+        if img is None:
+            # Fallback for missing files (should not happen based on validation)
+            # Create a black image of default size (assuming 266x266 as min size)
+            img = np.zeros((266, 266), dtype=np.uint8)
+
+        # Handle 16-bit images or other depths
+        img = img.astype(np.float32)
+
+        # Min-Max Normalization per image
+        min_val = np.min(img)
+        max_val = np.max(img)
+        if max_val > min_val:
+            img = (img - min_val) / (max_val - min_val)
+        else:
+            img = np.zeros_like(img)
+
+        return img
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # 1. Load 2.5D Images
+        # Paths are pre-calculated in the dataframe
+        path_curr = row["image_path"]
+        path_prev = row["prev_image_path"]
+        path_next = row["next_image_path"]
+
+        img_curr = self.load_slice(path_curr)
+        img_prev = self.load_slice(path_prev)
+        img_next = self.load_slice(path_next)
+=======
+    def load_slice(self, rel_path, vol_max):
+        """
+        Loads a single slice, converts to float32, and applies Volume-based normalization.
+        Cite solution_lesson_node_00002: Avoid per-slice min-max; use volume stats.
+        """
+        full_path = os.path.join(self.input_dir, rel_path)
+        img = cv2.imread(full_path, cv2.IMREAD_UNCHANGED)
+
+        if img is None:
+            # Fallback for missing files
+            img = np.zeros((266, 266), dtype=np.uint8)
+
+        # Handle 16-bit images or other depths
+        img = img.astype(np.float32)
+
+        # Volume-based Normalization
+        # Normalize by the 99th percentile of the volume to preserve relative intensity
+        if vol_max > 0:
+            img = img / vol_max
+            img = np.clip(img, 0, 1.0)
+        else:
+            img = np.zeros_like(img)
+
+        return img
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # 1. Load 2.5D Images
+        # Paths are pre-calculated in the dataframe
+        path_curr = row["image_path"]
+        path_prev = row["prev_image_path"]
+        path_next = row["next_image_path"]
+        
+        # Use pre-computed volume max for normalization
+        vol_max = row["vol_max"]
+
+        img_curr = self.load_slice(path_curr, vol_max)
+        img_prev = self.load_slice(path_prev, vol_max)
+        img_next = self.load_slice(path_next, vol_max)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configure for Fast Baseline
+    # Reduce epochs and ensure batch size is efficient
+    Config.EPOCHS = 5
+    Config.BATCH_SIZE = 32
+
+    # Setup directories
+    Config.setup(training=True)
+    set_seed(Config.SEED)
+
+    print("=== Configuration ===")
+    print(f"Epochs: {Config.EPOCHS}")
+    print(f"Batch Size: {Config.BATCH_SIZE}")
+    print(f"Device: {Config.DEVICE}")
+
+    # 2. Train Model
+    print("\n=== Starting Training ===")
+    # debug=False ensures we use the full dataset (or as configured) but with our custom EPOCHS
+    best_dice = train_model(debug=False)
+    print(f"Training finished. Best Val Dice (approx): {best_dice:.4f}")
+
+    # 3. Validate and Analyze
+    validate_and_analyze()
+
+    # 4. Inference and Submission
+    print("\n=== Generating Submission ===")
+    run_inference(debug=False)
+=======
+def main():
+    # 1. Configure for Fast Baseline
+    # Increase epochs to allow convergence with new normalization
+    Config.EPOCHS = 10
+    Config.BATCH_SIZE = 32
+
+    # Setup directories
+    Config.setup(training=True)
+    set_seed(Config.SEED)
+
+    print("=== Configuration ===")
+    print(f"Epochs: {Config.EPOCHS}")
+    print(f"Batch Size: {Config.BATCH_SIZE}")
+    print(f"Device: {Config.DEVICE}")
+
+    # 2. Train Model
+    print("\n=== Starting Training ===")
+    # debug=False ensures we use the full dataset (or as configured) but with our custom EPOCHS
+    best_dice = train_model(debug=False)
+    print(f"Training finished. Best Val Dice (approx): {best_dice:.4f}")
+
+    # 3. Validate and Analyze
+    # We capture the output to check the metric
+    # Note: validate_and_analyze prints the metric, but we can't easily capture stdout here without redirect.
+    # We will rely on the printed output for the user, but for submission logic we need to be careful.
+    # Since we can't modify validate_and_analyze return value easily without changing signature in runfile (which is allowed),
+    # let's just run inference unconditionally if it finishes without error, OR we can parse the logs?
+    # Actually, the requirement says "Generate predictions... If and only if the final validation metric is higher than 0.00463659".
+    # I will modify validate_and_analyze to return the score.
+    
+    final_score = validate_and_analyze()
+
+    # 4. Inference and Submission
+    if final_score is not None and final_score > 0.00463659:
+        print(f"\n=== Generating Submission (Score {final_score:.5f} > Baseline) ===")
+        run_inference(debug=False)
+    else:
+        print(f"\n=== Skipping Submission (Score {final_score} <= Baseline 0.00463659) ===")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Final Metric Calculation
+    metrics_df = pd.DataFrame(metrics_data)
+
+    # Mean over all rows (samples * classes)
+    final_dice = metrics_df["dice"].mean()
+    final_hd = metrics_df["hd_score"].mean()
+    final_score = 0.4 * final_dice + 0.6 * final_hd
+
+    print(f"Final Validation Metric: {final_score:.8f}")
+
+    # 6. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate correlation between Error (1 - Score) and features
+    metrics_df["error"] = 1.0 - metrics_df["score"]
+
+    # Correlation with Mask Area
+    corr_area = metrics_df["error"].corr(metrics_df["mask_area"])
+    print(f"Correlation between Error and Organ Mask Area: {corr_area:.4f}")
+
+    # Correlation with Depth (Slice Count)
+    corr_depth = metrics_df["error"].corr(metrics_df["depth"])
+    print(f"Correlation between Error and Scan Depth: {corr_depth:.4f}")
+
+    # Identify worst classes
+    print("\nMean Score by Class:")
+    print(metrics_df.groupby("class")["score"].mean())
+
+
+def main():
+=======
+    # 5. Final Metric Calculation
+    metrics_df = pd.DataFrame(metrics_data)
+
+    # Mean over all rows (samples * classes)
+    final_dice = metrics_df["dice"].mean()
+    final_hd = metrics_df["hd_score"].mean()
+    final_score = 0.4 * final_dice + 0.6 * final_hd
+
+    print(f"Final Validation Metric: {final_score:.8f}")
+
+    # 6. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate correlation between Error (1 - Score) and features
+    metrics_df["error"] = 1.0 - metrics_df["score"]
+
+    # Correlation with Mask Area
+    corr_area = metrics_df["error"].corr(metrics_df["mask_area"])
+    print(f"Correlation between Error and Organ Mask Area: {corr_area:.4f}")
+
+    # Correlation with Depth (Slice Count)
+    corr_depth = metrics_df["error"].corr(metrics_df["depth"])
+    print(f"Correlation between Error and Scan Depth: {corr_depth:.4f}")
+
+    # Identify worst classes
+    print("\nMean Score by Class:")
+    print(metrics_df.groupby("class")["score"].mean())
+    
+    return final_score
+
+
+def main():
+>>>>>>> REPLACE
+```

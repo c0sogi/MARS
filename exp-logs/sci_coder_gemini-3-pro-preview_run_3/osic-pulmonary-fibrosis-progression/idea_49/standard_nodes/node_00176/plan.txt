@@ -1,0 +1,283 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement the following optimizations to improve the SCAR-Net performance:
+
+1.  **Latent Fusion Architecture (Cite `solution_lesson_node_00052`, `solution_lesson_node_00060`):**
+    The previous solution fused the streams at the *output* level (summing predictions). I will switch to **Latent Fusion**, where the Linear Stream (Stream A) and the Deep Stream (Stream B) project to a shared latent space (64-dim) before being summed and passed to a shared head. This allows the model to learn a richer interaction between the dominant linear baseline and the non-linear residuals before committing to the final scalar outputs.
+
+2.  **Over-Parameterized Linear Stream (Cite `solution_lesson_node_00060`):**
+    I will modify Stream A to be a direct `Linear(5, 64)` projection (without ReLU). This creates an over-parameterized linear pathway that can robustly capture the strong autoregressive signal (Baseline FVC + Time) without being bottlenecked by low dimensionality or distorted by non-linearities.
+
+3.  **Extended Training Duration (Cite `solution_lesson_node_00100`):**
+    I will increase the training epochs from 20 to 30. The previous solution showed signs of premature stopping/plateauing, and lesson 100 highlights the importance of linking the scheduler horizon to a sufficient training duration to allow convergence in regression tasks.
+
+4.  **Dimensionality Constraints (Cite `solution_lesson_node_00065`, `solution_lesson_node_00146`):**
+    I will maintain the projection of high-dimensional image features (1408) to a lower dimension (64) before concatenation, ensuring the tabular features (5) are not drowned out during fusion.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Dimensions
+    BACKBONE_OUT_DIM = 1408  # EfficientNet-B2 final features
+    PROJECTION_DIM = 64  # Bottleneck projection for image features
+    HIDDEN_DIM = 128  # MLP hidden dimension
+    OUTPUT_DIM = 2  # Mean, LogStd (or RawStd)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    BATCH_SIZE = 32
+    EPOCHS = 30
+=======
+    # Dimensions
+    BACKBONE_OUT_DIM = 1408  # EfficientNet-B2 final features
+    PROJECTION_DIM = 64  # Bottleneck projection for image features (Cite solution_lesson_node_00065)
+    HIDDEN_DIM = 128  # MLP hidden dimension
+    OUTPUT_DIM = 2  # Mean, LogStd (or RawStd)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    BATCH_SIZE = 32
+    EPOCHS = 30  # Increased to ensure convergence (Cite solution_lesson_node_00100)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StreamA(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor.
+    Learns the baseline disease trajectory from clinical scalars.
+    """
+
+    def __init__(self, input_dim=5):
+        super(StreamA, self).__init__()
+        # MLP: Input -> 128 -> ReLU -> 64 -> 2
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, 64),
+            nn.Linear(64, Config.OUTPUT_DIM),  # Outputs: mu_base, sigma_base_raw
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class StreamB(nn.Module):
+    """
+    Stream B: Context-Injected Visual Residual.
+    Learns patient-specific corrections (residuals) based on image and clinical context.
+    """
+
+    def __init__(self, input_dim):
+        super(StreamB, self).__init__()
+        # Input dim = Image Projection (64) + Clinical (5) = 69
+        # MLP: Input -> 128 -> ReLU -> 64 -> 2
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, 64),
+            nn.Linear(64, Config.OUTPUT_DIM),  # Outputs: delta_mu, delta_sigma_raw
+        )
+        # Note: Using standard PyTorch initialization (Kaiming Uniform).
+        # Explicitly avoiding Zero-Initialization to prevent gradient stagnation.
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SCARNet(nn.Module):
+    """
+    Standardized Constraint-Aware Residual Network.
+    Combines a clinical anchor with a visual residual stream, enforcing metric constraints architecturally.
+    """
+
+    def __init__(self):
+        super(SCARNet, self).__init__()
+
+        # 1. Image Branch
+        self.image_branch = ImageBranch()
+
+        # Clinical features dimension is 5:
+        # [Baseline_FVC_Scaled, Time_Scaled, Age_Scaled, Sex_Code, Smoking_Code]
+        self.clinical_dim = 5
+
+        # 2. Stream A (Anchor)
+        self.stream_a = StreamA(input_dim=self.clinical_dim)
+
+        # 3. Stream B (Residual)
+        # Input: Image Projection (64) + Clinical (5)
+        self.stream_b_input_dim = Config.PROJECTION_DIM + self.clinical_dim
+        self.stream_b = StreamB(input_dim=self.stream_b_input_dim)
+
+        # Metric Constraint Floor (Standardized)
+        self.sigma_floor = Config.SIGMA_FLOOR_STD
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images (torch.Tensor): Batch of images (B, 3, H, W)
+            tabular (torch.Tensor): Batch of clinical features (B, 5)
+        Returns:
+            preds (torch.Tensor): (B, 2) -> [mu_scaled, sigma_scaled]
+        """
+        # 1. Extract Image Features
+        img_features = self.image_branch(images)  # (B, 64)
+
+        # 2. Stream A: Predict Baseline Trajectory
+        base_out = self.stream_a(tabular)  # (B, 2)
+        mu_base = base_out[:, 0:1]
+        sigma_base_raw = base_out[:, 1:2]
+
+        # 3. Stream B: Predict Residuals
+        # Context Injection: Concatenate projected image features with raw clinical scalars
+        combined_features = torch.cat([img_features, tabular], dim=1)  # (B, 69)
+        residual_out = self.stream_b(combined_features)  # (B, 2)
+        delta_mu = residual_out[:, 0:1]
+        delta_sigma_raw = residual_out[:, 1:2]
+
+        # 4. Constraint-Aware Fusion
+
+        # Mean: Base + Residual
+        mu_scaled = mu_base + delta_mu
+
+        # Uncertainty: Softplus(Base + Residual) + Floor
+        # We sum the raw logits first to allow the residual to freely correct the base,
+        # then apply Softplus to ensure positivity, then add the architectural floor.
+        sigma_combined_raw = sigma_base_raw + delta_sigma_raw
+        sigma_scaled = F.softplus(sigma_combined_raw) + self.sigma_floor
+
+        # Stack outputs
+        preds = torch.cat([mu_scaled, sigma_scaled], dim=1)
+
+        return preds
+=======
+class StreamA(nn.Module):
+    """
+    Stream A: Over-Parameterized Linear Stream.
+    Projects clinical features to a latent space using a linear mapping.
+    Acts as the dominant linear baseline (Cite solution_lesson_node_00052, solution_lesson_node_00060).
+    """
+
+    def __init__(self, input_dim=5):
+        super(StreamA, self).__init__()
+        # Linear Projection: Input -> Latent (64)
+        # No ReLU here to preserve pure linear relationships for the baseline.
+        self.net = nn.Linear(input_dim, Config.PROJECTION_DIM)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class StreamB(nn.Module):
+    """
+    Stream B: Deep Interaction Stream.
+    Fuses image features and clinical context via an MLP to learn non-linear residuals.
+    """
+
+    def __init__(self, input_dim):
+        super(StreamB, self).__init__()
+        # Input dim = Image Projection (64) + Clinical (5) = 69
+        # MLP: Input -> 128 -> ReLU -> Latent (64)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.PROJECTION_DIM),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SCARNet(nn.Module):
+    """
+    Standardized Constraint-Aware Residual Network (Latent Fusion Variant).
+    Fuses a linear stream and a deep stream in a shared latent space before final projection.
+    """
+
+    def __init__(self):
+        super(SCARNet, self).__init__()
+
+        # 1. Image Branch
+        self.image_branch = ImageBranch()
+
+        # Clinical features dimension is 5:
+        # [Baseline_FVC_Scaled, Time_Scaled, Age_Scaled, Sex_Code, Smoking_Code]
+        self.clinical_dim = 5
+
+        # 2. Stream A (Linear Latent)
+        self.stream_a = StreamA(input_dim=self.clinical_dim)
+
+        # 3. Stream B (Deep Latent)
+        # Input: Image Projection (64) + Clinical (5)
+        self.stream_b_input_dim = Config.PROJECTION_DIM + self.clinical_dim
+        self.stream_b = StreamB(input_dim=self.stream_b_input_dim)
+
+        # 4. Shared Head
+        # Projects fused latent (64) to Output (2)
+        self.head = nn.Linear(Config.PROJECTION_DIM, Config.OUTPUT_DIM)
+
+        # Metric Constraint Floor (Standardized)
+        self.sigma_floor = Config.SIGMA_FLOOR_STD
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images (torch.Tensor): Batch of images (B, 3, H, W)
+            tabular (torch.Tensor): Batch of clinical features (B, 5)
+        Returns:
+            preds (torch.Tensor): (B, 2) -> [mu_scaled, sigma_scaled]
+        """
+        # 1. Extract Image Features
+        img_features = self.image_branch(images)  # (B, 64)
+
+        # 2. Stream A: Linear Latent Representation
+        h_linear = self.stream_a(tabular)  # (B, 64)
+
+        # 3. Stream B: Deep Latent Representation
+        # Context Injection: Concatenate projected image features with raw clinical scalars
+        combined_features = torch.cat([img_features, tabular], dim=1)  # (B, 69)
+        h_deep = self.stream_b(combined_features)  # (B, 64)
+
+        # 4. Latent Fusion (Cite solution_lesson_node_00052)
+        # Summing the latent vectors allows the linear stream to provide a robust base
+        # while the deep stream adds non-linear corrections.
+        h_fused = h_linear + h_deep
+
+        # 5. Final Projection
+        out = self.head(h_fused)  # (B, 2)
+        mu_raw = out[:, 0:1]
+        sigma_raw = out[:, 1:2]
+
+        # 6. Constraint Application
+        mu_scaled = mu_raw
+        sigma_scaled = F.softplus(sigma_raw) + self.sigma_floor
+
+        # Stack outputs
+        preds = torch.cat([mu_scaled, sigma_scaled], dim=1)
+
+        return preds
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- 1. Configuration & Setup ---
+    # Adjust epochs for a fast baseline execution as requested
+    Config.EPOCHS = 20
+    Config.T_MAX = 20
+
+    # Ensure reproducibility
+=======
+    # --- 1. Configuration & Setup ---
+    # Adjust epochs for a fast baseline execution as requested
+    Config.EPOCHS = 30
+    Config.T_MAX = 30
+
+    # Ensure reproducibility
+>>>>>>> REPLACE
+```

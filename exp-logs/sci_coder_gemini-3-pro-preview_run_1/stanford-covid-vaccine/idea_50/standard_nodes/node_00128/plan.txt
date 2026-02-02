@@ -1,0 +1,802 @@
+To optimize the model performance, I will implement the following changes based on the provided lessons:
+
+1.  **Revert to Discrete Distance Embeddings**: I will replace the continuous sinusoidal distance encodings and Random Walk Positional Encodings (RWPE) with discrete embeddings for pairwise distances. Lesson 127 (Cite solution_lesson_node_00127) indicates that abstract graph features like RWPE can introduce noise in sequence architectures, and Lesson 113 (Cite solution_lesson_node_00113) suggests that discrete tokenization of topological distances is superior to continuous encodings for this task.
+2.  **Reduce Model Capacity**: I will reduce the `HIDDEN_DIM` from 512 to 384. Lesson 81 (Cite solution_lesson_node_00081) and Lesson 127 highlight that 512-dimensional models tend to overfit on this dataset size, while 384 provides a better balance.
+3.  **Adjust Hyperparameters**: I will set the `BATCH_SIZE` to 32 and `NUM_EPOCHS` to 20. Lesson 92 (Cite solution_lesson_node_00092) suggests that larger batch sizes (64) with fewer epochs can lead to optimization bottlenecks, while a smaller batch size ensures more gradient updates.
+4.  **Simplify Input Features**: I will remove RWPE completely and adjust the sequence embedding dimension to 100, aligning with the successful baseline configuration referenced in Lesson 99 (Cite solution_lesson_node_00099).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Model Architecture (Topologically-Augmented Stabilized Wide-Stream BiGRU)
+    # --------------------------------------------------------------------------
+    # Feature Embeddings
+    EMBED_DIM_SEQ = 128  # High-dim for atomic sequence
+    EMBED_DIM_LOOP = 64  # Moderate-dim for local context
+    EMBED_DIM_PAIR = 64  # Moderate-dim for pair distance
+
+    # Random Walk Positional Encoding (RWPE)
+    # Steps k for T^k diagonal elements
+    RWPE_STEPS = [1, 2, 4, 8, 16]
+
+    # Recurrent Backbone
+    HIDDEN_DIM = 512  # Wide-Stream capacity
+    NUM_LAYERS = 6  # Deep encoder
+    DROPOUT = 0.2  # Applied between layers (not on stem output)
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 64
+    NUM_EPOCHS = 20
+=======
+    # --------------------------------------------------------------------------
+    # Model Architecture (Stabilized Wide-Stream BiGRU)
+    # --------------------------------------------------------------------------
+    # Feature Embeddings
+    EMBED_DIM_SEQ = 100  # Cite solution_lesson_node_00099
+    EMBED_DIM_LOOP = 64
+    EMBED_DIM_PAIR = 64
+
+    # Discrete Pair Distance Vocabulary (Cite solution_lesson_node_00113)
+    # Range -107 to 107. Offset + 128.
+    VOCAB_SIZE_PAIR = 256
+
+    # Recurrent Backbone
+    HIDDEN_DIM = 384  # Cite solution_lesson_node_00081
+    NUM_LAYERS = 6
+    DROPOUT = 0.1
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 32  # Cite solution_lesson_node_00092
+    NUM_EPOCHS = 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/features.py
+<<<<<<< SEARCH
+def compute_rwpe(adj_matrix, steps):
+    """
+    Computes Random Walk Positional Encoding (RWPE) features.
+    Calculates the diagonal elements of the transition matrix powers T^k.
+
+    T = D^-1 * A
+
+    Args:
+        adj_matrix (np.ndarray): Adjacency matrix (seq_len, seq_len).
+        steps (list[int]): List of steps k to compute T^k diagonals for.
+
+    Returns:
+        np.ndarray: RWPE features of shape (seq_len, len(steps)).
+    """
+    seq_len = adj_matrix.shape[0]
+
+    # Compute Degree Matrix D
+    degrees = np.sum(adj_matrix, axis=1)
+
+    # Handle isolated nodes (though rare in RNA backbone) to avoid div by zero
+    # If degree is 0, we can leave it as 0 or set to 1 to avoid NaN.
+    # For RNA, backbone ensures degree >= 1 usually.
+    degrees[degrees == 0] = 1.0
+
+    # Compute Transition Matrix T = D^-1 A
+    # D_inv is diagonal matrix with 1/degree
+    d_inv = np.diag(1.0 / degrees)
+    T = np.matmul(d_inv, adj_matrix)
+
+    rwpe_features = []
+
+    # We need specific powers. Since steps are typically [1, 2, 4, 8, 16],
+    # we can optimize by repeated squaring if the steps are powers of 2,
+    # but for generality, we'll compute necessary powers.
+    # Given the steps are small and fixed in Config, we can just compute.
+
+    # Current power of T
+    T_curr = T
+    current_k = 1
+
+    # Sort steps to compute incrementally
+    sorted_steps = sorted(steps)
+    max_step = sorted_steps[-1]
+
+    # Dictionary to store diagonals for requested steps
+    diagonals = {}
+
+    # Iteratively multiply
+    # Note: Matrix multiplication is O(N^3). N=107 is small.
+    # We can just compute powers directly or incrementally.
+    # Incremental: T^k = T^{k-1} @ T
+
+    T_power = T.copy()
+    if 1 in sorted_steps:
+        diagonals[1] = np.diag(T_power)
+
+    for k in range(2, max_step + 1):
+        T_power = np.matmul(T_power, T)
+        if k in sorted_steps:
+            diagonals[k] = np.diag(T_power)
+
+    # Collect results in order of 'steps'
+    for k in steps:
+        rwpe_features.append(diagonals[k])
+
+    # Stack -> (len(steps), seq_len) -> transpose to (seq_len, len(steps))
+    return np.stack(rwpe_features, axis=1)
+
+
+def get_sinusoidal_encoding(structure, seq_len, embed_dim):
+    """
+    Generates Signed Sinusoidal Pairing Encodings.
+    Encodes the signed distance d = j - i for paired bases (i, j).
+    Unpaired bases have distance 0.
+
+    Args:
+        structure (str): Dot-bracket structure.
+        seq_len (int): Sequence length.
+        embed_dim (int): Output embedding dimension.
+
+    Returns:
+        np.ndarray: Encodings of shape (seq_len, embed_dim).
+    """
+    pairs = get_pair_map(structure)
+
+    # Calculate signed distances
+    # If i is paired with j, dist = j - i
+    # If unpaired, dist = 0
+    distances = np.zeros(seq_len, dtype=np.float32)
+    for i in range(seq_len):
+        if i in pairs:
+            distances[i] = pairs[i] - i
+        else:
+            distances[i] = 0.0
+
+    # Compute Sinusoidal Encoding
+    # PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+    # PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+    position = distances[:, np.newaxis]  # (seq_len, 1)
+    div_term = np.exp(np.arange(0, embed_dim, 2) * -(np.log(10000.0) / embed_dim))
+
+    pe = np.zeros((seq_len, embed_dim), dtype=np.float32)
+
+    # Argument for sin/cos
+    # (seq_len, 1) * (1, embed_dim/2) -> (seq_len, embed_dim/2)
+    args = position * div_term
+
+    pe[:, 0::2] = np.sin(args)
+    pe[:, 1::2] = np.cos(args)
+
+    return pe
+
+
+def extract_features(df, split_name, load_cached=True):
+    """
+    Orchestrates the feature extraction process for a dataframe.
+    Computes RWPE and Pair Encodings for all samples.
+    Handles caching to disk.
+
+    Args:
+        df (pd.DataFrame): Dataframe containing 'structure' and 'seq_length'.
+        split_name (str): Name of the split (e.g., 'train', 'val', 'test') for cache naming.
+        load_cached (bool): Whether to attempt loading from cache.
+
+    Returns:
+        dict: Dictionary containing:
+            - 'rwpe': torch.Tensor (N, L, n_steps)
+            - 'pair_enc': torch.Tensor (N, L, embed_dim)
+    """
+    cache_file = os.path.join(Config.CACHE_DIR, f"{split_name}_features.pt")
+
+    # 1. Try to load from cache
+    if load_cached and os.path.exists(cache_file):
+        print(f"Loading cached features from {cache_file}...")
+        try:
+            data = torch.load(cache_file)
+            return data
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    # 2. Compute features
+    print(f"Computing geometric features for {split_name} set ({len(df)} samples)...")
+
+    rwpe_list = []
+    pair_enc_list = []
+
+    # Use Config values
+    rwpe_steps = Config.RWPE_STEPS
+    pair_dim = Config.EMBED_DIM_PAIR
+
+    structures = df["structure"].values
+    # Ensure seq_length is consistent or use column if variable (though Config says 107)
+    # We'll use the actual length from the dataframe to be safe, or Config.SEQ_LENGTH
+
+    for idx, struct in enumerate(structures):
+        # Determine length (should be 107)
+        slen = len(struct)
+
+        # A. Adjacency & RWPE
+        adj = structure_to_adj(struct, slen)
+        rwpe = compute_rwpe(adj, rwpe_steps)  # (L, n_steps)
+
+        # B. Pair Encoding
+        p_enc = get_sinusoidal_encoding(struct, slen, pair_dim)  # (L, pair_dim)
+
+        rwpe_list.append(rwpe)
+        pair_enc_list.append(p_enc)
+
+    # Stack into tensors
+    rwpe_tensor = torch.tensor(np.array(rwpe_list), dtype=torch.float32)
+    pair_enc_tensor = torch.tensor(np.array(pair_enc_list), dtype=torch.float32)
+
+    result = {"rwpe": rwpe_tensor, "pair_enc": pair_enc_tensor}
+=======
+def get_distance_indices(structure, seq_len):
+    """
+    Generates Discrete Pairing Indices.
+    Maps signed distance d = j - i to a discrete index.
+    Unpaired bases have distance 0.
+    Indices are offset by 128 to handle negative values.
+
+    Args:
+        structure (str): Dot-bracket structure.
+        seq_len (int): Sequence length.
+
+    Returns:
+        np.ndarray: Indices of shape (seq_len,).
+    """
+    pairs = get_pair_map(structure)
+    indices = np.zeros(seq_len, dtype=np.int64)
+    
+    # Offset to handle negative distances (range approx -107 to 107)
+    # 0 -> 128
+    OFFSET = 128
+    
+    for i in range(seq_len):
+        if i in pairs:
+            dist = pairs[i] - i
+            # Clamp to vocabulary limits just in case
+            idx = dist + OFFSET
+            idx = max(0, min(idx, Config.VOCAB_SIZE_PAIR - 1))
+            indices[i] = idx
+        else:
+            indices[i] = OFFSET # Distance 0
+
+    return indices
+
+
+def extract_features(df, split_name, load_cached=True):
+    """
+    Orchestrates the feature extraction process for a dataframe.
+    Computes Pair Indices for all samples.
+    Handles caching to disk.
+
+    Args:
+        df (pd.DataFrame): Dataframe containing 'structure' and 'seq_length'.
+        split_name (str): Name of the split (e.g., 'train', 'val', 'test') for cache naming.
+        load_cached (bool): Whether to attempt loading from cache.
+
+    Returns:
+        dict: Dictionary containing:
+            - 'pair_indices': torch.Tensor (N, L)
+    """
+    cache_file = os.path.join(Config.CACHE_DIR, f"{split_name}_features_v2.pt")
+
+    # 1. Try to load from cache
+    if load_cached and os.path.exists(cache_file):
+        print(f"Loading cached features from {cache_file}...")
+        try:
+            data = torch.load(cache_file)
+            return data
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Recomputing...")
+
+    # 2. Compute features
+    print(f"Computing geometric features for {split_name} set ({len(df)} samples)...")
+
+    pair_indices_list = []
+
+    structures = df["structure"].values
+
+    for idx, struct in enumerate(structures):
+        slen = len(struct)
+        
+        # Pair Indices (Discrete)
+        p_idx = get_distance_indices(struct, slen)
+        pair_indices_list.append(p_idx)
+
+    # Stack into tensors
+    pair_indices_tensor = torch.tensor(np.array(pair_indices_list), dtype=torch.long)
+
+    result = {"pair_indices": pair_indices_tensor}
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # extract_features returns a dict of tensors
+        features = extract_features(
+            self.df, feature_split_name, load_cached=load_cached
+        )
+        self.rwpe = features["rwpe"]  # (N, L, n_steps)
+        self.pair_enc = features["pair_enc"]  # (N, L, embed_dim)
+
+        # 4. Tokenize Sequences and Loop Types
+=======
+        # extract_features returns a dict of tensors
+        features = extract_features(
+            self.df, feature_split_name, load_cached=load_cached
+        )
+        self.pair_indices = features["pair_indices"]  # (N, L)
+
+        # 4. Tokenize Sequences and Loop Types
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        """
+        Returns:
+            dict: {
+                'seq': (L,),
+                'loop': (L,),
+                'rwpe': (L, n_steps),
+                'pair_enc': (L, pair_dim),
+                'targets': (L, 3) [Optional],
+                'mask': (L,) [Optional],
+                'id': str
+            }
+        """
+        sample = {
+            "seq": self.seq_ids[idx],
+            "loop": self.loop_ids[idx],
+            "rwpe": self.rwpe[idx],
+            "pair_enc": self.pair_enc[idx],
+            "id": self.ids[idx],
+        }
+
+        if self.targets is not None:
+=======
+    def __getitem__(self, idx):
+        """
+        Returns:
+            dict: {
+                'seq': (L,),
+                'loop': (L,),
+                'pair_indices': (L,),
+                'targets': (L, 3) [Optional],
+                'mask': (L,) [Optional],
+                'id': str
+            }
+        """
+        sample = {
+            "seq": self.seq_ids[idx],
+            "loop": self.loop_ids[idx],
+            "pair_indices": self.pair_indices[idx],
+            "id": self.ids[idx],
+        }
+
+        if self.targets is not None:
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StabilizedWideBiGRU(nn.Module):
+    """
+    Topologically-Augmented Stabilized Wide-Stream BiGRU.
+    Fuses atomic sequence, loop type, pairing distance, and RWPE features.
+    Uses a deep, wide BiGRU backbone with Pre-LayerNorm and Gradient Clipping support.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # ----------------------------------------------------------------------
+        # 1. Embeddings & Input Processing
+        # ----------------------------------------------------------------------
+        # Atomic Sequence Embedding
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE_SEQ, Config.EMBED_DIM_SEQ)
+
+        # Predicted Loop Type Embedding
+        self.loop_embed = nn.Embedding(Config.VOCAB_SIZE_LOOP, Config.EMBED_DIM_LOOP)
+
+        # Calculate Total Input Dimension for Early Fusion
+        # Seq (128) + Loop (64) + Pair (64) + RWPE (5) = 261
+        self.input_dim = (
+            Config.EMBED_DIM_SEQ
+            + Config.EMBED_DIM_LOOP
+            + Config.EMBED_DIM_PAIR
+            + len(Config.RWPE_STEPS)
+        )
+
+        # ----------------------------------------------------------------------
+        # 2. Recurrent Stem
+        # ----------------------------------------------------------------------
+        # Projects fused features to the wide residual stream (512)
+        self.stem = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            bidirectional=True,
+            batch_first=True,
+        )
+
+        # ----------------------------------------------------------------------
+        # 3. Wide-Stream Backbone
+        # ----------------------------------------------------------------------
+        # Stack of Residual BiGRU Blocks
+        self.blocks = nn.ModuleList(
+            [
+                ResidualBiGRUBlock(Config.HIDDEN_DIM, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # ----------------------------------------------------------------------
+        # 4. Aggregation & Output
+        # ----------------------------------------------------------------------
+        # Mix outputs from Stem + 6 Blocks (Total 7 layers)
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # Final projection to targets
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.NUM_TARGETS)
+
+    def forward(self, seq, loop, rwpe, pair_enc):
+        """
+        Args:
+            seq (torch.Tensor): (Batch, Seq_Len) - Sequence IDs
+            loop (torch.Tensor): (Batch, Seq_Len) - Loop Type IDs
+            rwpe (torch.Tensor): (Batch, Seq_Len, n_steps) - Random Walk probabilities
+            pair_enc (torch.Tensor): (Batch, Seq_Len, pair_dim) - Sinusoidal Pair Encodings
+
+        Returns:
+            torch.Tensor: (Batch, Seq_Len, 3) - Predicted values
+        """
+        # 1. Embed Discrete Features
+        emb_seq = self.seq_embed(seq)  # (B, L, 128)
+        emb_loop = self.loop_embed(loop)  # (B, L, 64)
+
+        # 2. Early Fusion (Concatenation)
+        # Concatenate: Seq(128) + Loop(64) + Pair(64) + RWPE(5)
+        x = torch.cat([emb_seq, emb_loop, pair_enc, rwpe], dim=-1)
+
+        # 3. Stem Processing
+        stem_out, _ = self.stem(x)  # (B, L, 512)
+=======
+class StabilizedWideBiGRU(nn.Module):
+    """
+    Stabilized Wide-Stream BiGRU.
+    Fuses atomic sequence, loop type, and discrete pairing distance features.
+    Uses a deep, wide BiGRU backbone with Pre-LayerNorm and Gradient Clipping support.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # ----------------------------------------------------------------------
+        # 1. Embeddings & Input Processing
+        # ----------------------------------------------------------------------
+        # Atomic Sequence Embedding
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE_SEQ, Config.EMBED_DIM_SEQ)
+
+        # Predicted Loop Type Embedding
+        self.loop_embed = nn.Embedding(Config.VOCAB_SIZE_LOOP, Config.EMBED_DIM_LOOP)
+        
+        # Discrete Pair Distance Embedding
+        self.pair_embed = nn.Embedding(Config.VOCAB_SIZE_PAIR, Config.EMBED_DIM_PAIR)
+
+        # Calculate Total Input Dimension for Early Fusion
+        self.input_dim = (
+            Config.EMBED_DIM_SEQ
+            + Config.EMBED_DIM_LOOP
+            + Config.EMBED_DIM_PAIR
+        )
+
+        # ----------------------------------------------------------------------
+        # 2. Recurrent Stem
+        # ----------------------------------------------------------------------
+        # Projects fused features to the wide residual stream (384)
+        self.stem = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            bidirectional=True,
+            batch_first=True,
+        )
+
+        # ----------------------------------------------------------------------
+        # 3. Wide-Stream Backbone
+        # ----------------------------------------------------------------------
+        # Stack of Residual BiGRU Blocks
+        self.blocks = nn.ModuleList(
+            [
+                ResidualBiGRUBlock(Config.HIDDEN_DIM, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # ----------------------------------------------------------------------
+        # 4. Aggregation & Output
+        # ----------------------------------------------------------------------
+        # Mix outputs from Stem + 6 Blocks (Total 7 layers)
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # Final projection to targets
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.NUM_TARGETS)
+
+    def forward(self, seq, loop, pair_indices):
+        """
+        Args:
+            seq (torch.Tensor): (Batch, Seq_Len) - Sequence IDs
+            loop (torch.Tensor): (Batch, Seq_Len) - Loop Type IDs
+            pair_indices (torch.Tensor): (Batch, Seq_Len) - Pair Distance IDs
+
+        Returns:
+            torch.Tensor: (Batch, Seq_Len, 3) - Predicted values
+        """
+        # 1. Embed Discrete Features
+        emb_seq = self.seq_embed(seq)  # (B, L, 100)
+        emb_loop = self.loop_embed(loop)  # (B, L, 64)
+        emb_pair = self.pair_embed(pair_indices) # (B, L, 64)
+
+        # 2. Early Fusion (Concatenation)
+        x = torch.cat([emb_seq, emb_loop, emb_pair], dim=-1)
+
+        # 3. Stem Processing
+        stem_out, _ = self.stem(x)  # (B, L, 384)
+>>>>>>> REPLACE
+```
+
+```diff
+library/runner.py
+<<<<<<< SEARCH
+    for batch in dataloader:
+        # Move data to device
+        seq = batch["seq"].to(device)
+        loop = batch["loop"].to(device)
+        rwpe = batch["rwpe"].to(device)
+        pair_enc = batch["pair_enc"].to(device)
+        targets = batch["targets"].to(device)
+        mask = batch["mask"].to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        preds = model(seq, loop, rwpe, pair_enc)
+
+        # Compute loss
+=======
+    for batch in dataloader:
+        # Move data to device
+        seq = batch["seq"].to(device)
+        loop = batch["loop"].to(device)
+        pair_indices = batch["pair_indices"].to(device)
+        targets = batch["targets"].to(device)
+        mask = batch["mask"].to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        preds = model(seq, loop, pair_indices)
+
+        # Compute loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/runner.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in dataloader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            rwpe = batch["rwpe"].to(device)
+            pair_enc = batch["pair_enc"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, rwpe, pair_enc)
+
+            # Compute metric
+=======
+    with torch.no_grad():
+        for batch in dataloader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_indices = batch["pair_indices"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, pair_indices)
+
+            # Compute metric
+>>>>>>> REPLACE
+```
+
+```diff
+library/runner.py
+<<<<<<< SEARCH
+    print("Running inference...")
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            rwpe = batch["rwpe"].to(device)
+            pair_enc = batch["pair_enc"].to(device)
+            ids = batch["id"]  # List of strings
+
+            # (Batch, Seq_Len, 3)
+            preds = model(seq, loop, rwpe, pair_enc)
+
+            all_preds.append(preds.cpu().numpy())
+=======
+    print("Running inference...")
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_indices = batch["pair_indices"].to(device)
+            ids = batch["id"]  # List of strings
+
+            # (Batch, Seq_Len, 3)
+            preds = model(seq, loop, pair_indices)
+
+            all_preds.append(preds.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def evaluate_full(model, dataloader, device):
+    """
+    Computes MCRMSE on the full dataset to ensure exact precision.
+    Averaging batch MCRMSEs is an approximation; this function concatenates
+    all predictions and targets first.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_masks = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            rwpe = batch["rwpe"].to(device)
+            pair_enc = batch["pair_enc"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, rwpe, pair_enc)
+
+            all_preds.append(preds)
+            all_targets.append(targets)
+            all_masks.append(mask)
+
+    # Concatenate all batches
+    full_preds = torch.cat(all_preds, dim=0)
+    full_targets = torch.cat(all_targets, dim=0)
+    full_masks = torch.cat(all_masks, dim=0)
+
+    # Compute metric using the library function
+    score = mcrmse(full_preds, full_targets, full_masks)
+    return score.item()
+
+
+def run_failure_analysis(model, val_loader, val_df, device):
+    """
+    Analyzes model performance on the validation set.
+    Computes RMSE per sample and correlates it with metadata features.
+    """
+    print("\nRunning Failure Analysis on Validation Set...")
+    model.eval()
+
+    all_sample_errors = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            rwpe = batch["rwpe"].to(device)
+            pair_enc = batch["pair_enc"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, rwpe, pair_enc)
+
+            # Compute RMSE per sample
+            # Squared error: (Batch, Seq, 3)
+            squared_diff = (preds - targets) ** 2
+=======
+def evaluate_full(model, dataloader, device):
+    """
+    Computes MCRMSE on the full dataset to ensure exact precision.
+    Averaging batch MCRMSEs is an approximation; this function concatenates
+    all predictions and targets first.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_masks = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_indices = batch["pair_indices"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, pair_indices)
+
+            all_preds.append(preds)
+            all_targets.append(targets)
+            all_masks.append(mask)
+
+    # Concatenate all batches
+    full_preds = torch.cat(all_preds, dim=0)
+    full_targets = torch.cat(all_targets, dim=0)
+    full_masks = torch.cat(all_masks, dim=0)
+
+    # Compute metric using the library function
+    score = mcrmse(full_preds, full_targets, full_masks)
+    return score.item()
+
+
+def run_failure_analysis(model, val_loader, val_df, device):
+    """
+    Analyzes model performance on the validation set.
+    Computes RMSE per sample and correlates it with metadata features.
+    """
+    print("\nRunning Failure Analysis on Validation Set...")
+    model.eval()
+
+    all_sample_errors = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            seq = batch["seq"].to(device)
+            loop = batch["loop"].to(device)
+            pair_indices = batch["pair_indices"].to(device)
+            targets = batch["targets"].to(device)
+            mask = batch["mask"].to(device)
+
+            preds = model(seq, loop, pair_indices)
+
+            # Compute RMSE per sample
+            # Squared error: (Batch, Seq, 3)
+            squared_diff = (preds - targets) ** 2
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # 1. Configuration & Setup
+    # --------------------------------------------------------------------------
+    # Override Config for Fast Baseline execution
+    Config.NUM_EPOCHS = 15
+    Config.BATCH_SIZE = 32
+
+    set_seed(Config.SEED)
+=======
+    # --------------------------------------------------------------------------
+    # 1. Configuration & Setup
+    # --------------------------------------------------------------------------
+    # Override Config for Fast Baseline execution
+    Config.NUM_EPOCHS = 20
+    Config.BATCH_SIZE = 32
+
+    set_seed(Config.SEED)
+>>>>>>> REPLACE
+```

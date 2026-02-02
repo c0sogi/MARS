@@ -1,0 +1,339 @@
+To resolve the `torch.OutOfMemoryError` caused by the large model size and batch configuration, I will implement a comprehensive memory optimization strategy.
+
+1.  **Reduce Batch Size**: I will lower `train_batch_size` from 16 to 8 in `library/config.py` to fit the `DeBERTa-v3-large` model within the 16GB VRAM limit. Cite {debug_lesson_13}.
+2.  **Enable Gradient Checkpointing & Disable Cache**: In `library/model.py`, I will explicitly set `config.use_cache = False` (Cite {debug_lesson_5}) and enable gradient checkpointing on the backbone (Cite {debug_lesson_8}). This trades computation for memory by recomputing activations during the backward pass.
+3.  **Implement Mixed Precision (AMP)**: In `library/engine.py` and `runfile.py`, I will introduce `torch.amp.autocast` and `torch.amp.GradScaler`. This reduces memory usage by performing operations in float16 where possible. I will also ensure the `scaler` handles the adversarial weight perturbation (AWP) steps correctly by scaling gradients before backward passes and unscaling them before clipping. Cite {debug_lesson_8}.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    epochs = 5  # Extended training time for convergence
+    n_folds = 5
+
+    train_batch_size = 16  # Adjusted for A100 40GB with Large model + AWP
+    valid_batch_size = 32
+=======
+    epochs = 5  # Extended training time for convergence
+    n_folds = 5
+
+    train_batch_size = 8  # Reduced to 8 to fit in 16GB VRAM with Large model
+    valid_batch_size = 32
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # 1. Load Configuration and Backbone
+        self.config = AutoConfig.from_pretrained(Config.model_name)
+        self.config.output_hidden_states = True  # Crucial for Scalar Mixing
+        self.config.hidden_dropout_prob = Config.hidden_dropout_prob
+        self.config.attention_probs_dropout_prob = Config.attention_probs_dropout_prob
+
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(
+                Config.model_name, config=self.config
+            )
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        # 2. Scalar Layer Mixing
+=======
+        # 1. Load Configuration and Backbone
+        self.config = AutoConfig.from_pretrained(Config.model_name)
+        self.config.output_hidden_states = True  # Crucial for Scalar Mixing
+        self.config.use_cache = False  # Disable cache for gradient checkpointing compatibility
+        self.config.hidden_dropout_prob = Config.hidden_dropout_prob
+        self.config.attention_probs_dropout_prob = Config.attention_probs_dropout_prob
+
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(
+                Config.model_name, config=self.config
+            )
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        # Enable Gradient Checkpointing
+        self.backbone.gradient_checkpointing_enable()
+
+        # 2. Scalar Layer Mixing
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    awp=None,
+    ema=None,
+    loss_fn=None,
+):
+    """
+    Executes one training epoch.
+    Includes logic for Hybrid Loss, AWP, Gradient Clipping, LLRD (via optimizer), and EMA.
+    """
+    model.train()
+    losses = AverageMeter()
+
+    # Ensure gradients are zero before starting
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(train_loader):
+        # Move batch to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch["token_type_ids"].to(device)
+        labels = batch["label"].to(device)
+
+        batch_size = labels.size(0)
+
+        # -----------------------------------------------------------
+        # 1. Standard Forward Pass
+        # -----------------------------------------------------------
+        outputs = model(input_ids, attention_mask, token_type_ids)
+        loss, loss_dict = loss_fn(outputs, labels)
+
+        # -----------------------------------------------------------
+        # 2. Standard Backward Pass
+        # -----------------------------------------------------------
+        loss.backward()
+
+        # -----------------------------------------------------------
+        # 3. Adversarial Weight Perturbation (AWP)
+        # -----------------------------------------------------------
+        if config.use_awp and awp is not None and awp.should_apply(epoch):
+            # Save original weights and perturb them based on accumulated gradients
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            adv_outputs = model(input_ids, attention_mask, token_type_ids)
+            adv_loss, _ = loss_fn(adv_outputs, labels)
+
+            # Backward pass with perturbed weights (accumulate gradients)
+            adv_loss.backward()
+
+            # Restore original weights (gradients remain accumulated)
+            awp.restore()
+
+        # -----------------------------------------------------------
+        # 4. Optimization Step
+        # -----------------------------------------------------------
+        # Clip gradients to prevent exploding gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), config.max_grad_norm
+        )
+
+        optimizer.step()
+
+        # Update Learning Rate Scheduler (usually per step for Transformers)
+=======
+    awp=None,
+    ema=None,
+    loss_fn=None,
+    scaler=None,
+):
+    """
+    Executes one training epoch with Mixed Precision and AWP.
+    """
+    model.train()
+    losses = AverageMeter()
+
+    # Ensure gradients are zero before starting
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(train_loader):
+        # Move batch to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch["token_type_ids"].to(device)
+        labels = batch["label"].to(device)
+
+        batch_size = labels.size(0)
+
+        # -----------------------------------------------------------
+        # 1. Standard Forward Pass (Mixed Precision)
+        # -----------------------------------------------------------
+        with torch.amp.autocast("cuda"):
+            outputs = model(input_ids, attention_mask, token_type_ids)
+            loss, loss_dict = loss_fn(outputs, labels)
+
+        # -----------------------------------------------------------
+        # 2. Standard Backward Pass (Scaled)
+        # -----------------------------------------------------------
+        scaler.scale(loss).backward()
+
+        # -----------------------------------------------------------
+        # 3. Adversarial Weight Perturbation (AWP)
+        # -----------------------------------------------------------
+        if config.use_awp and awp is not None and awp.should_apply(epoch):
+            # AWP works with scaled gradients (direction is preserved)
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            with torch.amp.autocast("cuda"):
+                adv_outputs = model(input_ids, attention_mask, token_type_ids)
+                adv_loss, _ = loss_fn(adv_outputs, labels)
+
+            # Backward pass with perturbed weights (accumulate scaled gradients)
+            scaler.scale(adv_loss).backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # -----------------------------------------------------------
+        # 4. Optimization Step
+        # -----------------------------------------------------------
+        # Unscale gradients before clipping
+        scaler.unscale_(optimizer)
+
+        # Clip gradients to prevent exploding gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), config.max_grad_norm
+        )
+
+        # Scaler step (skips if NaNs found)
+        scaler.step(optimizer)
+        scaler.update()
+
+        # Update Learning Rate Scheduler (usually per step for Transformers)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            batch_size = labels.size(0)
+
+            outputs = model(input_ids, attention_mask, token_type_ids)
+
+            # Calculate validation loss
+            loss, _ = loss_fn(outputs, labels)
+            losses.update(loss.item(), batch_size)
+
+            # Extract regression logits (first element of tuple)
+            logits = outputs[0]
+
+            # Store predictions and targets
+            preds.append(logits.view(-1).cpu().numpy())
+            targets.append(labels.view(-1).cpu().numpy())
+=======
+            batch_size = labels.size(0)
+
+            # Use autocast for inference memory efficiency
+            with torch.amp.autocast("cuda"):
+                outputs = model(input_ids, attention_mask, token_type_ids)
+                loss, _ = loss_fn(outputs, labels)
+
+            losses.update(loss.item(), batch_size)
+
+            # Extract regression logits (first element of tuple)
+            logits = outputs[0]
+
+            # Store predictions and targets
+            preds.append(logits.view(-1).float().cpu().numpy())
+            targets.append(labels.view(-1).float().cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+
+            outputs = model(input_ids, attention_mask, token_type_ids)
+
+            # Extract regression logits
+            logits = outputs[0]
+
+            preds.append(logits.view(-1).cpu().numpy())
+=======
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+
+            with torch.amp.autocast("cuda"):
+                outputs = model(input_ids, attention_mask, token_type_ids)
+
+            # Extract regression logits
+            logits = outputs[0]
+
+            preds.append(logits.view(-1).float().cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    logger.info("Initializing Model...")
+    model = ScalarMixingModel(pretrained=True)
+    model.to(Config.device)
+
+    # Layer-wise Learning Rate Decay (LLRD) Setup
+=======
+    logger.info("Initializing Model...")
+    model = ScalarMixingModel(pretrained=True)
+    model.to(Config.device)
+
+    # Initialize GradScaler for AMP
+    scaler = torch.amp.GradScaler("cuda")
+
+    # Layer-wise Learning Rate Decay (LLRD) Setup
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Train
+        train_loss = train_fn(
+            train_loader,
+            model,
+            optimizer,
+            Config.device,
+            scheduler,
+            epoch,
+            Config,
+            awp,
+            ema,
+            loss_fn,
+        )
+=======
+        # Train
+        train_loss = train_fn(
+            train_loader,
+            model,
+            optimizer,
+            Config.device,
+            scheduler,
+            epoch,
+            Config,
+            awp,
+            ema,
+            loss_fn,
+            scaler,
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            token_type_ids = batch["token_type_ids"].to(Config.device)
+            labels = batch["label"].to(Config.device)
+
+            outputs = model(input_ids, attention_mask, token_type_ids)
+            # Regression logits are the first output
+            val_preds.append(outputs[0].view(-1).cpu().numpy())
+            val_targets.append(labels.view(-1).cpu().numpy())
+=======
+            token_type_ids = batch["token_type_ids"].to(Config.device)
+            labels = batch["label"].to(Config.device)
+
+            with torch.amp.autocast("cuda"):
+                outputs = model(input_ids, attention_mask, token_type_ids)
+            # Regression logits are the first output
+            val_preds.append(outputs[0].view(-1).float().cpu().numpy())
+            val_targets.append(labels.view(-1).float().cpu().numpy())
+>>>>>>> REPLACE
+```

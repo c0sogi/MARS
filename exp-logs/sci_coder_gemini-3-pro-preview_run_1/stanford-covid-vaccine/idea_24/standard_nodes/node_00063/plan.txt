@@ -1,0 +1,374 @@
+I will optimize the solution by replacing the Token-Adaptive Layer Aggregation (TALA) with a Global Scalar Mixture aggregation, as Lesson `solution_lesson_node_00061` indicates that global static aggregation outperforms local dynamic gating in noisy regimes. Additionally, I will restore the model capacity (Hidden Dim 384, 6 Layers) and training duration (20 Epochs) by removing the baseline overrides in `runfile.py`, adhering to Lesson `solution_lesson_node_00022` (Hidden Dimension Criticality) and Lesson `solution_lesson_node_00056` (Gradient Update Budget).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PROJECT_NAME = "RNA_Degradation_Prediction"
+    EXPERIMENT_NAME = "idea_24"  # Token-Adaptive Wide-Stream Residual BiGRU
+    SEED = 42
+=======
+    PROJECT_NAME = "RNA_Degradation_Prediction"
+    EXPERIMENT_NAME = "idea_25"  # Scalar-Aggregated Wide-Stream Residual BiGRU
+    SEED = 42
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TALA(nn.Module):
+    """
+    Token-Adaptive Layer Aggregation.
+    Dynamically computes position-specific weights to aggregate hidden states from all hierarchy levels.
+    """
+
+    def __init__(self, hidden_dim, num_sources):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_sources = num_sources
+
+        # Lightweight MLP to predict mixing weights based on the final layer's context
+        self.attention_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, num_sources),
+        )
+
+    def forward(self, hidden_states):
+        """
+        Args:
+            hidden_states: List of tensors, each of shape (B, L, W).
+                           Represents [stem_out, layer_1, ..., layer_N].
+        Returns:
+            Aggregated tensor of shape (B, L, W).
+        """
+        # Stack states along a new dimension: (B, L, Num_Sources, W)
+        stack = torch.stack(hidden_states, dim=2)
+
+        # Use the deepest representation (final layer) as the query for context
+        final_state = hidden_states[-1]  # (B, L, W)
+
+        # Predict logits for weights: (B, L, Num_Sources)
+        scores = self.attention_mlp(final_state)
+
+        # Normalize to get valid attention weights
+        weights = F.softmax(scores, dim=-1)
+
+        # Expand for broadcasting: (B, L, Num_Sources, 1)
+        weights_expanded = weights.unsqueeze(-1)
+
+        # Weighted sum over the source dimension
+        # (B, L, Num_Sources, W) * (B, L, Num_Sources, 1) -> Sum over dim 2
+        aggregated = torch.sum(stack * weights_expanded, dim=2)
+
+        return aggregated
+
+
+class TokenAdaptiveWideResBiGRU(nn.Module):
+    """
+    Main Architecture: Token-Adaptive Wide-Stream Residual BiGRU.
+    Combines multi-modal embeddings, a deep residual recurrent backbone, and
+    dynamic hierarchical aggregation.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Input Embeddings
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE, Config.EMBED_DIM)
+        self.loop_embed = nn.Embedding(Config.LOOP_VOCAB_SIZE, Config.LOOP_EMBED_DIM)
+        self.dist_embed = SinusoidalPositionalEmbedding(Config.DIST_EMBED_DIM)
+
+        # Concatenated Input Dimension
+        input_dim = Config.EMBED_DIM + Config.LOOP_EMBED_DIM + Config.DIST_EMBED_DIM
+
+        # 2. Recurrent Stem
+        # Projects inputs to the Wide Stream width (HIDDEN_DIM)
+        self.stem = nn.GRU(
+            input_size=input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.stem_dropout = nn.Dropout(Config.DROPOUT)
+
+        # 3. Backbone: Wide-Stream Residual Blocks
+        self.layers = nn.ModuleList(
+            [
+                WideResBiGRUBlock(Config.HIDDEN_DIM, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Token-Adaptive Layer Aggregation
+        # Sources = Stem + N Layers
+        num_sources = 1 + Config.NUM_LAYERS
+        self.tala = TALA(Config.HIDDEN_DIM, num_sources)
+
+        # 5. Output Head
+        # Shared projection for all targets
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.NUM_TARGETS)
+
+    def forward(self, sequence, loop_type, pair_dist):
+        """
+        Args:
+            sequence: (B, L) LongTensor
+            loop_type: (B, L) LongTensor
+            pair_dist: (B, L) FloatTensor (Signed distances)
+        Returns:
+            (B, L, 3) FloatTensor containing predictions
+        """
+        # --- Embeddings ---
+        emb_seq = self.seq_embed(sequence)  # (B, L, E_seq)
+        emb_loop = self.loop_embed(loop_type)  # (B, L, E_loop)
+        emb_dist = self.dist_embed(pair_dist)  # (B, L, E_dist)
+
+        # Concatenate features
+        x = torch.cat([emb_seq, emb_loop, emb_dist], dim=-1)  # (B, L, Input_Dim)
+
+        # --- Stem ---
+        x, _ = self.stem(x)  # (B, L, W)
+        x = self.stem_dropout(x)
+
+        # Initialize list of hidden states with the stem output
+        hidden_states = [x]
+
+        # --- Backbone ---
+        for layer in self.layers:
+            x = layer(x)
+            hidden_states.append(x)
+
+        # --- Aggregation (TALA) ---
+        # Dynamically aggregate information from all depths
+        agg_state = self.tala(hidden_states)  # (B, L, W)
+
+        # --- Head ---
+        out = self.head(agg_state)  # (B, L, 3)
+
+        return out
+=======
+class ScalarMixture(nn.Module):
+    """
+    Computes a learnable weighted sum of a list of tensors.
+    Cite solution_lesson_node_00061: Global Static Aggregation Outperforms Local Dynamic Gating.
+    """
+
+    def __init__(self, num_sources):
+        super().__init__()
+        self.weights = nn.Parameter(torch.zeros(num_sources))
+
+    def forward(self, tensors):
+        """
+        Args:
+            tensors: List of tensors, each of shape (..., D).
+        Returns:
+            Tensor of shape (..., D).
+        """
+        # Stack tensors along a new last dimension: (..., D, Num_Sources)
+        stacked = torch.stack(tensors, dim=-1)
+        
+        # Softmax weights to ensure they sum to 1
+        norm_weights = F.softmax(self.weights, dim=0)
+        
+        # Weighted sum over the source dimension
+        # Broadcasting: (..., D, Num_Sources) * (Num_Sources,)
+        out = torch.sum(stacked * norm_weights, dim=-1)
+        
+        return out
+
+
+class ScalarAggregatedWideResBiGRU(nn.Module):
+    """
+    Main Architecture: Scalar-Aggregated Wide-Stream Residual BiGRU.
+    Uses global scalar mixing to aggregate hierarchical features.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Input Embeddings
+        self.seq_embed = nn.Embedding(Config.VOCAB_SIZE, Config.EMBED_DIM)
+        self.loop_embed = nn.Embedding(Config.LOOP_VOCAB_SIZE, Config.LOOP_EMBED_DIM)
+        self.dist_embed = SinusoidalPositionalEmbedding(Config.DIST_EMBED_DIM)
+
+        # Concatenated Input Dimension
+        input_dim = Config.EMBED_DIM + Config.LOOP_EMBED_DIM + Config.DIST_EMBED_DIM
+
+        # 2. Recurrent Stem
+        # Projects inputs to the Wide Stream width (HIDDEN_DIM)
+        self.stem = nn.GRU(
+            input_size=input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.stem_dropout = nn.Dropout(Config.DROPOUT)
+
+        # 3. Backbone: Wide-Stream Residual Blocks
+        self.layers = nn.ModuleList(
+            [
+                WideResBiGRUBlock(Config.HIDDEN_DIM, Config.DROPOUT)
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Scalar Mixture Aggregation
+        # Sources = Stem + N Layers
+        num_sources = 1 + Config.NUM_LAYERS
+        self.scalar_mixture = ScalarMixture(num_sources)
+
+        # 5. Output Head
+        # Shared projection for all targets
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.NUM_TARGETS)
+
+    def forward(self, sequence, loop_type, pair_dist):
+        """
+        Args:
+            sequence: (B, L) LongTensor
+            loop_type: (B, L) LongTensor
+            pair_dist: (B, L) FloatTensor (Signed distances)
+        Returns:
+            (B, L, 3) FloatTensor containing predictions
+        """
+        # --- Embeddings ---
+        emb_seq = self.seq_embed(sequence)  # (B, L, E_seq)
+        emb_loop = self.loop_embed(loop_type)  # (B, L, E_loop)
+        emb_dist = self.dist_embed(pair_dist)  # (B, L, E_dist)
+
+        # Concatenate features
+        x = torch.cat([emb_seq, emb_loop, emb_dist], dim=-1)  # (B, L, Input_Dim)
+
+        # --- Stem ---
+        x, _ = self.stem(x)  # (B, L, W)
+        x = self.stem_dropout(x)
+
+        # Initialize list of hidden states with the stem output
+        hidden_states = [x]
+
+        # --- Backbone ---
+        for layer in self.layers:
+            x = layer(x)
+            hidden_states.append(x)
+
+        # --- Aggregation (Scalar Mixture) ---
+        agg_state = self.scalar_mixture(hidden_states)  # (B, L, W)
+
+        # --- Head ---
+        out = self.head(agg_state)  # (B, L, 3)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import TokenAdaptiveWideResBiGRU
+=======
+from library.model import ScalarAggregatedWideResBiGRU
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # --- Model Initialization ---
+    print("Initializing Model...")
+    model = TokenAdaptiveWideResBiGRU()
+    model.to(device)
+=======
+    # --- Model Initialization ---
+    print("Initializing Model...")
+    model = ScalarAggregatedWideResBiGRU()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # --- Inference on Test Set ---
+    print("Starting Inference on Test Set...")
+
+    # Load Best Model
+    model = TokenAdaptiveWideResBiGRU()
+    model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+    model.to(device)
+=======
+    # --- Inference on Test Set ---
+    print("Starting Inference on Test Set...")
+
+    # Load Best Model
+    model = ScalarAggregatedWideResBiGRU()
+    model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import TokenAdaptiveWideResBiGRU
+from library.engine import train_fn, eval_fn, inference_fn
+=======
+from library.model import ScalarAggregatedWideResBiGRU
+from library.engine import train_fn, eval_fn, inference_fn
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration Overrides for Fast Baseline
+    # Reducing complexity and epochs to satisfy "fast baseline" requirement
+    Config.EPOCHS = 10
+    Config.NUM_LAYERS = 4
+    Config.HIDDEN_DIM = 256
+
+    # Set Seed
+    seed_everything(Config.SEED)
+=======
+def main():
+    # 1. Configuration
+    # Cite solution_lesson_node_00056: Maintain gradient update budget.
+    # Cite solution_lesson_node_00022: Hidden Dimension Criticality.
+    # We restore the full capacity and training duration.
+    Config.EPOCHS = 20
+    
+    # Set Seed
+    seed_everything(Config.SEED)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = TokenAdaptiveWideResBiGRU()
+    model.to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = ScalarAggregatedWideResBiGRU()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Submission Logic
+    THRESHOLD = 0.6209375959946717
+
+    if final_metric < THRESHOLD:
+=======
+    # 7. Submission Logic
+    THRESHOLD = 0.6199890971183777
+
+    if final_metric < THRESHOLD:
+>>>>>>> REPLACE
+```

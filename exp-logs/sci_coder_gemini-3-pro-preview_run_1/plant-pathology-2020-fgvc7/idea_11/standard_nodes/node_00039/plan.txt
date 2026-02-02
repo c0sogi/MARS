@@ -1,0 +1,183 @@
+I will implement the following optimization strategy:
+
+1.  **Synchronize Scheduler**: I will update `Config.EPOCHS` and `Config.T_0` to 10. This ensures the Cosine Annealing scheduler completes a full cycle within the training budget, allowing the learning rate to decay to its minimum for optimal fine-tuning (Cite solution_lesson_node_00015).
+2.  **Enhance Augmentation**: I will increase the `rotate_limit` from 15 to 30 degrees in `library/dataset.py`. Since apple leaves are rotationally invariant, wider rotations improve the model's ability to generalize (Cite solution_lesson_node_00030).
+3.  **Streamline Pipeline**: I will remove the "Phase 1: Proxy Calibration" step from `runfile.py`. Based on the baseline's success and previous empirical findings, I will rely on the 10-epoch schedule and enable Test-Time Augmentation (TTA) by default. This saves computational time and focuses resources on training the ensemble.
+4.  **Execute Ensemble**: The script will proceed directly to training the 5-seed ensemble on the training set and evaluating it on the hold-out validation set.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Scheduler (Cosine Annealing Warm Restarts)
+    # Cycle length synchronized with total epoch budget
+    EPOCHS = 15
+    T_0 = 15
+    T_MULT = 1
+=======
+    # Scheduler (Cosine Annealing Warm Restarts)
+    # Cycle length synchronized with total epoch budget
+    # Cite solution_lesson_node_00015: Synchronize cycle length with budget
+    EPOCHS = 10
+    T_0 = 10
+    T_MULT = 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                # Robust Augmentation: ShiftScaleRotate and RandomBrightnessContrast
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5
+                ),
+=======
+                # Robust Augmentation: ShiftScaleRotate and RandomBrightnessContrast
+                # Cite solution_lesson_node_00030: Use wider rotation for rotationally invariant data
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5
+                ),
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 2. Phase 1: Proxy Calibration (5-Fold CV)
+    # ==========================================
+    # Purpose: Find optimal epoch and determine TTA strategy
+    print("\n==== Phase 1: Proxy Calibration (5-Fold CV) ====")
+
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Storage for metrics
+    fold_val_aucs = np.zeros((Config.N_FOLDS, Config.EPOCHS))
+    fold_models = []  # Store (model, val_loader) for TTA check
+
+    # Prepare stratification label
+    if "stratify_label" in train_df.columns:
+        y_strat = train_df["stratify_label"]
+    else:
+        y_strat = train_df[Config.CLASS_LABELS].idxmax(axis=1)
+
+    # Calculate class weights once for the training set
+    class_weights = get_class_weights(train_df, device=device)
+
+    for fold, (train_idx, cv_val_idx) in enumerate(skf.split(train_df, y_strat)):
+        # Create Fold DataFrames
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[cv_val_idx].reset_index(drop=True)
+
+        # Datasets & Loaders
+        train_dataset = AppleDataset(fold_train_df, transforms=get_transforms("train"))
+        val_dataset = AppleDataset(fold_val_df, transforms=get_transforms("valid"))
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY,
+        )
+
+        # Initialize Model & Optimization
+        model = AppleResNet34(pretrained=True).to(device)
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler: Cosine Annealing synchronized with EPOCHS
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.T_0, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+
+        criterion = WeightedCrossEntropyLoss(weights=class_weights, device=device)
+
+        # Training Loop
+        for epoch in range(Config.EPOCHS):
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, scheduler
+            )
+            val_loss, val_auc = valid_one_epoch(model, val_loader, criterion, device)
+            fold_val_aucs[fold, epoch] = val_auc
+
+        # Move model to CPU to save GPU memory, store for TTA check
+        model.to("cpu")
+        fold_models.append((model, val_loader))
+
+    # --- Analyze Phase 1 Results ---
+
+    # 1. Determine Optimal Epoch
+    mean_auc_per_epoch = fold_val_aucs.mean(axis=0)
+    best_epoch_idx = np.argmax(mean_auc_per_epoch)
+    optimal_epochs = best_epoch_idx + 1
+    print(
+        f"Optimal Epoch determined via CV: {optimal_epochs} (AUC: {mean_auc_per_epoch[best_epoch_idx]:.5f})"
+    )
+
+    # 2. Determine TTA Strategy
+    # We check TTA efficacy using the trained fold models
+    print("Checking TTA efficacy...")
+    auc_no_tta = []
+    auc_tta = []
+
+    for model, loader in fold_models:
+        model.to(device)
+
+        # Get ground truth
+        all_targets = []
+        for _, t in loader:
+            all_targets.append(t.numpy())
+        all_targets = np.concatenate(all_targets)
+
+        # Inference without TTA
+        preds_no_tta = inference_fn(model, loader, device, use_tta=False)
+        auc_no_tta.append(calculate_roc_auc(all_targets, preds_no_tta))
+
+        # Inference with TTA
+        preds_tta = inference_fn(model, loader, device, use_tta=True)
+        auc_tta.append(calculate_roc_auc(all_targets, preds_tta))
+
+        model.to("cpu")
+
+    mean_auc_no_tta = np.mean(auc_no_tta)
+    mean_auc_tta = np.mean(auc_tta)
+
+    use_tta = mean_auc_tta > mean_auc_no_tta
+    print(
+        f"TTA Check: No TTA={mean_auc_no_tta:.5f}, TTA={mean_auc_tta:.5f} -> Use TTA: {use_tta}"
+    )
+
+    # ==========================================
+    # 3. Phase 2: Production Training
+    # ==========================================
+    # Purpose: Train ensemble on 100% of training data for optimal_epochs
+    print("\n==== Phase 2: Production Training (Full-Data Seed Ensemble) ====")
+=======
+    # Calculate class weights once for the training set
+    class_weights = get_class_weights(train_df, device=device)
+
+    # ==========================================
+    # 2. Production Training (Full-Data Seed Ensemble)
+    # ==========================================
+    # Cite solution_lesson_node_00015: Using synchronized 10-epoch schedule
+    # Cite solution_lesson_node_00034: TTA was found beneficial in previous runs
+    print("\n==== Production Training (Full-Data Seed Ensemble) ====")
+
+    optimal_epochs = Config.EPOCHS
+    use_tta = True
+    print(f"Training for {optimal_epochs} epochs per model.")
+    print(f"Using TTA: {use_tta}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,490 @@
+Based on the provided lessons and empirical findings, I will implement a strategy to optimize the solution by reverting from the Parallel DCN-V2 architecture to a robust, Wide MLP, which was identified as the superior architecture in previous experiments.
+
+**Strategy:**
+1.  **Architecture Simplification (Cite solution_lesson_node_00006):** I will replace the `ParallelDCN` model with a `ManufacturingMLP` class. This removes the explicit feature crossing layers which were found to degrade performance compared to a high-capacity MLP on this dense tabular dataset.
+2.  **Capacity Enhancement (Cite solution_lesson_node_00002):** The MLP will be configured with a deeper and wider structure `[512, 256, 128]` to capture complex non-linear interactions between the continuous features and character embeddings.
+3.  **Batch Normalization & Dropout (Cite solution_lesson_node_00007):** I will implement the specific block structure `Linear -> ReLU -> BatchNorm -> Dropout` that proved essential for convergence in "Idea 1". I will also reduce the dropout rate from 0.2 to 0.1 as per the successful baseline configuration.
+4.  **Training Duration (Cite solution_lesson_node_00003):** I will increase the training epochs from 15 to 25. Previous analysis showed that while loss plateaued around epoch 15, the AUC metric continued to improve, indicating that early stopping was premature.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Experiment Specific Directory (Idea 2)
+IDEA_DIR = os.path.join(WORKING_DIR, "idea_2")
+
+# Create necessary writable directories
+os.makedirs(IDEA_DIR, exist_ok=True)
+=======
+# Experiment Specific Directory (Idea 3)
+IDEA_DIR = os.path.join(WORKING_DIR, "idea_3")
+
+# Create necessary writable directories
+os.makedirs(IDEA_DIR, exist_ok=True)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Deep Branch (MLP) Configuration
+DEEP_HIDDEN_UNITS = [256, 128, 64]
+DEEP_DROPOUT = 0.2
+
+# Cross Branch Configuration
+NUM_CROSS_LAYERS = 3
+
+# ------------------------------------------------------------------------------
+# Training Hyperparameters
+# ------------------------------------------------------------------------------
+BATCH_SIZE = 2048  # Large batch size for efficient tabular training on GPU
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+NUM_EPOCHS = 40
+=======
+# Deep Branch (MLP) Configuration
+DEEP_HIDDEN_UNITS = [512, 256, 128]
+DEEP_DROPOUT = 0.1
+
+# ------------------------------------------------------------------------------
+# Training Hyperparameters
+# ------------------------------------------------------------------------------
+BATCH_SIZE = 2048  # Large batch size for efficient tabular training on GPU
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+NUM_EPOCHS = 25
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import (
+    NUM_CONTINUOUS_FEATURES,
+    NUM_CATEGORICAL_POSITIONS,
+    VOCAB_SIZE,
+    EMBEDDING_DIM,
+    DEEP_HIDDEN_UNITS,
+    DEEP_DROPOUT,
+    NUM_CROSS_LAYERS,
+    MODEL_SAVE_PATH,
+    SUBMISSION_SAVE_PATH,
+    TEST_META_PATH,
+    DEVICE,
+)
+
+# ------------------------------------------------------------------------------
+# Model Architecture
+# ------------------------------------------------------------------------------
+
+
+class CrossLayer(nn.Module):
+    """
+    Implements a single layer of the Cross Network.
+    Formula: x_{l+1} = x_0 * (x_l^T . w_l) + b_l + x_l
+    """
+
+    def __init__(self, input_dim):
+        super(CrossLayer, self).__init__()
+        self.input_dim = input_dim
+
+        # Weight w_l: (input_dim, 1)
+        self.weight = nn.Parameter(torch.empty(input_dim, 1))
+        # Bias b_l: (input_dim, )
+        self.bias = nn.Parameter(torch.empty(input_dim))
+
+        # Initialize parameters
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x0, xl):
+        """
+        Args:
+            x0: Initial input feature vector (Batch, Input_Dim)
+            xl: Output from previous cross layer (Batch, Input_Dim)
+        Returns:
+            x_next: Output of this cross layer (Batch, Input_Dim)
+        """
+        # Compute scalar interaction (x_l^T . w_l) for each sample in batch
+        # x_l: (B, D), weight: (D, 1) -> matmul -> (B, 1)
+        interaction = torch.matmul(xl, self.weight)
+
+        # Apply formula: x_0 * interaction + bias + x_l
+        # Broadcasting interaction (B, 1) to (B, D)
+        x_next = x0 * interaction + self.bias + xl
+        return x_next
+
+
+class ParallelDCN(nn.Module):
+    """
+    Parallel Deep & Cross Network (DCN-V2) architecture.
+    Combines a Deep (MLP) branch and a Cross branch in parallel.
+    """
+
+    def __init__(
+        self,
+        num_continuous=NUM_CONTINUOUS_FEATURES,
+        num_categorical_pos=NUM_CATEGORICAL_POSITIONS,
+        vocab_size=VOCAB_SIZE,
+        embedding_dim=EMBEDDING_DIM,
+        deep_hidden_units=DEEP_HIDDEN_UNITS,
+        deep_dropout=DEEP_DROPOUT,
+        num_cross_layers=NUM_CROSS_LAYERS,
+    ):
+        super(ParallelDCN, self).__init__()
+
+        # 1. Input Processing
+        # Shared embedding layer for all character positions
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        # Calculate total dense input dimension
+        # Flattened embeddings + continuous features
+        self.input_dim = (num_categorical_pos * embedding_dim) + num_continuous
+
+        # 2. Cross Network Branch
+        self.cross_layers = nn.ModuleList(
+            [CrossLayer(self.input_dim) for _ in range(num_cross_layers)]
+        )
+
+        # 3. Deep Network Branch (MLP)
+        deep_layers = []
+        in_dim = self.input_dim
+        for hidden_dim in deep_hidden_units:
+            deep_layers.append(nn.Linear(in_dim, hidden_dim))
+            deep_layers.append(nn.ReLU())
+            deep_layers.append(nn.Dropout(deep_dropout))
+            in_dim = hidden_dim
+        self.deep_net = nn.Sequential(*deep_layers)
+        self.deep_out_dim = deep_hidden_units[-1]
+
+        # 4. Fusion Head
+        # Concatenate Cross output (input_dim) and Deep output (deep_out_dim)
+        stack_dim = self.input_dim + self.deep_out_dim
+        self.final_linear = nn.Linear(stack_dim, 1)
+
+    def forward(self, x_cat, x_cont):
+        """
+        Args:
+            x_cat: Categorical indices (Batch, 10)
+            x_cont: Continuous features (Batch, 30)
+        """
+        # Embed and Flatten Categorical
+        # (B, 10) -> (B, 10, Embed) -> (B, 10 * Embed)
+        bs = x_cat.size(0)
+        embeds = self.embedding(x_cat).view(bs, -1)
+
+        # Concatenate with Continuous -> x0
+        x0 = torch.cat([embeds, x_cont], dim=1)
+
+        # Cross Branch
+        xl = x0
+        for layer in self.cross_layers:
+            xl = layer(x0, xl)
+        cross_out = xl
+
+        # Deep Branch
+        deep_out = self.deep_net(x0)
+
+        # Fusion
+        stacked = torch.cat([cross_out, deep_out], dim=1)
+        logits = self.final_linear(stacked)
+
+        return logits
+=======
+from library.config import (
+    NUM_CONTINUOUS_FEATURES,
+    NUM_CATEGORICAL_POSITIONS,
+    VOCAB_SIZE,
+    EMBEDDING_DIM,
+    DEEP_HIDDEN_UNITS,
+    DEEP_DROPOUT,
+    MODEL_SAVE_PATH,
+    SUBMISSION_SAVE_PATH,
+    TEST_META_PATH,
+    DEVICE,
+)
+
+# ------------------------------------------------------------------------------
+# Model Architecture
+# ------------------------------------------------------------------------------
+
+
+class ManufacturingMLP(nn.Module):
+    """
+    Wide Multi-Layer Perceptron (MLP) for Manufacturing Control.
+    Uses a specific block structure: Linear -> ReLU -> BatchNorm -> Dropout.
+    Cite: solution_lesson_node_00002, solution_lesson_node_00007
+    """
+
+    def __init__(
+        self,
+        num_continuous=NUM_CONTINUOUS_FEATURES,
+        num_categorical_pos=NUM_CATEGORICAL_POSITIONS,
+        vocab_size=VOCAB_SIZE,
+        embedding_dim=EMBEDDING_DIM,
+        deep_hidden_units=DEEP_HIDDEN_UNITS,
+        deep_dropout=DEEP_DROPOUT,
+    ):
+        super(ManufacturingMLP, self).__init__()
+
+        # 1. Input Processing
+        # Shared embedding layer for all character positions
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        # Calculate total dense input dimension
+        # Flattened embeddings + continuous features
+        self.input_dim = (num_categorical_pos * embedding_dim) + num_continuous
+
+        # 2. Deep Network Branch (MLP)
+        # Structure: Linear -> ReLU -> BatchNorm -> Dropout
+        deep_layers = []
+        in_dim = self.input_dim
+        for hidden_dim in deep_hidden_units:
+            deep_layers.append(nn.Linear(in_dim, hidden_dim))
+            deep_layers.append(nn.ReLU())
+            deep_layers.append(nn.BatchNorm1d(hidden_dim))
+            deep_layers.append(nn.Dropout(deep_dropout))
+            in_dim = hidden_dim
+        
+        self.deep_net = nn.Sequential(*deep_layers)
+        
+        # 3. Output Head
+        self.final_linear = nn.Linear(in_dim, 1)
+
+    def forward(self, x_cat, x_cont):
+        """
+        Args:
+            x_cat: Categorical indices (Batch, 10)
+            x_cont: Continuous features (Batch, 30)
+        """
+        # Embed and Flatten Categorical
+        # (B, 10) -> (B, 10, Embed) -> (B, 10 * Embed)
+        bs = x_cat.size(0)
+        embeds = self.embedding(x_cat).view(bs, -1)
+
+        # Concatenate with Continuous
+        x = torch.cat([embeds, x_cont], dim=1)
+
+        # Deep MLP
+        features = self.deep_net(x)
+
+        # Final prediction
+        logits = self.final_linear(features)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import (
+    ParallelDCN,
+    train_model,
+    generate_submission,
+    train_one_epoch,
+    validate,
+)
+from library.config import seed_everything
+
+
+class Trainer:
+    """
+    Manages the training, validation, and inference lifecycle for the Manufacturing Control task.
+    """
+
+    def __init__(
+        self,
+        learning_rate=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+        seed=config.RANDOM_STATE,
+    ):
+        """
+        Initializes the Trainer with model, optimizer, and criterion.
+
+        Args:
+            learning_rate (float): Learning rate for the optimizer.
+            weight_decay (float): Weight decay for the optimizer.
+            seed (int): Random seed for reproducibility.
+        """
+        seed_everything(seed)
+        self.device = get_device()
+
+        # Initialize Model
+        self.model = ParallelDCN().to(self.device)
+
+        # Initialize Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+=======
+from library.model import (
+    ManufacturingMLP,
+    train_model,
+    generate_submission,
+    train_one_epoch,
+    validate,
+)
+from library.config import seed_everything
+
+
+class Trainer:
+    """
+    Manages the training, validation, and inference lifecycle for the Manufacturing Control task.
+    """
+
+    def __init__(
+        self,
+        learning_rate=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+        seed=config.RANDOM_STATE,
+    ):
+        """
+        Initializes the Trainer with model, optimizer, and criterion.
+
+        Args:
+            learning_rate (float): Learning rate for the optimizer.
+            weight_decay (float): Weight decay for the optimizer.
+            seed (int): Random seed for reproducibility.
+        """
+        seed_everything(seed)
+        self.device = get_device()
+
+        # Initialize Model
+        self.model = ManufacturingMLP().to(self.device)
+
+        # Initialize Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import ParallelDCN, generate_submission
+
+
+def predict_and_submit(
+    load_cached_data=True, model_path=MODEL_SAVE_PATH, output_path=SUBMISSION_SAVE_PATH
+):
+    """
+    Loads the trained model, generates predictions for the test set,
+    and saves the submission file.
+
+    Args:
+        load_cached_data (bool): Whether to use cached preprocessed data.
+                                 Passed to get_dataloaders.
+        model_path (str): Path to the saved model checkpoint.
+        output_path (str): Path to save the submission CSV.
+    """
+    # 1. Setup Device
+    device = get_device()
+
+    # 2. Load Data
+    # We invoke get_dataloaders to ensure data is preprocessed and loaded correctly.
+    # We only need the test_loader for inference.
+    print(f"Loading data (Cached={load_cached_data})...")
+    _, _, test_loader = get_dataloaders(load_cached_data=load_cached_data)
+
+    # 3. Initialize Model
+    # The architecture parameters are pulled from config defaults within the class __init__
+    print("Initializing model architecture...")
+    model = ParallelDCN()
+    model.to(device)
+=======
+from library.model import ManufacturingMLP, generate_submission
+
+
+def predict_and_submit(
+    load_cached_data=True, model_path=MODEL_SAVE_PATH, output_path=SUBMISSION_SAVE_PATH
+):
+    """
+    Loads the trained model, generates predictions for the test set,
+    and saves the submission file.
+
+    Args:
+        load_cached_data (bool): Whether to use cached preprocessed data.
+                                 Passed to get_dataloaders.
+        model_path (str): Path to the saved model checkpoint.
+        output_path (str): Path to save the submission CSV.
+    """
+    # 1. Setup Device
+    device = get_device()
+
+    # 2. Load Data
+    # We invoke get_dataloaders to ensure data is preprocessed and loaded correctly.
+    # We only need the test_loader for inference.
+    print(f"Loading data (Cached={load_cached_data})...")
+    _, _, test_loader = get_dataloaders(load_cached_data=load_cached_data)
+
+    # 3. Initialize Model
+    # The architecture parameters are pulled from config defaults within the class __init__
+    print("Initializing model architecture...")
+    model = ManufacturingMLP()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import (
+    seed_everything,
+    SUBMISSION_SAVE_PATH,
+    NUM_CONTINUOUS_FEATURES,
+    MODEL_SAVE_PATH,
+)
+from library.data_loader import get_dataloaders
+from library.trainer import Trainer
+from library.utils import get_device
+
+
+def main():
+    # --------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # --------------------------------------------------------------------------
+    seed_everything(42)
+    device = get_device()
+    print(f"Running on device: {device}")
+
+    # --------------------------------------------------------------------------
+    # 2. Model Training
+    # --------------------------------------------------------------------------
+    print("\n--- Starting Training Phase ---")
+    trainer = Trainer()
+
+    # We limit epochs to 15 to ensure a fast baseline execution as requested.
+    # The DCN-V2 architecture converges relatively quickly on this data.
+    test_loader = trainer.fit(num_epochs=15, load_cached_data=True)
+=======
+from library.config import (
+    seed_everything,
+    SUBMISSION_SAVE_PATH,
+    NUM_CONTINUOUS_FEATURES,
+    MODEL_SAVE_PATH,
+    NUM_EPOCHS,
+)
+from library.data_loader import get_dataloaders
+from library.trainer import Trainer
+from library.utils import get_device
+
+
+def main():
+    # --------------------------------------------------------------------------
+    # 1. Setup & Configuration
+    # --------------------------------------------------------------------------
+    seed_everything(42)
+    device = get_device()
+    print(f"Running on device: {device}")
+
+    # --------------------------------------------------------------------------
+    # 2. Model Training
+    # --------------------------------------------------------------------------
+    print("\n--- Starting Training Phase ---")
+    trainer = Trainer()
+
+    # Using optimized epoch count (25) as per Lesson solution_lesson_node_00003
+    test_loader = trainer.fit(num_epochs=NUM_EPOCHS, load_cached_data=True)
+>>>>>>> REPLACE
+```

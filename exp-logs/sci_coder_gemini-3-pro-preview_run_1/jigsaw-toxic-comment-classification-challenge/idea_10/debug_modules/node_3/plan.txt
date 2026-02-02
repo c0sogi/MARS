@@ -1,0 +1,399 @@
+The solution addresses the `torch.OutOfMemoryError` and potential FP16 overflow issues by implementing three key changes:
+
+1.  **Mixed Precision Training (AMP):** I will modify `library/engine.py` and `runfile.py` to incorporate `torch.cuda.amp.autocast` and `GradScaler`. This significantly reduces memory usage by performing operations in half-precision where safe. Cite {debug_lesson_10}.
+2.  **FP16-Safe Masking:** I will update `library/model.py` to replace the hardcoded `-1e9` masking constants with `-1e4`. This prevents numerical overflow errors when the model runs in mixed precision. Cite {debug_lesson_8}.
+3.  **Resource Management:** In `runfile.py`, I will reduce the batch size to 4 and temporarily offload the `ToxicModel` to the CPU during the `run_mlm` execution. This prevents the GPU from holding two large model instances simultaneously (Double Model Allocation). Cite {debug_lesson_10}.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Mask padding tokens (set score to -inf)
+        # mask is 1 for tokens, 0 for padding
+        min_value = -1e9
+        mask_expanded = mask.unsqueeze(-1)  # (batch_size, seq_len, 1)
+        scores = scores.masked_fill(mask_expanded == 0, min_value)
+=======
+        # Mask padding tokens (set score to -inf)
+        # mask is 1 for tokens, 0 for padding
+        min_value = -1e4  # Cite {debug_lesson_8}
+        mask_expanded = mask.unsqueeze(-1)  # (batch_size, seq_len, 1)
+        scores = scores.masked_fill(mask_expanded == 0, min_value)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # 1. Global Max Pooling
+        # Mask padding tokens to -inf so they don't affect max
+        mask_expanded = attention_mask.unsqueeze(-1)
+        fused_masked = fused_sequence.masked_fill(mask_expanded == 0, -1e9)
+        max_pooled = torch.max(fused_masked, dim=1)[0]  # (batch, hidden)
+=======
+        # 1. Global Max Pooling
+        # Mask padding tokens to -inf so they don't affect max
+        mask_expanded = attention_mask.unsqueeze(-1)
+        fused_masked = fused_sequence.masked_fill(mask_expanded == 0, -1e4)  # Cite {debug_lesson_8}
+        max_pooled = torch.max(fused_masked, dim=1)[0]  # (batch, hidden)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import (
+    AutoModelForMaskedLM,
+=======
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.cuda.amp import GradScaler, autocast  # Cite {debug_lesson_10}
+from transformers import (
+    AutoModelForMaskedLM,
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # Scheduler
+    num_train_steps = int(len(train_loader) * Config.dapt_epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_train_steps * 0.1),
+        num_training_steps=num_train_steps,
+    )
+
+    # Training Loop
+    for epoch in range(Config.dapt_epochs):
+        start_time = time.time()
+        total_loss = 0
+
+        for step, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(Config.device)
+            attention_mask = batch["attention_mask"].to(Config.device)
+            labels = batch["labels"].to(Config.device)
+
+            optimizer.zero_grad()
+
+            outputs = model(
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels
+            )
+
+            loss = outputs.loss
+            loss.backward()
+
+            optimizer.step()
+            scheduler.step()
+
+            total_loss += loss.item()
+=======
+    # Scheduler
+    num_train_steps = int(len(train_loader) * Config.dapt_epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(num_train_steps * 0.1),
+        num_training_steps=num_train_steps,
+    )
+
+    scaler = GradScaler()  # Cite {debug_lesson_10}
+
+    # Training Loop
+    for epoch in range(Config.dapt_epochs):
+        start_time = time.time()
+        total_loss = 0
+
+        for step, batch in enumerate(train_loader):
+            input_ids = batch["input_ids"].to(Config.device)
+            attention_mask = batch["attention_mask"].to(Config.device)
+            labels = batch["labels"].to(Config.device)
+
+            optimizer.zero_grad()
+
+            with autocast():  # Cite {debug_lesson_10}
+                outputs = model(
+                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                )
+                loss = outputs.loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            total_loss += loss.item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_fn(model, data_loader, optimizer, scheduler, device, epoch, awp=None):
+    """
+    Performs one epoch of supervised training.
+    """
+    model.train()
+    criterion = nn.BCEWithLogitsLoss()
+
+    total_loss = 0
+    start_time = time.time()
+
+    # Enable AWP if configured and epoch threshold is met
+    use_awp = False
+    if Config.use_awp and awp is not None and epoch >= Config.awp_start_epoch:
+        use_awp = True
+        print(f"  [Epoch {epoch+1}] AWP Enabled.")
+
+    for step, batch in enumerate(data_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Forward pass
+        logits = model(input_ids, attention_mask)
+        loss = criterion(logits, labels)
+
+        # Backward pass
+        loss.backward()
+
+        # Adversarial Weight Perturbation
+        if use_awp:
+            # Save weights and apply perturbation based on gradients
+            awp.attack()
+
+            # Forward pass with perturbed weights
+            logits_adv = model(input_ids, attention_mask)
+            loss_adv = criterion(logits_adv, labels)
+
+            # Backward pass for adversarial loss
+            loss_adv.backward()
+
+            # Restore original weights
+            awp._restore()
+
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        total_loss += loss.item()
+=======
+def train_fn(
+    model, data_loader, optimizer, scheduler, device, epoch, awp=None, scaler=None
+):
+    """
+    Performs one epoch of supervised training.
+    """
+    model.train()
+    criterion = nn.BCEWithLogitsLoss()
+
+    total_loss = 0
+    start_time = time.time()
+
+    # Enable AWP if configured and epoch threshold is met
+    use_awp = False
+    if Config.use_awp and awp is not None and epoch >= Config.awp_start_epoch:
+        use_awp = True
+        print(f"  [Epoch {epoch+1}] AWP Enabled.")
+
+    for step, batch in enumerate(data_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        with autocast():  # Cite {debug_lesson_10}
+            logits = model(input_ids, attention_mask)
+            loss = criterion(logits, labels)
+
+        # Backward pass
+        if scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Adversarial Weight Perturbation
+        if use_awp:
+            if scaler:
+                scaler.unscale_(optimizer)
+
+            # Save weights and apply perturbation based on gradients
+            awp.attack()
+
+            # Forward pass with perturbed weights
+            with autocast():
+                logits_adv = model(input_ids, attention_mask)
+                loss_adv = criterion(logits_adv, labels)
+
+            # Backward pass for adversarial loss
+            if scaler:
+                scaler.scale(loss_adv).backward()
+            else:
+                loss_adv.backward()
+
+            # Restore original weights
+            awp._restore()
+
+        # Gradient Clipping
+        if scaler:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+
+        scheduler.step()
+
+        total_loss += loss.item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for step, batch in enumerate(data_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            logits = model(input_ids, attention_mask)
+            loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+=======
+    with torch.no_grad():
+        for step, batch in enumerate(data_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            with autocast():  # Cite {debug_lesson_10}
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
+=======
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.cuda.amp import GradScaler  # Cite {debug_lesson_10}
+from transformers import get_linear_schedule_with_warmup
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Reduce batch sizes and epochs for demo
+    Config.train_batch_size = 8
+    Config.valid_batch_size = 8
+    Config.dapt_batch_size = 8
+    Config.epochs = 1
+=======
+    # Reduce batch sizes and epochs for demo
+    Config.train_batch_size = 4  # Cite {debug_lesson_10}
+    Config.valid_batch_size = 4
+    Config.dapt_batch_size = 4
+    Config.epochs = 1
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def demonstrate_engine(model, train_loader, val_loader, tokenizer):
+    print("\n=== Demonstrating library.engine ===")
+
+    # 1. Run MLM (Domain Adaptive Pre-training)
+    # This function internally creates its own loader and saves the model
+    print("Running DAPT (MLM) - Short run...")
+    run_mlm()
+
+    # Verify DAPT output
+    assert os.path.exists(Config.dapt_model_path), "DAPT model directory not created"
+=======
+def demonstrate_engine(model, train_loader, val_loader, tokenizer):
+    print("\n=== Demonstrating library.engine ===")
+
+    # 1. Run MLM (Domain Adaptive Pre-training)
+    # This function internally creates its own loader and saves the model
+    print("Running DAPT (MLM) - Short run...")
+
+    # Temporarily move model to CPU to avoid OOM during MLM
+    model.cpu()
+    torch.cuda.empty_cache()
+
+    run_mlm()
+
+    # Move model back to GPU
+    model.to(Config.device)
+
+    # Verify DAPT output
+    assert os.path.exists(Config.dapt_model_path), "DAPT model directory not created"
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Setup AWP (Adversarial Weight Perturbation)
+    awp = AWP(model, optimizer, adv_lr=Config.awp_lr, adv_eps=Config.awp_eps)
+
+    # Run one epoch of training
+    # We force epoch=Config.awp_start_epoch to trigger AWP logic usage for demonstration
+    epoch_idx = max(1, Config.awp_start_epoch)
+    avg_loss = train_fn(
+        model,
+        train_loader,
+        optimizer,
+        scheduler,
+        Config.device,
+        epoch=epoch_idx,
+        awp=awp,
+    )
+=======
+    # Setup Scaler for AMP
+    scaler = GradScaler()  # Cite {debug_lesson_10}
+
+    # Setup AWP (Adversarial Weight Perturbation)
+    awp = AWP(
+        model,
+        optimizer,
+        adv_lr=Config.awp_lr,
+        adv_eps=Config.awp_eps,
+        scaler=scaler
+    )
+
+    # Run one epoch of training
+    # We force epoch=Config.awp_start_epoch to trigger AWP logic usage for demonstration
+    epoch_idx = max(1, Config.awp_start_epoch)
+    avg_loss = train_fn(
+        model,
+        train_loader,
+        optimizer,
+        scheduler,
+        Config.device,
+        epoch=epoch_idx,
+        awp=awp,
+        scaler=scaler
+    )
+>>>>>>> REPLACE
+```

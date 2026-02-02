@@ -1,0 +1,489 @@
+To address the performance regression observed in the previous solution (Idea 9), I will restore the **dynamic augmentation pipeline** which was identified as a critical driver for generalization in small-data regimes (Cite Lesson 32). I will simplify the ensemble strategy by using a fixed optimal resolution (512x256) for all models, rather than a multi-resolution approach which complicated the caching logic. The solution will involve an ensemble of 3 Teacher models and 1 Student model (trained with SWA), all leveraging dynamic augmentations (Time Flip, SpecAugment-style masking) and Mixup.
+
+**Key Changes:**
+1.  **Config (`library/config.py`):**
+    *   Set `TEACHER_WIDTHS` to `[512, 512, 512]` to train an ensemble of 3 models at the optimal resolution.
+    *   Increase `BATCH_SIZE` to 32 (Cite Lesson 25).
+    *   Increase `MIXUP_ALPHA` to 0.4 (Cite Lesson 7).
+    *   Enable `AUGMENT = True`.
+2.  **Data (`library/data.py`):**
+    *   Implement `RandomTimeFlip` and `RandomMasking` (SpecAugment) transform classes.
+    *   Update `BirdDataset` to apply these transforms dynamically if `augment=True`.
+    *   Update `get_loader` to accept an `augment` flag.
+3.  **Pipeline (`library/pipeline.py`):**
+    *   Update `train_teachers` to use `augment=True` and save unique model files (indexed) for the ensemble.
+    *   Update `train_student_with_swa` to use `augment=True`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Multi-Resolution Ensemble Configuration
+# Teacher models trained at different widths to capture different features
+# Resolution A (Dense): 384
+# Resolution B (Balanced): 512
+# Resolution C (Detailed): 640
+TEACHER_WIDTHS = [384, 512, 640]
+
+# Student Model Configuration
+# The student operates at the balanced resolution
+STUDENT_WIDTH = 512
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+SEED = 42
+BATCH_SIZE = 16  # Optimized for small dataset stability
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+
+# Epochs
+TEACHER_EPOCHS = 30
+STUDENT_EPOCHS = 50
+
+# SWA (Stochastic Weight Averaging) Configuration
+# Activate SWA for the last 30% of student training
+SWA_START_EPOCH = int(STUDENT_EPOCHS * 0.7)
+SWA_LR = 1e-4
+
+# Augmentation
+MIXUP_ALPHA = 0.2
+=======
+# Multi-Resolution Ensemble Configuration
+# Teacher models trained at different widths to capture different features
+# We use an ensemble of 3 models at the optimal resolution (512) with dynamic augmentation
+TEACHER_WIDTHS = [512, 512, 512]
+
+# Student Model Configuration
+# The student operates at the balanced resolution
+STUDENT_WIDTH = 512
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+SEED = 42
+BATCH_SIZE = 32  # Increased back to 32 as per Lesson 25 (maximize batch size)
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+
+# Epochs
+TEACHER_EPOCHS = 35  # Extended slightly (Cite solution_lesson_node_00029)
+STUDENT_EPOCHS = 50
+
+# SWA (Stochastic Weight Averaging) Configuration
+# Activate SWA for the last 30% of student training
+SWA_START_EPOCH = int(STUDENT_EPOCHS * 0.7)
+SWA_LR = 1e-4
+
+# Augmentation
+MIXUP_ALPHA = 0.4  # Increased regularization (Cite solution_lesson_node_00007)
+AUGMENT = True  # Enable dynamic augmentation (Cite solution_lesson_node_00032)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class BirdDataset(Dataset):
+    """
+    PyTorch Dataset for Bird Species Classification.
+    Handles 3-channel replicated spectrograms and multi-label targets.
+    """
+
+    def __init__(self, images, labels, ids, transform=None):
+        """
+        Args:
+            images (torch.Tensor or np.ndarray): Image data of shape (N, 3, H, W).
+                                                 Values should be normalized (0-1) or standardized.
+            labels (torch.Tensor or np.ndarray): Label data of shape (N, num_classes).
+            ids (np.ndarray): Recording IDs corresponding to the images.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.images = images
+        self.labels = labels
+        self.ids = ids
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        # Ensure data is tensor
+        image = self.images[idx]
+        label = self.labels[idx]
+        rec_id = self.ids[idx]
+
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image).float()
+        if not isinstance(label, torch.Tensor):
+            label = torch.from_numpy(label).float()
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label, rec_id
+=======
+class RandomTimeFlip(torch.nn.Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.p = p
+
+    def forward(self, img):
+        if torch.rand(1) < self.p:
+            return torch.flip(img, [2])  # (C, H, W), flip W (time)
+        return img
+
+
+class RandomMasking(torch.nn.Module):
+    def __init__(self, p=0.5, num_masks=2, max_mask_pct=0.15):
+        super().__init__()
+        self.p = p
+        self.num_masks = num_masks
+        self.max_mask_pct = max_mask_pct
+
+    def forward(self, img):
+        if torch.rand(1) > self.p:
+            return img
+        
+        # img: (C, H, W)
+        _, H, W = img.shape
+        mask_img = img.clone()
+        
+        for _ in range(self.num_masks):
+            # Time mask
+            mask_w = int(torch.rand(1) * self.max_mask_pct * W)
+            if mask_w > 0:
+                start_w = int(torch.rand(1) * (W - mask_w))
+                mask_img[:, :, start_w : start_w + mask_w] = 0
+                
+            # Freq mask
+            mask_h = int(torch.rand(1) * self.max_mask_pct * H)
+            if mask_h > 0:
+                start_h = int(torch.rand(1) * (H - mask_h))
+                mask_img[:, start_h : start_h + mask_h, :] = 0
+                
+        return mask_img
+
+
+class BirdDataset(Dataset):
+    """
+    PyTorch Dataset for Bird Species Classification.
+    Handles 3-channel replicated spectrograms and multi-label targets.
+    """
+
+    def __init__(self, images, labels, ids, augment=False):
+        """
+        Args:
+            images (torch.Tensor or np.ndarray): Image data of shape (N, 3, H, W).
+            labels (torch.Tensor or np.ndarray): Label data of shape (N, num_classes).
+            ids (np.ndarray): Recording IDs corresponding to the images.
+            augment (bool): Whether to apply dynamic augmentation.
+        """
+        self.images = images
+        self.labels = labels
+        self.ids = ids
+        
+        if augment:
+            self.transform = torch.nn.Sequential(
+                RandomTimeFlip(p=0.5),
+                RandomMasking(p=0.5)
+            )
+        else:
+            self.transform = None
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        # Ensure data is tensor
+        image = self.images[idx]
+        label = self.labels[idx]
+        rec_id = self.ids[idx]
+
+        if not isinstance(image, torch.Tensor):
+            image = torch.from_numpy(image).float()
+        if not isinstance(label, torch.Tensor):
+            label = torch.from_numpy(label).float()
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label, rec_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_loader(
+    images, labels, ids, batch_size, shuffle=True, drop_last=False, transform=None
+):
+    """
+    Creates a DataLoader from pre-processed tensors.
+
+    Args:
+        images (torch.Tensor): Image tensor.
+        labels (torch.Tensor): Label tensor.
+        ids (np.ndarray): ID array.
+        batch_size (int): Batch size.
+        shuffle (bool): Whether to shuffle.
+        drop_last (bool): Whether to drop the last incomplete batch.
+        transform (callable): Optional transform.
+
+    Returns:
+        DataLoader: PyTorch DataLoader.
+    """
+    dataset = BirdDataset(images, labels, ids, transform=transform)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=drop_last,
+    )
+
+    return loader
+=======
+def get_loader(
+    images, labels, ids, batch_size, shuffle=True, drop_last=False, augment=False
+):
+    """
+    Creates a DataLoader from pre-processed tensors.
+
+    Args:
+        images (torch.Tensor): Image tensor.
+        labels (torch.Tensor): Label tensor.
+        ids (np.ndarray): ID array.
+        batch_size (int): Batch size.
+        shuffle (bool): Whether to shuffle.
+        drop_last (bool): Whether to drop the last incomplete batch.
+        augment (bool): Whether to apply dynamic augmentation.
+
+    Returns:
+        DataLoader: PyTorch DataLoader.
+    """
+    dataset = BirdDataset(images, labels, ids, augment=augment)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=drop_last,
+    )
+
+    return loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+from library.config import (
+    WORKING_DIR,
+    TEACHER_WIDTHS,
+    STUDENT_WIDTH,
+    IMG_HEIGHT,
+    TEACHER_EPOCHS,
+    STUDENT_EPOCHS,
+    SWA_START_EPOCH,
+    SWA_LR,
+    BATCH_SIZE,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    MIXUP_ALPHA,
+    DEVICE,
+    SEED,
+    NUM_CLASSES,
+)
+=======
+from library.config import (
+    WORKING_DIR,
+    TEACHER_WIDTHS,
+    STUDENT_WIDTH,
+    IMG_HEIGHT,
+    TEACHER_EPOCHS,
+    STUDENT_EPOCHS,
+    SWA_START_EPOCH,
+    SWA_LR,
+    BATCH_SIZE,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    MIXUP_ALPHA,
+    AUGMENT,
+    DEVICE,
+    SEED,
+    NUM_CLASSES,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+    for width in TEACHER_WIDTHS:
+        print(f"\n--- Training Teacher at Resolution {IMG_HEIGHT}x{width} ---")
+
+        # Prepare Data
+        # Note: process_and_cache_data handles caching internally
+        train_images, train_labels, train_ids = process_and_cache_data(
+            df_train, "train", width, IMG_HEIGHT, load_cached_data=True
+        )
+        val_images, val_labels, val_ids = process_and_cache_data(
+            df_val, "val", width, IMG_HEIGHT, load_cached_data=True
+        )
+
+        # Debug Slicing
+        if debug:
+            subset_size = 20
+            train_images = train_images[:subset_size]
+            train_labels = train_labels[:subset_size]
+            train_ids = train_ids[:subset_size]
+            val_images = val_images[:subset_size]
+            val_labels = val_labels[:subset_size]
+            val_ids = val_ids[:subset_size]
+
+        train_loader = get_loader(
+            train_images,
+            train_labels,
+            train_ids,
+            BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+        )
+        val_loader = get_loader(
+            val_images, val_labels, val_ids, BATCH_SIZE, shuffle=False, drop_last=False
+        )
+
+        # Model & Optimizer
+        model = get_bird_model(pretrained=True).to(DEVICE)
+        optimizer = optim.Adam(
+            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_auc = 0.0
+        best_model_path = os.path.join(WORKING_DIR, f"teacher_{width}.pth")
+
+        for epoch in range(epochs):
+=======
+    for i, width in enumerate(TEACHER_WIDTHS):
+        print(f"\n--- Training Teacher {i+1}/{len(TEACHER_WIDTHS)} at Resolution {IMG_HEIGHT}x{width} ---")
+
+        # Prepare Data
+        # Note: process_and_cache_data handles caching internally
+        train_images, train_labels, train_ids = process_and_cache_data(
+            df_train, "train", width, IMG_HEIGHT, load_cached_data=True
+        )
+        val_images, val_labels, val_ids = process_and_cache_data(
+            df_val, "val", width, IMG_HEIGHT, load_cached_data=True
+        )
+
+        # Debug Slicing
+        if debug:
+            subset_size = 20
+            train_images = train_images[:subset_size]
+            train_labels = train_labels[:subset_size]
+            train_ids = train_ids[:subset_size]
+            val_images = val_images[:subset_size]
+            val_labels = val_labels[:subset_size]
+            val_ids = val_ids[:subset_size]
+
+        train_loader = get_loader(
+            train_images,
+            train_labels,
+            train_ids,
+            BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            augment=AUGMENT,
+        )
+        val_loader = get_loader(
+            val_images, val_labels, val_ids, BATCH_SIZE, shuffle=False, drop_last=False, augment=False
+        )
+
+        # Model & Optimizer
+        model = get_bird_model(pretrained=True).to(DEVICE)
+        optimizer = optim.Adam(
+            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_auc = 0.0
+        # Use index in filename to ensure unique files for ensemble members with same width
+        best_model_path = os.path.join(WORKING_DIR, f"teacher_{i}_{width}.pth")
+
+        for epoch in range(epochs):
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+    for width, model_path in zip(TEACHER_WIDTHS, teacher_paths):
+        print(f"Inference with Teacher {width} from {model_path}...")
+
+        # Load test data at specific resolution
+        test_images, test_labels, ids = process_and_cache_data(
+            df_test, "test", width, IMG_HEIGHT, load_cached_data=True
+        )
+
+        if debug:
+            subset_size = 20
+            test_images = test_images[:subset_size]
+            test_labels = test_labels[:subset_size]
+            ids = ids[:subset_size]
+
+        test_loader = get_loader(
+            test_images, test_labels, ids, BATCH_SIZE, shuffle=False
+        )
+=======
+    for i, (width, model_path) in enumerate(zip(TEACHER_WIDTHS, teacher_paths)):
+        print(f"Inference with Teacher {i} ({width}) from {model_path}...")
+
+        # Load test data at specific resolution
+        test_images, test_labels, ids = process_and_cache_data(
+            df_test, "test", width, IMG_HEIGHT, load_cached_data=True
+        )
+
+        if debug:
+            subset_size = 20
+            test_images = test_images[:subset_size]
+            test_labels = test_labels[:subset_size]
+            ids = ids[:subset_size]
+
+        test_loader = get_loader(
+            test_images, test_labels, ids, BATCH_SIZE, shuffle=False, augment=False
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+    # Loaders
+    train_loader = get_loader(
+        combined_images,
+        combined_labels,
+        combined_ids,
+        BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+    )
+    val_loader = get_loader(val_images, val_labels, val_ids, BATCH_SIZE, shuffle=False)
+=======
+    # Loaders
+    train_loader = get_loader(
+        combined_images,
+        combined_labels,
+        combined_ids,
+        BATCH_SIZE,
+        shuffle=True,
+        drop_last=True,
+        augment=AUGMENT,
+    )
+    val_loader = get_loader(val_images, val_labels, val_ids, BATCH_SIZE, shuffle=False, augment=False)
+>>>>>>> REPLACE
+```

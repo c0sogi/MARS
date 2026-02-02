@@ -1,0 +1,388 @@
+My strategy focuses on reverting the architectural and augmentation changes that led to performance regression in the previous iteration, while optimizing the configuration based on successful prior lessons.
+
+1.  **Revert Dynamic Jittering & Multi-Scale TTA (Cite Lesson 00072)**: The previous solution's attempt to use "Dynamic Temporal Jittering" (random resizing) and Multi-Scale TTA caused a significant drop in AUC (0.9594 $\to$ 0.9357). Spectrograms have meaningful physical axes; random resizing distorts the spectrotemporal geometry (e.g., the slope of frequency modulation). I will revert to a **fixed high-fidelity resolution of 256x640** (Cite Lesson 00041), which previously yielded the best results.
+2.  **Increase Mixup Regularization (Cite Lesson 00007, Lesson 00039)**: I will increase `MIXUP_ALPHA` from 0.2 to 0.4. Higher resolution inputs (640px width) increase the feature space sparsity, requiring stronger manifold regularization to prevent overfitting.
+3.  **Simplify Inference Pipeline**: I will replace the `predict_ensemble_tta` function with `predict_ensemble`, which performs straightforward averaging of teacher predictions at the fixed resolution. This eliminates the interpolation artifacts introduced by resizing spectrograms during test-time augmentation.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+WORKING_DIR = os.path.join(BASE_DIR, "working", "idea_22")
+=======
+WORKING_DIR = os.path.join(BASE_DIR, "working", "idea_23")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+# Image Dimensions
+IMG_HEIGHT = 256
+IMG_WIDTH_TEST = 640  # Center of the high-fidelity band for standard inference
+
+# Dynamic Temporal Jittering (Training)
+# Widths will be sampled from this range during training
+JITTER_RANGE = (576, 704)
+
+# Multi-Scale TTA (Inference/Pseudo-labeling)
+# Fixed widths for test-time augmentation
+TTA_WIDTHS = [608, 640, 672]
+=======
+# Image Dimensions
+IMG_HEIGHT = 256
+IMG_WIDTH = 640  # Fixed high-fidelity width (Cite Lesson 00041, Lesson 00072)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+# Augmentation
+MIXUP_ALPHA = 0.2
+=======
+# Augmentation
+MIXUP_ALPHA = 0.4  # Increased regularization for high-res inputs (Cite Lesson 00007)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class DynamicBatchCollate:
+    """
+    Custom collate function that implements Dynamic Temporal Jittering.
+    Resizes the entire batch to a random width sampled from config.JITTER_RANGE during training.
+    """
+
+    def __init__(self, mode="train", fixed_width=None):
+        self.mode = mode
+        self.fixed_width = fixed_width
+        self.rng = np.random.default_rng(config.SEED)
+
+    def __call__(self, batch):
+        images, labels = zip(*batch)
+
+        # Stack images: (B, C, H, W_orig)
+        # Assuming all images from __getitem__ have the same size (256, 1246)
+        images = torch.stack(images)
+        labels = torch.stack(labels)
+
+        # Determine target width
+        if self.fixed_width is not None:
+            target_width = self.fixed_width
+        elif self.mode == "train":
+            target_width = self.rng.integers(
+                config.JITTER_RANGE[0], config.JITTER_RANGE[1] + 1
+            )
+        else:
+            target_width = config.IMG_WIDTH_TEST
+
+        # Resize
+        # F.interpolate expects (N, C, H, W)
+        # We use bilinear interpolation for spectrograms
+        if images.shape[3] != target_width:
+            images = F.interpolate(
+                images,
+                size=(config.IMG_HEIGHT, target_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        return images, labels
+=======
+class DynamicBatchCollate:
+    """
+    Custom collate function that resizes the batch to a fixed high-fidelity resolution.
+    Reverts Dynamic Temporal Jittering to preserve spectrotemporal geometry (Cite Lesson 00072).
+    """
+
+    def __init__(self, mode="train", fixed_width=None):
+        self.mode = mode
+        self.fixed_width = fixed_width or config.IMG_WIDTH
+
+    def __call__(self, batch):
+        images, labels = zip(*batch)
+
+        # Stack images: (B, C, H, W_orig)
+        images = torch.stack(images)
+        labels = torch.stack(labels)
+
+        # Resize to fixed width (Cite Lesson 00072)
+        if images.shape[3] != self.fixed_width:
+            images = F.interpolate(
+                images,
+                size=(config.IMG_HEIGHT, self.fixed_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        return images, labels
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def get_dataloaders(use_pseudo_labels=False, load_cached_data=True, tta_width=None):
+    """
+    Creates and returns DataLoaders for train, val, and test sets.
+
+    Args:
+        use_pseudo_labels (bool): Whether to include pseudo-labeled test data in training.
+        load_cached_data (bool): Whether to use cached metadata.
+        tta_width (int, optional): If provided, overrides the test loader width for TTA.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    # Load Metadata
+    train_df = load_metadata(
+        "train", use_pseudo_labels=use_pseudo_labels, load_cached_data=load_cached_data
+    )
+    val_df = load_metadata("val", load_cached_data=load_cached_data)
+    test_df = load_metadata("test", load_cached_data=load_cached_data)
+
+    # Datasets
+    train_dataset = BirdDataset(
+        train_df, mode="train", transform=get_transforms("train")
+    )
+    val_dataset = BirdDataset(val_df, mode="val", transform=get_transforms("val"))
+    test_dataset = BirdDataset(test_df, mode="test", transform=get_transforms("test"))
+
+    # Collate Functions
+    train_collate = DynamicBatchCollate(mode="train")
+    val_collate = DynamicBatchCollate(mode="val")
+
+    # Test Collate: Support TTA width if provided
+    test_width = tta_width if tta_width is not None else config.IMG_WIDTH_TEST
+    test_collate = DynamicBatchCollate(mode="test", fixed_width=test_width)
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=train_collate,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=val_collate,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=test_collate,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader
+=======
+def get_dataloaders(use_pseudo_labels=False, load_cached_data=True):
+    """
+    Creates and returns DataLoaders for train, val, and test sets.
+
+    Args:
+        use_pseudo_labels (bool): Whether to include pseudo-labeled test data in training.
+        load_cached_data (bool): Whether to use cached metadata.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    # Load Metadata
+    train_df = load_metadata(
+        "train", use_pseudo_labels=use_pseudo_labels, load_cached_data=load_cached_data
+    )
+    val_df = load_metadata("val", load_cached_data=load_cached_data)
+    test_df = load_metadata("test", load_cached_data=load_cached_data)
+
+    # Datasets
+    train_dataset = BirdDataset(
+        train_df, mode="train", transform=get_transforms("train")
+    )
+    val_dataset = BirdDataset(val_df, mode="val", transform=get_transforms("val"))
+    test_dataset = BirdDataset(test_df, mode="test", transform=get_transforms("test"))
+
+    # Collate Functions (Fixed Resolution)
+    train_collate = DynamicBatchCollate(mode="train")
+    val_collate = DynamicBatchCollate(mode="val")
+    test_collate = DynamicBatchCollate(mode="test")
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=train_collate,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=val_collate,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=test_collate,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+def predict_tta(model, device):
+    """
+    Performs Multi-Scale Test-Time Augmentation (TTA) using a single model.
+    Iterates through config.TTA_WIDTHS, generating predictions for both original
+    and horizontally flipped views, then averages them.
+
+    Args:
+        model (torch.nn.Module): The model to use.
+        device (str): Device to run inference on.
+
+    Returns:
+        np.ndarray: Averaged probabilities (N, num_classes).
+    """
+    accumulated_probs = None
+    num_views = 0
+
+    # Iterate over the defined TTA widths
+    for width in config.TTA_WIDTHS:
+        # Get a DataLoader configured for this specific width
+        # We ignore train/val loaders here
+        _, _, test_loader = data.get_dataloaders(tta_width=width, load_cached_data=True)
+
+        # 1. Original View
+        probs_orig = predict_probs(model, test_loader, device, apply_flip=False)
+
+        # 2. Flipped View
+        probs_flip = predict_probs(model, test_loader, device, apply_flip=True)
+
+        # Accumulate
+        if accumulated_probs is None:
+            accumulated_probs = probs_orig + probs_flip
+        else:
+            accumulated_probs += probs_orig + probs_flip
+
+        num_views += 2
+
+    # Average across all views (widths * 2 flips)
+    final_probs = accumulated_probs / num_views
+    return final_probs
+
+
+def predict_ensemble_tta(models, device):
+    """
+    Performs Multi-Scale TTA using an ensemble of models (e.g., Teachers).
+    Averages the TTA predictions of each model.
+
+    Args:
+        models (list of torch.nn.Module): List of loaded models.
+        device (str): Device to run inference on.
+
+    Returns:
+        np.ndarray: Ensemble averaged probabilities.
+    """
+    ensemble_probs = None
+
+    for model in models:
+        model_probs = predict_tta(model, device)
+
+        if ensemble_probs is None:
+            ensemble_probs = model_probs
+        else:
+            ensemble_probs += model_probs
+
+    return ensemble_probs / len(models)
+=======
+def predict_ensemble(models, device):
+    """
+    Performs inference using an ensemble of models.
+    Averages the predictions of each model.
+    Reverts TTA to standard inference to avoid geometric distortion (Cite Lesson 00072).
+
+    Args:
+        models (list of torch.nn.Module): List of loaded models.
+        device (str): Device to run inference on.
+
+    Returns:
+        np.ndarray: Ensemble averaged probabilities.
+    """
+    ensemble_probs = None
+    
+    # Get standard test loader
+    _, _, test_loader = data.get_dataloaders(load_cached_data=True)
+
+    for model in models:
+        # Standard inference (no TTA)
+        model_probs = predict_probs(model, test_loader, device, apply_flip=False)
+
+        if ensemble_probs is None:
+            ensemble_probs = model_probs
+        else:
+            ensemble_probs += model_probs
+
+    return ensemble_probs / len(models)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def generate_submission(model, device, output_path):
+    """
+    Generates the final submission file using the Single-Scale inference strategy
+    specified for the Student model.
+
+    Args:
+        model (torch.nn.Module): The final trained student model.
+        device (str): Device to run inference on.
+        output_path (str): Path to save the submission CSV.
+    """
+    # Use the standard inference width defined in config (single scale)
+    _, _, test_loader = data.get_dataloaders(
+        tta_width=config.IMG_WIDTH_TEST, load_cached_data=True
+    )
+
+    # Single forward pass (no flips, fixed resolution)
+    probs = predict_probs(model, test_loader, device, apply_flip=False)
+=======
+def generate_submission(model, device, output_path):
+    """
+    Generates the final submission file using the Single-Scale inference strategy
+    specified for the Student model.
+
+    Args:
+        model (torch.nn.Module): The final trained student model.
+        device (str): Device to run inference on.
+        output_path (str): Path to save the submission CSV.
+    """
+    # Use the standard inference width defined in config (single scale)
+    _, _, test_loader = data.get_dataloaders(load_cached_data=True)
+
+    # Single forward pass (no flips, fixed resolution)
+    probs = predict_probs(model, test_loader, device, apply_flip=False)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Generate Ensemble TTA Predictions
+    # This averages predictions across all teachers and TTA views
+    pseudo_probs = inference.predict_ensemble_tta(teachers, device)
+=======
+    # Generate Ensemble Predictions
+    # This averages predictions across all teachers (Fixed Resolution, No TTA)
+    # Cite Lesson 00072: Preserving Spectrotemporal Geometry
+    pseudo_probs = inference.predict_ensemble(teachers, device)
+>>>>>>> REPLACE
+```

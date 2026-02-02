@@ -1,0 +1,268 @@
+import os
+import json
+import random
+import pandas as pd
+import numpy as np
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+
+def get_records(folder_name):
+    """
+    Scans a folder (e.g., 'train') for record directories.
+    Returns a list of dictionaries with record_id and relative file paths.
+    """
+    folder_path = os.path.join(INPUT_DIR, folder_name)
+    if not os.path.exists(folder_path):
+        return []
+
+    records = []
+    # List subdirectories (each is a record_id)
+    try:
+        subdirs = [
+            d
+            for d in os.listdir(folder_path)
+            if os.path.isdir(os.path.join(folder_path, d))
+        ]
+    except OSError:
+        return []
+
+    for record_id in subdirs:
+        # Relative path to the record folder from input root
+        rel_record_path = os.path.join(folder_name, record_id)
+        abs_record_path = os.path.join(INPUT_DIR, rel_record_path)
+
+        entry = {"record_id": record_id}
+
+        # Bands 08-16
+        # We assume bands exist as per dataset description, but paths are constructed here.
+        for b in range(8, 17):
+            band_file = f"band_{b:02d}.npy"
+            entry[f"band_{b:02d}"] = os.path.join(rel_record_path, band_file)
+
+        # Masks - check existence explicitly
+        # human_pixel_masks.npy
+        pixel_mask_abs = os.path.join(abs_record_path, "human_pixel_masks.npy")
+        if os.path.exists(pixel_mask_abs):
+            entry["human_pixel_masks"] = os.path.join(
+                rel_record_path, "human_pixel_masks.npy"
+            )
+        else:
+            entry["human_pixel_masks"] = None
+
+        # human_individual_masks.npy
+        individual_mask_abs = os.path.join(
+            abs_record_path, "human_individual_masks.npy"
+        )
+        if os.path.exists(individual_mask_abs):
+            entry["human_individual_masks"] = os.path.join(
+                rel_record_path, "human_individual_masks.npy"
+            )
+        else:
+            entry["human_individual_masks"] = None
+
+        records.append(entry)
+
+    return records
+
+
+def load_metadata_json(filename):
+    """Loads a metadata json file into a DataFrame."""
+    path = os.path.join(INPUT_DIR, filename)
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return pd.DataFrame(data)
+    except Exception as e:
+        print(f"Warning: Could not load {filename}: {e}")
+        return pd.DataFrame()
+
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+
+
+def main():
+    # Ensure output directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # 1. Scan Directories
+    print("Scanning input directories...")
+    train_records = get_records("train")
+    val_records = get_records("validation")
+    test_records = get_records("test")
+
+    print(
+        f"Raw counts - Train: {len(train_records)}, Validation: {len(val_records)}, Test: {len(test_records)}"
+    )
+
+    # 2. Determine Validation Strategy
+    # Check if provided validation set has labels (human_pixel_masks)
+    val_has_labels = False
+    if val_records:
+        # Check if at least one record has a pixel mask
+        if any(r["human_pixel_masks"] is not None for r in val_records):
+            val_has_labels = True
+
+    use_provided_val = val_has_labels
+
+    final_train = []
+    final_val = []
+
+    if use_provided_val:
+        print("Using provided validation set.")
+        final_train = train_records
+        final_val = val_records
+    else:
+        print(
+            "Provided validation set is missing or unlabeled. Creating 80/20 split from training data."
+        )
+
+        # Filter train_records to ensure we only split records that actually have labels
+        valid_train_records = [
+            r for r in train_records if r["human_pixel_masks"] is not None
+        ]
+
+        if len(valid_train_records) < len(train_records):
+            print(
+                f"Warning: {len(train_records) - len(valid_train_records)} training records missing masks."
+            )
+
+        # Shuffle and split
+        random.seed(RANDOM_STATE)
+        random.shuffle(valid_train_records)
+
+        split_idx = int(len(valid_train_records) * 0.8)
+        final_train = valid_train_records[:split_idx]
+        final_val = valid_train_records[split_idx:]
+
+    # 3. Merge with JSON Metadata
+    train_meta_json = load_metadata_json("train_metadata.json")
+    val_meta_json = load_metadata_json("validation_metadata.json")
+
+    # Combine json metadata because if we split, records could be from anywhere.
+    # Drop duplicates based on record_id.
+    combined_json = pd.concat([train_meta_json, val_meta_json], ignore_index=True)
+    if not combined_json.empty:
+        combined_json = combined_json.drop_duplicates(subset=["record_id"])
+
+    def create_and_merge(records, meta_df):
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        if not meta_df.empty and "record_id" in df.columns:
+            # Convert record_id to string in both to ensure match
+            df["record_id"] = df["record_id"].astype(str)
+            meta_df["record_id"] = meta_df["record_id"].astype(str)
+            df = df.merge(meta_df, on="record_id", how="left")
+        return df
+
+    df_train = create_and_merge(final_train, combined_json)
+    df_val = create_and_merge(final_val, combined_json)
+    df_test = create_and_merge(
+        test_records, pd.DataFrame()
+    )  # No test metadata json provided
+
+    # 4. Save Metadata
+    train_csv_path = os.path.join(METADATA_DIR, "train.csv")
+    val_csv_path = os.path.join(METADATA_DIR, "validation.csv")
+    test_csv_path = os.path.join(METADATA_DIR, "test.csv")
+
+    if not df_train.empty:
+        df_train.to_csv(train_csv_path, index=False)
+    if not df_val.empty:
+        df_val.to_csv(val_csv_path, index=False)
+    if not df_test.empty:
+        df_test.to_csv(test_csv_path, index=False)
+
+    print("Metadata files generated.")
+
+    # 5. Verification
+    print("\n==== Verification ====")
+
+    # 5.1 Stats
+    print(f"Final Train Count: {len(df_train)}")
+    print(f"Final Validation Count: {len(df_val)}")
+    print(f"Final Test Count: {len(df_test)}")
+
+    # 5.2 Split Verification (if applicable)
+    if not use_provided_val and not df_train.empty and not df_val.empty:
+        total = len(df_train) + len(df_val)
+        ratio = len(df_val) / total
+        print(f"Calculated Validation Split Ratio: {ratio:.4f}")
+        if not (0.15 < ratio < 0.25):
+            raise AssertionError(
+                f"Validation split ratio {ratio} is not close to required 0.2"
+            )
+
+    # 5.3 Path Verification
+    all_dfs = []
+    if not df_train.empty:
+        all_dfs.append(df_train)
+    if not df_val.empty:
+        all_dfs.append(df_val)
+    if not df_test.empty:
+        all_dfs.append(df_test)
+
+    if all_dfs:
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+
+        # Identify path columns: those starting with 'band_' or ending with 'masks'
+        path_cols = [
+            c
+            for c in combined_df.columns
+            if c.startswith("band_") or c.endswith("masks")
+        ]
+
+        all_paths = []
+        for c in path_cols:
+            # Get non-null paths
+            paths = combined_df[c].dropna().tolist()
+            all_paths.extend(paths)
+
+        # Sample 1000 paths
+        sample_size = 1000
+        if len(all_paths) > sample_size:
+            sampled_paths = random.sample(all_paths, sample_size)
+        else:
+            sampled_paths = all_paths
+
+        print(f"Checking {len(sampled_paths)} random file paths for existence...")
+
+        missing_count = 0
+        missing_samples = []
+
+        for p in sampled_paths:
+            full_path = os.path.join(INPUT_DIR, p)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(p)
+
+        missing_ratio = missing_count / len(sampled_paths) if sampled_paths else 0
+        print(f"Missing paths: {missing_count} ({missing_ratio:.2%})")
+
+        if missing_ratio > 0.5:
+            print("Sample missing paths:", missing_samples)
+            raise RuntimeError(
+                f"Missing file ratio {missing_ratio} exceeds limit of 0.5"
+            )
+
+        print("Verification passed successfully.")
+
+
+if __name__ == "__main__":
+    main()

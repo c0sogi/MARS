@@ -1,0 +1,322 @@
+Based on the provided lessons and the analysis of the previous solution, I will implement the following optimizations:
+
+1.  **Revert to Pure Deep MLP Architecture (Cite 00087, 00089)**: The previous solution used a "Wide-and-Deep" topology (`DSRPEModel`) which added a linear residual path. Lessons indicate that on this dense tabular dataset, a pure Deep MLP ensemble (HPFE) outperforms the Wide-and-Deep approach unless explicit cross-product features are engineered. I will remove the `wide_path` and revert to a standard Heterogeneous Parallel Funnel Ensemble (`HPFEModel`).
+2.  **Extend Training Schedule (Cite 00080)**: The previous run was limited to 5 epochs ("Fast Baseline"). I will increase this to **30 epochs** to allow the OneCycleLR scheduler to properly anneal the learning rate and reach the high-precision manifold.
+3.  **Increase Batch Size (Cite 00079)**: To accommodate the increased epoch count within the runtime limit, I will increase the `BATCH_SIZE` from 1024 to **2048**. This improves throughput on the A100 GPU and works well with AdamW.
+4.  **Maintain Heterogeneity (Cite 00066)**: I will preserve the diverse stream configurations (varying depth/width/dropout) defined in the config.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+BATCH_SIZE = 1024
+EPOCHS = 50
+LEARNING_RATE = 1e-2
+WEIGHT_DECAY = 2e-5
+
+# ==========================================
+# Compute Configuration
+# ==========================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================================
+# Path Definitions
+# ==========================================
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+WORKING_DIR = "./working/idea_35"
+=======
+BATCH_SIZE = 2048
+EPOCHS = 30
+LEARNING_RATE = 1e-2
+WEIGHT_DECAY = 2e-5
+
+# ==========================================
+# Compute Configuration
+# ==========================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================================
+# Path Definitions
+# ==========================================
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+WORKING_DIR = "./working/idea_36"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DSRPEModel(nn.Module):
+    """
+    Deep Selective-Residual Parallel Ensemble (DSR-PE) Model.
+
+    Architecture:
+    - 5 Independent Streams (defined in library.config).
+    - Each stream possesses its own independent Entity Embeddings.
+    - Each stream implements a 'Selective Wide-and-Deep' topology:
+        - Deep Path: Funnel MLP processing fused inputs (Flattened Embeddings + Continuous).
+        - Wide Path: Linear Residual processing ONLY Continuous inputs.
+    """
+
+    def __init__(self, vocab_sizes, cont_dim):
+        """
+        Initialize the DSR-PE Model.
+
+        Args:
+            vocab_sizes (list or np.array): List of vocabulary sizes for each categorical feature.
+            cont_dim (int): Number of continuous features (input dimension for Wide Path).
+        """
+        super(DSRPEModel, self).__init__()
+
+        self.streams = nn.ModuleList()
+        self.num_cat = len(vocab_sizes)
+
+        # Calculate the input dimension for the Deep Path
+        # It receives: Flattened Embeddings (Num_Cat * 16) + Continuous Features
+        deep_input_dim = (self.num_cat * EMBEDDING_DIM) + cont_dim
+
+        for config in STREAM_CONFIGS:
+            stream = nn.ModuleDict()
+
+            # 1. Independent Embeddings
+            # We create a specific embedding layer for each categorical feature.
+            # These are NOT shared between streams.
+            embeddings = nn.ModuleList(
+                [
+                    nn.Embedding(num_embeddings=int(size), embedding_dim=EMBEDDING_DIM)
+                    for size in vocab_sizes
+                ]
+            )
+            stream["embeddings"] = embeddings
+
+            # 2. Deep Path (The Funnel)
+            # Processes fused data: Embeddings + Continuous
+            layers = []
+            in_dim = deep_input_dim
+
+            for hidden_dim in config["hidden_layers"]:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(p=config["dropout"]))
+                in_dim = hidden_dim
+
+            # Final projection to scalar logit
+            layers.append(nn.Linear(in_dim, 1))
+            stream["deep_path"] = nn.Sequential(*layers)
+
+            # 3. Wide Path (The Selective Residual)
+            # Processes ONLY Continuous data via a linear projection
+            stream["wide_path"] = nn.Linear(cont_dim, 1)
+
+            self.streams.append(stream)
+
+    def forward(self, cat_inputs, cont_inputs):
+        """
+        Forward pass for the ensemble.
+
+        Args:
+            cat_inputs (torch.Tensor): Categorical inputs [Batch, Num_Cat].
+            cont_inputs (torch.Tensor): Continuous inputs [Batch, Cont_Dim].
+
+        Returns:
+            list[torch.Tensor]: A list of 5 tensors, each containing the logits [Batch, 1]
+                                from one of the parallel streams.
+        """
+        outputs = []
+
+        for stream in self.streams:
+            # --- Embedding Lookup ---
+            # Process each categorical feature through its specific embedding layer
+            emb_vectors = []
+            for i, emb_layer in enumerate(stream["embeddings"]):
+                # cat_inputs[:, i] shape: [Batch] -> [Batch, Embed_Dim]
+                emb_vectors.append(emb_layer(cat_inputs[:, i]))
+
+            # Flatten embeddings: [Batch, Num_Cat * Embed_Dim]
+            emb_flat = torch.cat(emb_vectors, dim=1)
+
+            # --- Deep Path Execution ---
+            # Input: Concatenation of Flattened Embeddings and Continuous Features
+            deep_in = torch.cat([emb_flat, cont_inputs], dim=1)
+            deep_out = stream["deep_path"](deep_in)
+
+            # --- Wide Path Execution ---
+            # Input: Only Continuous Features
+            wide_out = stream["wide_path"](cont_inputs)
+
+            # --- Stream Output ---
+            # Sum of Deep and Wide paths
+            stream_logit = deep_out + wide_out
+            outputs.append(stream_logit)
+
+        return outputs
+=======
+class HPFEModel(nn.Module):
+    """
+    Heterogeneous Parallel Funnel Ensemble (HPFE) Model.
+
+    Architecture:
+    - 5 Independent Streams (defined in library.config).
+    - Each stream possesses its own independent Entity Embeddings.
+    - Each stream implements a Pure Deep MLP topology (Funnel).
+    - No linear residual (Wide) path, as per Lesson 00087/00089.
+    """
+
+    def __init__(self, vocab_sizes, cont_dim):
+        """
+        Initialize the HPFE Model.
+
+        Args:
+            vocab_sizes (list or np.array): List of vocabulary sizes for each categorical feature.
+            cont_dim (int): Number of continuous features.
+        """
+        super(HPFEModel, self).__init__()
+
+        self.streams = nn.ModuleList()
+        self.num_cat = len(vocab_sizes)
+
+        # Calculate the input dimension for the Deep Path
+        # It receives: Flattened Embeddings (Num_Cat * 16) + Continuous Features
+        deep_input_dim = (self.num_cat * EMBEDDING_DIM) + cont_dim
+
+        for config in STREAM_CONFIGS:
+            stream = nn.ModuleDict()
+
+            # 1. Independent Embeddings
+            # We create a specific embedding layer for each categorical feature.
+            # These are NOT shared between streams.
+            embeddings = nn.ModuleList(
+                [
+                    nn.Embedding(num_embeddings=int(size), embedding_dim=EMBEDDING_DIM)
+                    for size in vocab_sizes
+                ]
+            )
+            stream["embeddings"] = embeddings
+
+            # 2. Deep Path (The Funnel)
+            # Processes fused data: Embeddings + Continuous
+            layers = []
+            in_dim = deep_input_dim
+
+            for hidden_dim in config["hidden_layers"]:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(p=config["dropout"]))
+                in_dim = hidden_dim
+
+            # Final projection to scalar logit
+            layers.append(nn.Linear(in_dim, 1))
+            stream["deep_path"] = nn.Sequential(*layers)
+
+            self.streams.append(stream)
+
+    def forward(self, cat_inputs, cont_inputs):
+        """
+        Forward pass for the ensemble.
+
+        Args:
+            cat_inputs (torch.Tensor): Categorical inputs [Batch, Num_Cat].
+            cont_inputs (torch.Tensor): Continuous inputs [Batch, Cont_Dim].
+
+        Returns:
+            list[torch.Tensor]: A list of 5 tensors, each containing the logits [Batch, 1]
+                                from one of the parallel streams.
+        """
+        outputs = []
+
+        for stream in self.streams:
+            # --- Embedding Lookup ---
+            # Process each categorical feature through its specific embedding layer
+            emb_vectors = []
+            for i, emb_layer in enumerate(stream["embeddings"]):
+                # cat_inputs[:, i] shape: [Batch] -> [Batch, Embed_Dim]
+                emb_vectors.append(emb_layer(cat_inputs[:, i]))
+
+            # Flatten embeddings: [Batch, Num_Cat * Embed_Dim]
+            emb_flat = torch.cat(emb_vectors, dim=1)
+
+            # --- Deep Path Execution ---
+            # Input: Concatenation of Flattened Embeddings and Continuous Features
+            deep_in = torch.cat([emb_flat, cont_inputs], dim=1)
+            deep_out = stream["deep_path"](deep_in)
+
+            # --- Stream Output ---
+            outputs.append(deep_out)
+
+        return outputs
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import DSRPEModel
+=======
+from library.model import HPFEModel
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    print(
+        f"Initializing DSR-PE Model with {len(vocab_sizes)} categorical and {cont_dim} continuous features."
+    )
+    model = DSRPEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+=======
+    print(
+        f"Initializing HPFE Model with {len(vocab_sizes)} categorical and {cont_dim} continuous features."
+    )
+    model = HPFEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # Load Model
+    model = DSRPEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+=======
+    # Load Model
+    model = HPFEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DSRPEModel
+from library.trainer import train_one_epoch, validate, set_seed
+
+# Override EPOCHS for fast baseline execution
+FAST_RUN_EPOCHS = 5
+SUBMISSION_THRESHOLD = 0.9975746465492954
+=======
+from library.model import HPFEModel
+from library.trainer import train_one_epoch, validate, set_seed
+
+# Override EPOCHS for fast baseline execution
+FAST_RUN_EPOCHS = 30
+SUBMISSION_THRESHOLD = 0.9975746465492954
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print(f"Initializing model (Vocab: {vocab_sizes}, Cont Dim: {cont_dim})...")
+    model = DSRPEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+    model.to(DEVICE)
+=======
+    # 3. Model Initialization
+    print(f"Initializing model (Vocab: {vocab_sizes}, Cont Dim: {cont_dim})...")
+    model = HPFEModel(vocab_sizes=vocab_sizes, cont_dim=cont_dim)
+    model.to(DEVICE)
+>>>>>>> REPLACE
+```

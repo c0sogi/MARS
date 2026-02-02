@@ -1,0 +1,186 @@
+The `RuntimeError` is caused by attempting to concatenate tensors of different spatial dimensions into a single batch during Test-Time Augmentation (TTA). Specifically, rotating a non-square image (e.g., $258 \times 540$) by 90 or 270 degrees swaps its dimensions (to $540 \times 258$), making it incompatible for batching with the original image using `torch.cat` (Cite debug_lesson_2).
+
+To fix this, I will:
+1.  Modify `TTAHandler.apply_transforms` to group augmentations by their resulting shape. It will return a list of batches (e.g., one batch for original/180°/flips, and another for 90°/270°/flips) instead of a single tensor.
+2.  Update `TTAHandler.reverse_transforms` to accept a list of `(prediction_batch, transform_params)` tuples and aggregate the aligned results.
+3.  Update `predict_with_ensemble` to iterate over the batches returned by `apply_transforms`, run the model on each, and pass the results to the updated `reverse_transforms`.
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    def apply_transforms(self, image):
+        """
+        Applies all 8 geometric transformations to the input image.
+
+        Args:
+            image (torch.Tensor): Input image tensor of shape (1, C, H, W).
+
+        Returns:
+            torch.Tensor: Batch of transformed images (8, C, H, W).
+        """
+        augmented_images = []
+        for k, flip in self.transforms:
+            img_aug = image.clone()
+
+            # Apply Rotation (k * 90 degrees counter-clockwise)
+            if k > 0:
+                img_aug = torch.rot90(img_aug, k, dims=[-2, -1])
+
+            # Apply Horizontal Flip
+            if flip:
+                img_aug = torch.flip(img_aug, dims=[-1])
+
+            augmented_images.append(img_aug)
+
+        return torch.cat(augmented_images, dim=0)
+
+    def reverse_transforms(self, predictions):
+        """
+        Reverses the applied transformations to align predictions back to the original orientation.
+        Reversal order: Inverse Flip -> Inverse Rotation.
+
+        Args:
+            predictions (torch.Tensor): Batch of predictions (8, C, H, W).
+
+        Returns:
+            torch.Tensor: Batch of aligned predictions (8, C, H, W).
+        """
+        aligned_preds = []
+        for i, (k, flip) in enumerate(self.transforms):
+            pred = predictions[i : i + 1]  # Keep batch dim
+
+            # Inverse Flip (Flip is its own inverse)
+            if flip:
+                pred = torch.flip(pred, dims=[-1])
+
+            # Inverse Rotation (Rotate by -k or 4-k)
+            if k > 0:
+                pred = torch.rot90(pred, -k, dims=[-2, -1])
+
+            aligned_preds.append(pred)
+
+        return torch.cat(aligned_preds, dim=0)
+=======
+    def apply_transforms(self, image):
+        """
+        Applies all 8 geometric transformations to the input image.
+        Groups them by shape to handle non-square images (Cite debug_lesson_2).
+
+        Args:
+            image (torch.Tensor): Input image tensor of shape (1, C, H, W).
+
+        Returns:
+            list: A list of tuples (batch_tensor, transform_params_list).
+        """
+        # Group 1: Preserves aspect ratio (k=0, 2)
+        group_preserve = []
+        params_preserve = []
+        
+        # Group 2: Swaps aspect ratio (k=1, 3)
+        group_swap = []
+        params_swap = []
+
+        for k, flip in self.transforms:
+            img_aug = image.clone()
+
+            # Apply Rotation (k * 90 degrees counter-clockwise)
+            if k > 0:
+                img_aug = torch.rot90(img_aug, k, dims=[-2, -1])
+
+            # Apply Horizontal Flip
+            if flip:
+                img_aug = torch.flip(img_aug, dims=[-1])
+
+            # Check if dimensions are swapped (odd rotations swap H and W)
+            if k % 2 != 0:
+                group_swap.append(img_aug)
+                params_swap.append((k, flip))
+            else:
+                group_preserve.append(img_aug)
+                params_preserve.append((k, flip))
+
+        results = []
+        if group_preserve:
+            results.append((torch.cat(group_preserve, dim=0), params_preserve))
+        if group_swap:
+            results.append((torch.cat(group_swap, dim=0), params_swap))
+            
+        return results
+
+    def reverse_transforms(self, predictions_groups):
+        """
+        Reverses the applied transformations to align predictions back to the original orientation.
+
+        Args:
+            predictions_groups (list): List of (prediction_batch, transform_params_list).
+
+        Returns:
+            torch.Tensor: Batch of aligned predictions (8, C, H, W).
+        """
+        aligned_preds = []
+        
+        for batch, params_list in predictions_groups:
+            for i, (k, flip) in enumerate(params_list):
+                pred = batch[i : i + 1]  # Keep batch dim
+
+                # Inverse Flip (Flip is its own inverse)
+                if flip:
+                    pred = torch.flip(pred, dims=[-1])
+
+                # Inverse Rotation (Rotate by -k or 4-k)
+                if k > 0:
+                    pred = torch.rot90(pred, -k, dims=[-2, -1])
+
+                aligned_preds.append(pred)
+
+        return torch.cat(aligned_preds, dim=0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+            # Generate TTA batch (8, 1, H, W)
+            tta_batch = tta.apply_transforms(noisy_img)
+
+            ensemble_preds = []
+
+            # Pass TTA batch through each model in the ensemble
+            for model in models:
+                # Model output: (8, 1, H, W)
+                # Note: In eval mode, DeepSupervisionUNet returns only the final prediction tensor
+                preds = model(tta_batch)
+
+                # Reverse TTA to align predictions
+                aligned_preds = tta.reverse_transforms(preds)  # (8, 1, H, W)
+
+                # Average over TTA variations for this model
+                model_avg = torch.mean(
+                    aligned_preds, dim=0, keepdim=True
+                )  # (1, 1, H, W)
+                ensemble_preds.append(model_avg)
+=======
+            # Generate TTA batches (grouped by shape)
+            tta_groups = tta.apply_transforms(noisy_img)
+
+            ensemble_preds = []
+
+            # Pass TTA batches through each model in the ensemble
+            for model in models:
+                model_preds_groups = []
+                
+                for batch, params in tta_groups:
+                    # Model output: (BatchSize, 1, H, W)
+                    preds = model(batch)
+                    model_preds_groups.append((preds, params))
+
+                # Reverse TTA to align predictions
+                aligned_preds = tta.reverse_transforms(model_preds_groups)  # (8, 1, H, W)
+
+                # Average over TTA variations for this model
+                model_avg = torch.mean(
+                    aligned_preds, dim=0, keepdim=True
+                )  # (1, 1, H, W)
+                ensemble_preds.append(model_avg)
+>>>>>>> REPLACE
+```

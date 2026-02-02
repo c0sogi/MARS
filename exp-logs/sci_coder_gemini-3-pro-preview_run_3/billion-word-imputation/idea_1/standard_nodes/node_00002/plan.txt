@@ -1,0 +1,303 @@
+To optimize the solution, I will implement the **Pointer Head** mechanism for the Locator model as suggested in the lesson. This addresses the class imbalance issue in the previous token-classification approach by treating the localization task as a ranking problem (predicting the index of the gap) rather than independent binary classifications.
+
+Here is the implementation strategy:
+1.  **Modify `LocatorNetwork`**: Change the output layer to project to a scalar score per token and apply a mask to padding tokens. This allows the model to output a distribution over the sequence length.
+2.  **Modify `LocatorDataset`**: Update the label generation to return the scalar index of the gap position instead of a binary sequence mask.
+3.  **Modify `Trainer`**: Update the `train_locator` method to use `CrossEntropyLoss` on the sequence dimension (optimizing the correct index) and calculate sequence-level accuracy.
+4.  **Modify `InferencePipeline`**: Update the prediction logic to interpret the Locator's output as a probability distribution over positions (Softmax dim=1) and select the argmax.
+5.  **Update Configuration**: Increase `DEBUG_SAMPLE_SIZE` to 500,000 and training epochs to 3 in `runfile.py` to improve generalization within the 4-hour time limit.
+
+Cite `solution_lesson_node_00001` for the Pointer Head and Sparse Localization strategy.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    DEBUG_SAMPLE_SIZE = 50_000
+=======
+    DEBUG_SAMPLE_SIZE = 500_000
+>>>>>>> REPLACE
+```
+
+```diff
+library/models.py
+<<<<<<< SEARCH
+        # Classification head:
+        # Projects hidden state to 2 classes: [No Gap, Gap]
+        # We predict if a word is missing *after* the current token.
+        self.classifier = nn.Linear(self.hidden_size, 2)
+
+    def forward(self, input_ids, attention_mask=None):
+        """
+        Args:
+            input_ids (torch.Tensor): Shape (batch_size, seq_len)
+            attention_mask (torch.Tensor): Shape (batch_size, seq_len)
+
+        Returns:
+            logits (torch.Tensor): Shape (batch_size, seq_len, 2)
+        """
+        # Get hidden states from backbone
+        # outputs.last_hidden_state shape: (batch_size, seq_len, hidden_size)
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state
+
+        # Apply dropout
+        sequence_output = self.dropout(sequence_output)
+
+        # Project to logits
+        logits = self.classifier(sequence_output)
+
+        return logits
+=======
+        # Pointer Head:
+        # Projects hidden state to 1 scalar score per token.
+        # Cite solution_lesson_node_00001: Use Pointer Head for Sparse Localization.
+        self.classifier = nn.Linear(self.hidden_size, 1)
+
+    def forward(self, input_ids, attention_mask=None):
+        """
+        Args:
+            input_ids (torch.Tensor): Shape (batch_size, seq_len)
+            attention_mask (torch.Tensor): Shape (batch_size, seq_len)
+
+        Returns:
+            logits (torch.Tensor): Shape (batch_size, seq_len)
+        """
+        # Get hidden states from backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state
+
+        # Apply dropout
+        sequence_output = self.dropout(sequence_output)
+
+        # Project to logits (Batch, Seq_Len, 1)
+        logits = self.classifier(sequence_output)
+        
+        # Squeeze to (Batch, Seq_Len)
+        logits = logits.squeeze(-1)
+
+        # Mask padding tokens to -inf so they don't affect Softmax/Loss
+        if attention_mask is not None:
+            # attention_mask is 1 for keep, 0 for pad.
+            # We want pads to be -inf.
+            logits = logits + (1.0 - attention_mask) * -10000.0
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # Create labels: 0 everywhere, 1 at the token preceding the gap
+        labels = torch.zeros_like(input_ids)
+
+        # The gap is after 'pre_gap_str'.
+        # We need to find the token that ends exactly at len(pre_gap_str).
+        target_char_idx = len(pre_gap_str)
+
+        found_target = False
+        for i, (start, end) in enumerate(offset_mapping):
+            if attention_mask[i] == 0:
+                break
+            # Check if this token ends at the gap position
+            # We allow a small margin or exact match depending on tokenizer behavior
+            # Usually exact match works for joined strings.
+            if end == target_char_idx:
+                labels[i] = 1
+                found_target = True
+                break
+
+        # If target was truncated or not found (rare), we leave labels as all zeros (ignore)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+=======
+        # Cite solution_lesson_node_00001: Use index labels for Pointer Network.
+        # Label is the index of the token preceding the gap.
+        label_idx = -100  # Default to ignore_index
+
+        # The gap is after 'pre_gap_str'.
+        # We need to find the token that ends exactly at len(pre_gap_str).
+        target_char_idx = len(pre_gap_str)
+
+        for i, (start, end) in enumerate(offset_mapping):
+            if attention_mask[i] == 0:
+                break
+            # Check if this token ends at the gap position
+            if end == target_char_idx:
+                label_idx = i
+                break
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": torch.tensor(label_idx, dtype=torch.long),
+        }
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                # Forward
+                logits = model(input_ids, attention_mask)  # Shape: (B, L, 2)
+
+                # Flatten for loss calculation
+                # logits: (B*L, 2), labels: (B*L)
+                loss = self.locator_criterion(
+                    logits.view(-1, 2), labels.view(-1).long()
+                )
+=======
+                # Forward
+                logits = model(input_ids, attention_mask)  # Shape: (B, L)
+
+                # Cite solution_lesson_node_00001: Optimize NLL of correct index (CrossEntropy on sequence dim)
+                loss = self.locator_criterion(logits, labels)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                    logits = model(input_ids, attention_mask)
+                    loss = self.locator_criterion(
+                        logits.view(-1, 2), labels.view(-1).long()
+                    )
+                    val_loss += loss.item()
+
+                    # Metrics
+                    preds = torch.argmax(logits, dim=2)  # (B, L)
+
+                    # Token-level accuracy
+                    mask = attention_mask == 1
+                    correct += ((preds == labels) & mask).sum().item()
+                    total_tokens += mask.sum().item()
+
+                    # Sequence-level accuracy (did we find the exact 1?)
+                    # We look at where label is 1
+                    # Note: labels might be all zeros if data generation failed for a row, handle that
+                    label_gaps = (labels == 1).nonzero(as_tuple=False)
+                    # We only care about rows that actually have a gap labeled
+                    # Map row_idx -> col_idx
+                    # Simple heuristic: argmax of preds vs argmax of labels
+
+                    # For validation metric, let's just use Loss as primary for Early Stopping
+                    # But let's print simple accuracy
+
+            avg_val_loss = val_loss / len(val_loader)
+            val_acc = correct / total_tokens if total_tokens > 0 else 0.0
+
+            self.logger.info(
+                f"Epoch {epoch+1} | Train Loss: {avg_train_loss} | Val Loss: {avg_val_loss} | Val Token Acc: {val_acc}"
+            )
+=======
+                    logits = model(input_ids, attention_mask)
+                    loss = self.locator_criterion(logits, labels)
+                    val_loss += loss.item()
+
+                    # Metrics: Sequence-level accuracy (Pointer)
+                    # Pred is argmax over sequence
+                    preds = torch.argmax(logits, dim=1)  # (B,)
+                    
+                    # Filter out ignore_index (-100)
+                    valid_mask = labels != -100
+                    if valid_mask.sum() > 0:
+                        correct += (preds[valid_mask] == labels[valid_mask]).sum().item()
+                        total_seqs += valid_mask.sum().item()
+
+            avg_val_loss = val_loss / len(val_loader)
+            val_acc = correct / total_seqs if total_seqs > 0 else 0.0
+
+            self.logger.info(
+                f"Epoch {epoch+1} | Train Loss: {avg_train_loss} | Val Loss: {avg_val_loss} | Val Seq Acc: {val_acc}"
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                # --- Step 1: Locate ---
+                loc_logits = locator(input_ids, attention_mask)  # (B, L, 2)
+                # Get probability of class 1 (Gap)
+                gap_probs = torch.softmax(loc_logits, dim=2)[:, :, 1]
+
+                # Mask out padding/special tokens to avoid predicting them
+                # We usually don't want to predict gap at [CLS] (0) or [SEP] (last) or padding
+                # attention_mask is 0 for padding.
+                gap_probs = gap_probs * attention_mask
+
+                # Find argmax index
+                # This index 'k' means the gap is AFTER token k.
+                pred_indices = torch.argmax(gap_probs, dim=1)  # (B,)
+=======
+                # --- Step 1: Locate ---
+                # Cite solution_lesson_node_00001: Pointer Head Inference
+                loc_logits = locator(input_ids, attention_mask)  # (B, L)
+                
+                # Softmax over sequence dimension
+                gap_probs = torch.softmax(loc_logits, dim=1)
+
+                # Suppress CLS (index 0)
+                gap_probs[:, 0] = 0.0
+                
+                # Find argmax index
+                pred_indices = torch.argmax(gap_probs, dim=1)  # (B,)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                # --- Step 1: Locate the Gap ---
+                # Forward pass through Locator
+                loc_logits = self.locator(input_ids, attention_mask)  # (B, L, 2)
+
+                # Get probability of class 1 (Gap)
+                gap_probs = torch.softmax(loc_logits, dim=2)[:, :, 1]
+
+                # Mask out padding to prevent predicting gap in padding
+                gap_probs = gap_probs * attention_mask
+
+                # Find the token index after which the gap exists
+                pred_indices = torch.argmax(gap_probs, dim=1)  # (B,)
+=======
+                # --- Step 1: Locate the Gap ---
+                # Forward pass through Locator
+                # Cite solution_lesson_node_00001: Pointer Head Inference
+                loc_logits = self.locator(input_ids, attention_mask)  # (B, L)
+
+                # Softmax over sequence dimension
+                gap_probs = torch.softmax(loc_logits, dim=1)
+
+                # Suppress CLS (index 0)
+                gap_probs[:, 0] = 0.0
+
+                # Find the token index after which the gap exists
+                pred_indices = torch.argmax(gap_probs, dim=1)  # (B,)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Reduce epochs to 1 for speed
+    Config.LOCATOR_PARAMS["epochs"] = 1
+    Config.FILLER_PARAMS["epochs"] = 1
+
+    # Increase batch size for A100 efficiency
+    Config.LOCATOR_PARAMS["batch_size"] = 256
+    Config.FILLER_PARAMS["batch_size"] = 128
+=======
+    # Optimize epochs for better performance within time limit
+    Config.LOCATOR_PARAMS["epochs"] = 3
+    Config.FILLER_PARAMS["epochs"] = 3
+
+    # Increase batch size for A100 efficiency
+    Config.LOCATOR_PARAMS["batch_size"] = 256
+    Config.FILLER_PARAMS["batch_size"] = 128
+>>>>>>> REPLACE
+```

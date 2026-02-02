@@ -1,0 +1,147 @@
+The `torch.OutOfMemoryError` indicates that the batch size of 32 is too large for the DeBERTa-v3-base model on the available GPU, specifically due to the memory-intensive disentangled attention mechanism. To fix this, I will decouple the VRAM constraints from the batch size using Gradient Accumulation (Cite debug_lesson_5). I will reduce the physical `mlm_batch_size` to 4 and introduce `mlm_grad_accum = 8` to maintain the effective batch size of 32. I will also reduce the supervised `batch_size` to 4 to prevent OOM in the second stage, although gradient accumulation will not be applied there to avoid conflicts with AWP. The `train_mlm` function in `library/engine.py` will be updated to accumulate gradients over multiple steps before performing an optimizer update.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Stage 1: Domain-Adaptive Pre-training (MLM)
+    # ==========================================
+    mlm_epochs = 3
+    mlm_batch_size = 32  # A100 GPU allows for larger batch sizes
+    mlm_lr = 2e-5
+    mlm_weight_decay = 0.01
+
+    # ==========================================
+    # Stage 2: Classification Fine-Tuning
+    # ==========================================
+    n_folds = 5
+    epochs = 5
+    batch_size = 32
+=======
+    # ==========================================
+    # Stage 1: Domain-Adaptive Pre-training (MLM)
+    # ==========================================
+    mlm_epochs = 3
+    mlm_batch_size = 4  # Reduced to fit in VRAM
+    mlm_grad_accum = 8  # Accumulate to reach effective batch size of 32
+    mlm_lr = 2e-5
+    mlm_weight_decay = 0.01
+
+    # ==========================================
+    # Stage 2: Classification Fine-Tuning
+    # ==========================================
+    n_folds = 5
+    epochs = 5
+    batch_size = 4  # Reduced to fit in VRAM
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # Data Collator for masking
+    # We use the standard 15% masking probability
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
+    )
+
+    for epoch in range(epochs):
+        losses = AverageMeter()
+
+        for step, batch in enumerate(loader):
+            # The loader yields batches of input_ids and attention_mask (tensors)
+            # We need to convert them to a list of dicts for the DataCollator
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch_size = input_ids.size(0)
+
+            # Prepare inputs for collator
+            examples = [
+                {"input_ids": input_ids[i], "attention_mask": attention_mask[i]}
+                for i in range(batch_size)
+            ]
+
+            # Apply masking
+            # collator returns dict with keys: input_ids, attention_mask, labels
+            masked_batch = collator(examples)
+
+            # Move to device
+            b_input_ids = masked_batch["input_ids"].to(device)
+            b_attention_mask = masked_batch["attention_mask"].to(device)
+            b_labels = masked_batch["labels"].to(device)
+
+            # Forward
+            with autocast():
+                outputs = model(
+                    input_ids=b_input_ids,
+                    attention_mask=b_attention_mask,
+                    labels=b_labels,
+                )
+                loss = outputs.loss
+
+            # Backward
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            losses.update(loss.item(), batch_size)
+
+        print(f"MLM Epoch {epoch + 1}/{epochs} | Loss: {losses.avg:.6f}")
+=======
+    # Data Collator for masking
+    # We use the standard 15% masking probability
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
+    )
+
+    accumulation_steps = Config.mlm_grad_accum
+
+    for epoch in range(epochs):
+        losses = AverageMeter()
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(loader):
+            # The loader yields batches of input_ids and attention_mask (tensors)
+            # We need to convert them to a list of dicts for the DataCollator
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch_size = input_ids.size(0)
+
+            # Prepare inputs for collator
+            examples = [
+                {"input_ids": input_ids[i], "attention_mask": attention_mask[i]}
+                for i in range(batch_size)
+            ]
+
+            # Apply masking
+            # collator returns dict with keys: input_ids, attention_mask, labels
+            masked_batch = collator(examples)
+
+            # Move to device
+            b_input_ids = masked_batch["input_ids"].to(device)
+            b_attention_mask = masked_batch["attention_mask"].to(device)
+            b_labels = masked_batch["labels"].to(device)
+
+            # Forward
+            with autocast():
+                outputs = model(
+                    input_ids=b_input_ids,
+                    attention_mask=b_attention_mask,
+                    labels=b_labels,
+                )
+                loss = outputs.loss / accumulation_steps
+
+            # Backward
+            scaler.scale(loss).backward()
+
+            if (step + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            losses.update(loss.item() * accumulation_steps, batch_size)
+
+        print(f"MLM Epoch {epoch + 1}/{epochs} | Loss: {losses.avg:.6f}")
+>>>>>>> REPLACE
+```

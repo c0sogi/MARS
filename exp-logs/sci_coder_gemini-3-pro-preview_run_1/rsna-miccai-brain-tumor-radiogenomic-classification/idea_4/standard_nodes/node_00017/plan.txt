@@ -1,0 +1,310 @@
+I will implement a strategy that reverts the problematic stochastic sampling and low-precision preprocessing introduced in the previous iteration, while retaining the effective regularization settings.
+
+**Strategy:**
+1.  **Deterministic Slice Selection (Cite solution_lesson_node_00015):** I will modify `library/data.py` to abandon the stochastic volume sampling and ensemble inference. Instead, the model will deterministically select the middle slice (depth 0.5) for all subjects. This eliminates label noise caused by sampling non-tumor slices and aligns with the "Current Best" approach which achieved ~0.67 AUC.
+2.  **High-Fidelity Preprocessing (Cite solution_lesson_node_00016):** I will update `library/utils.py` and `library/data.py` to process MRI images as `float32` tensors in the [0, 1] range, avoiding the quantization to `uint8` (0-255). This preserves the subtle radiometric texture details critical for genetic subtyping.
+3.  **Pipeline Simplification:** I will update `library/engine.py` and `runfile.py` to handle standard 4D tensors `(B, C, H, W)` instead of the 5D ensemble tensors `(B, N, C, H, W)`, streamlining the training loop.
+4.  **Regularization:** I will retain the existing `WEIGHT_DECAY = 1e-2` and `ElasticTransform` augmentations (Cite solution_lesson_node_00010) which were proven effective in previous successful runs.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    if img_max > img_min:
+        img = (img - img_min) / (img_max - img_min)
+    else:
+        img = img - img_min  # Results in array of zeros
+
+    img = (img * 255).astype(np.uint8)
+
+    # Resize to target dimension
+    if img.shape[0] != size or img.shape[1] != size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+
+    return img
+=======
+    if img_max > img_min:
+        img = (img - img_min) / (img_max - img_min)
+    else:
+        img = img - img_min  # Results in array of zeros
+
+    # Resize to target dimension (keep as float32 to preserve radiometric resolution)
+    # Cite solution_lesson_node_00016: Avoid downsampling high-bit-depth data to 8-bit integers
+    if img.shape[0] != size or img.shape[1] != size:
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+
+    return img
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose(
+            [
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+=======
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose(
+            [
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+            # Handle missing files or read errors
+            if img is None:
+                img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+=======
+            # Handle missing files or read errors
+            if img is None:
+                img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # Determine depths to sample
+        voi_start, voi_end = Config.VOI_RANGE
+
+        if self.phase == "train":
+            # Stochastic Sampling: Pick ONE random depth within VOI
+            depth = random.uniform(voi_start, voi_end)
+
+            image = self._load_slice_at_depth(subject_id, depth)
+
+            if self.transform:
+                augmented = self.transform(image=image)
+                image = augmented["image"]
+            else:
+                # Fallback to tensor conversion
+                image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+
+            return image, label, subject_id
+
+        else:
+            # Inference Ensemble: Pick N equidistant depths
+            depths = np.linspace(voi_start, voi_end, Config.NUM_INFERENCE_SLICES)
+
+            images = []
+            for d in depths:
+                img = self._load_slice_at_depth(subject_id, d)
+
+                if self.transform:
+                    augmented = self.transform(image=img)
+                    img_tensor = augmented["image"]
+                else:
+                    img_tensor = (
+                        torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+                    )
+
+                images.append(img_tensor)
+
+            # Stack images: (N_SLICES, C, H, W)
+            images_stacked = torch.stack(images)
+
+            return images_stacked, label, subject_id
+=======
+        # Deterministic Sampling: Always pick the middle slice
+        # Cite solution_lesson_node_00015: Deterministic Geometric Heuristics Outperform Blind Stochastic Sampling
+        depth = 0.5
+
+        image = self._load_slice_at_depth(subject_id, depth)
+
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            # Fallback to tensor conversion (input is already float 0-1)
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float()
+
+        return image, label, subject_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set using 2.5D ensemble logic.
+    Input images shape: (B, N_SLICES, C, H, W)
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    # Use BCELoss for validation tracking since we compute probabilities manually
+    val_criterion = nn.BCELoss()
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device).unsqueeze(1)  # Shape: (B, 1)
+
+            B, N, C, H, W = images.shape
+
+            # Flatten slices into the batch dimension: (B*N, C, H, W)
+            flat_images = images.view(B * N, C, H, W)
+
+            # Forward pass
+            flat_logits = model(flat_images)  # (B*N, 1)
+            flat_probs = torch.sigmoid(flat_logits)
+
+            # Reshape back to (B, N) and average probabilities across slices
+            # This implements the ensemble voting mechanism
+            batch_probs = flat_probs.view(B, N).mean(dim=1, keepdim=True)  # (B, 1)
+
+            # Calculate loss on the aggregated predictions
+            loss = val_criterion(batch_probs, targets)
+
+            running_loss += loss.item() * B
+            dataset_size += B
+
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(batch_probs.cpu().numpy())
+=======
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device).unsqueeze(1)  # Shape: (B, 1)
+
+            # Forward pass
+            logits = model(images)
+            loss = criterion(logits, targets)
+
+            probs = torch.sigmoid(logits)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(probs.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def predict_test_set(model, dataloader, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for images, _, subject_ids in dataloader:
+            images = images.to(device)
+
+            B, N, C, H, W = images.shape
+
+            # Flatten, Predict, Reshape, Average
+            flat_images = images.view(B * N, C, H, W)
+            flat_logits = model(flat_images)
+            flat_probs = torch.sigmoid(flat_logits)
+            batch_probs = flat_probs.view(B, N).mean(dim=1).cpu().numpy()
+
+            # Collect results
+            for i in range(B):
+                results.append(
+                    {"BraTS21ID": subject_ids[i].item(), "MGMT_value": batch_probs[i]}
+                )
+
+    return pd.DataFrame(results)
+=======
+def predict_test_set(model, dataloader, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for images, _, subject_ids in dataloader:
+            images = images.to(device)
+
+            logits = model(images)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            # Collect results
+            for i in range(len(subject_ids)):
+                results.append(
+                    {"BraTS21ID": subject_ids[i].item(), "MGMT_value": probs[i][0]}
+                )
+
+    return pd.DataFrame(results)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, targets, subject_ids in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # Input shape: (B, N_SLICES, C, H, W)
+            B, N, C, H, W = images.shape
+
+            # Flatten slices into batch dimension
+            flat_images = images.view(B * N, C, H, W)
+
+            # Forward pass
+            flat_logits = model(flat_images)
+            flat_probs = torch.sigmoid(flat_logits)
+
+            # Reshape back to (B, N) and average
+            batch_probs = flat_probs.view(B, N).mean(dim=1)
+
+            all_preds.extend(batch_probs.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+            all_ids.extend(subject_ids.numpy())
+=======
+    with torch.no_grad():
+        for images, targets, subject_ids in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_targets.extend(targets.cpu().numpy())
+            all_ids.extend(subject_ids.numpy())
+>>>>>>> REPLACE
+```

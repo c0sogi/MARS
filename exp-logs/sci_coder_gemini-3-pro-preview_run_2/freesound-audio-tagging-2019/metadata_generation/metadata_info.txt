@@ -1,0 +1,284 @@
+# Python Script for Metadata Generation
+```
+import pandas as pd
+import numpy as np
+import os
+import sys
+from sklearn.preprocessing import MultiLabelBinarizer
+from skmultilearn.model_selection import iterative_train_test_split
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+
+
+def main():
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Step 1: Loading datasets...")
+    try:
+        train_curated_df = pd.read_csv(os.path.join(INPUT_DIR, "train_curated.csv"))
+        train_noisy_df = pd.read_csv(os.path.join(INPUT_DIR, "train_noisy.csv"))
+        sample_submission_df = pd.read_csv(
+            os.path.join(INPUT_DIR, "sample_submission.csv")
+        )
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    print("Step 2: Cleaning data...")
+    # Known bad files
+    corrupted_files = ["1d44b0bd.wav"]
+    wrong_label_files = [
+        "f76181c4.wav",
+        "77b925c2.wav",
+        "6a1f682a.wav",
+        "c7db12aa.wav",
+        "7752cc8a.wav",
+    ]
+    files_to_drop = set(corrupted_files + wrong_label_files)
+
+    # Remove bad files from curated
+    initial_count = len(train_curated_df)
+    train_curated_df = train_curated_df[
+        ~train_curated_df["fname"].isin(files_to_drop)
+    ].reset_index(drop=True)
+    print(f"Removed {initial_count - len(train_curated_df)} files from train_curated.")
+
+    print("Step 3: Generating file paths...")
+    train_curated_df["file_path"] = train_curated_df["fname"].apply(
+        lambda x: os.path.join("train_curated", x)
+    )
+    train_noisy_df["file_path"] = train_noisy_df["fname"].apply(
+        lambda x: os.path.join("train_noisy", x)
+    )
+    sample_submission_df["file_path"] = sample_submission_df["fname"].apply(
+        lambda x: os.path.join("test", x)
+    )
+
+    print("Step 4: Preparing for stratified split...")
+    # Shuffle curated data before splitting
+    train_curated_df = train_curated_df.sample(
+        frac=1, random_state=RANDOM_STATE
+    ).reset_index(drop=True)
+
+    # Parse labels for stratification
+    train_curated_df["label_list"] = train_curated_df["labels"].apply(
+        lambda x: x.split(",")
+    )
+
+    # Get vocabulary from sample_submission columns (excluding fname/file_path if added)
+    # The sample_submission has 81 columns: fname + 80 classes
+    classes = [
+        c for c in sample_submission_df.columns if c not in ["fname", "file_path"]
+    ]
+
+    mlb = MultiLabelBinarizer(classes=classes)
+    y_curated = mlb.fit_transform(train_curated_df["label_list"])
+
+    # X needs to be 2D array for iterative_train_test_split. We use indices.
+    X_indices = np.arange(len(train_curated_df)).reshape(-1, 1)
+
+    print("Step 5: Performing iterative stratified split (80/20)...")
+    # Split curated into train/val
+    X_train_idx, y_train, X_val_idx, y_val = iterative_train_test_split(
+        X_indices, y_curated, test_size=0.2
+    )
+
+    train_indices = X_train_idx.flatten()
+    val_indices = X_val_idx.flatten()
+
+    curated_train_subset = train_curated_df.iloc[train_indices].copy()
+    curated_val_subset = train_curated_df.iloc[val_indices].copy()
+
+    print(f"Curated Train Split: {len(curated_train_subset)}")
+    print(f"Curated Val Split: {len(curated_val_subset)}")
+
+    print("Step 6: Constructing final metadata...")
+    # Final Train = Curated(80%) + Noisy(100%)
+    # Ensure common columns
+    cols = ["fname", "labels", "file_path"]
+
+    final_train = pd.concat(
+        [curated_train_subset[cols], train_noisy_df[cols]], ignore_index=True
+    )
+    final_val = curated_val_subset[cols].reset_index(drop=True)
+    final_test = sample_submission_df[
+        ["fname", "file_path"]
+    ].copy()  # Keep minimal for test metadata
+
+    # Save to disk
+    final_train.to_csv(os.path.join(METADATA_DIR, "train.csv"), index=False)
+    final_val.to_csv(os.path.join(METADATA_DIR, "val.csv"), index=False)
+    final_test.to_csv(os.path.join(METADATA_DIR, "test.csv"), index=False)
+
+    print("Metadata saved.")
+
+    print("\n==== Verification Checks ====")
+
+    # 1. Summary Statistics
+    print(f"Final Train Size: {len(final_train)}")
+    print(f"Final Val Size: {len(final_val)}")
+    print(f"Final Test Size: {len(final_test)}")
+
+    # 2. File Path Verification
+    def verify_paths(df, name):
+        if len(df) == 0:
+            return
+        sample_n = min(1000, len(df))
+        samples = df.sample(n=sample_n, random_state=RANDOM_STATE)
+
+        missing_count = 0
+        missing_examples = []
+
+        for _, row in samples.iterrows():
+            rel_path = row["file_path"]
+            full_path = os.path.join(INPUT_DIR, rel_path)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(rel_path)
+
+        ratio = missing_count / sample_n
+        print(f"[{name}] Missing file ratio: {ratio:.4f}")
+
+        if missing_examples:
+            print(f"[{name}] Example missing paths: {missing_examples}")
+
+        if ratio > 0.5:
+            raise FileNotFoundError(
+                f"More than 50% of files missing in {name} metadata."
+            )
+
+    verify_paths(final_train, "Train")
+    verify_paths(final_val, "Val")
+    verify_paths(final_test, "Test")
+
+    # 3. Validation Split Ratio Verification
+    # Check ratio relative to the source (curated df)
+    curated_total = len(train_curated_df)
+    val_count = len(curated_val_subset)
+    split_ratio = val_count / curated_total
+    print(f"Validation Split Ratio (on curated source): {split_ratio:.4f}")
+
+    if not (0.15 <= split_ratio <= 0.25):
+        raise AssertionError(
+            f"Validation split ratio {split_ratio:.4f} is outside acceptable range (0.15-0.25)."
+        )
+
+    # 4. Stratification Verification
+    # Compare label distribution of Curated Source vs Validation Set
+    # Sum binary labels
+    source_label_counts = np.sum(y_curated, axis=0)
+    val_label_counts = np.sum(y_val, axis=0)
+
+    # Normalize to get distribution
+    source_dist = source_label_counts / np.sum(source_label_counts)
+    val_dist = val_label_counts / np.sum(val_label_counts)
+
+    # Calculate correlation
+    correlation = np.corrcoef(source_dist, val_dist)[0, 1]
+    print(f"Label Distribution Correlation (Source vs Val): {correlation:.4f}")
+
+    if correlation < 0.90:
+        raise AssertionError(
+            f"Stratification failed. Correlation {correlation:.4f} is too low."
+        )
+
+    print("All checks passed successfully.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+# Script Execution Output:
+Step 1: Loading datasets...
+Step 2: Cleaning data...
+Removed 6 files from train_curated.
+Step 3: Generating file paths...
+Step 4: Preparing for stratified split...
+Step 5: Performing iterative stratified split (80/20)...
+Curated Train Split: 3959
+Curated Val Split: 1005
+Step 6: Constructing final metadata...
+Metadata saved.
+
+==== Verification Checks ====
+Final Train Size: 23774
+Final Val Size: 1005
+Final Test Size: 3361
+[Train] Missing file ratio: 0.0000
+[Val] Missing file ratio: 0.0000
+[Test] Missing file ratio: 0.0000
+Validation Split Ratio (on curated source): 0.2025
+Label Distribution Correlation (Source vs Val): 0.9663
+All checks passed successfully.
+Execution time: 3 seconds (time limit is an hour).
+
+# Document
+Based on the provided Python script and its execution output, here is the detailed documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the combined training dataset used to train the audio tagging model.
+    *   It aggregates **80% of the cleaned `train_curated` dataset** (after removing 6 known bad files) and **100% of the `train_noisy` dataset**.
+    *   The curated portion was selected using iterative stratified splitting to ensure the label distribution matches the validation set.
+    *   It is used by the data loader to map training audio files to their ground truth labels.
+*   **Schema / Structure:**
+    *   **Format:** CSV (Comma Separated Values)
+    *   **Row Count:** 23,774 rows (plus header)
+    *   **Columns:**
+        *   `fname` (String): The unique filename of the audio clip (e.g., `0006ae4e.wav`).
+        *   `labels` (String): The ground truth tags for the audio clip. Multiple labels are comma-separated (e.g., `"Bark"` or `"Walk_and_footsteps,Slam"`).
+        *   `file_path` (String): The relative path to the audio file from the input root, distinguishing between source folders (e.g., `train_curated/0006ae4e.wav` or `train_noisy/00097e21.wav`).
+*   **Loading Method:**
+    *   Load using pandas:
+        ```python
+        import pandas as pd
+        df_train = pd.read_csv("./metadata/train.csv")
+        ```
+
+### 2. `./metadata/val.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the validation dataset used to evaluate model performance during training.
+    *   It consists of the remaining **20% of the cleaned `train_curated` dataset**.
+    *   It contains *only* curated data (high-quality labels) to ensure the model is evaluated against reliable ground truth.
+    *   The split was generated using iterative stratification to preserve the multi-label distribution of the original curated dataset.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Row Count:** 1,005 rows (plus header)
+    *   **Columns:**
+        *   `fname` (String): The unique filename of the audio clip.
+        *   `labels` (String): The ground truth tags (comma-separated).
+        *   `file_path` (String): The relative path to the audio file (e.g., `train_curated/0019ef41.wav`).
+*   **Loading Method:**
+    *   Load using pandas:
+        ```python
+        import pandas as pd
+        df_val = pd.read_csv("./metadata/val.csv")
+        ```
+
+### 3. `./metadata/test.csv`
+
+*   **Content and Purpose:**
+    *   This file contains the list of test audio clips for which predictions must be generated.
+    *   It is derived from the original `sample_submission.csv` but simplified to only include file identification information.
+    *   It is used during the inference phase to locate test files.
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Row Count:** 3,361 rows (plus header)
+    *   **Columns:**
+        *   `fname` (String): The unique filename of the audio clip (e.g., `4260ebea.wav`).
+        *   `file_path` (String): The relative path to the audio file (e.g., `test/4260ebea.wav`).
+*   **Loading Method:**
+    *   Load using pandas:
+        ```python
+        import pandas as pd
+        df_test = pd.read_csv("./metadata/test.csv")
+        ```

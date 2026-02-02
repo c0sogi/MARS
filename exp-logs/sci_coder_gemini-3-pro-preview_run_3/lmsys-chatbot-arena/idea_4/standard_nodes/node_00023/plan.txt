@@ -1,0 +1,881 @@
+The strategy involves transitioning from a Siamese architecture to a **Cross-Encoder architecture** using the `microsoft/deberta-v3-small` backbone. This change is motivated by Lesson 00006, which highlights that independent encoders (Siamese) often hit a performance ceiling in fine-grained preference tasks because they lack deep interaction between the prompt and the competing responses. By concatenating the prompt and both responses into a single sequence (`[CLS] Prompt [SEP] Resp A [SEP] Resp B [SEP]`), the Transformer's self-attention mechanism can directly compare the tokens of Response A and Response B in the context of the Prompt.
+
+To support this, I will modify the `ChatbotDataset` to construct these concatenated sequences, implementing a dynamic truncation strategy (Lesson 00013) that prioritizes the prompt while ensuring both responses are represented within the 512-token limit. I will also update the model architecture to `CrossEncoderHybridModel`, which processes the single input sequence and fuses the `[CLS]` embedding with the explicit scalar features (length logs) that were proven beneficial in Lesson 00004. Finally, I will update the training and evaluation loops to handle the new input format and adjust the submission threshold to the previous best score.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class ChatbotDataset(Dataset):
+    """
+    PyTorch Dataset for the Chatbot Arena task.
+    Constructs Siamese inputs (Prompt + Response A, Prompt + Response B)
+    and calculates explicit scalar features.
+    """
+
+    def __init__(self, data, tokenizer, max_length=512, is_test=False):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.is_test = is_test
+
+        # Pre-extract columns to lists for faster access during training
+        # Fill NaNs with empty strings to prevent tokenization errors
+        self.prompts = data["prompt"].fillna("").astype(str).tolist()
+        self.responses_a = data["response_a"].fillna("").astype(str).tolist()
+        self.responses_b = data["response_b"].fillna("").astype(str).tolist()
+
+        if not self.is_test:
+            # Targets: winner_model_a, winner_model_b, winner_tie
+            self.targets = data[
+                ["winner_model_a", "winner_model_b", "winner_tie"]
+            ].values.astype("float32")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        prompt = self.prompts[idx]
+        resp_a = self.responses_a[idx]
+        resp_b = self.responses_b[idx]
+
+        # 1. Calculate Explicit Scalar Features
+        # Log-transformed character lengths (log(len + 1))
+        # These provide high-level signal about verbosity which correlates with preference
+        feat_prompt = np.log1p(len(prompt))
+        feat_resp_a = np.log1p(len(resp_a))
+        feat_resp_b = np.log1p(len(resp_b))
+
+        scalars = torch.tensor(
+            [feat_prompt, feat_resp_a, feat_resp_b], dtype=torch.float32
+        )
+
+        # 2. Tokenization
+        # We construct two separate inputs sharing the same encoder:
+        # Branch A: [CLS] Prompt [SEP] Response A [SEP]
+        # Branch B: [CLS] Prompt [SEP] Response B [SEP]
+        # truncation='only_second' ensures the Prompt is preserved if the sequence is too long.
+
+        # Tokenize Branch A
+        enc_a = self.tokenizer(
+            prompt,
+            resp_a,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        # Tokenize Branch B
+        enc_b = self.tokenizer(
+            prompt,
+            resp_b,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        # Prepare output dictionary
+        # Squeeze(0) is needed because return_tensors='pt' adds a batch dimension (1, seq_len)
+        item = {
+            "input_ids_a": enc_a["input_ids"].squeeze(0),
+            "attention_mask_a": enc_a["attention_mask"].squeeze(0),
+            "input_ids_b": enc_b["input_ids"].squeeze(0),
+            "attention_mask_b": enc_b["attention_mask"].squeeze(0),
+            "scalars": scalars,
+        }
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.targets[idx], dtype=torch.float32)
+
+        return item
+=======
+class ChatbotDataset(Dataset):
+    """
+    PyTorch Dataset for the Chatbot Arena task.
+    Constructs Cross-Encoder inputs: [CLS] Prompt [SEP] Response A [SEP] Response B [SEP]
+    Cite solution_lesson_node_00006: Switching to Cross-Encoder for Transformer architectures.
+    """
+
+    def __init__(self, data, tokenizer, max_length=512, is_test=False):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.is_test = is_test
+
+        self.prompts = data["prompt"].fillna("").astype(str).tolist()
+        self.responses_a = data["response_a"].fillna("").astype(str).tolist()
+        self.responses_b = data["response_b"].fillna("").astype(str).tolist()
+
+        if not self.is_test:
+            self.targets = data[
+                ["winner_model_a", "winner_model_b", "winner_tie"]
+            ].values.astype("float32")
+
+        # Pre-fetch special token IDs
+        self.cls_token_id = tokenizer.cls_token_id
+        self.sep_token_id = tokenizer.sep_token_id
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        prompt = self.prompts[idx]
+        resp_a = self.responses_a[idx]
+        resp_b = self.responses_b[idx]
+
+        # 1. Scalars (Cite solution_lesson_node_00004)
+        feat_prompt = np.log1p(len(prompt))
+        feat_resp_a = np.log1p(len(resp_a))
+        feat_resp_b = np.log1p(len(resp_b))
+        scalars = torch.tensor(
+            [feat_prompt, feat_resp_a, feat_resp_b], dtype=torch.float32
+        )
+
+        # 2. Tokenization & Truncation
+        # We manually tokenize to control truncation logic (Cite solution_lesson_node_00013)
+        # Goal: [CLS] Prompt [SEP] Resp A [SEP] Resp B [SEP]
+        
+        ids_p = self.tokenizer.encode(prompt, add_special_tokens=False)
+        ids_a = self.tokenizer.encode(resp_a, add_special_tokens=False)
+        ids_b = self.tokenizer.encode(resp_b, add_special_tokens=False)
+
+        # Budget calculation
+        # 4 special tokens: CLS, SEP, SEP, SEP
+        max_seq_len = self.max_length
+        budget = max_seq_len - 4
+        
+        len_p = len(ids_p)
+        len_a = len(ids_a)
+        len_b = len(ids_b)
+
+        # Truncation Strategy:
+        # Cap Prompt at 40% of budget to ensure responses have space
+        # Split remaining space evenly between A and B
+        
+        prompt_cap = int(budget * 0.4)
+        if len_p > prompt_cap:
+            ids_p = ids_p[:prompt_cap]
+            len_p = prompt_cap
+        
+        remaining = budget - len_p
+        half_remaining = remaining // 2
+        
+        # Allocate space for A and B
+        # If one is short, give more to the other
+        if len_a <= half_remaining and len_b <= half_remaining:
+            # Both fit
+            pass
+        elif len_a <= half_remaining:
+            # A fits, B takes rest
+            ids_b = ids_b[: (remaining - len_a)]
+        elif len_b <= half_remaining:
+            # B fits, A takes rest
+            ids_a = ids_a[: (remaining - len_b)]
+        else:
+            # Both long, truncate both to half
+            ids_a = ids_a[:half_remaining]
+            ids_b = ids_b[: (remaining - len(ids_a))]
+
+        # Construct Sequence
+        input_ids = [self.cls_token_id] + ids_p + [self.sep_token_id] + ids_a + [self.sep_token_id] + ids_b + [self.sep_token_id]
+        attention_mask = [1] * len(input_ids)
+
+        # Padding
+        padding_length = max_seq_len - len(input_ids)
+        if padding_length > 0:
+            input_ids = input_ids + [self.pad_token_id] * padding_length
+            attention_mask = attention_mask + [0] * padding_length
+
+        item = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "scalars": scalars,
+        }
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.targets[idx], dtype=torch.float32)
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/modeling.py
+<<<<<<< SEARCH
+class AttentionPooling(nn.Module):
+    """
+    Learned weighted averaging of token embeddings.
+    """
+
+    def __init__(self, hidden_size):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 1)
+        )
+
+    def forward(self, last_hidden_state, attention_mask):
+        """
+        Args:
+            last_hidden_state: [batch_size, seq_len, hidden_size]
+            attention_mask: [batch_size, seq_len] (1 for valid, 0 for pad)
+        """
+        # Calculate attention scores
+        # w: [batch_size, seq_len, 1]
+        w = self.attention(last_hidden_state)
+
+        # Mask padding tokens
+        # We use a large negative number to effectively zero out the softmax probability for padding
+        mask_expanded = attention_mask.unsqueeze(-1)  # [batch, seq_len, 1]
+        w = w + (1.0 - mask_expanded) * -1e9
+
+        # Compute weights
+        scores = torch.softmax(w, dim=1)  # [batch, seq_len, 1]
+
+        # Weighted sum
+        # context_vector: [batch_size, hidden_size]
+        context_vector = torch.sum(last_hidden_state * scores, dim=1)
+        return context_vector
+
+
+class SiameseHybridModel(nn.Module):
+    """
+    Siamese Contextual Transformer with Hybrid Head.
+    Uses a shared encoder for two branches, attention pooling,
+    interaction features, and explicit scalar features.
+    """
+
+    def __init__(
+        self, model_name=Config.MODEL_NAME, num_labels=Config.NUM_LABELS, num_scalars=3
+    ):
+        super(SiameseHybridModel, self).__init__()
+
+        # 1. Backbone
+        self.config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+
+        # Enable gradient checkpointing for memory efficiency if needed
+        # self.backbone.gradient_checkpointing_enable()
+
+        hidden_size = self.config.hidden_size
+
+        # 2. Pooling
+        self.pooling = AttentionPooling(hidden_size)
+
+        # 3. Hybrid Head
+        # Interaction features: u, v, |u-v|, u*v -> 4 vectors
+        interaction_dim = 4 * hidden_size
+
+        # Total input dimension for MLP = Interaction vectors + Scalar features
+        combined_dim = interaction_dim + num_scalars
+
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, num_labels),
+        )
+
+    def forward(
+        self, input_ids_a, attention_mask_a, input_ids_b, attention_mask_b, scalars
+    ):
+        """
+        Args:
+            input_ids_a, attention_mask_a: Inputs for Branch A (Prompt + Resp A)
+            input_ids_b, attention_mask_b: Inputs for Branch B (Prompt + Resp B)
+            scalars: [batch_size, num_scalars] Explicit features
+        """
+        # Branch A Forward
+        out_a = self.backbone(input_ids=input_ids_a, attention_mask=attention_mask_a)
+        u = self.pooling(out_a.last_hidden_state, attention_mask_a)
+
+        # Branch B Forward
+        out_b = self.backbone(input_ids=input_ids_b, attention_mask=attention_mask_b)
+        v = self.pooling(out_b.last_hidden_state, attention_mask_b)
+
+        # Interaction Features
+        diff = torch.abs(u - v)
+        prod = u * v
+
+        # Concatenate: [u, v, |u-v|, u*v]
+        interaction = torch.cat([u, v, diff, prod], dim=1)
+
+        # Hybrid Fusion: [interaction, scalars]
+        combined = torch.cat([interaction, scalars], dim=1)
+
+        # Classification
+        logits = self.classifier(combined)
+
+        return logits
+=======
+class CrossEncoderHybridModel(nn.Module):
+    """
+    Cross-Encoder Transformer with Hybrid Head.
+    Processes [CLS] Prompt [SEP] Resp A [SEP] Resp B [SEP] in a single pass.
+    Cite solution_lesson_node_00006: Cross-Encoders allow deep interaction between prompt and responses.
+    """
+
+    def __init__(
+        self, model_name=Config.MODEL_NAME, num_labels=Config.NUM_LABELS, num_scalars=3
+    ):
+        super(CrossEncoderHybridModel, self).__init__()
+
+        # 1. Backbone
+        self.config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        
+        hidden_size = self.config.hidden_size
+
+        # 2. Hybrid Head (Cite solution_lesson_node_00004)
+        # We take the [CLS] embedding and concatenate scalars
+        combined_dim = hidden_size + num_scalars
+
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.2), # Increased dropout for regularization
+            nn.Linear(hidden_size, num_labels),
+        )
+
+    def forward(self, input_ids, attention_mask, scalars):
+        """
+        Args:
+            input_ids, attention_mask: Concatenated sequence inputs
+            scalars: [batch_size, num_scalars] Explicit features
+        """
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Take [CLS] token embedding (first token)
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+
+        # Hybrid Fusion
+        combined = torch.cat([cls_embedding, scalars], dim=1)
+
+        # Classification
+        logits = self.classifier(combined)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.modeling import SiameseHybridModel
+from library.data import get_dataloaders, get_test_dataloader
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, criterion, scaler):
+    """
+    Trains the model for one epoch using Mixed Precision.
+    """
+    model.train()
+    total_loss = 0.0
+
+    for batch in dataloader:
+        # Move inputs to device
+        input_ids_a = batch["input_ids_a"].to(device)
+        attention_mask_a = batch["attention_mask_a"].to(device)
+        input_ids_b = batch["input_ids_b"].to(device)
+        attention_mask_b = batch["attention_mask_b"].to(device)
+        scalars = batch["scalars"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed Precision Forward
+        with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+            logits = model(
+                input_ids_a, attention_mask_a, input_ids_b, attention_mask_b, scalars
+            )
+            loss = criterion(logits, labels)
+
+        # Backward
+        scaler.scale(loss).backward()
+
+        # Gradient Clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIPPING)
+
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+
+def evaluate(model, dataloader, device, criterion):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            input_ids_b = batch["input_ids_b"].to(device)
+            attention_mask_b = batch["attention_mask_b"].to(device)
+            scalars = batch["scalars"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(
+                    input_ids_a,
+                    attention_mask_a,
+                    input_ids_b,
+                    attention_mask_b,
+                    scalars,
+                )
+                loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+
+            # Apply softmax for predictions
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader)
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    # Compute metrics
+    metrics = compute_score(all_labels, all_preds)
+    metrics["log_loss"] = avg_loss
+
+    return metrics
+
+
+def train_model(tokenizer):
+    """
+    Main training loop with Early Stopping.
+    """
+    # Setup
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # Data
+    train_loader, val_loader = get_dataloaders(tokenizer)
+
+    # Model
+    model = SiameseHybridModel()
+    model.to(device)
+=======
+from library.modeling import CrossEncoderHybridModel
+from library.data import get_dataloaders, get_test_dataloader
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, criterion, scaler):
+    """
+    Trains the model for one epoch using Mixed Precision.
+    """
+    model.train()
+    total_loss = 0.0
+
+    for batch in dataloader:
+        # Move inputs to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        scalars = batch["scalars"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed Precision Forward
+        with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+            logits = model(input_ids, attention_mask, scalars)
+            loss = criterion(logits, labels)
+
+        # Backward
+        scaler.scale(loss).backward()
+
+        # Gradient Clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIPPING)
+
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+
+def evaluate(model, dataloader, device, criterion):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            scalars = batch["scalars"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(input_ids, attention_mask, scalars)
+                loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+
+            # Apply softmax for predictions
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader)
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    # Compute metrics
+    metrics = compute_score(all_labels, all_preds)
+    metrics["log_loss"] = avg_loss
+
+    return metrics
+
+
+def train_model(tokenizer):
+    """
+    Main training loop with Early Stopping.
+    """
+    # Setup
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # Data
+    train_loader, val_loader = get_dataloaders(tokenizer)
+
+    # Model
+    model = CrossEncoderHybridModel()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def predict(tokenizer):
+    """
+    Generates predictions for the test set and saves to submission.csv.
+    """
+    device = Config.DEVICE
+
+    # Load Data
+    test_loader = get_test_dataloader(tokenizer)
+
+    # Load Model
+    model = SiameseHybridModel()
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+        print(f"Loaded model from {Config.MODEL_PATH}")
+    else:
+        print(
+            "Warning: Model checkpoint not found. Using initialized weights (random)."
+        )
+
+    model.to(device)
+    model.eval()
+
+    all_preds = []
+
+    print("Generating predictions...")
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            input_ids_b = batch["input_ids_b"].to(device)
+            attention_mask_b = batch["attention_mask_b"].to(device)
+            scalars = batch["scalars"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(
+                    input_ids_a,
+                    attention_mask_a,
+                    input_ids_b,
+                    attention_mask_b,
+                    scalars,
+                )
+
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+=======
+def predict(tokenizer):
+    """
+    Generates predictions for the test set and saves to submission.csv.
+    """
+    device = Config.DEVICE
+
+    # Load Data
+    test_loader = get_test_dataloader(tokenizer)
+
+    # Load Model
+    model = CrossEncoderHybridModel()
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+        print(f"Loaded model from {Config.MODEL_PATH}")
+    else:
+        print(
+            "Warning: Model checkpoint not found. Using initialized weights (random)."
+        )
+
+    model.to(device)
+    model.eval()
+
+    all_preds = []
+
+    print("Generating predictions...")
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            scalars = batch["scalars"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(input_ids, attention_mask, scalars)
+
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.modeling import SiameseHybridModel
+from library.engine import train_model, predict
+from library.data import get_dataloaders
+
+
+def main():
+    # 1. Setup and Configuration
+    # Suppress transformers warnings/info
+    hf_logging.set_verbosity_error()
+
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+
+    # Override Config for fast baseline execution
+    # 2 Epochs on ~41k samples with batch size 16 is efficient enough for the time limit
+    # while providing enough data for the model to converge.
+    Config.EPOCHS = 2
+
+    print("Initializing Tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # 2. Training
+    print("Starting Training...")
+    # train_model handles the training loop, validation monitoring, and saves the best model to Config.MODEL_PATH
+    train_model(tokenizer)
+
+    # 3. Validation and Failure Analysis
+    print("Starting Post-Training Validation and Failure Analysis...")
+
+    # Load the best saved model for analysis to ensure consistency
+    device = Config.DEVICE
+    model = SiameseHybridModel()
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+        print(f"Loaded best model from {Config.MODEL_PATH}")
+    else:
+        print("Warning: Model checkpoint not found. Using current model weights.")
+
+    model.to(device)
+    model.eval()
+
+    # Get Validation Data
+    # We use the same dataloader function, utilizing the cache
+    _, val_loader = get_dataloaders(tokenizer, load_cached_data=True)
+
+    # Use reduction='none' to get loss per sample for failure analysis
+    criterion = torch.nn.CrossEntropyLoss(reduction="none")
+
+    all_losses = []
+    all_scalars = []
+    all_preds = []
+    all_labels = []
+
+    # Inference Loop
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            input_ids_b = batch["input_ids_b"].to(device)
+            attention_mask_b = batch["attention_mask_b"].to(device)
+            scalars = batch["scalars"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(
+                    input_ids_a,
+                    attention_mask_a,
+                    input_ids_b,
+                    attention_mask_b,
+                    scalars,
+                )
+                loss = criterion(logits, labels)
+
+            # Store data for analysis
+            all_losses.append(loss.cpu().numpy())
+            all_scalars.append(scalars.cpu().numpy())
+
+            # Store predictions for metric calculation
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    # Concatenate results
+    all_losses = np.concatenate(all_losses)
+    all_scalars = np.concatenate(all_scalars, axis=0)
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    # Compute Final Metric (Log Loss)
+    # y_true is (N, 3) probabilities, y_pred is (N, 3) probabilities
+    final_metric = log_loss(all_labels, all_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # Failure Analysis: Correlation between Error (Loss) and Scalar Features
+    # Scalars are: [log(prompt_len), log(resp_a_len), log(resp_b_len)]
+    feature_names = [
+        "Prompt Length (Log)",
+        "Response A Length (Log)",
+        "Response B Length (Log)",
+    ]
+
+    print("Failure Analysis - Correlation with Error Magnitude:")
+    for i, name in enumerate(feature_names):
+        # Calculate Pearson correlation
+        corr, _ = pearsonr(all_scalars[:, i], all_losses)
+        print(f"{name}: {corr:.4f}")
+
+    # 4. Submission
+    # Threshold defined in the task
+    THRESHOLD = 1.0392143626595562
+
+    if final_metric < THRESHOLD:
+=======
+from library.modeling import CrossEncoderHybridModel
+from library.engine import train_model, predict
+from library.data import get_dataloaders
+
+
+def main():
+    # 1. Setup and Configuration
+    # Suppress transformers warnings/info
+    hf_logging.set_verbosity_error()
+
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+
+    # Override Config for fast baseline execution
+    # 2 Epochs on ~41k samples with batch size 16 is efficient enough for the time limit
+    # while providing enough data for the model to converge.
+    Config.EPOCHS = 2
+
+    print("Initializing Tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # 2. Training
+    print("Starting Training...")
+    # train_model handles the training loop, validation monitoring, and saves the best model to Config.MODEL_PATH
+    train_model(tokenizer)
+
+    # 3. Validation and Failure Analysis
+    print("Starting Post-Training Validation and Failure Analysis...")
+
+    # Load the best saved model for analysis to ensure consistency
+    device = Config.DEVICE
+    model = CrossEncoderHybridModel()
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+        print(f"Loaded best model from {Config.MODEL_PATH}")
+    else:
+        print("Warning: Model checkpoint not found. Using current model weights.")
+
+    model.to(device)
+    model.eval()
+
+    # Get Validation Data
+    # We use the same dataloader function, utilizing the cache
+    _, val_loader = get_dataloaders(tokenizer, load_cached_data=True)
+
+    # Use reduction='none' to get loss per sample for failure analysis
+    criterion = torch.nn.CrossEntropyLoss(reduction="none")
+
+    all_losses = []
+    all_scalars = []
+    all_preds = []
+    all_labels = []
+
+    # Inference Loop
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            scalars = batch["scalars"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits = model(input_ids, attention_mask, scalars)
+                loss = criterion(logits, labels)
+
+            # Store data for analysis
+            all_losses.append(loss.cpu().numpy())
+            all_scalars.append(scalars.cpu().numpy())
+
+            # Store predictions for metric calculation
+            probs = torch.softmax(logits.float(), dim=1)
+            all_preds.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    # Concatenate results
+    all_losses = np.concatenate(all_losses)
+    all_scalars = np.concatenate(all_scalars, axis=0)
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    # Compute Final Metric (Log Loss)
+    # y_true is (N, 3) probabilities, y_pred is (N, 3) probabilities
+    final_metric = log_loss(all_labels, all_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # Failure Analysis: Correlation between Error (Loss) and Scalar Features
+    # Scalars are: [log(prompt_len), log(resp_a_len), log(resp_b_len)]
+    feature_names = [
+        "Prompt Length (Log)",
+        "Response A Length (Log)",
+        "Response B Length (Log)",
+    ]
+
+    print("Failure Analysis - Correlation with Error Magnitude:")
+    for i, name in enumerate(feature_names):
+        # Calculate Pearson correlation
+        corr, _ = pearsonr(all_scalars[:, i], all_losses)
+        print(f"{name}: {corr:.4f}")
+
+    # 4. Submission
+    # Threshold defined in the task
+    THRESHOLD = 1.010114098334317
+
+    if final_metric < THRESHOLD:
+>>>>>>> REPLACE
+```

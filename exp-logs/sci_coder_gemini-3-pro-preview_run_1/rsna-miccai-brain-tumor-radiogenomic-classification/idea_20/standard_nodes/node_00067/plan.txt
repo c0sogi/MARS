@@ -1,0 +1,259 @@
+To optimize the performance, I will revert the architecture from the experimental 9-channel "thick slab" approach back to the robust **3-channel 2.5D baseline** (using the middle slice of FLAIR, T1wCE, and T2w). Empirical lessons indicate that naively stacking volumetric depth into the channel dimension of 2D CNNs often destabilizes training and dilutes the signal (**Cite Lesson 00009**), whereas a deterministic middle-slice selection provides a strong, unbiased prior for this dataset (**Cite Lesson 00025**). I will retain the aggressive regularization strategy (Weight Decay 1e-2, Elastic Transforms) which has been shown to improve generalization in this small-sample regime (**Cite Lesson 00010**). I will also update the working directory to ensure cached data is regenerated with the correct dimensions.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    IMG_SIZE = 224
+    NUM_CHANNELS = 9  # 3 modalities (FLAIR, T1wCE, T2w) * 3 depths
+    STRIDE = 5  # Slice gap for volumetric stacking: M-5, M, M+5
+
+    # Normalization
+=======
+    IMG_SIZE = 224
+    NUM_CHANNELS = 3  # 3 modalities (FLAIR, T1wCE, T2w) * 1 depth (Middle)
+    STRIDE = 0  # Unused for single slice
+
+    # Normalization
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working Directory for this specific idea/experiment
+    WORKING_DIR = "./working/idea_20"
+=======
+    # Working Directory for this specific idea/experiment
+    WORKING_DIR = "./working/idea_21"
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def process_subject(row, input_dir: str, img_size: int, stride: int) -> np.ndarray:
+    """
+    Generates the 9-channel volumetric stack for a single subject.
+    Channels 0-2: [FLAIR, T1wCE, T2w] at Depth M - stride
+    Channels 3-5: [FLAIR, T1wCE, T2w] at Depth M
+    Channels 6-8: [FLAIR, T1wCE, T2w] at Depth M + stride
+    """
+    modalities = ["flair", "t1wce", "t2w"]  # T1w excluded as per idea description
+
+    stacked_volume = []
+
+    # Pre-fetch file lists and calculate medians
+    mod_files_map = {}
+    mod_median_map = {}
+
+    for mod in modalities:
+        rel_path = row[f"{mod}_path"]
+        full_path = os.path.join(input_dir, rel_path)
+        files = get_sorted_files(full_path)
+        mod_files_map[mod] = files
+        mod_median_map[mod] = len(files) // 2
+
+    offsets = [-stride, 0, stride]
+
+    # Interleave: For each depth, add all modalities
+    for offset in offsets:
+        for mod in modalities:
+            files = mod_files_map[mod]
+            median_idx = mod_median_map[mod]
+            target_idx = median_idx + offset
+
+            # Handle edge cases (missing files or indices out of bounds)
+            if len(files) == 0:
+                img = np.zeros((img_size, img_size), dtype=np.float32)
+            else:
+                # Clamp index to valid range
+                target_idx = max(0, min(target_idx, len(files) - 1))
+                file_name = files[target_idx]
+                file_path = os.path.join(input_dir, row[f"{mod}_path"], file_name)
+                img = load_dicom_slice(file_path, img_size)
+
+            stacked_volume.append(img)
+
+    # Stack along channel axis (last axis)
+    # List of (224, 224) -> (224, 224, 9)
+    volume = np.stack(stacked_volume, axis=-1)
+    return volume
+=======
+def process_subject(row, input_dir: str, img_size: int, stride: int) -> np.ndarray:
+    """
+    Generates the 3-channel image for a single subject using the middle slice.
+    Channels 0-2: [FLAIR, T1wCE, T2w] at Depth M
+    """
+    modalities = ["flair", "t1wce", "t2w"]
+
+    stacked_volume = []
+
+    for mod in modalities:
+        rel_path = row[f"{mod}_path"]
+        full_path = os.path.join(input_dir, rel_path)
+        files = get_sorted_files(full_path)
+        
+        if len(files) == 0:
+            img = np.zeros((img_size, img_size), dtype=np.float32)
+        else:
+            # Select middle slice
+            median_idx = len(files) // 2
+            file_name = files[median_idx]
+            file_path = os.path.join(input_dir, row[f"{mod}_path"], file_name)
+            img = load_dicom_slice(file_path, img_size)
+
+        stacked_volume.append(img)
+
+    # Stack along channel axis (last axis)
+    # List of (224, 224) -> (224, 224, 3)
+    volume = np.stack(stacked_volume, axis=-1)
+    return volume
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class WIVSNet(nn.Module):
+    """
+    Weight-Inflated 9-Channel Volumetric Stack (WIVS-Net).
+
+    This model adapts an EfficientNet-B0 backbone to process a 9-channel volumetric slab
+    (3 modalities x 3 depths). It employs a specific 'Weight Inflation' initialization
+    strategy to preserve ImageNet priors while enabling immediate volumetric feature extraction.
+    """
+
+    def __init__(self, pretrained=True):
+        super(WIVSNet, self).__init__()
+
+        # 1. Initialize standard EfficientNet-B0 with 3 channels
+        # We set num_classes=1 for binary classification (MGMT promoter methylation)
+        # drop_rate controls the dropout before the classifier
+        self.backbone = timm.create_model(
+            Config.MODEL_NAME,
+            pretrained=pretrained,
+            num_classes=1,
+            drop_rate=Config.DROPOUT,
+            in_chans=3,  # Start with 3 to get standard ImageNet weights
+        )
+
+        # 2. Apply Weight Inflation to the first convolutional layer
+        self._inflate_first_layer()
+
+    def _inflate_first_layer(self):
+        """
+        Replaces the first convolutional layer (3 channels) with a 9-channel layer.
+        Initializes weights by distributing RGB weights to corresponding modalities across depths.
+        """
+        # Access the first layer (conv_stem in timm EfficientNet)
+        old_conv = self.backbone.conv_stem
+
+        # Create new Conv2d layer
+        # in_channels = 9 (FLAIR, T1wCE, T2w repeated for 3 depths)
+        new_conv = nn.Conv2d(
+            in_channels=Config.NUM_CHANNELS,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+
+        # --- Weight Inflation Logic ---
+        with torch.no_grad():
+            # Original weights shape: (Out, 3, K, K)
+            old_weights = old_conv.weight
+            # New weights shape: (Out, 9, K, K)
+            new_weights = torch.zeros_like(new_conv.weight)
+
+            # Scaling factor to preserve activation magnitude (averaging over 3 depths)
+            scale = 1.0 / 3.0
+
+            # Mapping Strategy:
+            # Input Channel Order:
+            #   0: FLAIR (D-s), 1: T1wCE (D-s), 2: T2w (D-s)
+            #   3: FLAIR (D),   4: T1wCE (D),   5: T2w (D)
+            #   6: FLAIR (D+s), 7: T1wCE (D+s), 8: T2w (D+s)
+
+            # Source Weights:
+            #   Red (idx 0) -> FLAIR
+            #   Green (idx 1) -> T1wCE
+            #   Blue (idx 2) -> T2w
+
+            # Distribute Red weights to FLAIR channels (0, 3, 6)
+            new_weights[:, 0, :, :] = old_weights[:, 0, :, :] * scale
+            new_weights[:, 3, :, :] = old_weights[:, 0, :, :] * scale
+            new_weights[:, 6, :, :] = old_weights[:, 0, :, :] * scale
+
+            # Distribute Green weights to T1wCE channels (1, 4, 7)
+            new_weights[:, 1, :, :] = old_weights[:, 1, :, :] * scale
+            new_weights[:, 4, :, :] = old_weights[:, 1, :, :] * scale
+            new_weights[:, 7, :, :] = old_weights[:, 1, :, :] * scale
+
+            # Distribute Blue weights to T2w channels (2, 5, 8)
+            new_weights[:, 2, :, :] = old_weights[:, 2, :, :] * scale
+            new_weights[:, 5, :, :] = old_weights[:, 2, :, :] * scale
+            new_weights[:, 8, :, :] = old_weights[:, 2, :, :] * scale
+
+            # Assign weights
+            new_conv.weight.copy_(new_weights)
+
+            # Copy bias if present
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+
+        # Replace the layer in the backbone
+        self.backbone.conv_stem = new_conv
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, 9, H, W)
+        Returns:
+            torch.Tensor: Logits of shape (B, 1)
+        """
+        return self.backbone(x)
+=======
+class WIVSNet(nn.Module):
+    """
+    Standard EfficientNet-B0 backbone processing a 3-channel input (FLAIR, T1wCE, T2w).
+    Reverts to the robust 2.5D baseline.
+    """
+
+    def __init__(self, pretrained=True):
+        super(WIVSNet, self).__init__()
+
+        # Initialize standard EfficientNet-B0 with 3 channels
+        self.backbone = timm.create_model(
+            Config.MODEL_NAME,
+            pretrained=pretrained,
+            num_classes=1,
+            drop_rate=Config.DROPOUT,
+            in_chans=3, 
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, 3, H, W)
+        Returns:
+            torch.Tensor: Logits of shape (B, 1)
+        """
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Adjust Config for fast baseline execution
+    Config.EPOCHS = 10  # Reduced from 15 to ensure completion within time limits
+
+    seed_everything(Config.SEED)
+=======
+    # Adjust Config for fast baseline execution
+    # Config.EPOCHS = 10  # Removed to allow full 15 epochs for convergence
+
+    seed_everything(Config.SEED)
+>>>>>>> REPLACE
+```

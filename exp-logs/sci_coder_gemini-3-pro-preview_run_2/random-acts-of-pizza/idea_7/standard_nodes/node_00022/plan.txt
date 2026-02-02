@@ -1,0 +1,354 @@
+Based on the lessons learned, specifically **Lesson 00020** (Early Fusion outperforms Late Fusion on small datasets) and **Lesson 00019** (RankGauss + Bagging improves robustness), I will switch from the current Stacking/Late Fusion architecture to an Early Fusion approach. The previous solution's Late Fusion created an information bottleneck, preventing the model from learning joint weights between the semantic text features and the user metadata.
+
+My strategy is as follows:
+1.  **Early Fusion (Cite solution_lesson_node_00020)**: I will modify `runfile.py` to concatenate the 384-dimensional text embeddings and the RankGauss-normalized metadata into a single feature matrix before training.
+2.  **Unified Hyperparameter Grid (Cite solution_lesson_node_00012)**: I will update `library/config.py` to define a `COMBINED_GRID` that searches a wide range of regularization strengths (`C` from `0.0001` to `10.0`). This addresses the need for strong regularization when using high-dimensional embeddings on small datasets.
+3.  **Optimized Parallelism**: I will adjust the `BAGGING_PARAMS` to use `n_jobs=1` so that `GridSearchCV` can efficiently parallelize the search across the available 12 vCPUs without thread oversubscription.
+
+This approach simplifies the pipeline while increasing the model's capacity to find complex decision boundaries that span both text and metadata modalities.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- View A: Text Expert ---
+    # High regularization (Small C) to handle high-dimensional embeddings (384d)
+    TEXT_EXPERT_GRID = {
+        "C": [1e-4, 5e-4, 1e-3, 5e-3, 0.01],
+        "penalty": ["l2"],
+        "solver": ["liblinear"],  # Efficient for high-dimensional data
+        "class_weight": ["balanced", None],
+    }
+
+    # --- View B: Metadata Expert ---
+    # Low regularization (Large C) to exploit strong, low-dimensional signals
+    META_EXPERT_GRID = {
+        "C": [0.1, 1.0, 10.0, 50.0, 100.0],
+        "penalty": ["l2"],
+        "solver": ["lbfgs"],  # Standard for low-dimensional data
+        "class_weight": ["balanced", None],
+    }
+
+    # --- Bagging Configuration ---
+    # Applied to both experts to reduce variance
+    BAGGING_PARAMS = {
+        "n_estimators": 10,
+        "max_samples": 0.8,
+        "max_features": 1.0,
+        "bootstrap": True,
+        "n_jobs": -1,
+        "random_state": RANDOM_SEED,
+    }
+
+    # --- Stacking Meta-Learner ---
+    # Combines probabilities from View A and View B
+    STACKING_META_PARAMS = {
+        "C": 1.0,
+        "penalty": "l2",
+        "solver": "lbfgs",
+        "random_state": RANDOM_SEED,
+    }
+=======
+    # --- Combined Model Grid ---
+    # Search range covers both strong regularization (for embeddings) and weak regularization
+    COMBINED_GRID = {
+        "C": [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0],
+        "penalty": ["l2"],
+        "solver": ["liblinear"],
+        "class_weight": ["balanced", None],
+    }
+
+    # --- Bagging Configuration ---
+    # Applied to reduce variance. n_jobs=1 to allow GridSearchCV to handle parallelism.
+    BAGGING_PARAMS = {
+        "n_estimators": 10,
+        "max_samples": 0.8,
+        "max_features": 1.0,
+        "bootstrap": True,
+        "n_jobs": 1,
+        "random_state": RANDOM_SEED,
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model_factory import build_bagged_logistic_regression, build_meta_learner
+
+
+def get_best_estimator(X, y, param_grid, base_builder_func, random_state):
+    """
+    Helper function to perform GridSearchCV for a specific view.
+    Maps parameters to the inner estimator of the BaggingClassifier.
+    """
+    # Initialize the base bagged model
+    base_model = base_builder_func(random_state=random_state)
+
+    # Map grid parameters to the inner estimator (estimator__param)
+    # This is required because BaggingClassifier wraps the LogisticRegression
+    sklearn_grid = {}
+    for key, values in param_grid.items():
+        if key in ["C", "penalty", "solver", "class_weight"]:
+            sklearn_grid[f"estimator__{key}"] = values
+        else:
+            sklearn_grid[key] = values
+
+    # Run Grid Search
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=sklearn_grid,
+        scoring="roc_auc",
+        cv=3,  # Inner CV for hyperparameter tuning
+        n_jobs=-1,
+        verbose=0,
+    )
+    grid_search.fit(X, y)
+    return grid_search.best_estimator_
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.RANDOM_SEED)
+
+    # 2. Load Data
+    print("Loading Data...")
+    df_train, df_val, df_test = load_and_merge_data()
+
+    # 3. Extract Features
+    print("Extracting Features...")
+    # load_cached_data=True ensures we use pre-computed features if available
+    X_text_train, X_meta_train, X_text_val, X_meta_val, X_text_test, X_meta_test = (
+        extract_features(df_train, df_val, df_test, load_cached_data=True)
+    )
+
+    # Prepare targets and feature arrays
+    y_train = df_train["requester_received_pizza"].values
+    y_val = df_val["requester_received_pizza"].values
+
+    # Ensure Meta features are numpy arrays for sklearn compatibility
+    X_meta_train_np = X_meta_train.values
+    X_meta_val_np = X_meta_val.values
+    X_meta_test_np = X_meta_test.values
+
+    # 4. Stacking Loop
+    n_folds = Config.N_FOLDS
+    skf = StratifiedKFold(
+        n_splits=n_folds, shuffle=True, random_state=Config.RANDOM_SEED
+    )
+
+    # Initialize prediction containers
+    # Columns: 0 -> Text Expert, 1 -> Metadata Expert
+    oof_preds = np.zeros((len(y_train), 2))
+    val_preds_accum = np.zeros((len(y_val), 2))
+    test_preds_accum = np.zeros((len(df_test), 2))
+
+    print(f"Starting Stacking with {n_folds} folds...")
+
+    for fold, (train_idx, holdout_idx) in enumerate(skf.split(X_text_train, y_train)):
+        print(f"Processing Fold {fold + 1}/{n_folds}")
+
+        # Create Fold Splits
+        X_text_tr, X_text_ho = X_text_train[train_idx], X_text_train[holdout_idx]
+        X_meta_tr, X_meta_ho = X_meta_train_np[train_idx], X_meta_train_np[holdout_idx]
+        y_tr, y_ho = y_train[train_idx], y_train[holdout_idx]
+
+        # --- View A: Text Expert ---
+        # Tune and Train
+        best_text_model = get_best_estimator(
+            X_text_tr,
+            y_tr,
+            Config.TEXT_EXPERT_GRID,
+            build_bagged_logistic_regression,
+            Config.RANDOM_SEED,
+        )
+
+        # Predict
+        oof_preds[holdout_idx, 0] = best_text_model.predict_proba(X_text_ho)[:, 1]
+        val_preds_accum[:, 0] += best_text_model.predict_proba(X_text_val)[:, 1]
+        test_preds_accum[:, 0] += best_text_model.predict_proba(X_text_test)[:, 1]
+
+        # --- View B: Metadata Expert ---
+        # Tune and Train
+        best_meta_model = get_best_estimator(
+            X_meta_tr,
+            y_tr,
+            Config.META_EXPERT_GRID,
+            build_bagged_logistic_regression,
+            Config.RANDOM_SEED,
+        )
+
+        # Predict
+        oof_preds[holdout_idx, 1] = best_meta_model.predict_proba(X_meta_ho)[:, 1]
+        val_preds_accum[:, 1] += best_meta_model.predict_proba(X_meta_val_np)[:, 1]
+        test_preds_accum[:, 1] += best_meta_model.predict_proba(X_meta_test_np)[:, 1]
+
+    # Average predictions from all folds
+    val_preds_avg = val_preds_accum / n_folds
+    test_preds_avg = test_preds_accum / n_folds
+
+    # 5. Meta Learner Training
+    print("Training Meta-Learner...")
+    meta_learner = build_meta_learner(**Config.STACKING_META_PARAMS)
+    meta_learner.fit(oof_preds, y_train)
+
+    # 6. Validation Evaluation
+    final_val_probs = meta_learner.predict_proba(val_preds_avg)[:, 1]
+    val_auc = roc_auc_score(y_val, final_val_probs)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {val_auc}")
+
+    # 7. Failure Analysis
+    print("\nFailure Analysis:")
+    # Calculate absolute error
+    errors = np.abs(y_val - final_val_probs)
+
+    # Create a DataFrame for correlation analysis using the validation metadata features
+    analysis_df = X_meta_val.copy()
+    analysis_df["error"] = errors
+
+    # Compute correlation between features and error
+    correlations = (
+        analysis_df.corr()["error"].drop("error").sort_values(key=abs, ascending=False)
+    )
+
+    print("Correlation between Error and Features (Top 10):")
+    print(correlations.head(10))
+
+    # 8. Submission Generation
+    threshold = 0.6994047619047619
+
+    if val_auc > threshold:
+        print(f"\nValidation metric {val_auc} > {threshold}. Generating submission...")
+
+        # Generate final test probabilities
+        final_test_probs = meta_learner.predict_proba(test_preds_avg)[:, 1]
+=======
+from library.model_factory import build_bagged_logistic_regression
+
+
+def get_best_estimator(X, y, param_grid, base_builder_func, random_state):
+    """
+    Helper function to perform GridSearchCV.
+    Maps parameters to the inner estimator of the BaggingClassifier.
+    """
+    # Initialize the base bagged model
+    base_model = base_builder_func(random_state=random_state)
+
+    # Map grid parameters to the inner estimator (estimator__param)
+    sklearn_grid = {}
+    for key, values in param_grid.items():
+        if key in ["C", "penalty", "solver", "class_weight"]:
+            sklearn_grid[f"estimator__{key}"] = values
+        else:
+            sklearn_grid[key] = values
+
+    # Run Grid Search
+    # n_jobs=-1 here allows parallelizing the grid search
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=sklearn_grid,
+        scoring="roc_auc",
+        cv=3,
+        n_jobs=-1,
+        verbose=0,
+    )
+    grid_search.fit(X, y)
+    return grid_search.best_estimator_
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.RANDOM_SEED)
+
+    # 2. Load Data
+    print("Loading Data...")
+    df_train, df_val, df_test = load_and_merge_data()
+
+    # 3. Extract Features
+    print("Extracting Features...")
+    X_text_train, X_meta_train, X_text_val, X_meta_val, X_text_test, X_meta_test = (
+        extract_features(df_train, df_val, df_test, load_cached_data=True)
+    )
+
+    # Prepare targets
+    y_train = df_train["requester_received_pizza"].values
+    y_val = df_val["requester_received_pizza"].values
+
+    # 4. Early Fusion (Concatenation)
+    print("Concatenating Features (Early Fusion)...")
+    # Convert metadata DataFrames to numpy for concatenation
+    X_meta_train_np = X_meta_train.values
+    X_meta_val_np = X_meta_val.values
+    X_meta_test_np = X_meta_test.values
+
+    X_train_full = np.hstack((X_text_train, X_meta_train_np))
+    X_val_full = np.hstack((X_text_val, X_meta_val_np))
+    X_test_full = np.hstack((X_text_test, X_meta_test_np))
+
+    # 5. Cross-Validation Loop
+    n_folds = Config.N_FOLDS
+    skf = StratifiedKFold(
+        n_splits=n_folds, shuffle=True, random_state=Config.RANDOM_SEED
+    )
+
+    val_preds_accum = np.zeros(len(y_val))
+    test_preds_accum = np.zeros(len(df_test))
+
+    print(f"Starting Training with {n_folds} folds on Combined Features...")
+
+    for fold, (train_idx, holdout_idx) in enumerate(skf.split(X_train_full, y_train)):
+        print(f"Processing Fold {fold + 1}/{n_folds}")
+
+        # Create Fold Splits
+        X_tr, X_ho = X_train_full[train_idx], X_train_full[holdout_idx]
+        y_tr, y_ho = y_train[train_idx], y_train[holdout_idx]
+
+        # Tune and Train on Combined Features
+        # Using the Combined Grid to find optimal regularization for the hybrid feature set
+        best_model = get_best_estimator(
+            X_tr,
+            y_tr,
+            Config.COMBINED_GRID,
+            build_bagged_logistic_regression,
+            Config.RANDOM_SEED,
+        )
+
+        # Predict
+        val_preds_accum += best_model.predict_proba(X_val_full)[:, 1]
+        test_preds_accum += best_model.predict_proba(X_test_full)[:, 1]
+
+    # Average predictions
+    final_val_probs = val_preds_accum / n_folds
+    final_test_probs = test_preds_accum / n_folds
+
+    # 6. Validation Evaluation
+    val_auc = roc_auc_score(y_val, final_val_probs)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {val_auc}")
+
+    # 7. Failure Analysis
+    print("\nFailure Analysis:")
+    # Calculate absolute error
+    errors = np.abs(y_val - final_val_probs)
+
+    # Create a DataFrame for correlation analysis using the validation metadata features
+    analysis_df = X_meta_val.copy()
+    analysis_df["error"] = errors
+
+    # Compute correlation between features and error
+    correlations = (
+        analysis_df.corr()["error"].drop("error").sort_values(key=abs, ascending=False)
+    )
+
+    print("Correlation between Error and Features (Top 10):")
+    print(correlations.head(10))
+
+    # 8. Submission Generation
+    threshold = 0.7129152602593712
+
+    if val_auc > threshold:
+        print(f"\nValidation metric {val_auc} > {threshold}. Generating submission...")
+>>>>>>> REPLACE
+```

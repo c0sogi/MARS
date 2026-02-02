@@ -1,0 +1,481 @@
+To improve the solution's performance and robustness, I will implement a **5-Fold Cross-Validation Ensemble** strategy combined with the **SAM optimizer** and **GeM Pooling**.
+
+**Rationale:**
+1.  **Training Duration**: The previous run used 25 epochs, which is likely insufficient for full convergence on this dataset (Lesson 00095). I will increase `PHASE1_EPOCHS` to 50 to allow the model to reach a deeper minimum.
+2.  **Ensembling**: Instead of relying on a single model or a full-retrain strategy (which risks overfitting or underfitting due to fixed epoch selection, Lesson 00041), I will train 5 independent models on stratified folds. Averaging their predictions (Ensembling) significantly reduces variance and improves generalization (Lesson 00023, Lesson 00049).
+3.  **Architecture**: I will retain the **SAM + GeM Pooling** configuration, as it demonstrated superior single-model performance (0.1770) compared to standard training (Lesson 00093).
+4.  **SWA**: Stochastic Weight Averaging will be applied to each fold's model to further flatten the loss landscape and improve robustness.
+
+The `runfile.py` will be refactored to execute this 5-fold loop, accumulate Out-Of-Fold (OOF) predictions for a reliable global validation metric, and generate the submission by averaging the test predictions from all 5 trained models.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Training Loop
+N_FOLDS = 5
+MAX_EPOCHS_PHASE_1 = 60  # Upper bound for calibration phase
+SWA_EPOCHS = 12  # Phase 2 SWA duration
+EARLY_STOPPING_PATIENCE = 15
+=======
+# Training Loop
+N_FOLDS = 5
+MAX_EPOCHS_PHASE_1 = 50  # Increased for convergence (Cite 00095)
+SWA_EPOCHS = 10  # Phase 2 SWA duration
+EARLY_STOPPING_PATIENCE = 15
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Define constants for this run
+PHASE1_EPOCHS = 25
+SWA_EPOCHS = 6
+BATCH_SIZE = 32
+THRESHOLD = 0.16918645240183008
+
+
+def main():
+    # 1. Setup
+    utils.set_seed(config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 2. Load Data and Metadata
+    print("Loading data...")
+    # Load cached numpy arrays (contains all train.json data)
+    data_container = data_lib.load_data(load_cached_data=True)
+    all_train_b1, all_train_b2, all_train_angles, all_train_labels, all_train_ids = (
+        data_container["train"]
+    )
+    stats = data_container["stats"]
+
+    # Load metadata to split into Train/Val
+    df_train_meta = pd.read_csv(config.TRAIN_META_PATH)
+    df_val_meta = pd.read_csv(config.VAL_META_PATH)
+
+    train_indices = df_train_meta["sample_index"].values
+    val_indices = df_val_meta["sample_index"].values
+
+    # Slice data
+    train_b1 = all_train_b1[train_indices]
+    train_b2 = all_train_b2[train_indices]
+    train_angles = all_train_angles[train_indices]
+    train_labels = all_train_labels[train_indices]
+    train_ids = all_train_ids[train_indices]
+
+    val_b1 = all_train_b1[val_indices]
+    val_b2 = all_train_b2[val_indices]
+    val_angles = all_train_angles[val_indices]
+    val_labels = all_train_labels[val_indices]
+    val_ids = all_train_ids[val_indices]
+
+    print(f"Train set size: {len(train_indices)}")
+    print(f"Val set size: {len(val_indices)}")
+
+    # 3. Create Datasets and Loaders
+    # Transforms
+    train_transform = data_lib.get_transforms("train")
+    val_transform = data_lib.get_transforms("val")
+
+    train_dataset = data_lib.IcebergDataset(
+        train_b1,
+        train_b2,
+        train_angles,
+        labels=train_labels,
+        ids=train_ids,
+        transform=train_transform,
+        stats=stats,
+    )
+    val_dataset = data_lib.IcebergDataset(
+        val_b1,
+        val_b2,
+        val_angles,
+        labels=val_labels,
+        ids=val_ids,
+        transform=val_transform,
+        stats=stats,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 4. Initialize Model, Optimizer, Scheduler (Phase 1)
+    print("\n--- Phase 1: Calibration & Validation ---")
+    model = model_lib.IcebergResNet(
+        backbone_name=config.BACKBONE,
+        pretrained=config.PRETRAINED,
+        dropout_rate=config.DROPOUT_RATE,
+        num_classes=config.NUM_CLASSES,
+        gem_p=config.GEM_P_INIT,
+        gem_trainable=config.GEM_P_TRAINABLE,
+    ).to(device)
+
+    # Base optimizer for SAM
+    base_optimizer = torch.optim.AdamW
+    optimizer = sam_lib.SAM(
+        model.parameters(),
+        base_optimizer,
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+        rho=0.05,
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer.base_optimizer,
+        mode="min",
+        factor=config.SCHEDULER_FACTOR,
+        patience=config.SCHEDULER_PATIENCE,
+        min_lr=config.SCHEDULER_MIN_LR,
+    )
+
+    # 5. Train Phase 1
+    # We use SWA here to get the best possible validation metric for the report
+    swa_start = PHASE1_EPOCHS - SWA_EPOCHS
+    if swa_start < 1:
+        swa_start = 1
+
+    trained_model = engine_lib.fit_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        epochs=PHASE1_EPOCHS,
+        patience=config.EARLY_STOPPING_PATIENCE,
+        use_swa=True,
+        swa_start_epoch=swa_start,
+        save_dir=config.CHECKPOINT_DIR,
+        fold_idx="val_split",
+    )
+
+    # 6. Validation Assessment
+    print("\n--- Validation Assessment ---")
+    criterion = engine_lib.BCEWithLogitsLossLabelSmoothing()
+    val_loss, val_acc = engine_lib.validate_tta(
+        val_loader, trained_model, criterion, device
+    )
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {val_loss}")
+
+    # 7. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    trained_model.eval()
+    all_preds = []
+    all_targets = []
+
+    # Get predictions
+    with torch.no_grad():
+        for images, angles, labels in val_loader:
+            images = images.to(device)
+            angles = angles.to(device)
+
+            # TTA Preds
+            out1 = torch.sigmoid(trained_model(images, angles))
+            out2 = torch.sigmoid(trained_model(torch.flip(images, [3]), angles))
+            out3 = torch.sigmoid(trained_model(torch.flip(images, [2]), angles))
+            out4 = torch.sigmoid(trained_model(torch.rot90(images, 2, [2, 3]), angles))
+            avg_preds = (out1 + out2 + out3 + out4) / 4.0
+
+            all_preds.append(avg_preds.cpu().numpy())
+            all_targets.append(labels.numpy())
+
+    all_preds = np.concatenate(all_preds).ravel()
+    all_targets = np.concatenate(all_targets).ravel()
+
+    # Calculate errors
+    errors = np.abs(all_preds - all_targets)
+
+    # Features for correlation
+    b1_means = np.mean(val_b1, axis=(1, 2))
+    b2_means = np.mean(val_b2, axis=(1, 2))
+    b1_stds = np.std(val_b1, axis=(1, 2))
+    b2_stds = np.std(val_b2, axis=(1, 2))
+
+    analysis_df = pd.DataFrame(
+        {
+            "error": errors,
+            "inc_angle": val_angles,
+            "b1_mean": b1_means,
+            "b2_mean": b2_means,
+            "b1_std": b1_stds,
+            "b2_std": b2_stds,
+        }
+    )
+
+    print("Correlation between Error and Features:")
+    corrs = analysis_df.corr()["error"].drop("error")
+    print(corrs)
+
+    # 8. Submission (Conditional)
+    if val_loss < THRESHOLD:
+        print("\n--- Phase 2: Production Training & Submission ---")
+        # Train on FULL dataset
+        # Create Full Dataset
+        full_train_dataset = data_lib.IcebergDataset(
+            all_train_b1,
+            all_train_b2,
+            all_train_angles,
+            labels=all_train_labels,
+            ids=all_train_ids,
+            transform=train_transform,
+            stats=stats,
+        )
+        full_train_loader = DataLoader(
+            full_train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        # Re-initialize model
+        prod_model = model_lib.IcebergResNet(
+            backbone_name=config.BACKBONE,
+            pretrained=config.PRETRAINED,
+            dropout_rate=config.DROPOUT_RATE,
+            num_classes=config.NUM_CLASSES,
+            gem_p=config.GEM_P_INIT,
+            gem_trainable=config.GEM_P_TRAINABLE,
+        ).to(device)
+
+        prod_optimizer = sam_lib.SAM(
+            prod_model.parameters(),
+            base_optimizer,
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
+            rho=0.05,
+        )
+
+        prod_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            prod_optimizer.base_optimizer,
+            mode="min",
+            factor=config.SCHEDULER_FACTOR,
+            patience=config.SCHEDULER_PATIENCE,
+            min_lr=config.SCHEDULER_MIN_LR,
+        )
+
+        # Train
+        prod_model_trained = engine_lib.fit_model(
+            model=prod_model,
+            train_loader=full_train_loader,
+            val_loader=None,  # No validation in production
+            optimizer=prod_optimizer,
+            scheduler=prod_scheduler,
+            device=device,
+            epochs=PHASE1_EPOCHS,
+            use_swa=True,
+            swa_start_epoch=swa_start,
+            save_dir=config.CHECKPOINT_DIR,
+            fold_idx="full",
+        )
+
+        # Predict on Test
+        print("Generating predictions...")
+        test_loader = data_lib.get_dataloaders(mode="test", load_cached_data=True)
+
+        preds, ids = engine_lib.predict_tta(test_loader, prod_model_trained, device)
+
+        # Save
+        sub_df = pd.DataFrame({"id": ids, "is_iceberg": preds})
+        sub_df.to_csv(config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved to {config.SUBMISSION_PATH}")
+
+    else:
+        print(
+            f"Validation metric {val_loss} is not better than threshold {THRESHOLD}. Skipping submission."
+        )
+=======
+# Define constants for this run
+PHASE1_EPOCHS = 50  # Increased from 25 for better convergence (Cite 00095)
+SWA_EPOCHS = 10
+BATCH_SIZE = 32
+THRESHOLD = 0.16918645240183008
+
+
+def main():
+    # 1. Setup
+    utils.set_seed(config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 2. Load Data (We use the full dataset for CV)
+    print("Loading data...")
+    data_container = data_lib.load_data(load_cached_data=True)
+    
+    # 3. 5-Fold Cross-Validation Ensemble
+    # Cite 00023: K-Fold Ensembling > Bagging
+    # Cite 00049: SWA Ensembles
+    print(f"\n--- Starting {config.N_FOLDS}-Fold Cross-Validation ---")
+    
+    oof_preds = []
+    oof_targets = []
+    oof_angles = []
+    
+    # SWA Schedule
+    swa_start = PHASE1_EPOCHS - SWA_EPOCHS
+    if swa_start < 1:
+        swa_start = 1
+
+    for fold in range(config.N_FOLDS):
+        print(f"\nFold {fold + 1}/{config.N_FOLDS}")
+        
+        # Get Dataloaders
+        train_loader, val_loader = data_lib.get_dataloaders(
+            fold=fold,
+            n_folds=config.N_FOLDS,
+            batch_size=BATCH_SIZE,
+            mode="train_cv",
+            load_cached_data=True
+        )
+        
+        # Initialize Model (Cite 00093: SAM + GeM)
+        model = model_lib.IcebergResNet(
+            backbone_name=config.BACKBONE,
+            pretrained=config.PRETRAINED,
+            dropout_rate=config.DROPOUT_RATE,
+            num_classes=config.NUM_CLASSES,
+            gem_p=config.GEM_P_INIT,
+            gem_trainable=config.GEM_P_TRAINABLE,
+        ).to(device)
+
+        # Optimizer (SAM)
+        base_optimizer = torch.optim.AdamW
+        optimizer = sam_lib.SAM(
+            model.parameters(),
+            base_optimizer,
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
+            rho=0.05,
+        )
+
+        # Scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer.base_optimizer,
+            mode="min",
+            factor=config.SCHEDULER_FACTOR,
+            patience=config.SCHEDULER_PATIENCE,
+            min_lr=config.SCHEDULER_MIN_LR,
+        )
+
+        # Train
+        trained_model = engine_lib.fit_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            epochs=PHASE1_EPOCHS,
+            patience=config.EARLY_STOPPING_PATIENCE,
+            use_swa=True,
+            swa_start_epoch=swa_start,
+            save_dir=config.CHECKPOINT_DIR,
+            fold_idx=fold,
+        )
+        
+        # Validation Inference (TTA)
+        trained_model.eval()
+        with torch.no_grad():
+            for images, angles, labels in val_loader:
+                images = images.to(device)
+                angles = angles.to(device)
+
+                # TTA Preds
+                out1 = torch.sigmoid(trained_model(images, angles))
+                out2 = torch.sigmoid(trained_model(torch.flip(images, [3]), angles))
+                out3 = torch.sigmoid(trained_model(torch.flip(images, [2]), angles))
+                out4 = torch.sigmoid(trained_model(torch.rot90(images, 2, [2, 3]), angles))
+                avg_preds = (out1 + out2 + out3 + out4) / 4.0
+
+                oof_preds.extend(avg_preds.cpu().numpy().flatten())
+                oof_targets.extend(labels.numpy().flatten())
+                oof_angles.extend(angles.cpu().numpy().flatten())
+
+    # 4. Global CV Assessment
+    oof_preds = np.array(oof_preds)
+    oof_targets = np.array(oof_targets)
+    
+    # Clip for log loss stability
+    eps = 1e-15
+    oof_preds_clipped = np.clip(oof_preds, eps, 1 - eps)
+    
+    val_loss = log_loss(oof_targets, oof_preds_clipped)
+    
+    # REQUIRED OUTPUT FORMAT
+    print(f"\nFinal Validation Metric: {val_loss}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    errors = np.abs(oof_preds - oof_targets)
+    
+    analysis_df = pd.DataFrame({
+        "error": errors,
+        "inc_angle": oof_angles
+    })
+    
+    print("Correlation between Error and Features:")
+    print(analysis_df.corr()["error"].drop("error"))
+
+    # 6. Submission (Ensemble Inference)
+    if val_loss < THRESHOLD:
+        print("\n--- Generating Submission with 5-Fold Ensemble ---")
+        test_loader = data_lib.get_dataloaders(mode="test", load_cached_data=True)
+        
+        # Initialize array to store sum of predictions
+        test_preds_sum = None
+        test_ids = None
+        
+        for fold in range(config.N_FOLDS):
+            print(f"Predicting with model fold {fold}...")
+            # Load model
+            model = model_lib.IcebergResNet(
+                backbone_name=config.BACKBONE,
+                pretrained=config.PRETRAINED,
+                dropout_rate=config.DROPOUT_RATE,
+                num_classes=config.NUM_CLASSES,
+                gem_p=config.GEM_P_INIT,
+                gem_trainable=config.GEM_P_TRAINABLE,
+            ).to(device)
+            
+            # Load checkpoint
+            checkpoint_path = os.path.join(config.CHECKPOINT_DIR, f"swa_model_{fold}.pth")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["state_dict"])
+            
+            # Predict
+            preds, ids = engine_lib.predict_tta(test_loader, model, device)
+            
+            if test_preds_sum is None:
+                test_preds_sum = preds
+                test_ids = ids
+            else:
+                test_preds_sum += preds
+        
+        # Average
+        avg_test_preds = test_preds_sum / config.N_FOLDS
+        
+        # Save
+        sub_df = pd.DataFrame({"id": test_ids, "is_iceberg": avg_test_preds})
+        sub_df.to_csv(config.SUBMISSION_PATH, index=False)
+        print(f"Submission saved to {config.SUBMISSION_PATH}")
+    else:
+        print(f"Validation metric {val_loss} is not better than threshold {THRESHOLD}. Skipping submission.")
+>>>>>>> REPLACE
+```

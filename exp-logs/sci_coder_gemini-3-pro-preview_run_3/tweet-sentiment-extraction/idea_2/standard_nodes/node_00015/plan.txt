@@ -1,0 +1,628 @@
+To optimize the solution, I will implement the following changes based on the provided lessons:
+
+1.  **Simplify Model & Loss (Cite Lesson 00009)**: The previous solution failed (~0.419) likely because it combined a new backbone (DeBERTa-v3) with complex architectural additions (Multi-Sample Dropout, Soft Jaccard Loss) that destabilized training. I will revert to a standard DeBERTa-v3 backbone with a simple linear head and standard Cross-Entropy loss.
+2.  **Label Smoothing (Cite Lesson 00010)**: I will add Label Smoothing (0.1) to the Cross-Entropy loss to handle the subjective nature of the sentiment spans and prevent overconfidence.
+3.  **Data Cleaning (Cite Lesson 00013)**: I will implement a filtering step in the data processing pipeline to exclude training samples where the `selected_text` cannot be found within the `text` (due to cleaning/whitespace mismatches). This removes "impossible" targets that force the model to learn noise.
+4.  **Configuration**: I will update the configuration to disable the complex features and enable the new filtering and smoothing parameters.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Multi-Sample Dropout Settings
+    USE_MULTI_SAMPLE_DROPOUT = True
+    DROPOUT_RATES = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 3
+    TRAIN_BATCH_SIZE = 32
+    VALID_BATCH_SIZE = 32
+
+    # Optimizer
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    MAX_GRAD_NORM = 1.0
+    SCHEDULER_TYPE = "linear"  # or 'cosine'
+    WARMUP_RATIO = 0.1
+
+    # Loss Function
+    USE_SOFT_JACCARD = True
+    SOFT_JACCARD_WEIGHT = 0.5  # Weight for the soft jaccard component in the loss
+
+    # Data Strategy
+    FILTER_NEUTRAL_TRAIN = True  # Exclude 'neutral' samples from training
+=======
+    # Multi-Sample Dropout Settings
+    USE_MULTI_SAMPLE_DROPOUT = False
+    DROPOUT_RATES = [0.1]
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    EPOCHS = 3
+    TRAIN_BATCH_SIZE = 32
+    VALID_BATCH_SIZE = 32
+
+    # Optimizer
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    MAX_GRAD_NORM = 1.0
+    SCHEDULER_TYPE = "linear"  # or 'cosine'
+    WARMUP_RATIO = 0.1
+
+    # Loss Function
+    USE_SOFT_JACCARD = False
+    SOFT_JACCARD_WEIGHT = 0.0
+    LABEL_SMOOTHING = 0.1
+
+    # Data Strategy
+    FILTER_NEUTRAL_TRAIN = True  # Exclude 'neutral' samples from training
+    FILTER_IMPOSSIBLE_TRAIN = True  # Exclude samples where selected_text is not found
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+    def __init__(self, soft_jaccard_weight=None):
+        super(TweetLoss, self).__init__()
+        self.soft_jaccard_weight = (
+            soft_jaccard_weight
+            if soft_jaccard_weight is not None
+            else Config.SOFT_JACCARD_WEIGHT
+        )
+        self.ce_loss = nn.CrossEntropyLoss()
+
+    def forward(self, start_logits, end_logits, start_positions, end_positions):
+        """
+        Calculates the compound loss.
+
+        Args:
+            start_logits (torch.Tensor): Predicted logits for start index (Batch, Seq_Len).
+            end_logits (torch.Tensor): Predicted logits for end index (Batch, Seq_Len).
+            start_positions (torch.Tensor): Ground truth start indices (Batch).
+            end_positions (torch.Tensor): Ground truth end indices (Batch).
+
+        Returns:
+            torch.Tensor: The scalar loss value.
+        """
+        # 1. Standard Cross Entropy Loss
+        # We average the loss for start and end positions
+        start_ce = self.ce_loss(start_logits, start_positions)
+        end_ce = self.ce_loss(end_logits, end_positions)
+        ce_loss = (start_ce + end_ce) / 2
+
+        # If weight is 0, return only CE loss to save computation
+        if self.soft_jaccard_weight == 0:
+            return ce_loss
+
+        # 2. Soft Jaccard Loss
+        # Convert logits to probabilities
+        start_probs = torch.softmax(start_logits, dim=1)
+        end_probs = torch.softmax(end_logits, dim=1)
+
+        # Generate Soft Predicted Mask
+        # The probability that token 'i' is inside the span is:
+        # P(i in span) = P(start <= i) * P(end >= i)
+        # Assuming independence between start and end distributions.
+
+        # P(start <= i) is the cumulative sum of start probabilities from 0 to i
+        pred_start_cum = torch.cumsum(start_probs, dim=1)
+
+        # P(end >= i) is the cumulative sum of end probabilities from i to L-1
+        # We compute this by flipping, cumsum, and flipping back
+        pred_end_cum = torch.cumsum(end_probs.flip(1), dim=1).flip(1)
+
+        # Soft mask: (Batch, Seq_Len)
+        pred_mask = pred_start_cum * pred_end_cum
+
+        # Generate Ground Truth Mask
+        batch_size, seq_len = start_logits.size()
+        device = start_logits.device
+
+        # Create grid of indices: [0, 1, ..., seq_len-1] repeated for batch
+        indices = (
+            torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        )
+
+        # Mask is 1 where start_pos <= index <= end_pos
+        # Use unsqueeze to broadcast positions against indices
+        target_mask = (indices >= start_positions.unsqueeze(1)) & (
+            indices <= end_positions.unsqueeze(1)
+        )
+        target_mask = target_mask.float()
+
+        # Compute Jaccard Score
+        # Intersection = sum(pred * target)
+        intersection = (pred_mask * target_mask).sum(dim=1)
+
+        # Union = sum(pred) + sum(target) - intersection
+        union = pred_mask.sum(dim=1) + target_mask.sum(dim=1) - intersection
+
+        # Add epsilon to prevent division by zero
+        epsilon = 1e-7
+        jaccard_score = (intersection + epsilon) / (union + epsilon)
+
+        # Loss is 1 - Mean Jaccard Score
+        jaccard_loss = 1.0 - jaccard_score.mean()
+
+        # 3. Combine Losses
+        total_loss = ce_loss + (self.soft_jaccard_weight * jaccard_loss)
+
+        return total_loss
+=======
+    def __init__(self):
+        super(TweetLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=Config.LABEL_SMOOTHING)
+
+    def forward(self, start_logits, end_logits, start_positions, end_positions):
+        """
+        Calculates the Cross Entropy loss with Label Smoothing.
+        Cite solution_lesson_node_00010: Mitigating Boundary Noise in Span Extraction with Label Smoothing.
+        """
+        start_ce = self.ce_loss(start_logits, start_positions)
+        end_ce = self.ce_loss(end_logits, end_positions)
+        return (start_ce + end_ce) / 2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Multi-Sample Dropout settings
+        self.use_msd = Config.USE_MULTI_SAMPLE_DROPOUT
+        self.dropout_rates = Config.DROPOUT_RATES if self.use_msd else [0.1]
+
+        # Dropout Layers
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in self.dropout_rates])
+
+        # Classification Head
+        # Output size is 2: one for start logit, one for end logit
+        self.classifier = nn.Linear(self.config.hidden_size, 2)
+
+        # Initialize weights for the new head
+        self._init_weights(self.classifier)
+
+    def _init_weights(self, module):
+        """
+        Initialize the weights of the classification head following standard BERT initialization.
+        """
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Indices of input sequence tokens in the vocabulary.
+            attention_mask (torch.Tensor): Mask to avoid performing attention on padding token indices.
+
+        Returns:
+            start_logits (torch.Tensor): Logits for the start index (Batch, Seq_Len).
+            end_logits (torch.Tensor): Logits for the end index (Batch, Seq_Len).
+        """
+        # Pass through backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Get the last hidden state: (Batch, Seq_Len, Hidden_Size)
+        sequence_output = outputs.last_hidden_state
+
+        # Apply Multi-Sample Dropout
+        # We calculate logits for each dropout mask and then average them
+        logits_list = []
+        for dropout in self.dropouts:
+            # Apply dropout
+            out = dropout(sequence_output)
+            # Project to 2 dimensions (start/end)
+            logits = self.classifier(out)
+            logits_list.append(logits)
+
+        # Stack logits: (Num_Drops, Batch, Seq_Len, 2)
+        stacked_logits = torch.stack(logits_list, dim=0)
+
+        # Average over the dropout dimension: (Batch, Seq_Len, 2)
+        mean_logits = torch.mean(stacked_logits, dim=0)
+
+        # Split into start and end logits
+        # split returns a tuple of tensors. Each has shape (Batch, Seq_Len, 1)
+        start_logits, end_logits = mean_logits.split(1, dim=-1)
+
+        # Squeeze the last dimension to get (Batch, Seq_Len)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        return start_logits, end_logits
+=======
+        # Dropout Layer
+        self.dropout = nn.Dropout(0.1)
+
+        # Classification Head
+        self.classifier = nn.Linear(self.config.hidden_size, 2)
+
+        # Initialize weights
+        self._init_weights(self.classifier)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask):
+        # Pass through backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state
+
+        # Simple Head: Dropout + Linear
+        # Cite solution_lesson_node_00009: Decouple Backbone Upgrades from Architectural Changes
+        sequence_output = self.dropout(sequence_output)
+        logits = self.classifier(sequence_output)
+
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        return start_logits, end_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def _process_data(df, tokenizer, max_len, is_test=False):
+    """
+    Tokenizes data and computes start/end token indices for the selected text.
+    """
+    input_ids = []
+    attention_masks = []
+    start_positions = []
+    end_positions = []
+    offsets_list = []
+
+    # Iterate over dataframe efficiently
+    for row in df.itertuples(index=False):
+        text = str(row.text)
+        sentiment = str(row.sentiment)
+
+        # Tokenize: [CLS] sentiment [SEP] text [SEP]
+        # We pass (sentiment, text) to encode_plus
+        encoded = tokenizer(
+            sentiment,
+            text,
+            add_special_tokens=True,
+            max_length=max_len,
+            padding="max_length",
+            truncation=True,
+            return_offsets_mapping=True,
+        )
+
+        ids = encoded["input_ids"]
+        mask = encoded["attention_mask"]
+        offsets = encoded["offset_mapping"]
+
+        # sequence_ids identifies which part of the input the token belongs to.
+        # None: special tokens, 0: sentiment, 1: text
+        seq_ids = encoded.sequence_ids()
+
+        start_idx = 0
+        end_idx = 0
+
+        if not is_test:
+            selected_text = str(row.selected_text)
+
+            # Find the character start/end of selected_text within text
+            start_char = text.find(selected_text)
+
+            # Fallback for whitespace inconsistencies
+            if start_char == -1:
+                start_char = text.find(selected_text.strip())
+
+            if start_char == -1:
+                # If still not found, default to the entire text
+                start_char = 0
+                end_char = len(text)
+            else:
+                end_char = start_char + len(selected_text)
+
+            # Find the tokens corresponding to this character span
+            # We only look at tokens belonging to the 'text' sequence (seq_id == 1)
+            token_indices = [i for i, s in enumerate(seq_ids) if s == 1]
+
+            if token_indices:
+                # Default to the full text span
+                s_token = token_indices[0]
+                e_token = token_indices[-1]
+
+                # Refine start token: Find first token that overlaps with start_char
+                for idx in token_indices:
+                    off_start, off_end = offsets[idx]
+                    # Check if start_char falls within this token's span
+                    if off_start <= start_char < off_end:
+                        s_token = idx
+                        break
+                    # Or if the token starts after the character (shouldn't happen if contained)
+                    if off_start > start_char:
+                        s_token = idx
+                        break
+
+                # Refine end token: Find token that covers end_char
+                for idx in token_indices:
+                    off_start, off_end = offsets[idx]
+                    # Check if end_char falls within or at the end of this token
+                    if off_start < end_char <= off_end:
+                        e_token = idx
+                        break
+
+                start_idx = s_token
+                end_idx = e_token
+
+            # Safety clamp
+            if start_idx >= max_len:
+                start_idx = max_len - 1
+            if end_idx >= max_len:
+                end_idx = max_len - 1
+            if start_idx > end_idx:
+                end_idx = start_idx
+
+        input_ids.append(ids)
+        attention_masks.append(mask)
+        start_positions.append(start_idx)
+        end_positions.append(end_idx)
+        offsets_list.append(offsets)
+
+    return (
+        np.array(input_ids),
+        np.array(attention_masks),
+        np.array(start_positions),
+        np.array(end_positions),
+        np.array(offsets_list),
+    )
+
+
+def get_data(load_cached_data=True):
+    """
+    Loads data, processes it (with caching), and returns DataLoaders.
+    """
+    # Initialize Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # Load Metadata DataFrames
+    train_df = pd.read_csv(Config.TRAIN_META)
+    val_df = pd.read_csv(Config.VAL_META)
+    test_df = pd.read_csv(Config.TEST_META)
+
+    # Filter 'neutral' from training data if configured
+    if Config.FILTER_NEUTRAL_TRAIN:
+        train_df = train_df[train_df["sentiment"] != "neutral"].reset_index(drop=True)
+
+    # Helper to process or load cache
+    def get_split(df, split_name, is_test=False):
+        cache_dir = os.path.join(Config.WORKING_DIR, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        prefix = os.path.join(cache_dir, split_name)
+        files = {
+            "ids": f"{prefix}_ids.npy",
+            "masks": f"{prefix}_masks.npy",
+            "start": f"{prefix}_start.npy",
+            "end": f"{prefix}_end.npy",
+            "offsets": f"{prefix}_offsets.npy",
+        }
+
+        # Check if all cache files exist
+        cache_exists = all(os.path.exists(f) for f in files.values())
+
+        if load_cached_data and cache_exists:
+            input_ids = np.load(files["ids"])
+            attention_masks = np.load(files["masks"])
+            start_pos = np.load(files["start"])
+            end_pos = np.load(files["end"])
+            offsets = np.load(files["offsets"])
+        else:
+            # Compute from scratch
+            input_ids, attention_masks, start_pos, end_pos, offsets = _process_data(
+                df, tokenizer, Config.MAX_LEN, is_test
+            )
+            # Save to cache
+            np.save(files["ids"], input_ids)
+            np.save(files["masks"], attention_masks)
+            np.save(files["start"], start_pos)
+            np.save(files["end"], end_pos)
+            np.save(files["offsets"], offsets)
+
+        return TweetDataset(
+            input_ids=input_ids,
+            attention_masks=attention_masks,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            offsets=offsets,
+            orig_texts=df["text"].values,
+            sentiments=df["sentiment"].values,
+            selected_texts=df["selected_text"].values if not is_test else None,
+        )
+
+    # Create Datasets
+    # Use distinct cache names to avoid collisions (especially with filtering)
+    train_cache_name = "train_filtered" if Config.FILTER_NEUTRAL_TRAIN else "train"
+
+    train_dataset = get_split(train_df, train_cache_name, is_test=False)
+=======
+def _process_data(df, tokenizer, max_len, is_test=False, filter_impossible=False):
+    """
+    Tokenizes data and computes start/end token indices for the selected text.
+    Cite solution_lesson_node_00013: Joint Probability Maximization for Constrained Span Extraction
+    (Filtering impossible rows helps training stability).
+    """
+    input_ids = []
+    attention_masks = []
+    start_positions = []
+    end_positions = []
+    offsets_list = []
+    valid_indices = []
+
+    for idx, row in enumerate(df.itertuples(index=False)):
+        text = str(row.text)
+        sentiment = str(row.sentiment)
+
+        encoded = tokenizer(
+            sentiment,
+            text,
+            add_special_tokens=True,
+            max_length=max_len,
+            padding="max_length",
+            truncation=True,
+            return_offsets_mapping=True,
+        )
+
+        ids = encoded["input_ids"]
+        mask = encoded["attention_mask"]
+        offsets = encoded["offset_mapping"]
+        seq_ids = encoded.sequence_ids()
+
+        start_idx = 0
+        end_idx = 0
+        keep_row = True
+
+        if not is_test:
+            selected_text = str(row.selected_text)
+            start_char = text.find(selected_text)
+            if start_char == -1:
+                start_char = text.find(selected_text.strip())
+
+            if start_char == -1:
+                if filter_impossible:
+                    keep_row = False
+                else:
+                    start_char = 0
+                    end_char = len(text)
+            
+            if keep_row:
+                if start_char != -1:
+                    end_char = start_char + len(selected_text)
+                else:
+                    end_char = len(text)
+
+                token_indices = [i for i, s in enumerate(seq_ids) if s == 1]
+                
+                if not token_indices:
+                    if filter_impossible:
+                        keep_row = False
+                    else:
+                        start_idx = 0
+                        end_idx = 0
+                else:
+                    s_token = token_indices[0]
+                    e_token = token_indices[-1]
+
+                    for i_tok in token_indices:
+                        off_start, off_end = offsets[i_tok]
+                        if off_start <= start_char < off_end:
+                            s_token = i_tok
+                            break
+                        if off_start > start_char:
+                            s_token = i_tok
+                            break
+
+                    for i_tok in token_indices:
+                        off_start, off_end = offsets[i_tok]
+                        if off_start < end_char <= off_end:
+                            e_token = i_tok
+                            break
+                    
+                    start_idx = s_token
+                    end_idx = e_token
+
+                if start_idx >= max_len: start_idx = max_len - 1
+                if end_idx >= max_len: end_idx = max_len - 1
+                if start_idx > end_idx: end_idx = start_idx
+
+        if keep_row:
+            input_ids.append(ids)
+            attention_masks.append(mask)
+            start_positions.append(start_idx)
+            end_positions.append(end_idx)
+            offsets_list.append(offsets)
+            valid_indices.append(idx)
+
+    return (
+        np.array(input_ids),
+        np.array(attention_masks),
+        np.array(start_positions),
+        np.array(end_positions),
+        np.array(offsets_list),
+        np.array(valid_indices)
+    )
+
+
+def get_data(load_cached_data=True):
+    """
+    Loads data, processes it (with caching), and returns DataLoaders.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+    train_df = pd.read_csv(Config.TRAIN_META)
+    val_df = pd.read_csv(Config.VAL_META)
+    test_df = pd.read_csv(Config.TEST_META)
+
+    if Config.FILTER_NEUTRAL_TRAIN:
+        train_df = train_df[train_df["sentiment"] != "neutral"].reset_index(drop=True)
+
+    def get_split(df, split_name, is_test=False, filter_impossible=False):
+        cache_dir = os.path.join(Config.WORKING_DIR, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        prefix = os.path.join(cache_dir, split_name)
+        files = {
+            "ids": f"{prefix}_ids.npy",
+            "masks": f"{prefix}_masks.npy",
+            "start": f"{prefix}_start.npy",
+            "end": f"{prefix}_end.npy",
+            "offsets": f"{prefix}_offsets.npy",
+            "valid_idx": f"{prefix}_valid.npy"
+        }
+
+        cache_exists = all(os.path.exists(f) for f in files.values())
+
+        if load_cached_data and cache_exists:
+            input_ids = np.load(files["ids"])
+            attention_masks = np.load(files["masks"])
+            start_pos = np.load(files["start"])
+            end_pos = np.load(files["end"])
+            offsets = np.load(files["offsets"])
+            valid_indices = np.load(files["valid_idx"])
+        else:
+            input_ids, attention_masks, start_pos, end_pos, offsets, valid_indices = _process_data(
+                df, tokenizer, Config.MAX_LEN, is_test, filter_impossible
+            )
+            np.save(files["ids"], input_ids)
+            np.save(files["masks"], attention_masks)
+            np.save(files["start"], start_pos)
+            np.save(files["end"], end_pos)
+            np.save(files["offsets"], offsets)
+            np.save(files["valid_idx"], valid_indices)
+
+        df_filtered = df.iloc[valid_indices].reset_index(drop=True)
+
+        return TweetDataset(
+            input_ids=input_ids,
+            attention_masks=attention_masks,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            offsets=offsets,
+            orig_texts=df_filtered["text"].values,
+            sentiments=df_filtered["sentiment"].values,
+            selected_texts=df_filtered["selected_text"].values if not is_test else None,
+        )
+
+    train_cache_name = "train"
+    if Config.FILTER_NEUTRAL_TRAIN:
+        train_cache_name += "_no_neutral"
+    if Config.FILTER_IMPOSSIBLE_TRAIN:
+        train_cache_name += "_no_impossible"
+
+    train_dataset = get_split(train_df, train_cache_name, is_test=False, filter_impossible=Config.FILTER_IMPOSSIBLE_TRAIN)
+>>>>>>> REPLACE
+```

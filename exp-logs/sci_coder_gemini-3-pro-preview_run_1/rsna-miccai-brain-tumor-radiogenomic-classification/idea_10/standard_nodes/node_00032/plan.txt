@@ -1,0 +1,755 @@
+I will optimize the solution by transitioning from the overfitting Tri-Stream architecture to a simpler, more robust **Early Fusion** approach. This strategy is supported by Lesson 00031, which indicates that stacking spatially registered modalities as channels into a single backbone is superior for limited datasets. I will also revert to a deterministic "middle slice" selection (Lesson 00015) and ensure independent channel normalization (Lesson 00023).
+
+Here is the implementation plan:
+1.  **Configuration**: Update `config.py` to set `SLAB_DEPTH=1` and `EXPANSION_DEPTHS=[0.5]`, focusing on the single most informative slice to reduce noise (Cite Lesson 00018).
+2.  **Model**: Replace `TMSVNet` in `model.py` with `EarlyFusionNet`, a single EfficientNet-B0 backbone taking a 3-channel input (FLAIR, T1wCE, T2w).
+3.  **Data Loading**: Modify `data.py` to stack the three modalities into a single `(H, W, 3)` tensor before augmentation, enabling the backbone to learn cross-modality correlations immediately.
+4.  **Training**: Update `train.py` and `runfile.py` to handle the simplified input structure.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# The specific modalities used in the Tri-Stream architecture
+# Note: T1w is excluded based on the TMSV-Net design description
+MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+
+# Deterministic Data Expansion:
+# We extract samples centered at these relative depths of the brain volume
+EXPANSION_DEPTHS = [0.45, 0.50, 0.55]
+
+# Input dimensions
+# EfficientNet-B0 native resolution is typically 224x224.
+# Using 256x256 preserves slightly more detail while remaining computationally efficient.
+IMAGE_SIZE = (256, 256)
+
+# Number of slices per slab (channels per stream)
+# The architecture uses [z-1, z, z+1]
+SLAB_DEPTH = 3
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+MODEL_BACKBONE = "efficientnet_b0"
+PRETRAINED = True
+# High dropout rate for the fusion head as specified
+DROP_RATE = 0.5
+NUM_CLASSES = 1  # Binary classification (MGMT_value)
+=======
+# The specific modalities used in the Early Fusion architecture
+MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+
+# Deterministic Data Expansion:
+# Using strictly the middle slice to avoid noise from peripheral slices (Cite solution_lesson_node_00018)
+# and preferring deterministic heuristics (Cite solution_lesson_node_00015)
+EXPANSION_DEPTHS = [0.50]
+
+# Input dimensions
+IMAGE_SIZE = (256, 256)
+
+# Number of slices per slab
+# Using single slice per modality for Early Fusion (Cite solution_lesson_node_00031)
+SLAB_DEPTH = 1
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+MODEL_BACKBONE = "efficientnet_b0"
+PRETRAINED = True
+# Aggressive regularization helps in small-sample regimes (Cite solution_lesson_node_00010)
+DROP_RATE = 0.4
+NUM_CLASSES = 1  # Binary classification (MGMT_value)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TMSVNet(nn.Module):
+    """
+    Tri-Stream Modality-Specific Volumetric Network (TMSV-Net).
+
+    This architecture uses three parallel EfficientNet-B0 backbones to independently
+    process FLAIR, T1wCE, and T2w MRI slabs. The spatial features are fused via
+    concatenation and processed by a classification head.
+    """
+
+    def __init__(
+        self,
+        backbone_name=MODEL_BACKBONE,
+        pretrained=PRETRAINED,
+        drop_rate=DROP_RATE,
+        num_classes=NUM_CLASSES,
+    ):
+        """
+        Args:
+            backbone_name (str): Name of the timm backbone (default: efficientnet_b0).
+            pretrained (bool): Whether to load ImageNet weights.
+            drop_rate (float): Dropout probability for the fusion head.
+            num_classes (int): Number of output classes (default: 1).
+        """
+        super(TMSVNet, self).__init__()
+
+        # Stream 1: FLAIR
+        # Input: 3 channels (z-1, z, z+1)
+        self.flair_stream = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,  # Use Global Average Pooling, remove classification head
+            in_chans=3,
+        )
+
+        # Stream 2: T1wCE
+        # Input: 3 channels (z-1, z, z+1)
+        self.t1wce_stream = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0, in_chans=3
+        )
+
+        # Stream 3: T2w
+        # Input: 3 channels (z-1, z, z+1)
+        self.t2w_stream = timm.create_model(
+            backbone_name, pretrained=pretrained, num_classes=0, in_chans=3
+        )
+
+        # Determine feature dimension dynamically
+        # EfficientNet-B0 typically outputs 1280 features after GAP
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 224, 224)
+            # All streams are identical in architecture, so check one
+            feature_dim = self.flair_stream(dummy_input).shape[1]
+
+        self.fusion_dim = feature_dim * 3
+
+        # Fusion Head
+        # Concatenate features -> Dropout -> Dense
+        self.dropout = nn.Dropout(p=drop_rate)
+        self.classifier = nn.Linear(self.fusion_dim, num_classes)
+
+    def forward(self, x_flair, x_t1wce, x_t2w):
+        """
+        Forward pass of the TMSV-Net.
+
+        Args:
+            x_flair (torch.Tensor): Batch of FLAIR slabs (B, 3, H, W).
+            x_t1wce (torch.Tensor): Batch of T1wCE slabs (B, 3, H, W).
+            x_t2w (torch.Tensor): Batch of T2w slabs (B, 3, H, W).
+
+        Returns:
+            torch.Tensor: Logits (B, num_classes).
+        """
+        # Extract features from each stream
+        # Output shape: (B, feature_dim) e.g., (B, 1280)
+        f_flair = self.flair_stream(x_flair)
+        f_t1wce = self.t1wce_stream(x_t1wce)
+        f_t2w = self.t2w_stream(x_t2w)
+
+        # Feature Fusion
+        # Concatenate along the feature dimension
+        # Output shape: (B, feature_dim * 3) e.g., (B, 3840)
+        f_fused = torch.cat([f_flair, f_t1wce, f_t2w], dim=1)
+
+        # Classification Head
+        x = self.dropout(f_fused)
+        logits = self.classifier(x)
+
+        return logits
+=======
+class EarlyFusionNet(nn.Module):
+    """
+    Early Fusion Network.
+    
+    Uses a single EfficientNet-B0 backbone to process a 3-channel input 
+    composed of FLAIR, T1wCE, and T2w modalities stacked channel-wise.
+    This reduces parameter count and overfitting compared to multi-stream architectures
+    (Cite solution_lesson_node_00031).
+    """
+
+    def __init__(
+        self,
+        backbone_name=MODEL_BACKBONE,
+        pretrained=PRETRAINED,
+        drop_rate=DROP_RATE,
+        num_classes=NUM_CLASSES,
+    ):
+        super(EarlyFusionNet, self).__init__()
+
+        # Single backbone taking 3 input channels (FLAIR, T1wCE, T2w)
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            in_chans=3,
+            drop_rate=drop_rate
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Batch of stacked images (B, 3, H, W).
+        """
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+from library.config import (
+    TRAIN_METADATA_PATH,
+    VAL_METADATA_PATH,
+    TEST_METADATA_PATH,
+    CACHE_DIR,
+    EXPANSION_DEPTHS,
+    IMAGE_SIZE,
+    INPUT_DIR,
+    SEED,
+)
+from library.utils import (
+    get_brain_depth_range,
+    read_dicom_slab,
+    independent_slab_normalize,
+    set_seed,
+)
+=======
+from library.config import (
+    TRAIN_METADATA_PATH,
+    VAL_METADATA_PATH,
+    TEST_METADATA_PATH,
+    CACHE_DIR,
+    EXPANSION_DEPTHS,
+    IMAGE_SIZE,
+    INPUT_DIR,
+    SEED,
+    SLAB_DEPTH,
+)
+from library.utils import (
+    get_brain_depth_range,
+    read_dicom_slab,
+    independent_slab_normalize,
+    set_seed,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_transforms(phase="train"):
+    """
+    Returns the Albumentations transform pipeline.
+    Ensures geometric consistency across all 3 modality streams.
+    """
+    if phase == "train":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(limit=15, p=0.5),
+                # Elastic and Grid distortions for volumetric variation simulation
+                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+                A.GridDistortion(p=0.5),
+            ],
+            additional_targets={"t1wce": "image", "t2w": "image"},
+        )
+    return None
+
+
+class TMSVDataset(Dataset):
+    """
+    Dataset class for Tri-Stream Modality-Specific Volumetric Network.
+    Wraps pre-processed numpy arrays and applies synchronized augmentations.
+    """
+
+    def __init__(self, flair_data, t1wce_data, t2w_data, targets, ids, transform=None):
+        self.flair_data = flair_data
+        self.t1wce_data = t1wce_data
+        self.t2w_data = t2w_data
+        self.targets = targets
+        self.ids = ids
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # Retrieve slabs (H, W, 3)
+        img_flair = self.flair_data[idx]
+        img_t1wce = self.t1wce_data[idx]
+        img_t2w = self.t2w_data[idx]
+
+        # Apply synchronized augmentations
+        if self.transform:
+            augmented = self.transform(image=img_flair, t1wce=img_t1wce, t2w=img_t2w)
+            img_flair = augmented["image"]
+            img_t1wce = augmented["t1wce"]
+            img_t2w = augmented["t2w"]
+
+        # Convert to PyTorch format: (H, W, C) -> (C, H, W)
+        # Input to model expects (B, 3, H, W)
+        img_flair = np.transpose(img_flair, (2, 0, 1))
+        img_t1wce = np.transpose(img_t1wce, (2, 0, 1))
+        img_t2w = np.transpose(img_t2w, (2, 0, 1))
+
+        # Convert to tensors
+        sample = {
+            "flair": torch.tensor(img_flair, dtype=torch.float32),
+            "t1wce": torch.tensor(img_t1wce, dtype=torch.float32),
+            "t2w": torch.tensor(img_t2w, dtype=torch.float32),
+            "BraTS21ID": self.ids[idx],
+        }
+
+        if self.targets is not None:
+            sample["target"] = torch.tensor(
+                self.targets[idx], dtype=torch.float32
+            ).unsqueeze(0)
+
+        return sample
+=======
+def get_transforms(phase="train"):
+    """
+    Returns the Albumentations transform pipeline.
+    """
+    if phase == "train":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(limit=15, p=0.5),
+                # Elastic and Grid distortions for volumetric variation simulation
+                # (Cite solution_lesson_node_00010)
+                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+                A.GridDistortion(p=0.5),
+            ]
+        )
+    return None
+
+
+class EarlyFusionDataset(Dataset):
+    """
+    Dataset class for Early Fusion Network.
+    Stacks modalities into a single 3-channel image.
+    """
+
+    def __init__(self, flair_data, t1wce_data, t2w_data, targets, ids, transform=None):
+        self.flair_data = flair_data
+        self.t1wce_data = t1wce_data
+        self.t2w_data = t2w_data
+        self.targets = targets
+        self.ids = ids
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        # Retrieve single slices (H, W, 1)
+        img_flair = self.flair_data[idx]
+        img_t1wce = self.t1wce_data[idx]
+        img_t2w = self.t2w_data[idx]
+
+        # Stack to create (H, W, 3) image for Early Fusion
+        # (Cite solution_lesson_node_00031)
+        img = np.concatenate([img_flair, img_t1wce, img_t2w], axis=2)
+
+        # Apply augmentations
+        if self.transform:
+            augmented = self.transform(image=img)
+            img = augmented["image"]
+
+        # Convert to PyTorch format: (H, W, C) -> (C, H, W)
+        img = np.transpose(img, (2, 0, 1))
+
+        # Convert to tensors
+        sample = {
+            "image": torch.tensor(img, dtype=torch.float32),
+            "BraTS21ID": self.ids[idx],
+        }
+
+        if self.targets is not None:
+            sample["target"] = torch.tensor(
+                self.targets[idx], dtype=torch.float32
+            ).unsqueeze(0)
+
+        return sample
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+            # Read and Normalize Slabs
+            # Note: utils.read_dicom_slab returns (H, W, D)
+            slab_flair = read_dicom_slab(flair_path, center_idx)
+            slab_t1wce = read_dicom_slab(t1wce_path, center_idx)
+            slab_t2w = read_dicom_slab(t2w_path, center_idx)
+
+            norm_flair = independent_slab_normalize(slab_flair)
+            norm_t1wce = independent_slab_normalize(slab_t1wce)
+            norm_t2w = independent_slab_normalize(slab_t2w)
+
+            flair_list.append(norm_flair)
+            t1wce_list.append(norm_t1wce)
+            t2w_list.append(norm_t2w)
+=======
+            # Read and Normalize Slabs (Depth=1 for Early Fusion)
+            # Note: utils.read_dicom_slab returns (H, W, D)
+            # We use SLAB_DEPTH=1 to get single slices (Cite solution_lesson_node_00031)
+            slab_flair = read_dicom_slab(flair_path, center_idx, slab_depth=SLAB_DEPTH)
+            slab_t1wce = read_dicom_slab(t1wce_path, center_idx, slab_depth=SLAB_DEPTH)
+            slab_t2w = read_dicom_slab(t2w_path, center_idx, slab_depth=SLAB_DEPTH)
+
+            # Independent Normalization (Cite solution_lesson_node_00023)
+            norm_flair = independent_slab_normalize(slab_flair)
+            norm_t1wce = independent_slab_normalize(slab_t1wce)
+            norm_t2w = independent_slab_normalize(slab_t2w)
+
+            flair_list.append(norm_flair)
+            t1wce_list.append(norm_t1wce)
+            t2w_list.append(norm_t2w)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # 1. Train Data
+    print("Preparing Training Dataset...")
+    tr_flair, tr_t1wce, tr_t2w, tr_targets, tr_ids = _load_or_create_cache(
+        TRAIN_METADATA_PATH, "train", load_cached_data
+    )
+    train_dataset = TMSVDataset(
+        tr_flair,
+        tr_t1wce,
+        tr_t2w,
+        tr_targets,
+        tr_ids,
+        transform=get_transforms("train"),
+    )
+
+    # 2. Validation Data
+    print("Preparing Validation Dataset...")
+    val_flair, val_t1wce, val_t2w, val_targets, val_ids = _load_or_create_cache(
+        VAL_METADATA_PATH, "val", load_cached_data
+    )
+    val_dataset = TMSVDataset(
+        val_flair,
+        val_t1wce,
+        val_t2w,
+        val_targets,
+        val_ids,
+        transform=None,  # No augmentation for validation
+    )
+
+    # 3. Test Data
+    print("Preparing Test Dataset...")
+    te_flair, te_t1wce, te_t2w, te_targets, te_ids = _load_or_create_cache(
+        TEST_METADATA_PATH, "test", load_cached_data
+    )
+    test_dataset = TMSVDataset(
+        te_flair,
+        te_t1wce,
+        te_t2w,
+        te_targets,
+        te_ids,
+        transform=None,  # No augmentation for testing
+    )
+=======
+    # 1. Train Data
+    print("Preparing Training Dataset...")
+    tr_flair, tr_t1wce, tr_t2w, tr_targets, tr_ids = _load_or_create_cache(
+        TRAIN_METADATA_PATH, "train", load_cached_data
+    )
+    train_dataset = EarlyFusionDataset(
+        tr_flair,
+        tr_t1wce,
+        tr_t2w,
+        tr_targets,
+        tr_ids,
+        transform=get_transforms("train"),
+    )
+
+    # 2. Validation Data
+    print("Preparing Validation Dataset...")
+    val_flair, val_t1wce, val_t2w, val_targets, val_ids = _load_or_create_cache(
+        VAL_METADATA_PATH, "val", load_cached_data
+    )
+    val_dataset = EarlyFusionDataset(
+        val_flair,
+        val_t1wce,
+        val_t2w,
+        val_targets,
+        val_ids,
+        transform=None,  # No augmentation for validation
+    )
+
+    # 3. Test Data
+    print("Preparing Test Dataset...")
+    te_flair, te_t1wce, te_t2w, te_targets, te_ids = _load_or_create_cache(
+        TEST_METADATA_PATH, "test", load_cached_data
+    )
+    test_dataset = EarlyFusionDataset(
+        te_flair,
+        te_t1wce,
+        te_t2w,
+        te_targets,
+        te_ids,
+        transform=None,  # No augmentation for testing
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import TMSVNet
+from library.data import get_datasets
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        # Move inputs to device
+        flair = batch["flair"].to(device)
+        t1wce = batch["t1wce"].to(device)
+        t2w = batch["t2w"].to(device)
+        targets = batch["target"].to(device)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(flair, t1wce, t2w)
+
+        # Compute loss
+        loss = criterion(logits, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * flair.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def validate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Aggregates predictions by Subject ID to compute subject-level ROC AUC.
+    """
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            flair = batch["flair"].to(device)
+            t1wce = batch["t1wce"].to(device)
+            t2w = batch["t2w"].to(device)
+            targets = batch["target"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(flair, t1wce, t2w)
+            loss = criterion(logits, targets)
+
+            running_loss += loss.item() * flair.size(0)
+=======
+from library.model import EarlyFusionNet
+from library.data import get_datasets
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        # Move inputs to device
+        images = batch["image"].to(device)
+        targets = batch["target"].to(device)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(images)
+
+        # Compute loss
+        loss = criterion(logits, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def validate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Aggregates predictions by Subject ID to compute subject-level ROC AUC.
+    """
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["image"].to(device)
+            targets = batch["target"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(images)
+            loss = criterion(logits, targets)
+
+            running_loss += loss.item() * images.size(0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = TMSVNet().to(DEVICE)
+
+    criterion = nn.BCEWithLogitsLoss()
+=======
+    # 3. Model Initialization
+    model = EarlyFusionNet().to(DEVICE)
+
+    criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import TMSVNet
+from library.data import get_datasets
+from library.train import train_one_epoch, validate
+
+
+def run_failure_analysis(model, val_loader, val_metadata_path, device):
+    """
+    Performs failure analysis on the validation set.
+    Calculates error magnitude and correlates it with input features (FLAIR file count).
+    """
+    print("\n=== Failure Analysis ===")
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    # 1. Get Predictions
+    with torch.no_grad():
+        for batch in val_loader:
+            flair = batch["flair"].to(device)
+            t1wce = batch["t1wce"].to(device)
+            t2w = batch["t2w"].to(device)
+            targets = batch["target"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(flair, t1wce, t2w)
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_targets.extend(targets.cpu().numpy().flatten())
+            all_ids.extend(ids.numpy().flatten())
+=======
+from library.model import EarlyFusionNet
+from library.data import get_datasets
+from library.train import train_one_epoch, validate
+
+
+def run_failure_analysis(model, val_loader, val_metadata_path, device):
+    """
+    Performs failure analysis on the validation set.
+    Calculates error magnitude and correlates it with input features (FLAIR file count).
+    """
+    print("\n=== Failure Analysis ===")
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    # 1. Get Predictions
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(device)
+            targets = batch["target"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_targets.extend(targets.cpu().numpy().flatten())
+            all_ids.extend(ids.numpy().flatten())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("Threshold met. Generating predictions for test set...")
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            flair = batch["flair"].to(device)
+            t1wce = batch["t1wce"].to(device)
+            t2w = batch["t2w"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(flair, t1wce, t2w)
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_ids.extend(ids.numpy().flatten())
+=======
+    print("Threshold met. Generating predictions for test set...")
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["image"].to(device)
+            ids = batch["BraTS21ID"]
+
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_ids.extend(ids.numpy().flatten())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model & Training
+    model = TMSVNet().to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss()
+=======
+    # 3. Model & Training
+    model = EarlyFusionNet().to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```

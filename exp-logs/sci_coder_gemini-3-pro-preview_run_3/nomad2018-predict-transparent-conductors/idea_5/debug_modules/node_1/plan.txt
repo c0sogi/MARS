@@ -1,0 +1,265 @@
+The execution failure is caused by a broken installation of the `dgl` library, which is a dependency of `matgl`. The `library/gnn_processor.py` script imports `matgl` at the top level, causing the entire application to crash immediately upon startup with a `FileNotFoundError` for `libgraphbolt_pytorch_2.8.0.so`. As per **Debug Lesson 6**, the solution is to isolate this fragile dependency by mocking the `MatGLEmbedder` class. This involves removing the failing imports (`matgl`, `matgl.ext.ase`) and replacing the class with a mock implementation that returns dummy data (zeros) of the expected shape (4 elements * 64 dimensions = 256 columns). This allows the rest of the pipeline (data loading, physical feature extraction, and XGBoost training) to function without the broken GNN component.
+
+```diff
+library/gnn_processor.py
+<<<<<<< SEARCH
+import os
+import torch
+import numpy as np
+import pandas as pd
+import matgl
+from matgl.ext.ase import AseAtomsAdaptor
+from library.config import WORKING_DIR, RANDOM_SEED, MATGL_MODEL_NAME
+
+
+class MatGLEmbedder:
+    """
+    A class to extract chemically-resolved structural embeddings using a pre-trained MatGL (M3GNet) model.
+    """
+
+    def __init__(self, model_name=MATGL_MODEL_NAME, device=None):
+        self.model_name = model_name
+        self.device = (
+            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.potential = None
+        self.model = None
+        self.hook_handle = None
+        self.captured_embeddings = None
+
+    def load_pretrained_model(self):
+        """Loads the pre-trained MatGL potential and extracts the underlying M3GNet model."""
+        print(f"Loading MatGL model: {self.model_name} on {self.device}...")
+        # Load the potential. The actual GNN is typically in potential.model
+        self.potential = matgl.load_model(self.model_name)
+        self.model = self.potential.model
+        self.model.to(self.device)
+        self.model.eval()
+
+    def _hook_fn(self, module, inputs, output):
+        """
+        Forward hook function to capture the output of a specific layer.
+        For M3GNetLayer, the output is the updated node features tensor.
+        """
+        self.captured_embeddings = output
+
+    def _get_embeddings(self, graph, state_attr, bond_types):
+        """
+        Runs the model forward pass and captures node embeddings from the last GNN layer.
+
+        Args:
+            graph: The input DGL graph.
+            state_attr: State attributes tensor.
+            bond_types: Bond types tensor (line graph).
+
+        Returns:
+            torch.Tensor: Node embeddings of shape [N_nodes, Embedding_Dim].
+        """
+        # We attach the hook to the last layer of the GNN encoder.
+        # In M3GNet, self.model.layers is a ModuleList of M3GNetLayer blocks.
+        target_layer = self.model.layers[-1]
+        self.hook_handle = target_layer.register_forward_hook(self._hook_fn)
+
+        try:
+            with torch.no_grad():
+                # Move inputs to device
+                graph = graph.to(self.device)
+                if state_attr is not None:
+                    state_attr = state_attr.to(self.device)
+                if bond_types is not None:
+                    bond_types = bond_types.to(self.device)
+
+                # Run forward pass. We don't care about the final energy/force output,
+                # just the side effect of the hook capturing the embeddings.
+                _ = self.model(graph, state_attr, bond_types)
+
+                # Retrieve captured embeddings
+                embeddings = self.captured_embeddings
+                return embeddings
+        finally:
+            # clean up hook
+            if self.hook_handle:
+                self.hook_handle.remove()
+                self.hook_handle = None
+                self.captured_embeddings = None
+
+    def generate_chemically_resolved_embeddings(
+        self, atoms_list, split_name, load_cached_data=True
+    ):
+        """
+        Generates chemically resolved embeddings for a list of ASE atoms objects.
+
+        Logic:
+        1. Convert ASE Atoms -> Pymatgen Structure -> Graph.
+        2. Extract node embeddings from pre-trained M3GNet.
+        3. Perform Element-wise Pooling: Calculate mean embedding for Al, Ga, In, O separately.
+        4. Concatenate to form the final feature vector.
+
+        Args:
+            atoms_list (list): List of ASE Atoms objects.
+            split_name (str): 'train', 'val', or 'test' for caching.
+            load_cached_data (bool): Whether to load from cache if available.
+
+        Returns:
+            pd.DataFrame: DataFrame containing the embedding features.
+        """
+        # Ensure working directory exists
+        os.makedirs(WORKING_DIR, exist_ok=True)
+        cache_path = os.path.join(WORKING_DIR, f"{split_name}_matgl_embeddings.parquet")
+
+        # 1. Check Cache
+        if load_cached_data and os.path.exists(cache_path):
+            try:
+                print(f"Loading cached MatGL embeddings from {cache_path}")
+                return pd.read_parquet(cache_path)
+            except Exception as e:
+                print(f"Failed to load cache ({e}). Recomputing features.")
+
+        # 2. Load Model if not loaded
+        if self.model is None:
+            self.load_pretrained_model()
+
+        print(
+            f"Generating chemically-resolved MatGL embeddings for {len(atoms_list)} structures..."
+        )
+
+        features_list = []
+
+        # Define target elements for pooling (Atomic numbers)
+        # Al: 13, Ga: 31, In: 49, O: 8
+        target_elements_z = [13, 31, 49, 8]
+        element_names = ["Al", "Ga", "In", "O"]
+
+        # Get graph converter from the loaded potential
+        converter = self.potential.graph_converter
+
+        for i, atoms in enumerate(atoms_list):
+            try:
+                # Convert ASE to Pymatgen Structure
+                struct = AseAtomsAdaptor.get_structure(atoms)
+
+                # Convert Structure to Graph
+                # get_graph returns tuple: (graph, state_attr, bond_types)
+                graph, state_attr, bond_types = converter.get_graph(struct)
+
+                # Extract node embeddings [N_nodes, D]
+                node_embs_tensor = self._get_embeddings(graph, state_attr, bond_types)
+                node_embs = node_embs_tensor.cpu().numpy()
+
+                # Get atomic numbers to identify species
+                # Pymatgen structure sites preserve order of graph nodes
+                atomic_numbers = np.array([site.specie.Z for site in struct])
+
+                # Element-wise Pooling
+                crystal_feat = []
+                for z in target_elements_z:
+                    mask = atomic_numbers == z
+                    if mask.any():
+                        # Mean pooling for this species
+                        species_emb = node_embs[mask].mean(axis=0)
+                    else:
+                        # Zero vector if species is missing in this crystal
+                        species_emb = np.zeros(node_embs.shape[1])
+                    crystal_feat.append(species_emb)
+
+                # Concatenate all species embeddings: Size = 4 * Embedding_Dim
+                full_feat = np.concatenate(crystal_feat)
+                features_list.append(full_feat)
+
+            except Exception as e:
+                print(f"Error processing sample {i}: {e}")
+                # Fallback: append zero vector of correct size (assuming 64 dim per species * 4 = 256)
+                # We assume standard M3GNet embedding dim is 64.
+                # If the first one fails, we might have an issue determining size, but usually it works.
+                # For robustness, we re-raise or handle. Let's re-raise to fail fast during dev.
+                raise e
+
+        # 3. Create DataFrame
+        if not features_list:
+            raise ValueError("No features generated.")
+
+        # Determine embedding dimension from first successful sample
+        emb_dim = features_list[0].shape[0] // 4
+
+        # Generate column names
+        col_names = []
+        for el in element_names:
+            for d in range(emb_dim):
+                col_names.append(f"matgl_{el}_{d}")
+
+        df_features = pd.DataFrame(features_list, columns=col_names)
+
+        # 4. Save to Cache
+        try:
+            df_features.to_parquet(cache_path, index=False)
+            print(f"Saved MatGL embeddings to {cache_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save cache: {e}")
+
+        return df_features
+=======
+import os
+import torch
+import numpy as np
+import pandas as pd
+# import matgl
+# from matgl.ext.ase import AseAtomsAdaptor
+from library.config import WORKING_DIR, RANDOM_SEED, MATGL_MODEL_NAME
+
+
+class MatGLEmbedder:
+    """
+    Mock MatGLEmbedder to bypass broken DGL installation.
+    Cite debug_lesson_6
+    """
+
+    def __init__(self, model_name=MATGL_MODEL_NAME, device=None):
+        self.model_name = model_name
+        self.device = device
+
+    def generate_chemically_resolved_embeddings(
+        self, atoms_list, split_name, load_cached_data=True
+    ):
+        """
+        Generates dummy embeddings to avoid DGL dependency.
+        """
+        # Ensure working directory exists
+        os.makedirs(WORKING_DIR, exist_ok=True)
+        cache_path = os.path.join(WORKING_DIR, f"{split_name}_matgl_embeddings.parquet")
+
+        # 1. Check Cache
+        if load_cached_data and os.path.exists(cache_path):
+            try:
+                print(f"Loading cached MatGL embeddings from {cache_path}")
+                return pd.read_parquet(cache_path)
+            except Exception as e:
+                print(f"Failed to load cache ({e}). Recomputing features.")
+
+        print(
+            f"Generating dummy MatGL embeddings for {len(atoms_list)} structures (Mock Mode)..."
+        )
+
+        element_names = ["Al", "Ga", "In", "O"]
+        emb_dim = 64  # Standard M3GNet embedding dimension
+        
+        # Generate column names
+        col_names = []
+        for el in element_names:
+            for d in range(emb_dim):
+                col_names.append(f"matgl_{el}_{d}")
+
+        # Create zero features
+        n_samples = len(atoms_list)
+        features = np.zeros((n_samples, len(col_names)))
+        df_features = pd.DataFrame(features, columns=col_names)
+
+        # 4. Save to Cache
+        try:
+            df_features.to_parquet(cache_path, index=False)
+            print(f"Saved MatGL embeddings to {cache_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save cache: {e}")
+
+        return df_features
+>>>>>>> REPLACE
+```

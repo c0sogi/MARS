@@ -1,0 +1,650 @@
+I will implement the following changes to recover performance by removing the destructive auxiliary task and optimizing the architecture based on the lessons learned:
+
+1.  **`library/model.py`**:
+    *   Rename `UncertaintyAwareBiGRU` to `WideResBiGRU` and remove the `uncertainty_head`. This addresses **Lesson ID: solution_lesson_node_00094** (Destructive Interference via Unscaled Auxiliary Targets).
+    *   Modify `ScalarMixture` to use iterative accumulation instead of `torch.stack` + `torch.sum`. This addresses **Lesson ID: solution_lesson_node_00063** (Iterative Accumulation vs. Vectorized Stacking) to improve memory efficiency.
+    *   Update `forward` to return only the predicted values.
+
+2.  **`library/loss.py`**:
+    *   Replace `UncertaintyAwareMSELoss` with `MaskedMSELoss`. This removes the error prediction term from the objective function.
+
+3.  **`library/engine.py`**:
+    *   Update `train_one_epoch`, `validate`, and `generate_submission` to handle the single return value from the model (removing the tuple unpacking).
+
+4.  **`runfile.py`**:
+    *   Update imports and model/loss initialization to use `WideResBiGRU` and `MaskedMSELoss`.
+    *   Update `get_val_predictions` to handle single model output.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ScalarMixture(nn.Module):
+    """
+    Computes a learnable weighted sum of a list of tensors.
+    """
+
+    def __init__(self, n_layers: int):
+        super().__init__()
+        # Initialize weights to 1.0 (similar to the baseline in config.py)
+        self.weights = nn.Parameter(torch.ones(n_layers))
+
+    def forward(self, tensors):
+        """
+        Args:
+            tensors: List of tensors, each [Batch, SeqLen, HiddenDim]
+        Returns:
+            Weighted sum tensor [Batch, SeqLen, HiddenDim]
+        """
+        # Stack tensors: [Batch, SeqLen, HiddenDim, N_Layers]
+        stacked = torch.stack(tensors, dim=-1)
+
+        # Normalize weights
+        norm_weights = F.softmax(self.weights, dim=0)
+
+        # Weighted sum across the last dimension
+        return torch.sum(stacked * norm_weights, dim=-1)
+
+
+class UncertaintyAwareBiGRU(nn.Module):
+    """
+    Uncertainty-Aware Wide-Stream Residual BiGRU Architecture.
+
+    Features:
+    - Multi-channel input embeddings (Sequence, Loop, Distance).
+    - Wide-stream residual backbone (BiGRU).
+    - Scalar mixture aggregation of all layers.
+    - Dual-head output for Target Values and Uncertainty (Error) prediction.
+    """
+
+    def __init__(self, config: Config = None):
+        super().__init__()
+        if config is None:
+            config = Config()
+        self.config = config
+
+        # 1. Embeddings
+        # Atomic Sequence Embedding (A, G, C, U)
+        self.seq_embed = nn.Embedding(4, config.embed_dim)
+        # Predicted Loop Type Embedding (S, M, I, B, H, E, X)
+        self.loop_embed = nn.Embedding(7, config.embed_dim)
+        # Signed Sinusoidal Pairing Distance Embedding (Imported)
+        self.dist_embed = SinusoidalPositionalEmbedding(config.embed_dim)
+
+        # Input Projection: Concatenated Embeddings -> Hidden Dim
+        # Input dim = 3 * embed_dim (128) = 384
+        self.input_proj = nn.Linear(config.embed_dim * 3, config.hidden_dim)
+
+        # 2. Recurrent Stem
+        self.stem_gru = nn.GRU(
+            input_size=config.hidden_dim,
+            hidden_size=config.hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone: Residual Blocks
+        self.blocks = nn.ModuleList(
+            [ResidualBiGRUBlock(config) for _ in range(config.n_layers)]
+        )
+
+        # 4. Aggregation: Scalar Mixture
+        # We aggregate outputs from the Stem + all Blocks
+        self.mixture = ScalarMixture(n_layers=config.n_layers + 1)
+
+        # 5. Dual Output Heads
+        # Value Head: Predicts reactivity, deg_Mg_pH10, deg_Mg_50C
+        self.value_head = nn.Linear(config.hidden_dim, 3)
+        # Uncertainty Head: Predicts errors for the above targets
+        self.uncertainty_head = nn.Linear(config.hidden_dim, 3)
+
+    def forward(self, seq, loop, dist):
+        """
+        Args:
+            seq: [Batch, SeqLen] - Sequence indices
+            loop: [Batch, SeqLen] - Loop type indices
+            dist: [Batch, SeqLen] - Signed pairing distances
+
+        Returns:
+            values: [Batch, SeqLen, 3] - Predicted degradation rates
+            uncertainties: [Batch, SeqLen, 3] - Predicted experimental errors
+        """
+        # Embeddings
+        e_seq = self.seq_embed(seq)
+        e_loop = self.loop_embed(loop)
+        e_dist = self.dist_embed(dist)
+
+        # Concatenate and Project
+        x = torch.cat([e_seq, e_loop, e_dist], dim=-1)
+        x = self.input_proj(x)
+
+        # Stem Processing
+        x, _ = self.stem_gru(x)
+
+        # Collect layer outputs for mixture (starting with Stem output)
+        layer_outputs = [x]
+
+        # Backbone Processing
+        curr = x
+        for block in self.blocks:
+            curr = block(curr)
+            layer_outputs.append(curr)
+
+        # Aggregation
+        aggregated = self.mixture(layer_outputs)
+
+        # Heads
+        values = self.value_head(aggregated)
+        uncertainties = self.uncertainty_head(aggregated)
+
+        return values, uncertainties
+=======
+class ScalarMixture(nn.Module):
+    """
+    Computes a learnable weighted sum of a list of tensors.
+    """
+
+    def __init__(self, n_layers: int):
+        super().__init__()
+        # Initialize weights to 1.0
+        self.weights = nn.Parameter(torch.ones(n_layers))
+
+    def forward(self, tensors):
+        """
+        Args:
+            tensors: List of tensors, each [Batch, SeqLen, HiddenDim]
+        Returns:
+            Weighted sum tensor [Batch, SeqLen, HiddenDim]
+        """
+        # Cite solution_lesson_node_00063: Iterative Accumulation vs Vectorized Stacking
+        # Use iterative accumulation to save memory
+        norm_weights = F.softmax(self.weights, dim=0)
+        out = torch.zeros_like(tensors[0])
+        for i, t in enumerate(tensors):
+            out += norm_weights[i] * t
+        return out
+
+
+class WideResBiGRU(nn.Module):
+    """
+    Wide-Stream Residual BiGRU Architecture.
+    
+    Reverted to single-task regression to avoid destructive interference from 
+    unscaled auxiliary targets (Cite solution_lesson_node_00094).
+
+    Features:
+    - Multi-channel input embeddings (Sequence, Loop, Distance).
+    - Wide-stream residual backbone (BiGRU).
+    - Scalar mixture aggregation of all layers.
+    """
+
+    def __init__(self, config: Config = None):
+        super().__init__()
+        if config is None:
+            config = Config()
+        self.config = config
+
+        # 1. Embeddings
+        self.seq_embed = nn.Embedding(4, config.embed_dim)
+        self.loop_embed = nn.Embedding(7, config.embed_dim)
+        self.dist_embed = SinusoidalPositionalEmbedding(config.embed_dim)
+
+        # Input Projection: Concatenated Embeddings -> Hidden Dim
+        self.input_proj = nn.Linear(config.embed_dim * 3, config.hidden_dim)
+
+        # 2. Recurrent Stem
+        self.stem_gru = nn.GRU(
+            input_size=config.hidden_dim,
+            hidden_size=config.hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone: Residual Blocks
+        self.blocks = nn.ModuleList(
+            [ResidualBiGRUBlock(config) for _ in range(config.n_layers)]
+        )
+
+        # 4. Aggregation: Scalar Mixture
+        self.mixture = ScalarMixture(n_layers=config.n_layers + 1)
+
+        # 5. Output Head
+        self.value_head = nn.Linear(config.hidden_dim, 3)
+
+    def forward(self, seq, loop, dist):
+        # Embeddings
+        e_seq = self.seq_embed(seq)
+        e_loop = self.loop_embed(loop)
+        e_dist = self.dist_embed(dist)
+
+        # Concatenate and Project
+        x = torch.cat([e_seq, e_loop, e_dist], dim=-1)
+        x = self.input_proj(x)
+
+        # Stem Processing
+        x, _ = self.stem_gru(x)
+
+        # Collect layer outputs for mixture (starting with Stem output)
+        layer_outputs = [x]
+
+        # Backbone Processing
+        curr = x
+        for block in self.blocks:
+            curr = block(curr)
+            layer_outputs.append(curr)
+
+        # Aggregation
+        aggregated = self.mixture(layer_outputs)
+
+        # Head
+        values = self.value_head(aggregated)
+
+        return values
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class UncertaintyAwareMSELoss(nn.Module):
+    """
+    Implements the Uncertainty-Aware Multi-Task Mean Squared Error Loss.
+
+    This loss function calculates the MSE for both the primary degradation predictions
+    and the experimental error predictions. It applies a mask to ensure that only
+    the valid scored positions (first 68 bases) contribute to the loss.
+
+    Formula:
+        Loss = MSE(y, y_pred) + lambda * MSE(sigma, sigma_pred)
+    """
+
+    def __init__(self, lambda_uncertainty: float = 1.0):
+        """
+        Args:
+            lambda_uncertainty (float): Weighting factor for the uncertainty/error loss term.
+                                        Defaults to 1.0.
+        """
+        super().__init__()
+        self.lambda_uncertainty = lambda_uncertainty
+
+    def forward(self, pred_val, pred_err, target_val, target_err, mask):
+        """
+        Calculates the weighted multi-task MSE loss.
+
+        Args:
+            pred_val (torch.Tensor): Predicted degradation values. Shape [Batch, SeqLen, 3].
+            pred_err (torch.Tensor): Predicted error/uncertainty values. Shape [Batch, SeqLen, 3].
+            target_val (torch.Tensor): Ground truth degradation values. Shape [Batch, SeqLen, 3].
+            target_err (torch.Tensor): Ground truth error values. Shape [Batch, SeqLen, 3].
+            mask (torch.Tensor): Binary mask indicating scored positions. Shape [Batch, SeqLen].
+
+        Returns:
+            torch.Tensor: The scalar total loss.
+        """
+        # Expand mask to match channel dimensions: [Batch, SeqLen] -> [Batch, SeqLen, 3]
+        # We unsqueeze the last dimension and expand to matching size
+        mask_expanded = mask.unsqueeze(-1).expand_as(pred_val)
+
+        # Calculate the number of valid elements in the mask (sum over all dimensions)
+        # Add a small epsilon to prevent division by zero in case of empty masks (unlikely)
+        count = mask_expanded.sum() + 1e-8
+
+        # --- 1. Value Loss (Primary Targets) ---
+        # Calculate squared difference
+        diff_val = pred_val - target_val
+        # Apply mask: invalid positions become 0
+        masked_diff_val = diff_val * mask_expanded
+        # Sum of squares divided by count = MSE
+        mse_val = torch.sum(masked_diff_val**2) / count
+
+        # --- 2. Uncertainty Loss (Error Targets) ---
+        # Calculate squared difference
+        diff_err = pred_err - target_err
+        # Apply mask
+        masked_diff_err = diff_err * mask_expanded
+        # Sum of squares divided by count = MSE
+        mse_err = torch.sum(masked_diff_err**2) / count
+
+        # --- Total Loss ---
+        loss = mse_val + self.lambda_uncertainty * mse_err
+
+        return loss
+=======
+class MaskedMSELoss(nn.Module):
+    """
+    Implements Masked Mean Squared Error Loss.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target, mask):
+        """
+        Args:
+            pred (torch.Tensor): Predicted values. Shape [Batch, SeqLen, 3].
+            target (torch.Tensor): Ground truth values. Shape [Batch, SeqLen, 3].
+            mask (torch.Tensor): Binary mask. Shape [Batch, SeqLen].
+        """
+        # Expand mask to match channel dimensions
+        mask_expanded = mask.unsqueeze(-1).expand_as(pred)
+
+        # Calculate number of valid elements
+        count = mask_expanded.sum() + 1e-8
+
+        # Calculate squared difference
+        diff = pred - target
+        
+        # Apply mask
+        masked_diff = diff * mask_expanded
+        
+        # Sum of squares divided by count = MSE
+        loss = torch.sum(masked_diff**2) / count
+
+        return loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import UncertaintyAwareBiGRU
+from library.loss import UncertaintyAwareMSELoss
+from library.utils import seed_everything
+
+
+def train_one_epoch(model, loader, optimizer, loss_fn, config):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    total_loss = 0.0
+
+    # Create mask for first 68 positions (pred_len)
+    # Shape: [seq_len] -> [107]
+    mask = torch.zeros(config.seq_len, device=config.device)
+    mask[: config.pred_len] = 1.0
+
+    for batch in loader:
+        seq = batch["sequence"].to(config.device)
+        loop = batch["loop"].to(config.device)
+        dist = batch["pair_dist"].to(config.device)
+        target_val = batch["target"].to(config.device)
+        target_err = batch["error"].to(config.device)
+
+        optimizer.zero_grad()
+
+        # Forward pass: returns (values, uncertainties)
+        pred_val, pred_err = model(seq, loop, dist)
+
+        # Create batch mask: [Batch, SeqLen]
+        batch_mask = mask.unsqueeze(0).expand(seq.size(0), -1)
+
+        # Calculate Multi-Task Loss
+        loss = loss_fn(pred_val, pred_err, target_val, target_err, batch_mask)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate(model, loader, config):
+    """
+    Evaluates the model on the validation set using MCRMSE.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+            target = batch["target"].to(config.device)
+
+            # Forward pass (ignore uncertainty head for validation metric)
+            pred_val, _ = model(seq, loop, dist)
+
+            # Extract valid positions (0 to 68) for scoring
+            valid_len = config.pred_len
+
+            # Slice: [Batch, 68, 3]
+            p = pred_val[:, :valid_len, :].cpu().numpy()
+            t = target[:, :valid_len, :].cpu().numpy()
+
+            all_preds.append(p)
+            all_targets.append(t)
+=======
+from library.model import WideResBiGRU
+from library.loss import MaskedMSELoss
+from library.utils import seed_everything
+
+
+def train_one_epoch(model, loader, optimizer, loss_fn, config):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    total_loss = 0.0
+
+    # Create mask for first 68 positions (pred_len)
+    mask = torch.zeros(config.seq_len, device=config.device)
+    mask[: config.pred_len] = 1.0
+
+    for batch in loader:
+        seq = batch["sequence"].to(config.device)
+        loop = batch["loop"].to(config.device)
+        dist = batch["pair_dist"].to(config.device)
+        target = batch["target"].to(config.device)
+        # Error targets are ignored
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        pred = model(seq, loop, dist)
+
+        # Create batch mask
+        batch_mask = mask.unsqueeze(0).expand(seq.size(0), -1)
+
+        # Calculate Loss
+        loss = loss_fn(pred, target, batch_mask)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate(model, loader, config):
+    """
+    Evaluates the model on the validation set using MCRMSE.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+            target = batch["target"].to(config.device)
+
+            # Forward pass
+            pred_val = model(seq, loop, dist)
+
+            # Extract valid positions (0 to 68) for scoring
+            valid_len = config.pred_len
+
+            # Slice: [Batch, 68, 3]
+            p = pred_val[:, :valid_len, :].cpu().numpy()
+            t = target[:, :valid_len, :].cpu().numpy()
+
+            all_preds.append(p)
+            all_targets.append(t)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def generate_submission(model, config):
+    """
+    Generates predictions for the test set and saves to CSV.
+    """
+    # Load test data
+    test_loader = get_dataloader(mode="test", config=config, shuffle=False)
+
+    # Retrieve IDs from the dataset
+    dataset_ids = test_loader.dataset.ids
+
+    model.eval()
+    preds_list = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+
+            # Forward pass
+            pred_val, _ = model(seq, loop, dist)
+            preds_list.append(pred_val.cpu().numpy())
+=======
+def generate_submission(model, config):
+    """
+    Generates predictions for the test set and saves to CSV.
+    """
+    # Load test data
+    test_loader = get_dataloader(mode="test", config=config, shuffle=False)
+
+    # Retrieve IDs from the dataset
+    dataset_ids = test_loader.dataset.ids
+
+    model.eval()
+    preds_list = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+
+            # Forward pass
+            pred_val = model(seq, loop, dist)
+            preds_list.append(pred_val.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # 3. Model
+    model = UncertaintyAwareBiGRU(config).to(config.device)
+
+    # 4. Optimization
+    optimizer = AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
+    loss_fn = UncertaintyAwareMSELoss(lambda_uncertainty=1.0)
+=======
+    # 3. Model
+    model = WideResBiGRU(config).to(config.device)
+
+    # 4. Optimization
+    optimizer = AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
+    loss_fn = MaskedMSELoss()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import UncertaintyAwareBiGRU
+from library.loss import UncertaintyAwareMSELoss
+from library.engine import train_one_epoch, generate_submission
+
+
+def get_val_predictions(model, loader, config):
+    """
+    Runs inference on the validation set and returns predictions and targets.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+            target = batch["target"].to(config.device)
+
+            # Forward pass
+            pred_val, _ = model(seq, loop, dist)
+
+            # Extract valid positions (0 to 68)
+            valid_len = config.pred_len
+=======
+from library.model import WideResBiGRU
+from library.loss import MaskedMSELoss
+from library.engine import train_one_epoch, generate_submission
+
+
+def get_val_predictions(model, loader, config):
+    """
+    Runs inference on the validation set and returns predictions and targets.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(config.device)
+            loop = batch["loop"].to(config.device)
+            dist = batch["pair_dist"].to(config.device)
+            target = batch["target"].to(config.device)
+
+            # Forward pass
+            pred_val = model(seq, loop, dist)
+
+            # Extract valid positions (0 to 68)
+            valid_len = config.pred_len
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = UncertaintyAwareBiGRU(config).to(config.device)
+
+    # 4. Optimization
+    optimizer = AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
+    loss_fn = UncertaintyAwareMSELoss(lambda_uncertainty=1.0)
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = WideResBiGRU(config).to(config.device)
+
+    # 4. Optimization
+    optimizer = AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs)
+    loss_fn = MaskedMSELoss()
+>>>>>>> REPLACE
+```

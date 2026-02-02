@@ -1,0 +1,306 @@
+To improve the model's performance within the 4-hour time limit, I will implement a strategy focused on stabilizing the training and leveraging ensemble methods.
+
+1.  **Refine SWA Learning Rate (Cite Lesson 00024)**: I will reduce the Stochastic Weight Averaging (SWA) learning rate from `5e-5` to `2e-5`. The previous execution logs showed that the validation loss began to degrade (increase) during the SWA phase (from 0.1318 to 0.1500), suggesting the learning rate was too aggressive to allow the model to settle into the optimal flat minimum. A lower learning rate will help the model converge better during this averaging phase.
+2.  **Enable 5-Fold Cross-Validation Ensemble (Cite Lesson 00021)**: I will modify `runfile.py` to run a full 5-Fold Cross-Validation instead of just training Fold 0. Ensembling models trained on different data splits is a reliable way to reduce generalization error and Log Loss without increasing model complexity. Given that one fold took ~30 minutes, running 5 folds will take ~2.5 hours, which fits safely within the 4-hour limit.
+3.  **System Optimization**: I will increase `num_workers` from 4 to 6 to better utilize the 12 vCPUs and minimize data loading bottlenecks.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    num_workers = 4
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+=======
+    num_workers = 6
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Phase 3: Stochastic Weight Averaging (SWA)
+    swa_epochs = 5
+    swa_lr = 5e-5
+    # SWA starts after head adaptation and fine-tuning
+=======
+    # Phase 3: Stochastic Weight Averaging (SWA)
+    swa_epochs = 5
+    swa_lr = 2e-5
+    # SWA starts after head adaptation and fine-tuning
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Define Folds
+    # We use 5 splits to maintain the standard 80/20 distribution structure
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=Config.seed)
+=======
+    # Define Folds
+    # We use Config.n_folds splits
+    skf = StratifiedKFold(n_splits=Config.n_folds, shuffle=True, random_state=Config.seed)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Train Fold 0 (Fast Baseline)
+    # We only train the first fold to minimize runtime while still verifying the idea
+    fold_idx = 0
+    print(f"Training Fold {fold_idx} only (Fast Baseline)...")
+
+    train_df = all_df[all_df["fold"] != fold_idx].reset_index(drop=True)
+    val_df = all_df[all_df["fold"] == fold_idx].reset_index(drop=True)
+
+    # Execute the 3-Phase training strategy (Head Adapt -> Finetune -> SWA)
+    ckpt_name = run_fold(fold_idx, train_df, val_df, classes, device)
+
+    # 4. Validation Assessment
+    print("\n=== Validation Assessment ===")
+
+    # Load the trained SWA model
+    model = DogClassifier(num_classes=len(classes), pretrained=False)
+    ckpt_path = get_checkpoint_path(ckpt_name)
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+
+    state_dict = torch.load(ckpt_path, map_location=device)
+
+    # Handle SWA/AveragedModel state dict keys (strip 'module.' prefix if present)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_state_dict[k[7:]] = v
+        elif k == "n_averaged":
+            continue
+        else:
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict)
+    model.to(device)
+    model.eval()
+
+    # Prepare Validation Loader
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    val_dataset = DogDataset(
+        val_df, transform=get_transforms("val"), mode="val", label_map=class_to_idx
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Generate Predictions on Validation Set
+    print("Generating validation predictions...")
+    val_probs = predict(model, val_loader, device, use_tta=Config.use_tta)
+    val_probs_np = val_probs.numpy()
+    val_targets_np = np.array(val_dataset.labels)
+
+    # Calculate Final Metric (Multi Class Log Loss)
+    final_metric = log_loss(
+        val_targets_np, val_probs_np, labels=list(range(len(classes)))
+    )
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+
+    # Calculate per-sample loss (Negative Log Likelihood of the true class)
+    # Clip probabilities to avoid log(0)
+    eps = 1e-15
+    val_probs_clipped = np.clip(val_probs_np, eps, 1 - eps)
+    # Extract probability assigned to the true class
+    true_class_probs = val_probs_clipped[np.arange(len(val_targets_np)), val_targets_np]
+    losses = -np.log(true_class_probs)
+
+    # Extract Input Features (Width, Height, Aspect Ratio)
+    print("Extracting image metadata for analysis...")
+    widths = []
+    heights = []
+    aspect_ratios = []
+
+    for rel_path in val_df["file_path"]:
+        full_path = os.path.join(Config.input_dir, rel_path)
+        # Read image dimensions
+        img = cv2.imread(full_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            widths.append(w)
+            heights.append(h)
+            aspect_ratios.append(w / h)
+        else:
+            # Fallback (should not occur with verified metadata)
+            widths.append(0)
+            heights.append(0)
+            aspect_ratios.append(0)
+
+    # Create Analysis DataFrame
+    analysis_df = pd.DataFrame(
+        {
+            "loss": losses,
+            "width": widths,
+            "height": heights,
+            "aspect_ratio": aspect_ratios,
+            "area": np.array(widths) * np.array(heights),
+        }
+    )
+
+    # Calculate Correlations
+    correlations = analysis_df.corr()["loss"].drop("loss")
+    print("Correlation between Error Magnitude (Loss) and Input Features:")
+    print(correlations)
+
+    # 6. Submission Logic
+    threshold = 0.14144190501755333
+    if final_metric < threshold:
+        print(f"\nMetric {final_metric:.6f} is lower than threshold {threshold:.6f}.")
+        print("Generating submission for Test Set...")
+
+        # Prepare Test Loader
+        test_dataset = DogDataset(
+            test_meta, transform=get_transforms("test"), mode="test"
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+
+        # Generate Submission using the trained model
+        # We pass the list of checkpoints (just one in this baseline case)
+        generate_submission(test_loader, [ckpt_name], classes, device)
+=======
+    # 3. Train All Folds (5-Fold CV)
+    print(f"Starting {Config.n_folds}-Fold Cross-Validation...")
+    
+    model_paths = []
+    oof_preds = np.zeros((len(all_df), len(classes)))
+    oof_targets = np.zeros(len(all_df), dtype=int)
+    
+    for fold_idx in range(Config.n_folds):
+        print(f"\n--- Fold {fold_idx} ---")
+        
+        train_df = all_df[all_df["fold"] != fold_idx].reset_index(drop=True)
+        val_df = all_df[all_df["fold"] == fold_idx].reset_index(drop=True)
+        val_idx = all_df[all_df["fold"] == fold_idx].index
+
+        # Execute the 3-Phase training strategy
+        ckpt_name = run_fold(fold_idx, train_df, val_df, classes, device)
+        model_paths.append(ckpt_name)
+        
+        # --- Generate OOF Predictions for this fold ---
+        print(f"Generating OOF predictions for Fold {fold_idx}...")
+        
+        # Load the trained SWA model
+        model = DogClassifier(num_classes=len(classes), pretrained=False)
+        ckpt_path = get_checkpoint_path(ckpt_name)
+        
+        state_dict = torch.load(ckpt_path, map_location=device)
+        
+        # Handle SWA/AveragedModel state dict keys
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("module."):
+                new_state_dict[k[7:]] = v
+            elif k == "n_averaged":
+                continue
+            else:
+                new_state_dict[k] = v
+                
+        model.load_state_dict(new_state_dict)
+        model.to(device)
+        model.eval()
+        
+        # Prepare Validation Loader
+        class_to_idx = {c: i for i, c in enumerate(classes)}
+        val_dataset = DogDataset(
+            val_df, transform=get_transforms("val"), mode="val", label_map=class_to_idx
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+        
+        # Predict
+        val_probs = predict(model, val_loader, device, use_tta=Config.use_tta)
+        
+        # Store in global OOF arrays
+        oof_preds[val_idx] = val_probs.numpy()
+        oof_targets[val_idx] = np.array(val_dataset.labels)
+
+    # 4. Validation Assessment (Global CV)
+    print("\n=== Validation Assessment (5-Fold CV) ===")
+    
+    final_metric = log_loss(oof_targets, oof_preds, labels=list(range(len(classes))))
+    print(f"Final CV Metric (Multi Class Log Loss): {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+
+    # Calculate per-sample loss
+    eps = 1e-15
+    oof_preds_clipped = np.clip(oof_preds, eps, 1 - eps)
+    true_class_probs = oof_preds_clipped[np.arange(len(oof_targets)), oof_targets]
+    losses = -np.log(true_class_probs)
+
+    # Extract Input Features
+    print("Extracting image metadata for analysis...")
+    widths = []
+    heights = []
+    aspect_ratios = []
+    
+    # We iterate over all_df because oof_preds corresponds to all_df indices
+    for rel_path in all_df["file_path"]:
+        full_path = os.path.join(Config.input_dir, rel_path)
+        img = cv2.imread(full_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            widths.append(w)
+            heights.append(h)
+            aspect_ratios.append(w / h)
+        else:
+            widths.append(0)
+            heights.append(0)
+            aspect_ratios.append(0)
+
+    # Create Analysis DataFrame
+    analysis_df = pd.DataFrame(
+        {
+            "loss": losses,
+            "width": widths,
+            "height": heights,
+            "aspect_ratio": aspect_ratios,
+            "area": np.array(widths) * np.array(heights),
+        }
+    )
+
+    # Calculate Correlations
+    correlations = analysis_df.corr()["loss"].drop("loss")
+    print("Correlation between Error Magnitude (Loss) and Input Features:")
+    print(correlations)
+
+    # 6. Submission Logic
+    threshold = 0.12970461086690332
+    if final_metric < threshold:
+        print(f"\nMetric {final_metric:.6f} is lower than threshold {threshold:.6f}.")
+        print("Generating submission for Test Set (Ensemble)...")
+
+        # Prepare Test Loader
+        test_dataset = DogDataset(
+            test_meta, transform=get_transforms("test"), mode="test"
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+
+        # Generate Submission using all trained models
+        generate_submission(test_loader, model_paths, classes, device)
+>>>>>>> REPLACE
+```

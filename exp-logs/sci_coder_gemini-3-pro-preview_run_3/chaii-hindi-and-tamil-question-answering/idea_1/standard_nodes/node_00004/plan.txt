@@ -1,0 +1,472 @@
+I will optimize the solution by replacing the "Hard Retrieval" strategy (TF-IDF sentence selection) with a "Sliding Window" approach as recommended in **solution_lesson_node_00002**. This ensures the model evaluates the entire context by processing it in overlapping chunks, eliminating the information loss caused by the previous heuristic filter.
+
+**Implementation Strategy:**
+1.  **Configuration (`library/config.py`)**: Increase `MAX_LEN` to 384 and introduce `DOC_STRIDE = 128` to support overlapping windows.
+2.  **Data Processing (`library/data_loader.py`)**:
+    *   Remove `SparseRetriever` and `split_sentences`.
+    *   Rewrite `process_data` to use the tokenizer's built-in sliding window capability (`stride` and `return_overflowing_tokens`).
+    *   Update `QADataset` to track `sample_idx` so that chunks can be mapped back to their original documents.
+    *   Update label generation to mark answer spans only in the chunk that fully contains them.
+3.  **Training & Inference (`library/trainer.py`)**:
+    *   Modify `validate` and `predict` to aggregate predictions from multiple chunks belonging to the same document.
+    *   Implement an aggregation heuristic: select the longest non-empty predicted string across all chunks for a given document.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Maximum sequence length for the tokenizer.
+    # Since we retrieve specific sentences, 256 is sufficient (Question + Sentence).
+    MAX_LEN = 256
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    TRAIN_BATCH_SIZE = 16
+=======
+    # Maximum sequence length for the tokenizer.
+    # Increased to 384 to handle larger context chunks with sliding window.
+    MAX_LEN = 384
+    DOC_STRIDE = 128
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    TRAIN_BATCH_SIZE = 16
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+class SparseRetriever:
+    """
+    Retrieves the most relevant sentence from a context given a question
+    using TF-IDF and cosine similarity.
+    """
+
+    def __init__(self):
+        pass
+
+    def retrieve(self, question, context_sentences):
+        """
+        Selects the best sentence from the context based on similarity to the question.
+
+        Args:
+            question (str): The question text.
+            context_sentences (list): List of sentence strings.
+
+        Returns:
+            str: The selected sentence.
+        """
+        if not context_sentences:
+            return ""
+
+        # Combine question and sentences into a mini-corpus
+        # Index 0 is the Question, Indices 1..N are the Sentences
+        corpus = [question] + context_sentences
+
+        try:
+            # Fit TF-IDF on this specific sample
+            # Use char n-grams to mitigate length bias and improve robustness for multilingual text
+            vectorizer = TfidfVectorizer(
+                analyzer="char", ngram_range=(2, 4)
+            ).fit_transform(corpus)
+            vectors = vectorizer.toarray()
+
+            query_vec = vectors[0].reshape(1, -1)
+            candidate_vecs = vectors[1:]
+
+            # Compute cosine similarity between Question and all Sentences
+            similarities = cosine_similarity(query_vec, candidate_vecs).flatten()
+
+            # Get index of the sentence with highest similarity
+            best_idx = np.argmax(similarities)
+            return context_sentences[best_idx]
+
+        except (ValueError, IndexError):
+            # Fallback for empty vocabulary or other edge cases
+            return context_sentences[0] if context_sentences else ""
+
+
+class QADataset(Dataset):
+    """
+    PyTorch Dataset for Question Answering Token Classification.
+    """
+
+    def __init__(self, encodings, labels=None):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        # Convert encoding lists to tensors
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        if self.labels:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+        return item
+
+    def __len__(self):
+        return len(self.encodings["input_ids"])
+
+
+def find_gold_sentence(row):
+    """
+    Identifies the sentence in the context that contains the answer text.
+    """
+    context = row["context"]
+    answer_text = row["answer_text"]
+
+    sentences = split_sentences(context)
+
+    # Filter sentences that contain the answer string
+    candidates = [s for s in sentences if answer_text in s]
+
+    if not candidates:
+        return None
+
+    # If multiple sentences contain the answer, we pick the first one.
+    return candidates[0]
+
+
+def process_data(df, tokenizer, mode="train"):
+    """
+    Converts a pandas DataFrame into a QADataset.
+
+    Args:
+        df (pd.DataFrame): The data.
+        tokenizer: Hugging Face tokenizer.
+        mode (str): 'train', 'val', or 'test'.
+
+    Returns:
+        QADataset: The processed dataset.
+    """
+    questions = []
+    sentences = []
+    # Store answer texts to generate labels later
+    answers = []
+
+    retriever = SparseRetriever()
+
+    # Filter and prepare text pairs
+    for _, row in df.iterrows():
+        question = row["question"]
+        context = row["context"]
+
+        target_sentence = None
+
+        if mode in ["train", "val"]:
+            target_sentence = find_gold_sentence(row)
+            # Skip if answer cannot be found in any sentence (data noise/split issues)
+            if target_sentence is None:
+                continue
+            answers.append(row["answer_text"])
+        else:
+            # For inference, retrieve the best sentence
+            context_sentences = split_sentences(context)
+            target_sentence = retriever.retrieve(question, context_sentences)
+
+        questions.append(question)
+        sentences.append(target_sentence)
+
+    # Tokenize
+    # We keep offset_mapping to map predictions back to characters if needed
+    encodings = tokenizer(
+        questions,
+        sentences,
+        truncation=True,
+        padding="max_length",
+        max_length=Config.MAX_LEN,
+        return_offsets_mapping=True,
+    )
+
+    labels = None
+
+    if mode in ["train", "val"]:
+        labels = []
+        offset_mappings = encodings["offset_mapping"]
+
+        for i, offset in enumerate(offset_mappings):
+            answer_text = answers[i]
+            sentence = sentences[i]
+
+            # Find character indices of answer in the sentence
+            start_char = sentence.find(answer_text)
+            end_char = start_char + len(answer_text)
+
+            sequence_ids = encodings.sequence_ids(i)
+
+            # Initialize labels with O (0)
+            label_ids = [Config.LABELS_TO_IDS["O"]] * len(sequence_ids)
+
+            # Identify the token span for the sentence (sequence_id == 1)
+            token_indices = [
+                idx for idx, seq_id in enumerate(sequence_ids) if seq_id == 1
+            ]
+
+            if not token_indices:
+                labels.append(label_ids)
+                continue
+
+            found_start = False
+
+            for idx in token_indices:
+                # offset[idx] is (start, end) char index in the sentence
+                token_start, token_end = offset[idx]
+
+                # Check if token is inside the answer span
+                if token_start < end_char and token_end > start_char:
+                    if not found_start:
+                        label_ids[idx] = Config.LABELS_TO_IDS["B-ANS"]
+                        found_start = True
+                    else:
+                        label_ids[idx] = Config.LABELS_TO_IDS["I-ANS"]
+
+            labels.append(label_ids)
+
+    return QADataset(encodings, labels)
+=======
+class QADataset(Dataset):
+    """
+    PyTorch Dataset for Question Answering Token Classification with Sliding Window.
+    """
+
+    def __init__(self, encodings, labels=None, sample_indices=None):
+        self.encodings = encodings
+        self.labels = labels
+        self.sample_indices = sample_indices
+
+    def __getitem__(self, idx):
+        # Convert encoding lists to tensors
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        if self.labels:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+        if self.sample_indices is not None:
+            item["sample_idx"] = torch.tensor(self.sample_indices[idx], dtype=torch.long)
+        return item
+
+    def __len__(self):
+        return len(self.encodings["input_ids"])
+
+
+def process_data(df, tokenizer, mode="train"):
+    """
+    Converts a pandas DataFrame into a QADataset using sliding window.
+    Cite solution_lesson_node_00002: Replaces hard retrieval with sliding window.
+    """
+    questions = df["question"].astype(str).tolist()
+    contexts = df["context"].astype(str).tolist()
+    
+    # Tokenize with sliding window
+    encodings = tokenizer(
+        questions,
+        contexts,
+        truncation="only_second",
+        max_length=Config.MAX_LEN,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    # Map chunks back to original examples
+    sample_mapping = encodings.pop("overflow_to_sample_mapping")
+    offset_mapping = encodings.pop("offset_mapping")
+    
+    labels = None
+
+    if mode in ["train", "val"]:
+        labels = []
+        answers = df["answer_text"].astype(str).tolist()
+        answer_starts = df["answer_start"].tolist()
+
+        for i, offsets in enumerate(offset_mapping):
+            sample_idx = sample_mapping[i]
+            answer_text = answers[sample_idx]
+            start_char = answer_starts[sample_idx]
+            end_char = start_char + len(answer_text)
+            
+            sequence_ids = encodings.sequence_ids(i)
+            
+            # Initialize labels with O
+            label_ids = [Config.LABELS_TO_IDS["O"]] * len(sequence_ids)
+            
+            # Find the context start and end indices in the token list
+            # sequence_ids: None (special), 0 (question), 1 (context)
+            context_token_indices = [
+                idx for idx, seq_id in enumerate(sequence_ids) if seq_id == 1
+            ]
+            
+            if not context_token_indices:
+                labels.append(label_ids)
+                continue
+                
+            # Check if answer is fully contained in this chunk
+            # offsets[idx] is (start, end) in original context string
+            chunk_start_char = offsets[context_token_indices[0]][0]
+            chunk_end_char = offsets[context_token_indices[-1]][1]
+            
+            # If answer is within this chunk
+            if start_char >= chunk_start_char and end_char <= chunk_end_char:
+                found_start = False
+                for idx in context_token_indices:
+                    token_start, token_end = offsets[idx]
+                    
+                    # Check overlap with answer span
+                    if token_start < end_char and token_end > start_char:
+                        if not found_start:
+                            label_ids[idx] = Config.LABELS_TO_IDS["B-ANS"]
+                            found_start = True
+                        else:
+                            label_ids[idx] = Config.LABELS_TO_IDS["I-ANS"]
+            
+            labels.append(label_ids)
+
+    return QADataset(encodings, labels, sample_indices=sample_mapping)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def validate(self, val_loader, val_df):
+        self.model.eval()
+        total_jaccard = 0.0
+        count = 0
+
+        batch_size = val_loader.batch_size
+
+        with torch.no_grad():
+            for i, batch in enumerate(val_loader):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+
+                outputs = self.model(input_ids, attention_mask)
+                logits = outputs.logits
+
+                pred_strings = self._decode_batch(logits, input_ids)
+
+                # Align with DataFrame
+                start_idx = i * batch_size
+                end_idx = start_idx + len(input_ids)
+                batch_df = val_df.iloc[start_idx:end_idx]
+                gt_strings = batch_df["answer_text"].tolist()
+
+                for pred, gt in zip(pred_strings, gt_strings):
+                    score = jaccard(gt, pred)
+                    total_jaccard += score
+                    count += 1
+
+        return total_jaccard / count if count > 0 else 0.0
+
+    def predict(self, test_loader, test_df):
+        self.model.eval()
+        predictions = []
+        ids = []
+
+        batch_size = test_loader.batch_size
+
+        with torch.no_grad():
+            for i, batch in enumerate(test_loader):
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+
+                outputs = self.model(input_ids, attention_mask)
+                logits = outputs.logits
+
+                pred_strings = self._decode_batch(logits, input_ids)
+
+                start_idx = i * batch_size
+                end_idx = start_idx + len(input_ids)
+                batch_df = test_df.iloc[start_idx:end_idx]
+
+                batch_ids = batch_df["id"].tolist()
+
+                predictions.extend(pred_strings)
+                ids.extend(batch_ids)
+
+        return ids, predictions
+=======
+    def validate(self, val_loader, val_df):
+        self.model.eval()
+        
+        # Dictionary to aggregate predictions: {sample_idx: [pred_str, ...]}
+        sample_preds = {}
+
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                sample_indices = batch["sample_idx"].tolist()
+
+                outputs = self.model(input_ids, attention_mask)
+                logits = outputs.logits
+
+                pred_strings = self._decode_batch(logits, input_ids)
+
+                for idx, pred in zip(sample_indices, pred_strings):
+                    if idx not in sample_preds:
+                        sample_preds[idx] = []
+                    sample_preds[idx].append(pred)
+
+        # Compute Jaccard
+        total_jaccard = 0.0
+        count = 0
+        
+        # Iterate over the original dataframe
+        for idx, row in val_df.iterrows():
+            gt = row["answer_text"]
+            candidates = sample_preds.get(idx, [])
+            
+            # Aggregation Strategy: Pick longest non-empty string
+            # Cite solution_lesson_node_00002: Sliding window aggregation
+            best_pred = ""
+            if candidates:
+                # Filter out empty strings
+                non_empty = [s for s in candidates if s.strip()]
+                if non_empty:
+                    best_pred = max(non_empty, key=len)
+            
+            score = jaccard(gt, best_pred)
+            total_jaccard += score
+            count += 1
+
+        return total_jaccard / count if count > 0 else 0.0
+
+    def predict(self, test_loader, test_df):
+        self.model.eval()
+        sample_preds = {}
+
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                sample_indices = batch["sample_idx"].tolist()
+
+                outputs = self.model(input_ids, attention_mask)
+                logits = outputs.logits
+
+                pred_strings = self._decode_batch(logits, input_ids)
+                
+                for idx, pred in zip(sample_indices, pred_strings):
+                    if idx not in sample_preds:
+                        sample_preds[idx] = []
+                    sample_preds[idx].append(pred)
+
+        # Aggregate and align with test_df
+        ids = []
+        predictions = []
+        
+        for idx, row in test_df.iterrows():
+            ids.append(row["id"])
+            candidates = sample_preds.get(idx, [])
+            
+            best_pred = ""
+            if candidates:
+                non_empty = [s for s in candidates if s.strip()]
+                if non_empty:
+                    best_pred = max(non_empty, key=len)
+            
+            predictions.append(best_pred)
+
+        return ids, predictions
+>>>>>>> REPLACE
+```

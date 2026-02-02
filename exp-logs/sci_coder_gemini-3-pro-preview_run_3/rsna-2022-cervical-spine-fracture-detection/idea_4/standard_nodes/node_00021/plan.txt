@@ -1,0 +1,227 @@
+To optimize the solution, I will revert the architecture from the "Attention-based" approach (Idea 3) to the superior "Sequence-Smoothed Max-Pooling" approach (Idea 2), while retaining the efficient hierarchical loss function.
+
+**Strategy:**
+1.  **Architecture Overhaul (Cite solution_lesson_node_00019, solution_lesson_node_00020):** I will replace the `GatedAttention` mechanism and `Positional Injection` with a **1D Convolutional Sequence Smoother** followed by **Global Max Pooling**.
+    *   *Reasoning:* Lesson 00019 demonstrates that Attention mechanisms often fail in sparse anomaly detection (like fractures) by diluting the signal, whereas Max Pooling preserves the strongest signal. Lesson 00020 shows that explicitly modeling inter-slice context via 1D Convolutions outperforms simple positional embeddings for volumetric data.
+2.  **Training Schedule Optimization (Cite solution_lesson_node_00007):** I will increase the training epochs from 5 to 10.
+    *   *Reasoning:* Previous experiments indicated that the model typically converges to its best validation score around epoch 7. Extending the run to 10 epochs ensures we capture this optimum.
+
+**Implementation:**
+-   **`library/model.py`**: Remove `GatedAttention`. Rewrite `FractureMILModel` to use `nn.Conv1d` for sequence smoothing and `torch.max` for aggregation.
+-   **`runfile.py`**: Update `Config.EPOCHS` to 10.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GatedAttention(nn.Module):
+    """
+    Gated Attention Mechanism for Multiple Instance Learning.
+    Based on 'Attention-based Deep Multiple Instance Learning' (Ilse et al., 2018).
+    """
+
+    def __init__(self, input_dim, attention_dim=128):
+        super(GatedAttention, self).__init__()
+        self.attention_V = nn.Sequential(nn.Linear(input_dim, attention_dim), nn.Tanh())
+        self.attention_U = nn.Sequential(
+            nn.Linear(input_dim, attention_dim), nn.Sigmoid()
+        )
+        self.attention_w = nn.Linear(attention_dim, 1)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, Slices, Input_Dim)
+
+        Returns:
+            torch.Tensor: Aggregated feature representation of shape (Batch, Input_Dim)
+            torch.Tensor: Attention weights of shape (Batch, Slices, 1)
+        """
+        # x: (B, S, D)
+
+        # Compute attention scores
+        # V: (B, S, attention_dim)
+        v_out = self.attention_V(x)
+        # U: (B, S, attention_dim)
+        u_out = self.attention_U(x)
+
+        # Element-wise multiplication (Gating)
+        # w: (B, S, 1)
+        a_val = self.attention_w(v_out * u_out)
+
+        # Softmax over the slice dimension (dim=1)
+        a_weights = F.softmax(a_val, dim=1)
+
+        # Weighted sum of input features
+        # (B, S, 1) * (B, S, D) -> (B, S, D) -> sum -> (B, D)
+        z = torch.sum(x * a_weights, dim=1)
+
+        return z, a_weights
+
+
+class FractureMILModel(nn.Module):
+    """
+    Anatomically-Guided Attention-MIL Network.
+    Uses ResNet18 backbone, Positional Injection, and Gated Attention.
+    """
+
+    def __init__(self):
+        super(FractureMILModel, self).__init__()
+
+        # 1. Backbone: ResNet18
+        # We use the pretrained weights if available, or default initialization
+        # Note: In this environment, we might not have internet, so we rely on cache or random init.
+        # Ideally weights=models.ResNet18_Weights.DEFAULT, but for robustness we use standard call.
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+        # Remove the final FC layer.
+        # ResNet18 structure: ... -> avgpool -> fc
+        # We keep everything up to avgpool.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+
+        # Feature dimension from ResNet18 is 512
+        self.feature_dim = 512
+
+        # 2. Positional Injection
+        # We append 1 dimension (normalized depth) to the features
+        self.mil_input_dim = self.feature_dim + 1
+
+        # 3. Aggregation: Gated Attention
+        self.attention = GatedAttention(input_dim=self.mil_input_dim, attention_dim=128)
+
+        # 4. Classifier Head
+        # Maps aggregated features to 7 classes (C1-C7)
+        self.classifier = nn.Linear(self.mil_input_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input volume of shape (Batch, Slices, Channels, Height, Width)
+                              Channels should be 3 (2.5D stacking).
+
+        Returns:
+            torch.Tensor: Logits for C1-C7 of shape (Batch, 7)
+        """
+        batch_size, num_slices, channels, height, width = x.shape
+
+        # --- 1. Feature Extraction ---
+        # Reshape to process all slices in parallel: (B*S, C, H, W)
+        x_flat = x.view(batch_size * num_slices, channels, height, width)
+
+        # Pass through backbone
+        features = self.backbone(x_flat)  # (B*S, 512, 1, 1)
+        features = features.view(features.size(0), -1)  # Flatten to (B*S, 512)
+
+        # --- 2. Positional Injection ---
+        # Generate normalized depth coordinates [0, 1]
+        # We assume slices are ordered.
+        device = x.device
+
+        # Create a linspace from 0 to 1 for the number of slices
+        # Shape: (S,)
+        pos_encoding = torch.linspace(0, 1, steps=num_slices, device=device)
+
+        # Reshape to (1, S, 1) and repeat for batch
+        # Shape: (B, S, 1)
+        pos_encoding = pos_encoding.view(1, num_slices, 1).expand(batch_size, -1, -1)
+
+        # Flatten to match features: (B*S, 1)
+        pos_encoding_flat = pos_encoding.reshape(batch_size * num_slices, 1)
+
+        # Concatenate features and positional encoding
+        # (B*S, 512) cat (B*S, 1) -> (B*S, 513)
+        features_aug = torch.cat([features, pos_encoding_flat], dim=1)
+
+        # --- 3. Sequence Aggregation ---
+        # Reshape back to sequence format: (B, S, 513)
+        features_seq = features_aug.view(batch_size, num_slices, -1)
+
+        # Apply Gated Attention
+        # z: (B, 513), attn_weights: (B, S, 1)
+        z, attn_weights = self.attention(features_seq)
+
+        # --- 4. Classification ---
+        # Predict logits for C1-C7
+        logits = self.classifier(z)  # (B, 7)
+
+        # Note: patient_overall is derived from these logits during loss calculation or inference
+        # as max(sigmoid(logits)). The model returns the raw logits for the vertebrae.
+
+        return logits
+=======
+class FractureMILModel(nn.Module):
+    """
+    Sequence-Smoothed Max-Pooling MIL Network.
+    Uses ResNet18 backbone, 1D Convolution for context, and Global Max Pooling.
+    Cite solution_lesson_node_00019 (Max Pooling > Attention)
+    Cite solution_lesson_node_00020 (1D Conv > Positional Injection)
+    """
+
+    def __init__(self):
+        super(FractureMILModel, self).__init__()
+
+        # 1. Backbone: ResNet18
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.feature_dim = 512
+
+        # 2. Sequence Smoother (1D Convolution)
+        # Models inter-slice dependencies (z-axis context)
+        self.seq_smoother = nn.Conv1d(
+            in_channels=self.feature_dim,
+            out_channels=self.feature_dim,
+            kernel_size=3,
+            padding=1,
+        )
+
+        # 3. Classifier Head
+        self.classifier = nn.Linear(self.feature_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input volume of shape (Batch, Slices, Channels, Height, Width)
+
+        Returns:
+            torch.Tensor: Logits for C1-C7 of shape (Batch, 7)
+        """
+        batch_size, num_slices, channels, height, width = x.shape
+
+        # --- 1. Feature Extraction ---
+        # Reshape to process all slices in parallel: (B*S, C, H, W)
+        x_flat = x.view(batch_size * num_slices, channels, height, width)
+
+        # Pass through backbone
+        features = self.backbone(x_flat)  # (B*S, 512, 1, 1)
+        features = features.view(batch_size, num_slices, -1)  # (B, S, 512)
+
+        # --- 2. Sequence Smoothing ---
+        # Permute to (B, C, S) for Conv1d
+        features = features.permute(0, 2, 1)
+        features = self.seq_smoother(features)
+        # Permute back to (B, S, C)
+        features = features.permute(0, 2, 1)
+
+        # --- 3. Classification per Slice ---
+        logits_seq = self.classifier(features)  # (B, S, 7)
+
+        # --- 4. Aggregation (Max Pooling) ---
+        # Select the most confident slice for each class
+        # This acts as a hard attention mechanism
+        logits, _ = torch.max(logits_seq, dim=1)  # (B, 7)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for fast baseline execution
+    Config.EPOCHS = 5
+    # Use full provided dataset (it is small enough for 5 epochs)
+=======
+    # Override Config for fast baseline execution
+    Config.EPOCHS = 10
+    # Use full provided dataset (it is small enough for 5 epochs)
+>>>>>>> REPLACE
+```

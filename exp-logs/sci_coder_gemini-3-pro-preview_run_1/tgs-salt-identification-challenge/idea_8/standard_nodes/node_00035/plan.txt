@@ -1,0 +1,564 @@
+To improve the model's performance, I will implement a strategy focused on maximizing data utilization, simplifying the architecture, and stabilizing the training process.
+
+**Implementation Strategy:**
+1.  **Maximize Data Utilization (Cite {solution_lesson_node_00034}):** I will modify the data loading process to merge the existing training and validation datasets and then re-split them with a 90/10 ratio. This increases the effective training set size, which is critical for performance in data-constrained regimes.
+2.  **Architecture Simplification (Cite {solution_lesson_node_00033}):** I will replace the `ResUNetASPP` with a `DeepResUNet`. The Atrous Spatial Pyramid Pooling (ASPP) module will be removed and replaced with a standard Residual Block bottleneck. ASPP's large receptive field is likely introducing noise on the small 101x101 input images.
+3.  **Optimization Stability (Cite {solution_lesson_node_00033}, Cite {solution_lesson_node_00018}):** I will remove the hard switch to the Lovasz-Hinge loss function, which caused catastrophic forgetting in the previous run. Instead, I will use the consistent `Phase1Loss` (BCE + Sample-Wise Dice) throughout the entire 150-epoch training duration. Additionally, I will increase the batch size to 64 to improve gradient stability (Cite {solution_lesson_node_00023}).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 5. Training Hyperparameters (Lovasz-Cycle)
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Cycle Schedule
+    # Total 150 epochs: 3 cycles of 50 epochs each
+    NUM_EPOCHS = 150
+    CYCLE_LENGTH = 50
+
+    # Phase Definitions
+    # Phase 1: BCE + Dice (Cycles 1 & 2)
+    # Phase 2: BCE + Lovasz (Cycle 3)
+    PHASE_1_EPOCHS = 100
+=======
+    # -------------------------------------------------------------------------
+    # 5. Training Hyperparameters (Lovasz-Cycle)
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Cycle Schedule
+    # Total 150 epochs: 3 cycles of 50 epochs each
+    NUM_EPOCHS = 150
+    CYCLE_LENGTH = 50
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+from library.model_components import ResidualBlock, ASPP, DecoderBlock
+
+
+class ResUNetASPP(nn.Module):
+    """
+    Context-Aware Deep Residual U-Net with ASPP and Deep Supervision.
+
+    Architecture:
+    1. Encoder: Deep Residual Backbone (64 -> 128 -> 256 -> 512 filters).
+    2. Bottleneck: Atrous Spatial Pyramid Pooling (ASPP) for multi-scale context.
+    3. Decoder: Bilinear Upsampling + scSE Attention + Skip Connections.
+    4. Heads: Main prediction head + Auxiliary heads for deep supervision.
+    """
+
+    def __init__(
+        self,
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        filters=Config.ENCODER_FILTERS,
+    ):
+        super(ResUNetASPP, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # Encoder (Deep Residual Backbone)
+        # ---------------------------------------------------------------------
+        # Initial convolution to expand input channels (2 -> 64)
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, filters, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(filters),
+            nn.ReLU(inplace=True),
+        )
+
+        # Level 1: 128x128, 64 filters
+        self.enc1 = ResidualBlock(filters, filters)
+
+        # Level 2: 64x64, 128 filters (Downsampled via Stride 2)
+        self.enc2 = ResidualBlock(filters, filters * 2, stride=2)
+
+        # Level 3: 32x32, 256 filters (Downsampled via Stride 2)
+        self.enc3 = ResidualBlock(filters * 2, filters * 4, stride=2)
+
+        # Level 4: 16x16, 512 filters (Downsampled via Stride 2)
+        self.enc4 = ResidualBlock(filters * 4, filters * 8, stride=2)
+
+        # ---------------------------------------------------------------------
+        # Bottleneck (ASPP)
+        # ---------------------------------------------------------------------
+        # Captures multi-scale context at 16x16 resolution
+        # Input: 512 filters, Output: 512 filters
+        self.aspp = ASPP(filters * 8, filters * 8)
+
+        # ---------------------------------------------------------------------
+        # Decoder (with scSE Attention)
+        # ---------------------------------------------------------------------
+        # Decoder 3: Upsample 16x16 -> 32x32
+        # Input: 512 (ASPP), Skip: 256 (Enc3) -> Output: 256
+        self.dec3 = DecoderBlock(filters * 8, filters * 4, filters * 4)
+
+        # Decoder 2: Upsample 32x32 -> 64x64
+        # Input: 256 (Dec3), Skip: 128 (Enc2) -> Output: 128
+        self.dec2 = DecoderBlock(filters * 4, filters * 2, filters * 2)
+
+        # Decoder 1: Upsample 64x64 -> 128x128
+        # Input: 128 (Dec2), Skip: 64 (Enc1) -> Output: 64
+        self.dec1 = DecoderBlock(filters * 2, filters, filters)
+
+        # ---------------------------------------------------------------------
+        # Prediction Heads
+        # ---------------------------------------------------------------------
+        # Main Head (Final 128x128 prediction)
+        self.final_conv = nn.Conv2d(filters, out_channels, kernel_size=1)
+
+        # Auxiliary Heads for Deep Supervision
+        # Attached to Decoder 3 (32x32) and Decoder 2 (64x64)
+        self.aux_head3 = nn.Conv2d(filters * 4, out_channels, kernel_size=1)
+        self.aux_head2 = nn.Conv2d(filters * 2, out_channels, kernel_size=1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # ---------------------------------------------------------------------
+        # Encoder Forward Pass
+        # ---------------------------------------------------------------------
+        x0 = self.input_conv(x)  # (B, 64, 128, 128)
+        x1 = self.enc1(x0)  # (B, 64, 128, 128)
+        x2 = self.enc2(x1)  # (B, 128, 64, 64)
+        x3 = self.enc3(x2)  # (B, 256, 32, 32)
+        x4 = self.enc4(x3)  # (B, 512, 16, 16)
+
+        # ---------------------------------------------------------------------
+        # Bottleneck Forward Pass
+        # ---------------------------------------------------------------------
+        b = self.aspp(x4)  # (B, 512, 16, 16)
+
+        # ---------------------------------------------------------------------
+        # Decoder Forward Pass
+        # ---------------------------------------------------------------------
+        d3 = self.dec3(b, x3)  # (B, 256, 32, 32)
+        d2 = self.dec2(d3, x2)  # (B, 128, 64, 64)
+        d1 = self.dec1(d2, x1)  # (B, 64, 128, 128)
+
+        # ---------------------------------------------------------------------
+        # Heads Forward Pass
+        # ---------------------------------------------------------------------
+        logits = self.final_conv(d1)
+
+        if self.training:
+            # Deep Supervision: Return auxiliary logits upsampled to input size
+            # Aux 3 (from 32x32)
+            aux3 = self.aux_head3(d3)
+            aux3 = F.interpolate(
+                aux3, size=logits.shape[2:], mode="bilinear", align_corners=False
+            )
+
+            # Aux 2 (from 64x64)
+            aux2 = self.aux_head2(d2)
+            aux2 = F.interpolate(
+                aux2, size=logits.shape[2:], mode="bilinear", align_corners=False
+            )
+
+            return logits, aux2, aux3
+
+        return logits
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+from library.model_components import ResidualBlock, DecoderBlock
+
+
+class DeepResUNet(nn.Module):
+    """
+    Deep Residual U-Net with Deep Supervision.
+    Replaces ASPP with a standard Residual Bottleneck to avoid excessive receptive fields.
+
+    Architecture:
+    1. Encoder: Deep Residual Backbone (64 -> 128 -> 256 -> 512 filters).
+    2. Bottleneck: Residual Block.
+    3. Decoder: Bilinear Upsampling + scSE Attention + Skip Connections.
+    4. Heads: Main prediction head + Auxiliary heads for deep supervision.
+    """
+
+    def __init__(
+        self,
+        in_channels=Config.IN_CHANNELS,
+        out_channels=Config.OUT_CHANNELS,
+        filters=Config.ENCODER_FILTERS,
+    ):
+        super(DeepResUNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # Encoder (Deep Residual Backbone)
+        # ---------------------------------------------------------------------
+        # Initial convolution to expand input channels (2 -> 64)
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, filters, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(filters),
+            nn.ReLU(inplace=True),
+        )
+
+        # Level 1: 128x128, 64 filters
+        self.enc1 = ResidualBlock(filters, filters)
+
+        # Level 2: 64x64, 128 filters (Downsampled via Stride 2)
+        self.enc2 = ResidualBlock(filters, filters * 2, stride=2)
+
+        # Level 3: 32x32, 256 filters (Downsampled via Stride 2)
+        self.enc3 = ResidualBlock(filters * 2, filters * 4, stride=2)
+
+        # Level 4: 16x16, 512 filters (Downsampled via Stride 2)
+        self.enc4 = ResidualBlock(filters * 4, filters * 8, stride=2)
+
+        # ---------------------------------------------------------------------
+        # Bottleneck
+        # ---------------------------------------------------------------------
+        # Standard Residual Block instead of ASPP
+        self.center = ResidualBlock(filters * 8, filters * 8)
+
+        # ---------------------------------------------------------------------
+        # Decoder (with scSE Attention)
+        # ---------------------------------------------------------------------
+        # Decoder 3: Upsample 16x16 -> 32x32
+        # Input: 512 (Center), Skip: 256 (Enc3) -> Output: 256
+        self.dec3 = DecoderBlock(filters * 8, filters * 4, filters * 4)
+
+        # Decoder 2: Upsample 32x32 -> 64x64
+        # Input: 256 (Dec3), Skip: 128 (Enc2) -> Output: 128
+        self.dec2 = DecoderBlock(filters * 4, filters * 2, filters * 2)
+
+        # Decoder 1: Upsample 64x64 -> 128x128
+        # Input: 128 (Dec2), Skip: 64 (Enc1) -> Output: 64
+        self.dec1 = DecoderBlock(filters * 2, filters, filters)
+
+        # ---------------------------------------------------------------------
+        # Prediction Heads
+        # ---------------------------------------------------------------------
+        # Main Head (Final 128x128 prediction)
+        self.final_conv = nn.Conv2d(filters, out_channels, kernel_size=1)
+
+        # Auxiliary Heads for Deep Supervision
+        # Attached to Decoder 3 (32x32) and Decoder 2 (64x64)
+        self.aux_head3 = nn.Conv2d(filters * 4, out_channels, kernel_size=1)
+        self.aux_head2 = nn.Conv2d(filters * 2, out_channels, kernel_size=1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # ---------------------------------------------------------------------
+        # Encoder Forward Pass
+        # ---------------------------------------------------------------------
+        x0 = self.input_conv(x)  # (B, 64, 128, 128)
+        x1 = self.enc1(x0)  # (B, 64, 128, 128)
+        x2 = self.enc2(x1)  # (B, 128, 64, 64)
+        x3 = self.enc3(x2)  # (B, 256, 32, 32)
+        x4 = self.enc4(x3)  # (B, 512, 16, 16)
+
+        # ---------------------------------------------------------------------
+        # Bottleneck Forward Pass
+        # ---------------------------------------------------------------------
+        b = self.center(x4)  # (B, 512, 16, 16)
+
+        # ---------------------------------------------------------------------
+        # Decoder Forward Pass
+        # ---------------------------------------------------------------------
+        d3 = self.dec3(b, x3)  # (B, 256, 32, 32)
+        d2 = self.dec2(d3, x2)  # (B, 128, 64, 64)
+        d1 = self.dec1(d2, x1)  # (B, 64, 128, 128)
+
+        # ---------------------------------------------------------------------
+        # Heads Forward Pass
+        # ---------------------------------------------------------------------
+        logits = self.final_conv(d1)
+
+        if self.training:
+            # Deep Supervision: Return auxiliary logits upsampled to input size
+            # Aux 3 (from 32x32)
+            aux3 = self.aux_head3(d3)
+            aux3 = F.interpolate(
+                aux3, size=logits.shape[2:], mode="bilinear", align_corners=False
+            )
+
+            # Aux 2 (from 64x64)
+            aux2 = self.aux_head2(d2)
+            aux2 = F.interpolate(
+                aux2, size=logits.shape[2:], mode="bilinear", align_corners=False
+            )
+
+            return logits, aux2, aux3
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from library.config import Config
+=======
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import train_test_split
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # 2. Load Data Arrays (with Caching)
+    train_imgs, train_masks, train_depths, train_ids = cache_and_load_data(
+        df_train, "train", load_cached
+    )
+    val_imgs, val_masks, val_depths, val_ids = cache_and_load_data(
+        df_val, "val", load_cached
+    )
+    test_imgs, _, test_depths, test_ids = cache_and_load_data(
+        df_test, "test", load_cached
+    )
+
+    # 3. Global Depth Normalization
+    # Compute min/max across entire dataset to ensure consistency
+    all_depths = np.concatenate([train_depths, val_depths, test_depths])
+
+    # Handle NaNs (e.g. missing test depths) to prevent propagation to train/val
+    if np.isnan(all_depths).any():
+        print("Warning: NaNs detected in depth data. Filling with mean value.")
+        mean_depth = np.nanmean(all_depths)
+        train_depths = np.nan_to_num(train_depths, nan=mean_depth)
+        val_depths = np.nan_to_num(val_depths, nan=mean_depth)
+        test_depths = np.nan_to_num(test_depths, nan=mean_depth)
+        # Update all_depths for min/max calculation
+        all_depths = np.concatenate([train_depths, val_depths, test_depths])
+
+    min_depth = all_depths.min()
+    max_depth = all_depths.max()
+
+    # Avoid division by zero
+    denom = (max_depth - min_depth) if (max_depth - min_depth) > 0 else 1.0
+
+    train_depths = (train_depths - min_depth) / denom
+    val_depths = (val_depths - min_depth) / denom
+    test_depths = (test_depths - min_depth) / denom
+=======
+    # 2. Load Data Arrays (with Caching)
+    train_imgs, train_masks, train_depths, train_ids = cache_and_load_data(
+        df_train, "train", load_cached
+    )
+    val_imgs, val_masks, val_depths, val_ids = cache_and_load_data(
+        df_val, "val", load_cached
+    )
+    test_imgs, _, test_depths, test_ids = cache_and_load_data(
+        df_test, "test", load_cached
+    )
+
+    # Merge Train and Val for 90/10 Split (Maximize Data Utilization)
+    if not debug:
+        print("Merging Train and Val sets for 90/10 split...")
+        all_imgs = np.concatenate([train_imgs, val_imgs])
+        all_masks = np.concatenate([train_masks, val_masks])
+        all_depths = np.concatenate([train_depths, val_depths])
+        all_ids = np.concatenate([train_ids, val_ids])
+        
+        # Merge DataFrames to get stratification labels
+        df_all = pd.concat([df_train, df_val]).reset_index(drop=True)
+        
+        # Stratified Split
+        train_idx, val_idx = train_test_split(
+            np.arange(len(all_imgs)),
+            test_size=0.1,
+            random_state=Config.SEED,
+            stratify=df_all["coverage_class"]
+        )
+        
+        train_imgs, val_imgs = all_imgs[train_idx], all_imgs[val_idx]
+        train_masks, val_masks = all_masks[train_idx], all_masks[val_idx]
+        train_depths, val_depths = all_depths[train_idx], all_depths[val_idx]
+        train_ids, val_ids = all_ids[train_idx], all_ids[val_idx]
+
+    # 3. Global Depth Normalization
+    # Compute min/max across entire dataset to ensure consistency
+    all_depths = np.concatenate([train_depths, val_depths, test_depths])
+
+    # Handle NaNs (e.g. missing test depths) to prevent propagation to train/val
+    if np.isnan(all_depths).any():
+        print("Warning: NaNs detected in depth data. Filling with mean value.")
+        mean_depth = np.nanmean(all_depths)
+        train_depths = np.nan_to_num(train_depths, nan=mean_depth)
+        val_depths = np.nan_to_num(val_depths, nan=mean_depth)
+        test_depths = np.nan_to_num(test_depths, nan=mean_depth)
+        # Update all_depths for min/max calculation
+        all_depths = np.concatenate([train_depths, val_depths, test_depths])
+
+    min_depth = all_depths.min()
+    max_depth = all_depths.max()
+
+    # Avoid division by zero
+    denom = (max_depth - min_depth) if (max_depth - min_depth) > 0 else 1.0
+
+    train_depths = (train_depths - min_depth) / denom
+    val_depths = (val_depths - min_depth) / denom
+    test_depths = (test_depths - min_depth) / denom
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.losses import Phase1Loss, Phase2Loss
+
+
+def get_loss_function(epoch):
+    """
+    Selects the loss function based on the current epoch/phase.
+    Phase 1 (Epochs 0-100): BCE + Sample-Wise Dice
+    Phase 2 (Epochs 100+): BCE + Lovasz-Hinge
+    """
+    if epoch < Config.PHASE_1_EPOCHS:
+        return Phase1Loss()
+    else:
+        return Phase2Loss()
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    criterion = get_loss_function(epoch).to(device)
+
+    running_loss = 0.0
+    dataset_size = len(dataloader.dataset)
+=======
+from library.losses import Phase1Loss
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+    """
+    Performs one epoch of training.
+    """
+    model.train()
+    # Consistent Phase1Loss (BCE + Dice) throughout
+    criterion = Phase1Loss().to(device)
+
+    running_loss = 0.0
+    dataset_size = len(dataloader.dataset)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def evaluate(model, dataloader, device, epoch):
+    """
+    Evaluates the model on the validation set.
+    Calculates Loss and Mean Average Precision (mAP).
+    """
+    model.eval()
+    criterion = get_loss_function(epoch).to(device)
+
+    running_loss = 0.0
+=======
+def evaluate(model, dataloader, device, epoch):
+    """
+    Evaluates the model on the validation set.
+    Calculates Loss and Mean Average Precision (mAP).
+    """
+    model.eval()
+    criterion = Phase1Loss().to(device)
+
+    running_loss = 0.0
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ResUNetASPP
+from library.engine import train_one_epoch, evaluate
+=======
+from library.model import DeepResUNet
+from library.engine import train_one_epoch, evaluate
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 3. Model & Optimization
+    # -------------------------------------------------------------------------
+    print("Initializing model...")
+    model = ResUNetASPP().to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+=======
+    # -------------------------------------------------------------------------
+    # 3. Model & Optimization
+    # -------------------------------------------------------------------------
+    print("Initializing model...")
+    model = DeepResUNet().to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("\nLoading snapshot models for ensemble...")
+
+    # Load Cycle 2 Model
+    model_c2 = ResUNetASPP().to(device)
+    model_c2.load_state_dict(torch.load(path_cycle_2, map_location=device))
+
+    # Load Cycle 3 Model
+    model_c3 = ResUNetASPP().to(device)
+    model_c3.load_state_dict(torch.load(path_cycle_3, map_location=device))
+=======
+    print("\nLoading snapshot models for ensemble...")
+
+    # Load Cycle 2 Model
+    model_c2 = DeepResUNet().to(device)
+    model_c2.load_state_dict(torch.load(path_cycle_2, map_location=device))
+
+    # Load Cycle 3 Model
+    model_c3 = DeepResUNet().to(device)
+    model_c3.load_state_dict(torch.load(path_cycle_3, map_location=device))
+>>>>>>> REPLACE
+```

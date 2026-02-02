@@ -1,0 +1,503 @@
+The optimization strategy involves reverting the model architecture from `google/muril-base-cased` to `distilbert-base-multilingual-cased`. Previous experiments demonstrated that MuRIL failed to converge on this small dataset (~800 samples), whereas DistilBERT achieved a respectable baseline score (Cite solution_lesson_node_00009). 
+
+To support DistilBERT, which does not natively use `token_type_ids`, we must modify the data pipeline. While the model doesn't need these IDs for the forward pass, the inference post-processing logic relies on them to mask out question tokens and focus on the context. Therefore, we will manually generate `token_type_ids` (1 for context, 0 for question) during feature preparation (Cite solution_lesson_node_00016). We will also update the model wrapper, trainer, and predictor to remove `token_type_ids` from the model's input arguments to prevent runtime errors.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_5"
+
+    # Create working directory if it doesn't exist
+    os.makedirs(WORKING_DIR, exist_ok=True)
+
+    # Data Paths
+    # Using original train.csv for Group K-Fold Cross Validation to use all data
+    ORIGINAL_TRAIN_PATH = os.path.join(INPUT_DIR, "train.csv")
+    TEST_PATH = os.path.join(INPUT_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Metadata Paths (provided for reference/validation splits)
+    META_TRAIN_PATH = os.path.join(METADATA_DIR, "train.csv")
+    META_VAL_PATH = os.path.join(METADATA_DIR, "val.csv")
+    META_TEST_PATH = os.path.join(METADATA_DIR, "test.csv")
+
+    # Output Paths
+    SUBMISSION_PATH = "./submission/submission.csv"
+
+    # =========================================================================
+    # Model Configuration
+    # =========================================================================
+    MODEL_NAME = "google/muril-base-cased"
+    TOKENIZER_NAME = "google/muril-base-cased"
+
+    # Sliding Window / Input Settings
+    MAX_LENGTH = 384
+    DOC_STRIDE = 128
+    PAD_TO_MAX_LENGTH = True
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    NUM_FOLDS = 3
+    EPOCHS = 3
+    BATCH_SIZE = 16  # Adjusted for A100 and MuRIL Base memory footprint
+=======
+    WORKING_DIR = "./working/optimized_distilbert"
+
+    # Create working directory if it doesn't exist
+    os.makedirs(WORKING_DIR, exist_ok=True)
+
+    # Data Paths
+    # Using original train.csv for Group K-Fold Cross Validation to use all data
+    ORIGINAL_TRAIN_PATH = os.path.join(INPUT_DIR, "train.csv")
+    TEST_PATH = os.path.join(INPUT_DIR, "test.csv")
+    SAMPLE_SUBMISSION_PATH = os.path.join(INPUT_DIR, "sample_submission.csv")
+
+    # Metadata Paths (provided for reference/validation splits)
+    META_TRAIN_PATH = os.path.join(METADATA_DIR, "train.csv")
+    META_VAL_PATH = os.path.join(METADATA_DIR, "val.csv")
+    META_TEST_PATH = os.path.join(METADATA_DIR, "test.csv")
+
+    # Output Paths
+    SUBMISSION_PATH = "./submission/submission.csv"
+
+    # =========================================================================
+    # Model Configuration
+    # =========================================================================
+    MODEL_NAME = "distilbert-base-multilingual-cased"
+    TOKENIZER_NAME = "distilbert-base-multilingual-cased"
+
+    # Sliding Window / Input Settings
+    MAX_LENGTH = 384
+    DOC_STRIDE = 128
+    PAD_TO_MAX_LENGTH = True
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    NUM_FOLDS = 3
+    EPOCHS = 3
+    BATCH_SIZE = 32  # Increased for DistilBERT
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MuRILForQA(nn.Module):
+    """
+    MuRIL-based model for Question Answering.
+
+    This model uses the 'google/muril-base-cased' backbone to generate contextualized
+    embeddings for the input sequence (Question + Context). A linear head then projects
+    these embeddings to start and end logits for answer span prediction.
+    """
+
+    def __init__(self):
+        super(MuRILForQA, self).__init__()
+
+        # Load configuration and pre-trained backbone
+        self.config = AutoConfig.from_pretrained(Config.MODEL_NAME)
+        self.muril = AutoModel.from_pretrained(Config.MODEL_NAME)
+
+        # QA Classification Head
+        # Projects hidden states to 2 values: start_logit and end_logit
+        self.qa_outputs = nn.Linear(self.config.hidden_size, 2)
+
+        # Initialize weights for the head (optional, but good practice)
+        self._init_weights(self.qa_outputs)
+
+    def _init_weights(self, module):
+        """Initialize the weights of the linear head."""
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Indices of input sequence tokens in the vocabulary.
+            attention_mask (torch.Tensor): Mask to avoid performing attention on padding token indices.
+            token_type_ids (torch.Tensor): Segment token indices to indicate first and second portions of the inputs.
+                                           Crucial for MuRIL to distinguish Question (0) from Context (1).
+
+        Returns:
+            start_logits (torch.Tensor): Logits for the start position of the answer. Shape: (batch_size, seq_len)
+            end_logits (torch.Tensor): Logits for the end position of the answer. Shape: (batch_size, seq_len)
+        """
+
+        # Pass inputs to the MuRIL backbone
+        # We explicitly pass token_type_ids as MuRIL (BERT-based) relies on them for segment embedding
+        outputs = self.muril(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+
+        # sequence_output shape: (batch_size, sequence_length, hidden_size)
+        sequence_output = outputs[0]
+
+        # Project to QA logits
+        # logits shape: (batch_size, sequence_length, 2)
+        logits = self.qa_outputs(sequence_output)
+
+        # Split logits into start and end
+        start_logits, end_logits = logits.split(1, dim=-1)
+
+        # Squeeze the last dimension to get (batch_size, sequence_length)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        return start_logits, end_logits
+=======
+class DistilBertForQA(nn.Module):
+    """
+    DistilBERT-based model for Question Answering.
+    """
+
+    def __init__(self):
+        super(DistilBertForQA, self).__init__()
+
+        # Load configuration and pre-trained backbone
+        self.config = AutoConfig.from_pretrained(Config.MODEL_NAME)
+        self.distilbert = AutoModel.from_pretrained(Config.MODEL_NAME)
+
+        # QA Classification Head
+        self.qa_outputs = nn.Linear(self.config.hidden_size, 2)
+
+        # Initialize weights for the head
+        self._init_weights(self.qa_outputs)
+
+    def _init_weights(self, module):
+        """Initialize the weights of the linear head."""
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass of the model.
+        DistilBERT does not use token_type_ids.
+        """
+
+        outputs = self.distilbert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        # sequence_output shape: (batch_size, sequence_length, hidden_size)
+        sequence_output = outputs[0]
+
+        # Project to QA logits
+        logits = self.qa_outputs(sequence_output)
+
+        # Split logits into start and end
+        start_logits, end_logits = logits.split(1, dim=-1)
+
+        # Squeeze the last dimension to get (batch_size, sequence_length)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        return start_logits, end_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    # Tokenize our examples with truncation and padding, but keep the overflows using a stride.
+    # This results in one example possible giving several features when a context is long.
+    tokenized_examples = tokenizer(
+        examples["question"].tolist(),
+        examples["context"].tolist(),
+        truncation="only_second",  # Truncate context, not question
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+        return_token_type_ids=True,  # Crucial for MuRIL
+    )
+
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized_examples.pop("offset_mapping")
+
+    # Let's label those examples!
+    tokenized_examples["start_positions"] = []
+    tokenized_examples["end_positions"] = []
+    tokenized_examples["example_id"] = []
+
+    for i, offsets in enumerate(offset_mapping):
+        # We will label impossible answers with the index of the CLS token.
+=======
+    # Tokenize our examples with truncation and padding, but keep the overflows using a stride.
+    tokenized_examples = tokenizer(
+        examples["question"].tolist(),
+        examples["context"].tolist(),
+        truncation="only_second",
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+        return_token_type_ids=False,  # DistilBERT doesn't need these for model
+    )
+
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized_examples.pop("offset_mapping")
+
+    # Let's label those examples!
+    tokenized_examples["start_positions"] = []
+    tokenized_examples["end_positions"] = []
+    tokenized_examples["example_id"] = []
+    tokenized_examples["token_type_ids"] = []  # Manually creating for post-processing
+
+    for i, offsets in enumerate(offset_mapping):
+        # Generate token_type_ids manually for masking: 1 for context, 0 otherwise
+        seq_ids = tokenized_examples.sequence_ids(i)
+        # sequence_ids: None (special), 0 (question), 1 (context)
+        # We map 1 -> 1, others -> 0
+        token_type_ids = [1 if s == 1 else 0 for s in seq_ids]
+        tokenized_examples["token_type_ids"].append(token_type_ids)
+
+        # We will label impossible answers with the index of the CLS token.
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def prepare_test_features(examples, tokenizer):
+    """
+    Tokenizes test examples with sliding window.
+    Retains offset_mapping and example_id for post-processing predictions.
+    """
+    tokenized_examples = tokenizer(
+        examples["question"].tolist(),
+        examples["context"].tolist(),
+        truncation="only_second",
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+        return_token_type_ids=True,
+    )
+
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+
+    # We need to keep the example_id for each feature to aggregate predictions later
+    tokenized_examples["example_id"] = []
+
+    for i in range(len(tokenized_examples["input_ids"])):
+        sample_index = sample_mapping[i]
+        tokenized_examples["example_id"].append(examples.iloc[sample_index]["id"])
+
+        # We also need to process offset_mapping to set None for non-context tokens
+        # This helps in post-processing to ignore question tokens
+        sequence_ids = tokenized_examples.sequence_ids(i)
+        offsets = tokenized_examples["offset_mapping"][i]
+
+        # Set offsets to None (or (0,0)) for tokens that are not part of the context
+        # However, for Parquet storage, None might be tricky.
+        # We will keep the original offsets but use sequence_ids/token_type_ids during inference to filter.
+        # Just ensure offsets are storable.
+
+    return pd.DataFrame(
+        {
+            "input_ids": tokenized_examples["input_ids"],
+            "attention_mask": tokenized_examples["attention_mask"],
+            "token_type_ids": tokenized_examples["token_type_ids"],
+            "offset_mapping": tokenized_examples["offset_mapping"],
+            "example_id": tokenized_examples["example_id"],
+        }
+    )
+=======
+def prepare_test_features(examples, tokenizer):
+    """
+    Tokenizes test examples with sliding window.
+    Retains offset_mapping and example_id for post-processing predictions.
+    """
+    tokenized_examples = tokenizer(
+        examples["question"].tolist(),
+        examples["context"].tolist(),
+        truncation="only_second",
+        max_length=Config.MAX_LENGTH,
+        stride=Config.DOC_STRIDE,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+        return_token_type_ids=False,
+    )
+
+    sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+
+    # We need to keep the example_id for each feature to aggregate predictions later
+    tokenized_examples["example_id"] = []
+    tokenized_examples["token_type_ids"] = []
+
+    for i in range(len(tokenized_examples["input_ids"])):
+        sample_index = sample_mapping[i]
+        tokenized_examples["example_id"].append(examples.iloc[sample_index]["id"])
+
+        # Generate token_type_ids manually for masking
+        seq_ids = tokenized_examples.sequence_ids(i)
+        token_type_ids = [1 if s == 1 else 0 for s in seq_ids]
+        tokenized_examples["token_type_ids"].append(token_type_ids)
+
+    return pd.DataFrame(
+        {
+            "input_ids": tokenized_examples["input_ids"],
+            "attention_mask": tokenized_examples["attention_mask"],
+            "token_type_ids": tokenized_examples["token_type_ids"],
+            "offset_mapping": tokenized_examples["offset_mapping"],
+            "example_id": tokenized_examples["example_id"],
+        }
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Forward pass with Mixed Precision
+            with autocast(enabled=Config.FP16):
+                start_logits, end_logits = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                )
+
+                # Calculate Loss
+=======
+            # Forward pass with Mixed Precision
+            with autocast(enabled=Config.FP16):
+                start_logits, end_logits = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+
+                # Calculate Loss
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                # Forward pass
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                    )
+
+                    loss_fct = nn.CrossEntropyLoss()
+=======
+                # Forward pass
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+
+                    loss_fct = nn.CrossEntropyLoss()
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                    )
+
+                start_logits = start_logits.cpu().numpy()
+=======
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+
+                start_logits = start_logits.cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+library/predictor.py
+<<<<<<< SEARCH
+from library.model import MuRILForQA
+from library.data_loader import get_processed_data, QADataset
+from library.utils import seed_everything
+=======
+from library.model import DistilBertForQA
+from library.data_loader import get_processed_data, QADataset
+from library.utils import seed_everything
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                # Use mixed precision for inference
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                    )
+
+                all_start_logits.append(start_logits.cpu().numpy())
+=======
+                # Use mixed precision for inference
+                with autocast(enabled=Config.FP16):
+                    start_logits, end_logits = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+
+                all_start_logits.append(start_logits.cpu().numpy())
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            print(f"Loading model for fold {fold} from {model_path}...")
+            model = MuRILForQA()
+            state_dict = torch.load(model_path, map_location=self.device)
+            model.load_state_dict(state_dict)
+=======
+            print(f"Loading model for fold {fold} from {model_path}...")
+            model = DistilBertForQA()
+            state_dict = torch.load(model_path, map_location=self.device)
+            model.load_state_dict(state_dict)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MuRILForQA
+from library.trainer import QATrainer
+from library.predictor import Predictor
+=======
+from library.model import DistilBertForQA
+from library.trainer import QATrainer
+from library.predictor import Predictor
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Initialize Model
+        model = MuRILForQA()
+        model.to(device)
+=======
+        # Initialize Model
+        model = DistilBertForQA()
+        model.to(device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        model = MuRILForQA()
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+        s_logits, e_logits = predictor.predict_fn(model, val_loader_inf)
+=======
+        model = DistilBertForQA()
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+        s_logits, e_logits = predictor.predict_fn(model, val_loader_inf)
+>>>>>>> REPLACE
+```

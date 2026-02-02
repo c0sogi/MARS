@@ -1,0 +1,824 @@
+To improve the model's performance, I will implement a **Cross-Encoder architecture** by fine-tuning a pre-trained transformer (`microsoft/deberta-v3-small`). This directly addresses the lesson learned (Cite solution_lesson_node_00001) that frozen embeddings fail to capture the qualitative nuances required for ranking. Instead of treating texts independently, the new model will process the Prompt and both Responses as a single sequence (`Prompt [SEP] Response A [SEP] Response B`), enabling the self-attention mechanism to directly compare the content. I will also optimize the training pipeline by introducing **Mixed Precision (AMP)** for efficiency on the A100 GPU and adjusting hyperparameters (Batch Size: 8, LR: 2e-5) for stable fine-tuning.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    # Backbone: Lightweight Sentence Transformer
+    TRANSFORMER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Text Processing
+    MAX_LENGTH = 256  # Max token length for the transformer
+    EMBEDDING_DIM = 384  # Output dimension of all-MiniLM-L6-v2
+
+    # MLP Head Configuration
+    # Input dim will be EMBEDDING_DIM * 4 (Prompt, ResA, ResB, Diff, Prod -> Wait, idea says:
+    # 1. Prompt, 2. ResA, 3. ResB.
+    # Plus interaction: Diff (A-B) and Prod (A*B).
+    # Total vectors: Prompt(1) + ResA(1) + ResB(1) + Diff(1) + Prod(1) = 5 vectors?
+    # Or Prompt, ResA, ResB, Diff, Prod.
+    # Let's assume the feature builder will concatenate these.
+    # 5 * 384 = 1920 input features.
+    HIDDEN_LAYERS = [1024, 512, 256]
+    DROPOUT_RATE = 0.3
+    NUM_CLASSES = 3  # Winner A, Winner B, Tie
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 256
+    LEARNING_RATE = 1e-3
+    EPOCHS = 50
+    EARLY_STOPPING_PATIENCE = 5
+=======
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    # Backbone: Fine-tuning DeBERTa v3 Small (Cross-Encoder)
+    TRANSFORMER_MODEL = "microsoft/deberta-v3-small"
+
+    # Text Processing
+    MAX_LENGTH = 1024  # Increased for Prompt + ResA + ResB
+    
+    # Model Configuration
+    NUM_CLASSES = 3  # Winner A, Winner B, Tie
+    DROPOUT_RATE = 0.1 # Standard for transformers
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 8 # Smaller batch size for fine-tuning
+    LEARNING_RATE = 2e-5 # Lower learning rate for fine-tuning
+    EPOCHS = 3
+    EARLY_STOPPING_PATIENCE = 2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+class ChatbotMLP(nn.Module):
+    """
+    Multi-Layer Perceptron (MLP) for Chatbot Preference Prediction.
+
+    This model is designed to work with pre-computed embeddings (Frozen Siamese Transformer approach).
+    It takes a dense feature vector as input—constructed from the prompt embedding,
+    response embeddings, and their interactions (difference, product)—and predicts
+    the logits for the three target classes: Winner Model A, Winner Model B, and Tie.
+
+    Architecture:
+        - Input Layer: Matches the combined embedding dimension.
+        - Hidden Layers: A sequence of (Linear -> BatchNorm -> ReLU -> Dropout) blocks.
+        - Output Layer: Linear layer projecting to the number of classes.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_layers: list = None,
+        dropout_rate: float = None,
+        num_classes: int = None,
+    ):
+        """
+        Initialize the ChatbotMLP model.
+
+        Args:
+            input_dim (int): The size of the input feature vector.
+            hidden_layers (list, optional): List of integers defining the size of each hidden layer.
+                                            Defaults to Config.HIDDEN_LAYERS.
+            dropout_rate (float, optional): The dropout probability. Defaults to Config.DROPOUT_RATE.
+            num_classes (int, optional): The number of output classes. Defaults to Config.NUM_CLASSES.
+        """
+        super(ChatbotMLP, self).__init__()
+
+        # Set defaults from Config if arguments are not provided
+        if hidden_layers is None:
+            hidden_layers = Config.HIDDEN_LAYERS
+        if dropout_rate is None:
+            dropout_rate = Config.DROPOUT_RATE
+        if num_classes is None:
+            num_classes = Config.NUM_CLASSES
+
+        layers = []
+        current_dim = input_dim
+
+        # Build hidden layers
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = h_dim
+
+        # Output layer
+        layers.append(nn.Linear(current_dim, num_classes))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input feature tensor of shape (batch_size, input_dim).
+
+        Returns:
+            torch.Tensor: Output logits of shape (batch_size, num_classes).
+        """
+        return self.network(x)
+=======
+import torch
+import torch.nn as nn
+from transformers import AutoModelForSequenceClassification, AutoConfig
+from library.config import Config
+
+
+class ChatbotTransformer(nn.Module):
+    """
+    Transformer-based Cross-Encoder for Chatbot Preference Prediction.
+    
+    Uses a pre-trained transformer (e.g., DeBERTa) to jointly encode the prompt
+    and both responses, allowing for deep interaction and quality comparison.
+    Cite solution_lesson_node_00001: Switching from frozen embeddings to a Cross-Encoder
+    architecture to capture quality nuances.
+    """
+
+    def __init__(self, model_name=Config.TRANSFORMER_MODEL, num_classes=Config.NUM_CLASSES):
+        super(ChatbotTransformer, self).__init__()
+        
+        config = AutoConfig.from_pretrained(model_name, num_labels=num_classes)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, config=config)
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        """
+        Forward pass.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
+        return outputs.logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
+from library.config import Config
+from library.utils import get_logger
+
+# Initialize logger
+logger = get_logger("data_processing")
+
+
+class TextVectorizer:
+    """
+    Wrapper for SentenceTransformer to encode text into embeddings.
+    """
+
+    def __init__(self, model_name=Config.TRANSFORMER_MODEL, device=Config.DEVICE):
+        self.device = device
+        logger.info(f"Loading SentenceTransformer: {model_name} on {self.device}")
+        self.model = SentenceTransformer(model_name, device=self.device)
+        self.model.max_seq_length = Config.MAX_LENGTH
+
+    def encode(self, texts, batch_size=256, show_progress_bar=False):
+        """
+        Encodes a list of texts into numpy embeddings.
+        """
+        # Ensure texts is a list
+        if isinstance(texts, pd.Series):
+            texts = texts.tolist()
+
+        # Handle potential NaNs by replacing with empty string
+        texts = [str(t) if pd.notna(t) else "" for t in texts]
+
+        embeddings = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_numpy=True,
+            normalize_embeddings=True,  # Normalize for better cosine/dot product properties in interaction features
+        )
+        return embeddings
+
+
+class ChatbotDataset(Dataset):
+    """
+    PyTorch Dataset for Chatbot Preference Prediction.
+    Constructs feature vectors from pre-computed embeddings on the fly.
+    """
+
+    def __init__(self, prompt_emb, res_a_emb, res_b_emb, targets=None):
+        self.prompt_emb = prompt_emb
+        self.res_a_emb = res_a_emb
+        self.res_b_emb = res_b_emb
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.prompt_emb)
+
+    def __getitem__(self, idx):
+        # Retrieve embeddings
+        p = self.prompt_emb[idx]
+        a = self.res_a_emb[idx]
+        b = self.res_b_emb[idx]
+
+        # Compute interaction features
+        diff = a - b
+        prod = a * b
+
+        # Concatenate all features: [Prompt, ResA, ResB, Diff, Prod]
+        # Shape: (EMBEDDING_DIM * 5, )
+        features = np.concatenate([p, a, b, diff, prod], axis=0)
+
+        # Convert to tensor
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+
+        if self.targets is not None:
+            target = self.targets[idx]
+            return features_tensor, torch.tensor(target, dtype=torch.long)
+        else:
+            return features_tensor
+
+
+def get_embeddings_for_split(df, split_name, vectorizer, load_cached_data):
+    """
+    Handles caching logic: loads embeddings from disk if available/requested,
+    otherwise computes them and saves to disk.
+    """
+    cache_file = os.path.join(Config.WORKING_DIR, f"{split_name}_embeddings.npz")
+
+    # Try loading from cache
+    if load_cached_data and os.path.exists(cache_file):
+        logger.info(f"Loading cached embeddings for {split_name} from {cache_file}")
+        try:
+            data = np.load(cache_file)
+            return data["prompt"], data["res_a"], data["res_b"]
+        except Exception as e:
+            logger.warning(
+                f"Failed to load cache for {split_name}: {e}. Recomputing..."
+            )
+
+    # Compute embeddings
+    logger.info(f"Computing embeddings for {split_name}...")
+    prompt_emb = vectorizer.encode(df["prompt"], show_progress_bar=False)
+    res_a_emb = vectorizer.encode(df["response_a"], show_progress_bar=False)
+    res_b_emb = vectorizer.encode(df["response_b"], show_progress_bar=False)
+
+    # Save to cache
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+    np.savez(cache_file, prompt=prompt_emb, res_a=res_a_emb, res_b=res_b_emb)
+    logger.info(f"Saved embeddings for {split_name} to {cache_file}")
+
+    return prompt_emb, res_a_emb, res_b_emb
+
+
+def create_dataloaders(batch_size=Config.BATCH_SIZE, load_cached_data=True):
+    """
+    Main function to prepare DataLoaders for Train, Val, and Test.
+    """
+    logger.info("Starting data processing...")
+
+    # 1. Load Metadata
+    train_df = pd.read_csv(Config.TRAIN_DATA_PATH)
+    val_df = pd.read_csv(Config.VAL_DATA_PATH)
+    test_df = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Debug Mode: Subsample
+    if Config.DEBUG:
+        logger.info(
+            f"DEBUG mode enabled. Subsampling to {Config.DEBUG_SAMPLE_SIZE} rows."
+        )
+        train_df = train_df.head(Config.DEBUG_SAMPLE_SIZE)
+        val_df = val_df.head(Config.DEBUG_SAMPLE_SIZE)
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Initialize Vectorizer
+    # We only need the vectorizer if we are NOT loading everything from cache,
+    # but since we process splits sequentially, we initialize it once.
+    # To save memory, we could initialize it inside get_embeddings_for_split only if needed,
+    # but keeping it here is cleaner.
+    vectorizer = TextVectorizer()
+
+    # 3. Process Splits
+
+    # --- Train ---
+    t_p, t_a, t_b = get_embeddings_for_split(
+        train_df, "train", vectorizer, load_cached_data
+    )
+    # Convert one-hot targets to class indices
+    # 0: Model A, 1: Model B, 2: Tie
+    # Assuming columns: winner_model_a, winner_model_b, winner_tie
+    train_targets = np.argmax(
+        train_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1
+    )
+
+    train_dataset = ChatbotDataset(t_p, t_a, t_b, train_targets)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # --- Validation ---
+    v_p, v_a, v_b = get_embeddings_for_split(
+        val_df, "val", vectorizer, load_cached_data
+    )
+    val_targets = np.argmax(
+        val_df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1
+    )
+
+    val_dataset = ChatbotDataset(v_p, v_a, v_b, val_targets)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # --- Test ---
+    test_p, test_a, test_b = get_embeddings_for_split(
+        test_df, "test", vectorizer, load_cached_data
+    )
+    # Test set has no targets
+    test_dataset = ChatbotDataset(test_p, test_a, test_b, targets=None)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    logger.info("DataLoaders created successfully.")
+    return train_loader, val_loader, test_loader
+=======
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from library.config import Config
+from library.utils import get_logger
+
+# Initialize logger
+logger = get_logger("data_processing")
+
+
+class ChatbotDataset(Dataset):
+    """
+    PyTorch Dataset for Chatbot Preference Prediction.
+    Tokenizes text on-the-fly for the transformer.
+    """
+
+    def __init__(self, df, tokenizer, max_length=Config.MAX_LENGTH, is_test=False):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.is_test = is_test
+        
+        # Pre-extract columns to lists for speed
+        self.prompts = df["prompt"].fillna("").astype(str).tolist()
+        self.res_a = df["response_a"].fillna("").astype(str).tolist()
+        self.res_b = df["response_b"].fillna("").astype(str).tolist()
+        
+        if not self.is_test:
+            # 0: Model A, 1: Model B, 2: Tie
+            self.targets = np.argmax(
+                df[["winner_model_a", "winner_model_b", "winner_tie"]].values, axis=1
+            )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        prompt = self.prompts[idx]
+        res_a = self.res_a[idx]
+        res_b = self.res_b[idx]
+        
+        # Construct input text: "Prompt [SEP] Response A [SEP] Response B"
+        sep = self.tokenizer.sep_token
+        full_text = f"{prompt} {sep} {res_a} {sep} {res_b}"
+        
+        encoding = self.tokenizer(
+            full_text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Squeeze to remove batch dimension added by tokenizer
+        item = {
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+        }
+        
+        if "token_type_ids" in encoding:
+            item["token_type_ids"] = encoding["token_type_ids"].squeeze(0)
+
+        if not self.is_test:
+            item["labels"] = torch.tensor(self.targets[idx], dtype=torch.long)
+            
+        return item
+
+
+def create_dataloaders(batch_size=Config.BATCH_SIZE, load_cached_data=True):
+    """
+    Main function to prepare DataLoaders for Train, Val, and Test.
+    """
+    logger.info("Starting data processing...")
+
+    # 1. Load Metadata
+    train_df = pd.read_csv(Config.TRAIN_DATA_PATH)
+    val_df = pd.read_csv(Config.VAL_DATA_PATH)
+    test_df = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Debug Mode: Subsample
+    if Config.DEBUG:
+        logger.info(
+            f"DEBUG mode enabled. Subsampling to {Config.DEBUG_SAMPLE_SIZE} rows."
+        )
+        train_df = train_df.head(Config.DEBUG_SAMPLE_SIZE)
+        val_df = val_df.head(Config.DEBUG_SAMPLE_SIZE)
+        test_df = test_df.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Initialize Tokenizer
+    logger.info(f"Loading Tokenizer: {Config.TRANSFORMER_MODEL}")
+    tokenizer = AutoTokenizer.from_pretrained(Config.TRANSFORMER_MODEL)
+
+    # 3. Create Datasets
+    train_dataset = ChatbotDataset(train_df, tokenizer)
+    val_dataset = ChatbotDataset(val_df, tokenizer)
+    test_dataset = ChatbotDataset(test_df, tokenizer, is_test=True)
+
+    # 4. Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    logger.info("DataLoaders created successfully.")
+    return train_loader, val_loader, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def train_epoch(self):
+        """
+        Runs one epoch of training.
+
+        Returns:
+            float: Average training loss for the epoch.
+        """
+        self.model.train()
+        running_loss = 0.0
+        dataset_size = 0
+
+        for features, targets in self.train_loader:
+            features = features.to(self.device)
+            targets = targets.to(self.device)
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            logits = self.model(features)
+            loss = self.criterion(logits, targets)
+
+            # Backward pass and optimize
+            loss.backward()
+            self.optimizer.step()
+
+            # Accumulate loss (multiply by batch size to handle last batch correctly)
+            batch_size = features.size(0)
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+        avg_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return avg_loss
+
+    def validate(self):
+        """
+        Runs validation on the validation set.
+
+        Returns:
+            float: Average validation loss.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        dataset_size = 0
+
+        with torch.no_grad():
+            for features, targets in self.val_loader:
+                features = features.to(self.device)
+                targets = targets.to(self.device)
+
+                logits = self.model(features)
+                loss = self.criterion(logits, targets)
+
+                batch_size = features.size(0)
+                running_loss += loss.item() * batch_size
+                dataset_size += batch_size
+
+        avg_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return avg_loss
+=======
+    def train_epoch(self):
+        """
+        Runs one epoch of training with Mixed Precision.
+
+        Returns:
+            float: Average training loss for the epoch.
+        """
+        self.model.train()
+        running_loss = 0.0
+        dataset_size = 0
+        
+        scaler = torch.amp.GradScaler('cuda')
+
+        for batch in self.train_loader:
+            # Move batch to device
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            targets = batch["labels"].to(self.device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(self.device)
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+
+            # Forward pass with AMP
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                logits = self.model(input_ids, attention_mask, token_type_ids)
+                loss = self.criterion(logits, targets)
+
+            # Backward pass and optimize
+            scaler.scale(loss).backward()
+            scaler.step(self.optimizer)
+            scaler.update()
+
+            # Accumulate loss
+            batch_size = input_ids.size(0)
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+        avg_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return avg_loss
+
+    def validate(self):
+        """
+        Runs validation on the validation set.
+
+        Returns:
+            float: Average validation loss.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        dataset_size = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                targets = batch["labels"].to(self.device)
+                token_type_ids = batch.get("token_type_ids")
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids.to(self.device)
+
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = self.model(input_ids, attention_mask, token_type_ids)
+                    loss = self.criterion(logits, targets)
+
+                batch_size = input_ids.size(0)
+                running_loss += loss.item() * batch_size
+                dataset_size += batch_size
+
+        avg_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return avg_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Inference loop
+        with torch.no_grad():
+            for features in self.test_loader:
+                features = features.to(self.device)
+
+                # Forward pass
+                logits = self.model(features)
+
+                # Apply Softmax to get probabilities
+                probs = torch.softmax(logits, dim=1)
+                all_probs.append(probs.cpu().numpy())
+=======
+        # Inference loop
+        with torch.no_grad():
+            for batch in self.test_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                token_type_ids = batch.get("token_type_ids")
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids.to(self.device)
+
+                # Forward pass
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = self.model(input_ids, attention_mask, token_type_ids)
+
+                # Apply Softmax to get probabilities
+                probs = torch.softmax(logits, dim=1)
+                all_probs.append(probs.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ChatbotMLP
+from library.trainer import ModelTrainer
+
+# Initialize Logger
+logger = get_logger("runfile")
+
+
+def perform_failure_analysis(model, val_loader):
+    """
+    Calculates per-sample loss on the validation set and correlates it with
+    input features (text lengths) to identify error patterns.
+    """
+    logger.info("Starting Failure Analysis...")
+
+    # Ensure model is in eval mode
+    model.eval()
+    device = Config.DEVICE
+
+    # Store losses
+    all_losses = []
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    # 1. Compute Loss per sample
+    with torch.no_grad():
+        for features, targets in val_loader:
+            features = features.to(device)
+            targets = targets.to(device)
+
+            logits = model(features)
+            # Calculate loss per sample (no reduction)
+            losses = criterion(logits, targets)
+            all_losses.extend(losses.cpu().numpy())
+
+    # 2. Load Validation Metadata to get features
+=======
+from library.model import ChatbotTransformer
+from library.trainer import ModelTrainer
+
+# Initialize Logger
+logger = get_logger("runfile")
+
+
+def perform_failure_analysis(model, val_loader):
+    """
+    Calculates per-sample loss on the validation set and correlates it with
+    input features (text lengths) to identify error patterns.
+    """
+    logger.info("Starting Failure Analysis...")
+
+    # Ensure model is in eval mode
+    model.eval()
+    device = Config.DEVICE
+
+    # Store losses
+    all_losses = []
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    # 1. Compute Loss per sample
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            targets = batch["labels"].to(device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(device)
+
+            logits = model(input_ids, attention_mask, token_type_ids)
+            # Calculate loss per sample (no reduction)
+            losses = criterion(logits, targets)
+            all_losses.extend(losses.cpu().numpy())
+
+    # 2. Load Validation Metadata to get features
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # --- 1. Configuration & Setup ---
+    # Override Config for Fast Baseline
+    Config.EPOCHS = 15  # Sufficient for MLP convergence on embeddings
+    Config.BATCH_SIZE = 512  # Increase batch size for A100 efficiency
+    Config.EARLY_STOPPING_PATIENCE = 3
+
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    logger.info("Pipeline configuration complete.")
+
+    # --- 2. Data Loading ---
+    # Load cached embeddings or compute them if missing
+    logger.info("Loading DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+
+    # --- 3. Model Initialization ---
+    # Input dimension = 5 vectors (Prompt, ResA, ResB, Diff, Prod) * Embedding Dim
+    input_dim = Config.EMBEDDING_DIM * 5
+    logger.info(f"Initializing ChatbotMLP with input dim: {input_dim}")
+
+    model = ChatbotMLP(
+        input_dim=input_dim,
+        hidden_layers=Config.HIDDEN_LAYERS,
+        dropout_rate=Config.DROPOUT_RATE,
+        num_classes=Config.NUM_CLASSES,
+    )
+
+    # --- 4. Training ---
+    trainer = ModelTrainer(model, train_loader, val_loader, test_loader)
+    trainer.train()
+=======
+def main():
+    # --- 1. Configuration & Setup ---
+    # Override Config for Fine-Tuning
+    Config.EPOCHS = 3 
+    Config.BATCH_SIZE = 8
+    Config.LEARNING_RATE = 2e-5
+    Config.EARLY_STOPPING_PATIENCE = 1
+
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    logger.info("Pipeline configuration complete.")
+
+    # --- 2. Data Loading ---
+    logger.info("Loading DataLoaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        batch_size=Config.BATCH_SIZE, load_cached_data=False
+    )
+
+    # --- 3. Model Initialization ---
+    logger.info(f"Initializing ChatbotTransformer: {Config.TRANSFORMER_MODEL}")
+    model = ChatbotTransformer()
+
+    # --- 4. Training ---
+    trainer = ModelTrainer(model, train_loader, val_loader, test_loader)
+    trainer.train()
+>>>>>>> REPLACE
+```

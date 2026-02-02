@@ -1,0 +1,338 @@
+The strategy involves optimizing the training pipeline by reverting to **Full-Dataset Cross-Validation** (Cite solution_lesson_node_00028) and disabling **Adversarial Weight Perturbation (AWP)** (Cite solution_lesson_node_00035).
+
+1.  **Full-Dataset CV**: The previous solution used a fixed hold-out set, which underutilized the available data (~20% less training data). By training on the full `input/train.csv` using 5-fold CV, we maximize the data available for the model to learn complex patterns.
+2.  **Disable AWP & Restore Epochs**: AWP was previously used with reduced epochs (2) to save time, but this degraded performance as AWP requires more iterations to converge. We disable AWP to improve training speed and restore the epoch count to 3 to ensure proper convergence of the DeBERTa-v3-Large model.
+3.  **OOF Evaluation**: We replace the hold-out validation logic in `runfile.py` with an Out-Of-Fold (OOF) evaluation loop. This ensures we generate unbiased predictions for the entire training set to calculate a reliable global Jaccard score.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Original input path (useful if concatenating train+val for full CV)
+    original_train_path = "./input/train.csv"
+
+    # Output paths
+    working_dir = "./working/idea_7/"
+=======
+    # Original input path (useful if concatenating train+val for full CV)
+    original_train_path = "./input/train.csv"
+
+    # Output paths
+    working_dir = "./working/idea_8/"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Training Hyperparameters ---
+    epochs = 3
+
+    # Batch Size Strategy:
+=======
+    # --- Training Hyperparameters ---
+    epochs = 3
+
+    # Batch Size Strategy:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Adversarial Weight Perturbation (AWP) ---
+    use_awp = True
+    awp_lr = 1e-4
+    awp_eps = 1e-4
+    # Enable AWP after the first epoch to ensure stable initialization.
+    # Epochs are 0-indexed, so 1 means starting at the second epoch.
+    awp_start_epoch = 1
+=======
+    # --- Adversarial Weight Perturbation (AWP) ---
+    use_awp = False
+    awp_lr = 1e-4
+    awp_eps = 1e-4
+    # Enable AWP after the first epoch to ensure stable initialization.
+    # Epochs are 0-indexed, so 1 means starting at the second epoch.
+    awp_start_epoch = 1
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config to use the metadata training split.
+    # This ensures that metadata/val.csv is treated as a true hold-out set.
+    Config.original_train_path = Config.train_metadata_path
+
+    # Optimization for Fast Baseline: Reduce epochs to 2.
+    # A100 is fast, but we want to ensure completion well within limits.
+    Config.epochs = 2
+
+    # Clear any existing cache to ensure the new training data is processed correctly.
+    # The cache is located in the working directory defined in Config.
+    print("Clearing data cache...")
+    cache_files = glob.glob(os.path.join(Config.working_dir, "cached_*"))
+    for f in cache_files:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+    # 2. Training Loop (5 Folds)
+    print(f"Starting Training on {Config.original_train_path}...")
+    for fold in range(Config.n_folds):
+        # train_fold handles data loading, model init, training, and saving best checkpoint
+        train_fold(fold)
+
+    # 3. Holdout Validation Evaluation
+    print("Starting Evaluation on Hold-out Validation Set...")
+
+    # Load the hold-out validation set
+    df_val = pd.read_csv(Config.val_metadata_path)
+
+    # Preprocess validation data
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+
+    input_ids_list = []
+    attention_mask_list = []
+    offsets_list = []
+    texts = df_val["text"].values.astype(str)
+
+    # Tokenize all validation texts
+    for text in texts:
+        # Normalize whitespace as done in training
+        text = " " + " ".join(text.split())
+        encoded = tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=Config.max_len,
+            padding="max_length",
+            truncation=True,
+            return_offsets_mapping=True,
+        )
+        input_ids_list.append(encoded["input_ids"])
+        attention_mask_list.append(encoded["attention_mask"])
+        offsets_list.append(encoded["offset_mapping"])
+
+    # Create Dataset and DataLoader for Validation
+    # We pass selected_texts to allow for later analysis, though not used in __getitem__ for test mode
+    val_dataset = TweetDataset(
+        input_ids=np.array(input_ids_list),
+        attention_mask=np.array(attention_mask_list),
+        texts=texts,
+        offsets=np.array(offsets_list),
+        sentiments=df_val["sentiment"].values,
+        selected_texts=df_val["selected_text"].values,
+        is_test=True,  # Use test mode to skip start/end position requirements
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.valid_batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Ensemble Inference on Validation Set
+    n_samples = len(df_val)
+    final_start_logits = np.zeros((n_samples, Config.max_len))
+    final_end_logits = np.zeros((n_samples, Config.max_len))
+
+    print("Running Ensemble Inference...")
+    for fold in range(Config.n_folds):
+        model_path = os.path.join(Config.working_dir, f"model_fold_{fold}.bin")
+
+        # Load Model
+        model = TweetModel(Config)
+        model.load_state_dict(torch.load(model_path, map_location=Config.device))
+        model.to(Config.device)
+        model.eval()
+
+        # Get Logits
+        _, (start_logits, end_logits) = eval_fn(val_loader, model, Config.device)
+
+        # Accumulate
+        final_start_logits += start_logits
+        final_end_logits += end_logits
+
+        # Cleanup
+        del model
+        torch.cuda.empty_cache()
+
+    # Average Logits
+    final_start_logits /= Config.n_folds
+    final_end_logits /= Config.n_folds
+
+    # Decode Predictions and Compute Metrics
+    predictions = []
+    scores = []
+
+    for i in range(n_samples):
+        sentiment = df_val.iloc[i]["sentiment"]
+        text = texts[i]
+        selected_text = str(df_val.iloc[i]["selected_text"])
+
+        # Deterministic Rule for Neutral
+        if sentiment == "neutral":
+            pred = text
+        else:
+            # Model Prediction for Positive/Negative
+            cleaned_text = " " + " ".join(text.split())
+            offsets = val_dataset.offsets[i]
+            pred = get_best_start_end_idxs(
+                final_start_logits[i], final_end_logits[i], cleaned_text, offsets
+            )
+
+        score = jaccard(pred, selected_text)
+        predictions.append(pred)
+        scores.append(score)
+
+    final_metric = np.mean(scores)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 4. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    df_val["jaccard"] = scores
+    df_val["error"] = 1.0 - df_val["jaccard"]
+    df_val["text_len"] = df_val["text"].apply(len)
+
+    # Map sentiment to numeric for correlation
+    sentiment_map = {"negative": -1, "neutral": 0, "positive": 1}
+    df_val["sentiment_code"] = df_val["sentiment"].map(sentiment_map)
+
+    # Calculate correlations
+    corr_len, _ = pearsonr(df_val["error"], df_val["text_len"])
+    corr_sent, _ = pearsonr(df_val["error"], df_val["sentiment_code"])
+
+    print(f"Correlation (Error vs Text Length): {corr_len:.4f}")
+    print(f"Correlation (Error vs Sentiment): {corr_sent:.4f}")
+=======
+    # Clear any existing cache to ensure the new training data is processed correctly.
+    # The cache is located in the working directory defined in Config.
+    print("Clearing data cache...")
+    cache_files = glob.glob(os.path.join(Config.working_dir, "cached_*"))
+    for f in cache_files:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+    # 2. Training Loop (5 Folds)
+    print(f"Starting Training on {Config.original_train_path}...")
+    for fold in range(Config.n_folds):
+        # train_fold handles data loading, model init, training, and saving best checkpoint
+        train_fold(fold)
+
+    # 3. Out-Of-Fold (OOF) Evaluation
+    print("Starting Out-Of-Fold (OOF) Evaluation...")
+    
+    # Load data needed for OOF
+    from library.dataset import get_data
+    from sklearn.model_selection import StratifiedKFold
+    
+    # Load filtered training data (pos/neg only)
+    # get_data handles loading/caching. Since we cleared cache, it will re-process Config.original_train_path
+    df_filtered, input_ids, attention_mask, _, _, offsets = get_data(load_cached_data=True)
+    
+    # Initialize OOF predictions container for the filtered dataset
+    oof_preds = [""] * len(df_filtered)
+    
+    # Setup StratifiedKFold to match training split
+    skf = StratifiedKFold(n_splits=Config.n_folds, shuffle=True, random_state=Config.seed)
+    
+    # Iterate through folds to generate predictions for validation sets
+    for fold, (_, val_idx) in enumerate(skf.split(df_filtered, df_filtered["sentiment"])):
+        print(f"Generating OOF predictions for Fold {fold}...")
+        
+        # Create Validation Dataset for this fold
+        val_dataset = TweetDataset(
+            input_ids=input_ids[val_idx],
+            attention_mask=attention_mask[val_idx],
+            texts=df_filtered.iloc[val_idx]["text"].values,
+            offsets=offsets[val_idx],
+            sentiments=df_filtered.iloc[val_idx]["sentiment"].values,
+            is_test=True 
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.valid_batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+        
+        # Load Model
+        model_path = os.path.join(Config.working_dir, f"model_fold_{fold}.bin")
+        model = TweetModel(Config)
+        model.load_state_dict(torch.load(model_path, map_location=Config.device))
+        model.to(Config.device)
+        model.eval()
+        
+        # Inference
+        _, (start_logits, end_logits) = eval_fn(val_loader, model, Config.device)
+        
+        # Decode
+        for i, idx in enumerate(val_idx):
+            text = val_dataset.texts[i]
+            off = val_dataset.offsets[i]
+            cleaned_text = " " + " ".join(str(text).split())
+            
+            pred = get_best_start_end_idxs(
+                start_logits[i], end_logits[i], cleaned_text, off
+            )
+            oof_preds[idx] = pred
+            
+        del model
+        torch.cuda.empty_cache()
+
+    # 4. Global Metric Calculation
+    # We need to combine OOF preds (pos/neg) with Neutral preds (identity)
+    print("Calculating Global Jaccard Score...")
+    
+    df_full = pd.read_csv(Config.original_train_path)
+    df_full.dropna(subset=["text", "selected_text", "sentiment"], inplace=True)
+    
+    # Create a mapping from textID to OOF prediction for pos/neg
+    # df_filtered is a subset of df_full. We use textID to map back.
+    df_filtered["oof_pred"] = oof_preds
+    pred_map = dict(zip(df_filtered["textID"], df_filtered["oof_pred"]))
+    
+    final_predictions = []
+    scores = []
+    
+    for i in range(len(df_full)):
+        row = df_full.iloc[i]
+        text_id = row["textID"]
+        sentiment = row["sentiment"]
+        text = str(row["text"])
+        selected_text = str(row["selected_text"])
+        
+        if sentiment == "neutral":
+            pred = text
+        else:
+            # Retrieve OOF prediction
+            # If textID not in map (dropped during preprocessing), fallback to text (or empty)
+            # Using text as fallback is safer for Jaccard than empty string
+            pred = pred_map.get(text_id, text) 
+            
+        score = jaccard(pred, selected_text)
+        final_predictions.append(pred)
+        scores.append(score)
+        
+    final_metric = np.mean(scores)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Create a temporary dataframe for analysis
+    df_analysis = df_full.copy()
+    df_analysis["jaccard"] = scores
+    df_analysis["error"] = 1.0 - df_analysis["jaccard"]
+    df_analysis["text_len"] = df_analysis["text"].apply(len)
+
+    # Map sentiment to numeric for correlation
+    sentiment_map = {"negative": -1, "neutral": 0, "positive": 1}
+    df_analysis["sentiment_code"] = df_analysis["sentiment"].map(sentiment_map)
+
+    # Calculate correlations
+    corr_len, _ = pearsonr(df_analysis["error"], df_analysis["text_len"])
+    corr_sent, _ = pearsonr(df_analysis["error"], df_analysis["sentiment_code"])
+
+    print(f"Correlation (Error vs Text Length): {corr_len:.4f}")
+    print(f"Correlation (Error vs Sentiment): {corr_sent:.4f}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,305 @@
+# Python Script for Metadata Generation
+```
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import random
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_FILE = "labels.csv"  # As per file listing
+TEST_FILE = "test.csv"
+RANDOM_STATE = 42
+VAL_SIZE = 0.2
+
+
+def check_file_paths(df, sample_size=1000):
+    """
+    Checks if any column looks like a file path relative to ./input.
+    If found, verifies a random sample of paths exists.
+    """
+    path_cols = []
+    # Heuristic: check string columns for 'input/' or common extensions
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        # Check first valid value
+        sample_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else ""
+        if isinstance(sample_val, str) and (
+            sample_val.startswith("input/") or sample_val.startswith("./input/")
+        ):
+            path_cols.append(col)
+
+    if not path_cols:
+        return
+
+    print(f"Checking file paths in columns: {path_cols}")
+    for col in path_cols:
+        paths = df[col].dropna().tolist()
+        if not paths:
+            continue
+
+        # Sample paths
+        n_check = min(len(paths), sample_size)
+        check_paths = random.sample(paths, n_check)
+
+        missing_count = 0
+        missing_samples = []
+
+        for p in check_paths:
+            # Resolve relative to current working directory (assuming paths are relative to root)
+            # or relative to input. The prompt says paths are relative to ./input.
+            # Usually metadata stores 'input/img.jpg'.
+            if not os.path.exists(p):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(p)
+
+        missing_ratio = missing_count / n_check
+        print(f"Column '{col}': Missing ratio = {missing_ratio:.4f}")
+
+        if missing_ratio > 0.5:
+            print("Sample missing paths:", missing_samples)
+            raise FileNotFoundError(f"More than 50% of files missing in column {col}")
+
+
+def generate_metadata():
+    print("Starting metadata generation...")
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    # --- Process Test Data ---
+    test_path = os.path.join(INPUT_DIR, TEST_FILE)
+    if os.path.exists(test_path):
+        print(f"Loading {TEST_FILE}...")
+        df_test = pd.read_csv(test_path)
+        test_out_path = os.path.join(METADATA_DIR, "test.parquet")
+        df_test.to_parquet(test_out_path, index=False)
+        print(f"Saved test metadata to {test_out_path} ({df_test.shape})")
+    else:
+        raise FileNotFoundError(f"{TEST_FILE} not found in {INPUT_DIR}")
+
+    # --- Process Training Data ---
+    train_path = os.path.join(INPUT_DIR, TRAIN_FILE)
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"{TRAIN_FILE} not found in {INPUT_DIR}")
+
+    print(f"Loading {TRAIN_FILE} (this may take a moment)...")
+    # Use pyarrow engine for faster reading of large CSVs
+    try:
+        df = pd.read_csv(train_path, engine="pyarrow")
+    except Exception as e:
+        print(f"PyArrow engine failed ({e}), falling back to default...")
+        df = pd.read_csv(train_path)
+
+    print(f"Loaded training data: {df.shape}")
+
+    # --- Stratified Split ---
+    print("Creating stratified split based on 'fare_amount'...")
+
+    # Create bins for continuous target stratification
+    # qcut divides into equal-sized buckets. duplicates='drop' handles dense values.
+    try:
+        df["stratify_bin"] = pd.qcut(
+            df["fare_amount"], q=20, labels=False, duplicates="drop"
+        )
+    except Exception as e:
+        print(f"Binning failed ({e}). Using random split without stratification.")
+        df["stratify_bin"] = 0
+
+    # Fill NaNs in bin (if any) to avoid split errors
+    df["stratify_bin"] = df["stratify_bin"].fillna(-1)
+
+    train_df, val_df = train_test_split(
+        df, test_size=VAL_SIZE, random_state=RANDOM_STATE, stratify=df["stratify_bin"]
+    )
+
+    # Clean up auxiliary column
+    train_df = train_df.drop(columns=["stratify_bin"])
+    val_df = val_df.drop(columns=["stratify_bin"])
+
+    # Save to Parquet
+    print("Saving train/val splits to metadata...")
+    train_df.to_parquet(os.path.join(METADATA_DIR, "train.parquet"), index=False)
+    val_df.to_parquet(os.path.join(METADATA_DIR, "val.parquet"), index=False)
+    print("Metadata generation finished.")
+
+
+def verify_metadata():
+    print("\n--- Verifying Metadata ---")
+
+    # Load generated metadata
+    try:
+        train_df = pd.read_parquet(os.path.join(METADATA_DIR, "train.parquet"))
+        val_df = pd.read_parquet(os.path.join(METADATA_DIR, "val.parquet"))
+        test_df = pd.read_parquet(os.path.join(METADATA_DIR, "test.parquet"))
+    except Exception as e:
+        raise AssertionError(f"Failed to load generated metadata files: {e}")
+
+    # 1. Summary Statistics
+    print(f"Train set shape: {train_df.shape}")
+    print(f"Val set shape:   {val_df.shape}")
+    print(f"Test set shape:  {test_df.shape}")
+
+    print("\nTrain Fare Amount Stats:")
+    print(train_df["fare_amount"].describe())
+    print("\nVal Fare Amount Stats:")
+    print(val_df["fare_amount"].describe())
+
+    # 2. Check File Paths
+    # (If columns contained paths like 'input/image_01.jpg', this would validate them)
+    check_file_paths(train_df)
+    check_file_paths(val_df)
+    check_file_paths(test_df)
+
+    # 3. Verify Split Requirements
+    total_samples = len(train_df) + len(val_df)
+    val_ratio = len(val_df) / total_samples
+    print(f"\nValidation Split Ratio: {val_ratio:.4f}")
+
+    # Assert split ratio is within small margin of 0.2
+    assert 0.199 < val_ratio < 0.201, f"Validation ratio {val_ratio} deviates from 0.2"
+
+    # 4. Verify Stratification
+    # Compare means of target variable
+    train_mean = train_df["fare_amount"].mean()
+    val_mean = val_df["fare_amount"].mean()
+
+    # Calculate relative difference
+    # We expect them to be very close due to stratification and large N
+    rel_diff = abs(train_mean - val_mean) / (abs(train_mean) + 1e-9)
+    print(f"Relative difference in mean fare_amount: {rel_diff:.6f}")
+
+    # Assert stratification success (tolerance 1%)
+    if rel_diff > 0.01:
+        raise AssertionError(
+            f"Stratification failed: Train mean {train_mean} vs Val mean {val_mean} differ significantly."
+        )
+
+    print("\nVerification passed successfully.")
+
+
+if __name__ == "__main__":
+    generate_metadata()
+    verify_metadata()
+
+```
+
+# Script Execution Output:
+Starting metadata generation...
+Loading test.csv...
+Saved test metadata to ./metadata/test.parquet ((9914, 7))
+Loading labels.csv (this may take a moment)...
+Loaded training data: (55413942, 8)
+Creating stratified split based on 'fare_amount'...
+Saving train/val splits to metadata...
+Metadata generation finished.
+
+--- Verifying Metadata ---
+Train set shape: (44331153, 8)
+Val set shape:   (11082789, 8)
+Test set shape:  (9914, 7)
+
+Train Fare Amount Stats:
+count    4.433115e+07
+mean     1.134512e+01
+std      2.066162e+01
+min     -3.000000e+02
+25%      6.000000e+00
+50%      8.500000e+00
+75%      1.250000e+01
+max      9.396336e+04
+Name: fare_amount, dtype: float64
+
+Val Fare Amount Stats:
+count    1.108279e+07
+mean     1.134462e+01
+std      2.091356e+01
+min     -8.000000e+01
+25%      6.000000e+00
+50%      8.500000e+00
+75%      1.250000e+01
+max      6.155086e+04
+Name: fare_amount, dtype: float64
+
+Validation Split Ratio: 0.2000
+Relative difference in mean fare_amount: 0.000044
+
+Verification passed successfully.
+Execution time: 4 minutes (time limit is an hour).
+
+# Document
+Based on the provided Python script and its execution output, here is the documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train.parquet`
+
+*   **Content and Purpose:**
+    *   This file contains the **training subset** of the original dataset (`labels.csv`). It represents approximately 80% of the total available labeled data (approx. 44.3 million rows).
+    *   It is used to train the machine learning model. The data has been stratified based on the `fare_amount` to ensure the distribution of the target variable matches the validation set.
+*   **Schema / Structure:**
+    *   **Format:** Parquet
+    *   **Columns:**
+        *   `key` (string): Unique identifier for the ride.
+        *   `fare_amount` (float): The target variable; cost of the ride.
+        *   `pickup_datetime` (string/timestamp): Start time of the ride.
+        *   `pickup_longitude` (float): Longitude of pickup location.
+        *   `pickup_latitude` (float): Latitude of pickup location.
+        *   `dropoff_longitude` (float): Longitude of dropoff location.
+        *   `dropoff_latitude` (float): Latitude of dropoff location.
+        *   `passenger_count` (int): Number of passengers.
+    *   **Example Row (Conceptual):**
+        ```json
+        {
+          "key": "2014-03-30 12:14:00.000000128",
+          "fare_amount": 4.5,
+          "pickup_datetime": "2014-03-30 12:14:00 UTC",
+          "pickup_longitude": -73.9884,
+          "pickup_latitude": 40.7745,
+          "dropoff_longitude": -73.9833,
+          "dropoff_latitude": 40.7676,
+          "passenger_count": 6
+        }
+        ```
+*   **Loading Method:**
+    *   Load using pandas with the pyarrow engine (optional but recommended for speed):
+        ```python
+        import pandas as pd
+        df_train = pd.read_parquet("./metadata/train.parquet")
+        ```
+
+### 2. `./metadata/val.parquet`
+
+*   **Content and Purpose:**
+    *   This file contains the **validation subset** of the original dataset (`labels.csv`). It represents approximately 20% of the total available labeled data (approx. 11.1 million rows).
+    *   It is used to evaluate the model's performance (calculate RMSE) during development to prevent overfitting. Like the training set, it was created using stratified splitting on `fare_amount`.
+*   **Schema / Structure:**
+    *   **Format:** Parquet
+    *   **Columns:** Identical to `./metadata/train.parquet` (includes the target `fare_amount`).
+        *   `key`, `fare_amount`, `pickup_datetime`, `pickup_longitude`, `pickup_latitude`, `dropoff_longitude`, `dropoff_latitude`, `passenger_count`.
+*   **Loading Method:**
+    *   Load using pandas:
+        ```python
+        import pandas as pd
+        df_val = pd.read_parquet("./metadata/val.parquet")
+        ```
+
+### 3. `./metadata/test.parquet`
+
+*   **Content and Purpose:**
+    *   This file contains the **test dataset** converted from the raw `test.csv` input. It contains approximately 10,000 rows.
+    *   It serves as the input for generating the final submission predictions. It does **not** contain the `fare_amount` target column.
+*   **Schema / Structure:**
+    *   **Format:** Parquet
+    *   **Columns:**
+        *   `key` (string): Unique identifier.
+        *   `pickup_datetime` (string/timestamp): Start time of the ride.
+        *   `pickup_longitude` (float): Longitude of pickup location.
+        *   `pickup_latitude` (float): Latitude of pickup location.
+        *   `dropoff_longitude` (float): Longitude of dropoff location.
+        *   `dropoff_latitude` (float): Latitude of dropoff location.
+        *   `passenger_count` (int): Number of passengers.
+*   **Loading Method:**
+    *   Load using pandas:
+        ```python
+        import pandas as pd
+        df_test = pd.read_parquet("./metadata/test.parquet")
+        ```

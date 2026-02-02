@@ -1,0 +1,593 @@
+Based on the analysis of the previous solution and the provided lessons, the performance degradation in the previous run (Validation Score: 0.397) compared to the best historical run (Validation Score: 0.408) is primarily attributed to the architectural switch from a **Dual-Encoder (Siamese)** to a **Cross-Encoder** with partitioned pooling. As detailed in **Lesson `solution_lesson_node_00030`**, the Cross-Encoder approach introduces "context leakage" where the Answer content influences the Question representation, adding noise to the prediction of intrinsic Question labels.
+
+To optimize performance, I will revert to the **Dual-Encoder architecture** using `distilroberta-base` as the backbone (Cite `solution_lesson_node_00008`, `solution_lesson_node_00023`). This model will process the Question and Answer independently to preserve feature purity. I will employ **Hybrid Pooling** (Average + Max) (Cite `solution_lesson_node_00003`) and compute explicit **interaction heuristics** (element-wise product and absolute difference) specifically on the Average-pooled representations (Cite `solution_lesson_node_00007`). The fused features will be normalized via **Layer Normalization** (Cite `solution_lesson_node_00009`) and passed to a **Non-Linear MLP head** (Cite `solution_lesson_node_00027`). I will maintain the optimized training configuration: **Batch Size 16** (Cite `solution_lesson_node_00012`), **Differential Learning Rates** (Cite `solution_lesson_node_00015`), and **Parameter-Grouped Weight Decay** (Cite `solution_lesson_node_00018`).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Paths
+    # ==========================================
+    # Base directories
+    input_dir = "./input"
+    metadata_dir = "./metadata"
+    working_dir = "./working/idea_6"
+    submission_dir = "./submission"
+=======
+    # ==========================================
+    # Paths
+    # ==========================================
+    # Base directories
+    input_dir = "./input"
+    metadata_dir = "./metadata"
+    working_dir = "./working/idea_7"
+    submission_dir = "./submission"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    model_name = "microsoft/deberta-v3-small"
+    hidden_size = 768  # Hidden size for deberta-v3-small
+    num_classes = 30  # Number of target labels
+    max_len = 512  # Maximum sequence length
+
+    # Architecture Specifics (Idea 6)
+    use_partitioned_pooling = (
+        True  # Masked Global Avg + Max Pooling for Q and A separately
+    )
+    use_interaction_fusion = True  # Include interaction terms (u*v, |u-v|)
+    use_nonlinear_head = (
+        True  # Use MLP (Linear-GELU-Dropout-Linear) instead of simple Linear
+    )
+=======
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    model_name = "distilroberta-base"
+    hidden_size = 768  # Hidden size for distilroberta-base
+    num_classes = 30  # Number of target labels
+    max_len = 256  # Max length per tower (Q and A processed separately)
+
+    # Architecture Specifics (Idea 7 - Dual Encoder)
+    use_interaction_fusion = True  # Include interaction terms (u*v, |u-v|)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def process_text_data(df, tokenizer, target_cols=None, is_test=False):
+    """
+    Tokenizes text data and generates specific masks for questions and answers.
+    """
+    # 1. Prepare Text
+    # Concatenate title and body for the question part
+    questions = (
+        df[Config.question_title_col].fillna("")
+        + " "
+        + df[Config.question_body_col].fillna("")
+    ).tolist()
+    answers = df[Config.answer_col].fillna("").tolist()
+
+    # 2. Tokenize
+    # We tokenize pairs (question, answer) to get [CLS] Q [SEP] A [SEP]
+    # return_token_type_ids=True is default for many, but we rely on sequence_ids() for robustness
+    encodings = tokenizer(
+        questions,
+        answers,
+        truncation=True,
+        max_length=Config.max_len,
+        padding=False,  # We pad dynamically in Collate
+        add_special_tokens=True,
+    )
+
+    # 3. Process into list of dicts for DataFrame storage
+    processed_samples = []
+
+    # Pre-fetch labels if not test
+    if not is_test and target_cols is not None:
+        labels = df[target_cols].values.astype(np.float32)
+
+    qa_ids = df[Config.qa_id_col].values
+
+    for i in range(len(questions)):
+        input_ids = encodings.input_ids[i]
+
+        # Generate Partition Masks using sequence_ids
+        # sequence_ids: None (special), 0 (question), 1 (answer)
+        seq_ids = encodings.sequence_ids(i)
+
+        # Create binary masks
+        # question_mask: 1 where token belongs to Question (seq_id=0), else 0
+        question_mask = [1 if s == 0 else 0 for s in seq_ids]
+
+        # answer_mask: 1 where token belongs to Answer (seq_id=1), else 0
+        answer_mask = [1 if s == 1 else 0 for s in seq_ids]
+
+        # Standard attention mask (1 for all real tokens)
+        attention_mask = [1] * len(input_ids)
+
+        sample = {
+            "qa_id": qa_ids[i],
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "question_mask": question_mask,
+            "answer_mask": answer_mask,
+        }
+
+        if not is_test:
+            sample["labels"] = labels[i]
+
+        processed_samples.append(sample)
+
+    return processed_samples
+=======
+def process_text_data(df, tokenizer, target_cols=None, is_test=False):
+    """
+    Tokenizes text data separately for Question and Answer (Dual Encoder approach).
+    """
+    # 1. Prepare Text
+    questions = (
+        df[Config.question_title_col].fillna("")
+        + " "
+        + df[Config.question_body_col].fillna("")
+    ).tolist()
+    answers = df[Config.answer_col].fillna("").tolist()
+
+    # 2. Tokenize Separately
+    # Question Encoding
+    q_encodings = tokenizer(
+        questions,
+        truncation=True,
+        max_length=Config.max_len,
+        padding=False,
+        add_special_tokens=True,
+    )
+
+    # Answer Encoding
+    a_encodings = tokenizer(
+        answers,
+        truncation=True,
+        max_length=Config.max_len,
+        padding=False,
+        add_special_tokens=True,
+    )
+
+    # 3. Process into list of dicts
+    processed_samples = []
+
+    if not is_test and target_cols is not None:
+        labels = df[target_cols].values.astype(np.float32)
+
+    qa_ids = df[Config.qa_id_col].values
+
+    for i in range(len(questions)):
+        sample = {
+            "qa_id": qa_ids[i],
+            "input_ids_q": q_encodings.input_ids[i],
+            "attention_mask_q": q_encodings.attention_mask[i],
+            "input_ids_a": a_encodings.input_ids[i],
+            "attention_mask_a": a_encodings.attention_mask[i],
+        }
+
+        if not is_test:
+            sample["labels"] = labels[i]
+
+        processed_samples.append(sample)
+
+    return processed_samples
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class QUESTDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+
+        # Convert lists to numpy arrays or tensors usually happens in collate or here
+        # Returning raw lists/arrays here, Collate will tensorize and pad
+        return {
+            "qa_id": item["qa_id"],
+            "input_ids": item["input_ids"],
+            "attention_mask": item["attention_mask"],
+            "question_mask": item["question_mask"],
+            "answer_mask": item["answer_mask"],
+            "labels": item.get("labels", None),
+        }
+
+
+class Collate:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = 0  # Fallback
+
+    def __call__(self, batch):
+        # Extract fields
+        qa_ids = [item["qa_id"] for item in batch]
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        question_mask = [item["question_mask"] for item in batch]
+        answer_mask = [item["answer_mask"] for item in batch]
+
+        # Check if labels exist
+        has_labels = batch[0]["labels"] is not None
+        labels = [item["labels"] for item in batch] if has_labels else None
+
+        # Dynamic Padding
+        # Find max length in this batch
+        max_len = max(len(ids) for ids in input_ids)
+
+        # Helper to pad list of lists
+        def pad_sequence(sequences, pad_value, max_len):
+            padded = np.full((len(sequences), max_len), pad_value, dtype=np.int64)
+            for i, seq in enumerate(sequences):
+                padded[i, : len(seq)] = seq
+            return torch.tensor(padded)
+
+        # Pad inputs
+        input_ids_tensor = pad_sequence(input_ids, self.pad_token_id, max_len)
+        attention_mask_tensor = pad_sequence(attention_mask, 0, max_len)
+
+        # Pad custom masks with 0 (inactive)
+        question_mask_tensor = pad_sequence(question_mask, 0, max_len)
+        answer_mask_tensor = pad_sequence(answer_mask, 0, max_len)
+
+        batch_out = {
+            "qa_ids": torch.tensor(qa_ids, dtype=torch.long),
+            "input_ids": input_ids_tensor,
+            "attention_mask": attention_mask_tensor,
+            "question_mask": question_mask_tensor,
+            "answer_mask": answer_mask_tensor,
+        }
+
+        if has_labels:
+            # Labels are fixed size 30, no padding needed, just stack
+            # Ensure they are float32 tensors
+            # Convert list of arrays to single tensor
+            labels_tensor = torch.tensor(np.array(labels), dtype=torch.float32)
+            batch_out["labels"] = labels_tensor
+
+        return batch_out
+=======
+class QUESTDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            "qa_id": item["qa_id"],
+            "input_ids_q": item["input_ids_q"],
+            "attention_mask_q": item["attention_mask_q"],
+            "input_ids_a": item["input_ids_a"],
+            "attention_mask_a": item["attention_mask_a"],
+            "labels": item.get("labels", None),
+        }
+
+
+class Collate:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = 0
+
+    def __call__(self, batch):
+        qa_ids = [item["qa_id"] for item in batch]
+        input_ids_q = [item["input_ids_q"] for item in batch]
+        attention_mask_q = [item["attention_mask_q"] for item in batch]
+        input_ids_a = [item["input_ids_a"] for item in batch]
+        attention_mask_a = [item["attention_mask_a"] for item in batch]
+
+        has_labels = batch[0]["labels"] is not None
+        labels = [item["labels"] for item in batch] if has_labels else None
+
+        def pad_sequence(sequences, pad_value):
+            max_len = max(len(seq) for seq in sequences)
+            padded = np.full((len(sequences), max_len), pad_value, dtype=np.int64)
+            for i, seq in enumerate(sequences):
+                padded[i, : len(seq)] = seq
+            return torch.tensor(padded)
+
+        batch_out = {
+            "qa_ids": torch.tensor(qa_ids, dtype=torch.long),
+            "input_ids_q": pad_sequence(input_ids_q, self.pad_token_id),
+            "attention_mask_q": pad_sequence(attention_mask_q, 0),
+            "input_ids_a": pad_sequence(input_ids_a, self.pad_token_id),
+            "attention_mask_a": pad_sequence(attention_mask_a, 0),
+        }
+
+        if has_labels:
+            labels_tensor = torch.tensor(np.array(labels), dtype=torch.float32)
+            batch_out["labels"] = labels_tensor
+
+        return batch_out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def _pool(self, last_hidden_state, mask, pool_type="avg"):
+        """
+        Args:
+            last_hidden_state: (Batch, Seq, Hidden)
+            mask: (Batch, Seq) - Binary mask (1 for valid, 0 for ignore)
+            pool_type: 'avg' or 'max'
+        """
+        # Expand mask to (Batch, Seq, 1) for broadcasting
+        mask_expanded = mask.unsqueeze(-1).float()
+
+        if pool_type == "avg":
+            # Sum of embeddings
+            sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
+            # Count of tokens (clamp to avoid div by zero)
+            sum_mask = torch.sum(mask_expanded, dim=1)
+            sum_mask = torch.clamp(sum_mask, min=1e-9)
+            return sum_embeddings / sum_mask
+
+        elif pool_type == "max":
+            # Fill masked positions with very small number
+            # mask == 0 means ignore
+            input_masked = last_hidden_state.masked_fill(mask_expanded == 0, -1e9)
+            max_embeddings = torch.max(input_masked, dim=1)[0]
+            return max_embeddings
+
+        else:
+            raise ValueError("Invalid pool_type")
+
+    def forward(self, input_ids, attention_mask, question_mask, answer_mask, **kwargs):
+        # Backbone Output
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state  # (Batch, Seq, Hidden)
+
+        # Partitioned Pooling
+        # Question Representation
+        q_avg = self._pool(last_hidden_state, question_mask, "avg")
+        q_max = self._pool(last_hidden_state, question_mask, "max")
+
+        # Answer Representation
+        a_avg = self._pool(last_hidden_state, answer_mask, "avg")
+        a_max = self._pool(last_hidden_state, answer_mask, "max")
+
+        # Interaction Terms (based on Avg pooling)
+        interaction_prod = q_avg * a_avg
+        interaction_diff = torch.abs(q_avg - a_avg)
+
+        # Fusion
+        fused_vector = torch.cat(
+            [q_avg, q_max, a_avg, a_max, interaction_prod, interaction_diff], dim=1
+        )
+
+        # Normalize
+        fused_vector = self.layer_norm(fused_vector)
+
+        # MLP Head
+        # 1. Projection + Activation
+        features = self.head_projection(fused_vector)
+        features = self.activation(features)
+
+        # 2. Multi-Sample Dropout + Final Regression
+        logits_list = []
+        for dropout in self.dropouts:
+            dropped_features = dropout(features)
+            logits_list.append(self.regressor(dropped_features))
+
+        # Average logits across dropout samples
+        logits = torch.mean(torch.stack(logits_list), dim=0)
+
+        return logits
+=======
+    def _pool(self, last_hidden_state, attention_mask):
+        """
+        Returns both Avg and Max pooling.
+        Args:
+            last_hidden_state: (Batch, Seq, Hidden)
+            attention_mask: (Batch, Seq)
+        """
+        mask_expanded = attention_mask.unsqueeze(-1).float()
+
+        # Avg Pooling
+        sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
+        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+        avg_pool = sum_embeddings / sum_mask
+
+        # Max Pooling
+        # Mask out padding with large negative value
+        input_masked = last_hidden_state.masked_fill(mask_expanded == 0, -1e9)
+        max_pool = torch.max(input_masked, dim=1)[0]
+
+        return avg_pool, max_pool
+
+    def forward(self, input_ids_q, attention_mask_q, input_ids_a, attention_mask_a, **kwargs):
+        # Process Question
+        out_q = self.backbone(input_ids=input_ids_q, attention_mask=attention_mask_q)
+        q_avg, q_max = self._pool(out_q.last_hidden_state, attention_mask_q)
+
+        # Process Answer
+        out_a = self.backbone(input_ids=input_ids_a, attention_mask=attention_mask_a)
+        a_avg, a_max = self._pool(out_a.last_hidden_state, attention_mask_a)
+
+        # Interaction Terms (Cite solution_lesson_node_00007: Use Avg for interactions)
+        interaction_prod = q_avg * a_avg
+        interaction_diff = torch.abs(q_avg - a_avg)
+
+        # Fusion
+        fused_vector = torch.cat(
+            [q_avg, q_max, a_avg, a_max, interaction_prod, interaction_diff], dim=1
+        )
+
+        # Normalize (Cite solution_lesson_node_00009)
+        fused_vector = self.layer_norm(fused_vector)
+
+        # MLP Head (Cite solution_lesson_node_00027)
+        features = self.head_projection(fused_vector)
+        features = self.activation(features)
+
+        # Multi-Sample Dropout + Final Regression
+        logits_list = []
+        for dropout in self.dropouts:
+            dropped_features = dropout(features)
+            logits_list.append(self.regressor(dropped_features))
+
+        logits = torch.mean(torch.stack(logits_list), dim=0)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for step, batch in enumerate(train_loader):
+        # Unpack batch
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        question_mask = batch["question_mask"].to(device)
+        answer_mask = batch["answer_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        batch_size = labels.size(0)
+
+        # Forward
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            question_mask=question_mask,
+            answer_mask=answer_mask,
+        )
+=======
+    for step, batch in enumerate(train_loader):
+        # Unpack batch
+        input_ids_q = batch["input_ids_q"].to(device)
+        attention_mask_q = batch["attention_mask_q"].to(device)
+        input_ids_a = batch["input_ids_a"].to(device)
+        attention_mask_a = batch["attention_mask_a"].to(device)
+        labels = batch["labels"].to(device)
+
+        batch_size = labels.size(0)
+
+        # Forward
+        logits = model(
+            input_ids_q=input_ids_q,
+            attention_mask_q=attention_mask_q,
+            input_ids_a=input_ids_a,
+            attention_mask_a=attention_mask_a,
+        )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for step, batch in enumerate(val_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            question_mask = batch["question_mask"].to(device)
+            answer_mask = batch["answer_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            batch_size = labels.size(0)
+
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                question_mask=question_mask,
+                answer_mask=answer_mask,
+            )
+=======
+    with torch.no_grad():
+        for step, batch in enumerate(val_loader):
+            input_ids_q = batch["input_ids_q"].to(device)
+            attention_mask_q = batch["attention_mask_q"].to(device)
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            labels = batch["labels"].to(device)
+
+            batch_size = labels.size(0)
+
+            logits = model(
+                input_ids_q=input_ids_q,
+                attention_mask_q=attention_mask_q,
+                input_ids_a=input_ids_a,
+                attention_mask_a=attention_mask_a,
+            )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for step, batch in enumerate(test_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            question_mask = batch["question_mask"].to(device)
+            answer_mask = batch["answer_mask"].to(device)
+            qa_ids = batch["qa_ids"]
+
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                question_mask=question_mask,
+                answer_mask=answer_mask,
+            )
+=======
+    with torch.no_grad():
+        for step, batch in enumerate(test_loader):
+            input_ids_q = batch["input_ids_q"].to(device)
+            attention_mask_q = batch["attention_mask_q"].to(device)
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            qa_ids = batch["qa_ids"]
+
+            logits = model(
+                input_ids_q=input_ids_q,
+                attention_mask_q=attention_mask_q,
+                input_ids_a=input_ids_a,
+                attention_mask_a=attention_mask_a,
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            question_mask = batch["question_mask"].to(device)
+            answer_mask = batch["answer_mask"].to(device)
+            labels = batch["labels"].to(device)
+            qa_ids = batch["qa_ids"]
+
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                question_mask=question_mask,
+                answer_mask=answer_mask,
+            )
+=======
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids_q = batch["input_ids_q"].to(device)
+            attention_mask_q = batch["attention_mask_q"].to(device)
+            input_ids_a = batch["input_ids_a"].to(device)
+            attention_mask_a = batch["attention_mask_a"].to(device)
+            labels = batch["labels"].to(device)
+            qa_ids = batch["qa_ids"]
+
+            logits = model(
+                input_ids_q=input_ids_q,
+                attention_mask_q=attention_mask_q,
+                input_ids_a=input_ids_a,
+                attention_mask_a=attention_mask_a,
+            )
+>>>>>>> REPLACE
+```

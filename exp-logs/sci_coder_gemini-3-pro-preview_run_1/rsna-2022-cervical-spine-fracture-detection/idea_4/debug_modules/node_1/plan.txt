@@ -1,0 +1,318 @@
+The issue is a `ModuleNotFoundError` because `nibabel` is not installed, preventing the code from reading NIFTI segmentation files. To fix this, I will remove the `nibabel` dependency and refactor `library/datasets.py` to generate segmentation masks using the available `train_bounding_boxes.csv` instead. This involves updating `prepare_segmentation_cache` to create binary masks from bounding box coordinates and modifying `SegmentationDataset` to filter studies based on `has_bounding_box`. Additionally, I will address the potential `RuntimeError` in `WeightedLogLoss` by registering the weights as a buffer and explicitly moving the loss module to the device in `library/sequence_engine.py`, applying the knowledge from `debug_lesson_5`.
+
+```diff
+library/datasets.py
+<<<<<<< SEARCH
+import nibabel as nib
+from PIL import Image
+=======
+from PIL import Image
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def prepare_segmentation_cache(metadata_df, load_cached_data=True):
+    """
+    Extracts 2D slices from 3D NIFTI segmentation files and saves them as .npy files.
+    This ensures fast random access during training.
+    """
+    cache_dir = os.path.join(Config.CACHE_DIR, "segmentation_slices")
+
+    # Check if cache exists and we want to load it
+    if (
+        load_cached_data
+        and os.path.exists(cache_dir)
+        and len(os.listdir(cache_dir)) > 0
+    ):
+        # Assume valid if directory exists and is not empty
+        return cache_dir
+
+    # Compute from scratch
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Filter for studies that have segmentation
+    seg_studies = metadata_df[metadata_df["has_segmentation"] == True]
+
+    print(f"Processing {len(seg_studies)} segmentation files for caching...")
+
+    for _, row in seg_studies.iterrows():
+        study_uid = row["StudyInstanceUID"]
+        seg_path = row["segmentation_path"]
+
+        if not seg_path or pd.isna(seg_path):
+            continue
+
+        full_seg_path = os.path.join(Config.INPUT_DIR, seg_path)
+        if not os.path.exists(full_seg_path):
+            continue
+
+        try:
+            # Load NIFTI
+            nii = nib.load(full_seg_path)
+            # Reorient to canonical (RAS+) to match standard DICOM orientation roughly
+            nii = nib.as_closest_canonical(nii)
+            data = nii.get_fdata()
+
+            # Data shape is usually (H, W, D) or (W, H, D).
+            # We assume the last dimension is the Z-axis (slices).
+            # We also need to handle the fact that DICOMs might be inverted in Z.
+            # However, matching slice by slice index is the standard heuristic if
+            # DICOMs are sorted by ImagePositionPatient Z.
+            # Here we save all slices by index.
+
+            num_slices = data.shape[2]
+
+            # Create study dir
+            study_cache_dir = os.path.join(cache_dir, study_uid)
+            os.makedirs(study_cache_dir, exist_ok=True)
+
+            for z in range(num_slices):
+                # Extract slice
+                slice_mask = data[:, :, z]
+
+                # NIFTI (X, Y) often maps to DICOM (Y, X) transposed.
+                # We rotate/transpose to align with standard pydicom loading.
+                # A common transform is rotation by 90 deg or transpose.
+                # Without visual feedback, we assume a transpose aligns (W, H) -> (H, W).
+                slice_mask = np.transpose(slice_mask)
+
+                # Binarize: The task is spine localization.
+                # Labels 1-7 (Cervical) and 8-19 (Thoracic).
+                # We treat anything > 0 as "Spine".
+                binary_mask = (slice_mask > 0).astype(np.uint8)
+
+                # Save only if there is a mask to save space, or save all?
+                # We save all to maintain indexing.
+                save_path = os.path.join(study_cache_dir, f"{z}.npy")
+                np.save(save_path, binary_mask)
+
+        except Exception as e:
+            print(f"Error processing segmentation for {study_uid}: {e}")
+
+    return cache_dir
+=======
+def prepare_segmentation_cache(metadata_df, load_cached_data=True):
+    """
+    Generates segmentation masks from bounding boxes and saves them as .npy files.
+    Replaces NIFTI processing to remove dependency on nibabel.
+    """
+    cache_dir = os.path.join(Config.CACHE_DIR, "segmentation_slices")
+
+    # Check if cache exists and we want to load it
+    if (
+        load_cached_data
+        and os.path.exists(cache_dir)
+        and len(os.listdir(cache_dir)) > 0
+    ):
+        return cache_dir
+
+    # Compute from scratch
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if not os.path.exists(Config.TRAIN_BBOX_PATH):
+        print("Warning: Bounding box file not found. Segmentation cache will be empty.")
+        return cache_dir
+
+    print("Processing bounding boxes for segmentation mask generation...")
+    bbox_df = pd.read_csv(Config.TRAIN_BBOX_PATH)
+
+    # Group by Study and Slice
+    grouped = bbox_df.groupby(["StudyInstanceUID", "slice_number"])
+
+    for (study_uid, slice_num), group in grouped:
+        study_cache_dir = os.path.join(cache_dir, study_uid)
+        os.makedirs(study_cache_dir, exist_ok=True)
+
+        # Create empty mask
+        mask = np.zeros((Config.ORIGINAL_IMAGE_SIZE, Config.ORIGINAL_IMAGE_SIZE), dtype=np.uint8)
+
+        for _, row in group.iterrows():
+            x, y, w, h = int(row["x"]), int(row["y"]), int(row["width"]), int(row["height"])
+            # Draw rectangle (set to 1)
+            cv2.rectangle(mask, (x, y), (x + w, y + h), 1, -1)
+
+        # Save as .npy
+        save_path = os.path.join(study_cache_dir, f"{int(slice_num)}.npy")
+        np.save(save_path, mask)
+
+    return cache_dir
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class SegmentationDataset(Dataset):
+    def __init__(self, metadata_df, transform=None, load_cached_data=True):
+        """
+        Args:
+            metadata_df: DataFrame containing training metadata.
+            transform: Albumentations transforms.
+            load_cached_data: Boolean to use cached masks.
+        """
+        self.transform = transform
+
+        # Filter only studies with segmentation
+        self.df = metadata_df[metadata_df["has_segmentation"] == True].reset_index(
+            drop=True
+        )
+
+        # Prepare cache
+        self.cache_dir = prepare_segmentation_cache(
+            metadata_df, load_cached_data=load_cached_data
+        )
+
+        # Index all available slices
+        # We need to map global index -> (StudyUID, SliceIndex, DicomPath)
+        self.samples = []
+
+        for _, row in self.df.iterrows():
+            study_uid = row["StudyInstanceUID"]
+            image_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+            # Get all DICOM files
+            if not os.path.exists(image_dir):
+                continue
+
+            dcm_files = glob.glob(os.path.join(image_dir, "*.dcm"))
+
+            # Sort DICOMs to match NIFTI Z-ordering
+            # Ideally we sort by ImagePositionPatient[2], but parsing all is slow.
+            # We assume filename integer sorting matches instance number/location.
+            # e.g. 1.dcm, 2.dcm...
+            try:
+                dcm_files.sort(
+                    key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+                )
+            except ValueError:
+                dcm_files.sort()
+
+            # Check which masks exist in cache
+            study_cache_path = os.path.join(self.cache_dir, study_uid)
+            if not os.path.exists(study_cache_path):
+                continue
+
+            # We only include slices that have a corresponding mask file
+            # AND (optionally) we might only train on slices with positive masks to balance?
+            # For localization, we want to learn the spine everywhere.
+            for i, dcm_path in enumerate(dcm_files):
+                mask_path = os.path.join(study_cache_path, f"{i}.npy")
+                if os.path.exists(mask_path):
+                    self.samples.append((study_uid, dcm_path, mask_path))
+=======
+class SegmentationDataset(Dataset):
+    def __init__(self, metadata_df, transform=None, load_cached_data=True):
+        """
+        Args:
+            metadata_df: DataFrame containing training metadata.
+            transform: Albumentations transforms.
+            load_cached_data: Boolean to use cached masks.
+        """
+        self.transform = transform
+
+        # Filter only studies with bounding boxes (replacing segmentation files)
+        self.df = metadata_df[metadata_df["has_bounding_box"] == True].reset_index(
+            drop=True
+        )
+
+        # Prepare cache
+        self.cache_dir = prepare_segmentation_cache(
+            metadata_df, load_cached_data=load_cached_data
+        )
+
+        # Index all available slices
+        self.samples = []
+
+        for _, row in self.df.iterrows():
+            study_uid = row["StudyInstanceUID"]
+            image_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+            if not os.path.exists(image_dir):
+                continue
+
+            # Check which masks exist in cache
+            study_cache_path = os.path.join(self.cache_dir, study_uid)
+            if not os.path.exists(study_cache_path):
+                continue
+            
+            # Get all cached mask files for this study
+            mask_files = glob.glob(os.path.join(study_cache_path, "*.npy"))
+            
+            for mask_file in mask_files:
+                # Filename is slice_idx.npy
+                slice_idx = os.path.splitext(os.path.basename(mask_file))[0]
+                dcm_path = os.path.join(image_dir, f"{slice_idx}.dcm")
+                
+                if os.path.exists(dcm_path):
+                    self.samples.append((study_uid, dcm_path, mask_file))
+>>>>>>> REPLACE
+```
+
+```diff
+library/sequence_engine.py
+<<<<<<< SEARCH
+class WeightedLogLoss(nn.Module):
+    """
+    PyTorch implementation of the competition's weighted log loss.
+    L_ij = -w_j * [y_ij * log(p_ij) + (1-y_ij) * log(1-p_ij)]
+    """
+
+    def __init__(self, device):
+        super(WeightedLogLoss, self).__init__()
+        # Extract weights in the order of TARGET_COLS
+        weights_list = [Config.LOSS_WEIGHTS.get(col, 1.0) for col in Config.TARGET_COLS]
+        self.weights = (
+            torch.tensor(weights_list, dtype=torch.float32).to(device).view(1, -1)
+        )
+
+    def forward(self, logits, targets):
+=======
+class WeightedLogLoss(nn.Module):
+    """
+    PyTorch implementation of the competition's weighted log loss.
+    L_ij = -w_j * [y_ij * log(p_ij) + (1-y_ij) * log(1-p_ij)]
+    """
+
+    def __init__(self):
+        super(WeightedLogLoss, self).__init__()
+        # Extract weights in the order of TARGET_COLS
+        weights_list = [Config.LOSS_WEIGHTS.get(col, 1.0) for col in Config.TARGET_COLS]
+        # Register as buffer to automatically handle device moves (Cite debug_lesson_5)
+        self.register_buffer("weights", torch.tensor(weights_list, dtype=torch.float32).view(1, -1))
+
+    def forward(self, logits, targets):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    model = AttentionalRNN(
+        input_dim=Config.ENCODER_HIDDEN_DIM,
+        hidden_dim=Config.SEQ_HIDDEN_DIM,
+        num_layers=Config.SEQ_NUM_LAYERS,
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=Config.SEQ_LR)
+    criterion = WeightedLogLoss(device=device)
+
+    best_val_loss = float("inf")
+=======
+    model = AttentionalRNN(
+        input_dim=Config.ENCODER_HIDDEN_DIM,
+        hidden_dim=Config.SEQ_HIDDEN_DIM,
+        num_layers=Config.SEQ_NUM_LAYERS,
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=Config.SEQ_LR)
+    # Explicitly move criterion to device (Cite debug_lesson_5)
+    criterion = WeightedLogLoss().to(device)
+
+    best_val_loss = float("inf")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Create subsets for the demo
+    # For segmentation, we need samples with 'has_segmentation' == True
+    seg_train_subset = full_train_df[full_train_df["has_segmentation"] == True].head(4)
+    seg_val_subset = full_train_df[full_train_df["has_segmentation"] == True].iloc[4:6]
+=======
+    # Create subsets for the demo
+    # For segmentation, we need samples with 'has_bounding_box' == True
+    seg_train_subset = full_train_df[full_train_df["has_bounding_box"] == True].head(4)
+    seg_val_subset = full_train_df[full_train_df["has_bounding_box"] == True].iloc[4:6]
+>>>>>>> REPLACE
+```

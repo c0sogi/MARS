@@ -1,0 +1,948 @@
+To optimize the performance of the crystal property prediction model, I will implement the following changes based on the provided lessons:
+
+1.  **Architecture Simplification & Capacity Increase**: I will replace the `ACSRNet` (which used a dual-stream architecture) with a pure **Crystal Graph Convolutional Neural Network (CGCNN)**. Lesson `solution_lesson_node_00040` indicates that implicit compositional encoding in wide GNNs is superior to explicit residual architectures. Consequently, I will increase the `EMBEDDING_DIM` from 64 to 128 (Cite `solution_lesson_node_00039`) to maximize the structural encoder's capacity.
+2.  **Decoupled Prediction Heads**: I will implement separate Multi-Layer Perceptron (MLP) heads for predicting formation energy and bandgap energy, rather than sharing the final layers. This prevents task interference and allows the model to specialize features for each target (Cite `solution_lesson_node_00039`).
+3.  **Improved Non-Linearity**: I will modify the `CGCNNConv` layer to apply a Softplus activation function *after* the residual addition, ensuring the network retains its expressive power across depth (Cite `solution_lesson_node_00041`).
+4.  **Workflow Updates**: I will update the training and prediction scripts to remove the processing of explicit composition features, as the GNN will now handle this implicitly.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Dimension of node embeddings and hidden layers
+EMBEDDING_DIM = 64
+
+# Number of Graph Convolution layers (CGCNN blocks)
+=======
+# Dimension of node embeddings and hidden layers
+# Increased to 128 to maximize capacity (Cite solution_lesson_node_00039)
+EMBEDDING_DIM = 128
+
+# Number of Graph Convolution layers (CGCNN blocks)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CompositionalMLP(nn.Module):
+    """
+    Predicts property baselines purely from atomic composition.
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class CGCNNConv(MessagePassing):
+    """
+    Crystal Graph Convolutional Neural Network Layer.
+    Updates node embeddings using gated edge messages.
+    """
+
+    def __init__(self, node_dim, edge_dim):
+        super().__init__(aggr="add")
+        self.emb_dim = node_dim
+        self.edge_dim = edge_dim
+
+        # Input to linear layers involves node_i, node_j, and edge_ij
+        input_dim = 2 * node_dim + edge_dim
+
+        self.linear_f = nn.Linear(input_dim, node_dim)
+        self.linear_s = nn.Linear(input_dim, node_dim)
+        self.bn = nn.BatchNorm1d(node_dim)
+
+    def forward(self, x, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_i, x_j, edge_attr):
+        # Concatenate source node, target node, and edge features
+        z = torch.cat([x_i, x_j, edge_attr], dim=-1)
+
+        # Gated convolution: sigmoid(W_f * z) * softplus(W_s * z)
+        gate = torch.sigmoid(self.linear_f(z))
+        filter_ = F.softplus(self.linear_s(z))
+
+        return gate * filter_
+
+    def update(self, aggr_out, x):
+        # Residual connection and batch normalization
+        return self.bn(x + aggr_out)
+
+
+class StructuralCGCNN(nn.Module):
+    """
+    Graph Neural Network to predict property residuals from crystal structure.
+    """
+
+    def __init__(self, node_dim, edge_dim, n_layers, output_dim, dropout):
+        super().__init__()
+        # Embedding for atomic numbers (1-100)
+        self.embedding = nn.Embedding(100, node_dim)
+
+        # Edge expansion
+        self.edge_expansion = GaussianSmearing(0.0, CUTOFF_RADIUS, edge_dim)
+
+        # Stack of Graph Convolutions
+        self.convs = nn.ModuleList(
+            [CGCNNConv(node_dim, edge_dim) for _ in range(n_layers)]
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Readout function to map graph embedding to residual
+        self.readout = nn.Sequential(
+            nn.Linear(node_dim, node_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, output_dim),
+        )
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        # Initial node embeddings
+        h = self.embedding(x)
+
+        # Expand scalar distances to RBF vectors
+        edge_features = self.edge_expansion(edge_attr.squeeze(-1))
+
+        # Message Passing
+        for conv in self.convs:
+            h = conv(h, edge_index, edge_features)
+            h = self.dropout(h)
+
+        # Global Pooling
+        h_graph = global_mean_pool(h, batch)
+
+        # Predict residuals
+        out = self.readout(h_graph)
+        return out
+
+
+class ACSRNet(nn.Module):
+    """
+    Additive Composition-Structure Residual Network.
+
+    Prediction = Baseline(Composition) + Residual(Structure)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Compositional Baseline Stream
+        self.comp_mlp = CompositionalMLP(
+            input_dim=len(COMPOSITION_COLS),
+            hidden_dim=EMBEDDING_DIM,
+            output_dim=len(TARGET_COLS),
+            dropout=DROPOUT,
+        )
+
+        # 2. Structural Residual Stream
+        self.struct_gnn = StructuralCGCNN(
+            node_dim=EMBEDDING_DIM,
+            edge_dim=N_RBF,
+            n_layers=N_CONV_LAYERS,
+            output_dim=len(TARGET_COLS),
+            dropout=DROPOUT,
+        )
+
+    def forward(self, composition, data):
+        """
+        Args:
+            composition (Tensor): [Batch, n_comp_features] - Standardized atomic fractions.
+            data (Data): PyG DataBatch object containing graph structure.
+
+        Returns:
+            Tensor: [Batch, n_targets] - Predicted log-standardized properties.
+        """
+        # Predict baseline from composition
+        baseline = self.comp_mlp(composition)
+
+        # Predict residual from structure
+        residual = self.struct_gnn(data)
+
+        # Additive fusion
+        prediction = baseline + residual
+
+        return prediction
+=======
+class CGCNNConv(MessagePassing):
+    """
+    Crystal Graph Convolutional Neural Network Layer.
+    Updates node embeddings using gated edge messages.
+    """
+
+    def __init__(self, node_dim, edge_dim):
+        super().__init__(aggr="add")
+        self.emb_dim = node_dim
+        self.edge_dim = edge_dim
+
+        # Input to linear layers involves node_i, node_j, and edge_ij
+        input_dim = 2 * node_dim + edge_dim
+
+        self.linear_f = nn.Linear(input_dim, node_dim)
+        self.linear_s = nn.Linear(input_dim, node_dim)
+        self.bn = nn.BatchNorm1d(node_dim)
+
+    def forward(self, x, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_i, x_j, edge_attr):
+        # Concatenate source node, target node, and edge features
+        z = torch.cat([x_i, x_j, edge_attr], dim=-1)
+
+        # Gated convolution: sigmoid(W_f * z) * softplus(W_s * z)
+        gate = torch.sigmoid(self.linear_f(z))
+        filter_ = F.softplus(self.linear_s(z))
+
+        return gate * filter_
+
+    def update(self, aggr_out, x):
+        # Residual connection, activation, and batch normalization
+        # Cite solution_lesson_node_00041: Non-Linearity Placement in Residual GNN Blocks
+        return self.bn(F.softplus(x + aggr_out))
+
+
+class CrystalGraphConvNet(nn.Module):
+    """
+    Standard Crystal Graph Convolutional Neural Network (CGCNN) with Decoupled Heads.
+    Replaces ACSRNet to use implicit compositional encoding (Cite solution_lesson_node_00040).
+    """
+
+    def __init__(self):
+        super().__init__()
+        
+        node_dim = EMBEDDING_DIM
+        edge_dim = N_RBF
+        n_layers = N_CONV_LAYERS
+        dropout = DROPOUT
+
+        # Embedding for atomic numbers (1-100)
+        self.embedding = nn.Embedding(100, node_dim)
+
+        # Edge expansion
+        self.edge_expansion = GaussianSmearing(0.0, CUTOFF_RADIUS, edge_dim)
+
+        # Stack of Graph Convolutions
+        self.convs = nn.ModuleList(
+            [CGCNNConv(node_dim, edge_dim) for _ in range(n_layers)]
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Decoupled Prediction Heads (Cite solution_lesson_node_00039)
+        # Head 1: Formation Energy
+        self.head_formation = nn.Sequential(
+            nn.Linear(node_dim, node_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, 1),
+        )
+
+        # Head 2: Bandgap Energy
+        self.head_bandgap = nn.Sequential(
+            nn.Linear(node_dim, node_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, 1),
+        )
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        # Initial node embeddings
+        h = self.embedding(x)
+
+        # Expand scalar distances to RBF vectors
+        edge_features = self.edge_expansion(edge_attr.squeeze(-1))
+
+        # Message Passing
+        for conv in self.convs:
+            h = conv(h, edge_index, edge_features)
+            h = self.dropout(h)
+
+        # Global Pooling
+        h_graph = global_mean_pool(h, batch)
+
+        # Predict targets using decoupled heads
+        out_formation = self.head_formation(h_graph)
+        out_bandgap = self.head_bandgap(h_graph)
+
+        # Concatenate outputs [Batch, 2]
+        return torch.cat([out_formation, out_bandgap], dim=1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import ACSRNet
+from library.data import get_dataloaders
+from library.utils import rmsle
+
+
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train_one_epoch(
+    model, loader, optimizer, criterion, device, comp_scaler, target_scaler
+):
+    model.train()
+    running_loss = 0.0
+
+    for batch in loader:
+        batch = batch.to(device)
+
+        # Prepare inputs
+        # Scale composition features
+        composition = comp_scaler.transform(batch.composition)
+
+        # Scale targets for training stability (Log1p + Standardization)
+        targets = target_scaler.transform(batch.y)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        preds = model(composition, batch)
+
+        # Compute loss in the scaled space
+        loss = criterion(preds, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch.num_graphs
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def validate(model, loader, criterion, device, comp_scaler, target_scaler):
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            # Prepare inputs
+            composition = comp_scaler.transform(batch.composition)
+
+            # Targets for loss calculation
+            targets_scaled = target_scaler.transform(batch.y)
+
+            # Forward pass
+            preds_scaled = model(composition, batch)
+
+            # Loss in scaled space
+            loss = criterion(preds_scaled, targets_scaled)
+            running_loss += loss.item() * batch.num_graphs
+
+            # Inverse transform for metric calculation (back to eV)
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+            targets_original = batch.y  # Original values are in batch.y
+
+            all_preds.append(preds_original.cpu().numpy())
+            all_targets.append(targets_original.cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+
+    # Concatenate all predictions and targets
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate RMSLE on original scale
+    # Ensure non-negative for log
+    all_preds = np.maximum(all_preds, 0)
+    all_targets = np.maximum(all_targets, 0)
+
+    val_rmsle = rmsle(all_targets, all_preds)
+
+    return epoch_loss, val_rmsle
+
+
+def generate_submission(model, loader, device, comp_scaler, target_scaler, output_path):
+    model.eval()
+    ids = []
+    preds_list = []
+
+    print("Generating submission...")
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            # Prepare inputs
+            composition = comp_scaler.transform(batch.composition)
+
+            # Forward pass
+            preds_scaled = model(composition, batch)
+
+            # Inverse transform to get original units
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+
+            # Collect IDs and predictions
+            # batch.id is a list or tensor of IDs
+            if isinstance(batch.id, torch.Tensor):
+                ids.extend(batch.id.cpu().numpy().tolist())
+            else:
+                ids.extend(batch.id)
+
+            preds_list.append(preds_original.cpu().numpy())
+
+    # Concatenate predictions
+    all_preds = np.concatenate(preds_list, axis=0)
+
+    # Create DataFrame
+    submission_df = pd.DataFrame(
+        {"id": ids, TARGET_COLS[0]: all_preds[:, 0], TARGET_COLS[1]: all_preds[:, 1]}
+    )
+
+    # Sort by ID to match sample submission format
+    submission_df = submission_df.sort_values("id")
+
+    # Save to CSV
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    submission_df.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+
+
+def run_training(
+    num_epochs=NUM_EPOCHS,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    patience=PATIENCE,
+    load_cached_data=True,
+):
+    set_seed(SEED)
+
+    # Load data
+    train_loader, val_loader, test_loader, comp_scaler, target_scaler = get_dataloaders(
+        load_cached_data=load_cached_data
+    )
+
+    # Initialize model
+    model = ACSRNet().to(DEVICE)
+
+    # Optimizer and Loss
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+=======
+from library.model import CrystalGraphConvNet
+from library.data import get_dataloaders
+from library.utils import rmsle
+
+
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train_one_epoch(
+    model, loader, optimizer, criterion, device, comp_scaler, target_scaler
+):
+    model.train()
+    running_loss = 0.0
+
+    for batch in loader:
+        batch = batch.to(device)
+
+        # Scale targets for training stability (Log1p + Standardization)
+        targets = target_scaler.transform(batch.y)
+
+        optimizer.zero_grad()
+
+        # Forward pass (removed composition input)
+        preds = model(batch)
+
+        # Compute loss in the scaled space
+        loss = criterion(preds, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch.num_graphs
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def validate(model, loader, criterion, device, comp_scaler, target_scaler):
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            # Targets for loss calculation
+            targets_scaled = target_scaler.transform(batch.y)
+
+            # Forward pass (removed composition input)
+            preds_scaled = model(batch)
+
+            # Loss in scaled space
+            loss = criterion(preds_scaled, targets_scaled)
+            running_loss += loss.item() * batch.num_graphs
+
+            # Inverse transform for metric calculation (back to eV)
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+            targets_original = batch.y  # Original values are in batch.y
+
+            all_preds.append(preds_original.cpu().numpy())
+            all_targets.append(targets_original.cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+
+    # Concatenate all predictions and targets
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate RMSLE on original scale
+    # Ensure non-negative for log
+    all_preds = np.maximum(all_preds, 0)
+    all_targets = np.maximum(all_targets, 0)
+
+    val_rmsle = rmsle(all_targets, all_preds)
+
+    return epoch_loss, val_rmsle
+
+
+def generate_submission(model, loader, device, comp_scaler, target_scaler, output_path):
+    model.eval()
+    ids = []
+    preds_list = []
+
+    print("Generating submission...")
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            # Forward pass (removed composition input)
+            preds_scaled = model(batch)
+
+            # Inverse transform to get original units
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+
+            # Collect IDs and predictions
+            # batch.id is a list or tensor of IDs
+            if isinstance(batch.id, torch.Tensor):
+                ids.extend(batch.id.cpu().numpy().tolist())
+            else:
+                ids.extend(batch.id)
+
+            preds_list.append(preds_original.cpu().numpy())
+
+    # Concatenate predictions
+    all_preds = np.concatenate(preds_list, axis=0)
+
+    # Create DataFrame
+    submission_df = pd.DataFrame(
+        {"id": ids, TARGET_COLS[0]: all_preds[:, 0], TARGET_COLS[1]: all_preds[:, 1]}
+    )
+
+    # Sort by ID to match sample submission format
+    submission_df = submission_df.sort_values("id")
+
+    # Save to CSV
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    submission_df.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+
+
+def run_training(
+    num_epochs=NUM_EPOCHS,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    patience=PATIENCE,
+    load_cached_data=True,
+):
+    set_seed(SEED)
+
+    # Load data
+    train_loader, val_loader, test_loader, comp_scaler, target_scaler = get_dataloaders(
+        load_cached_data=load_cached_data
+    )
+
+    # Initialize model (Updated to CrystalGraphConvNet)
+    model = CrystalGraphConvNet().to(DEVICE)
+
+    # Optimizer and Loss
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+from library.model import ACSRNet
+from library.train import generate_submission
+
+
+def set_seed(seed):
+    """
+    Sets random seeds for reproducibility.
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def generate_predictions(load_cached_data=True, debug_sample_size=None):
+    """
+    Generates predictions for the test set using the best trained model.
+
+    Args:
+        load_cached_data (bool): Whether to load pre-processed graph data from cache.
+        debug_sample_size (int, optional): If set, limits the number of test samples for debugging.
+    """
+    set_seed(SEED)
+
+    # Apply debug limit to the data processing module if requested
+    if debug_sample_size is not None:
+        library.data.DEBUG_SAMPLE_SIZE = debug_sample_size
+        print(f"Debug mode enabled: limiting test set to {debug_sample_size} samples.")
+
+    # 1. Load Fitted Scalers
+    # These must exist from the training phase
+    print("Loading scalers from cache...")
+    comp_scaler_path = os.path.join(CACHE_DIR, "global_scaler.npz")
+    target_scaler_path = os.path.join(CACHE_DIR, "target_scaler.npz")
+
+    if not os.path.exists(comp_scaler_path) or not os.path.exists(target_scaler_path):
+        raise FileNotFoundError(
+            f"Scalers not found in {CACHE_DIR}. Please run training first to generate them."
+        )
+
+    comp_scaler = CompositionScaler()
+    comp_scaler.load(comp_scaler_path)
+
+    target_scaler = LogStandardScaler()
+    target_scaler.load(target_scaler_path)
+
+    # 2. Prepare Test Data
+    # We use the shared process_data function which handles caching internally
+    print("Processing/Loading test data...")
+    test_cache_path = os.path.join(CACHE_DIR, "test_graphs.npz")
+
+    # process_data returns a list of Data objects
+    test_data_list = process_data(
+        metadata_path=TEST_CSV,
+        cache_path=test_cache_path,
+        load_cached_data=load_cached_data,
+        is_test=True,
+    )
+
+    test_dataset = CrystalDataset(test_data_list)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 3. Load Model
+    print("Loading best model checkpoint...")
+    model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+
+    model = ACSRNet().to(DEVICE)
+    state_dict = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+
+    # 4. Generate and Save Submission
+    # The generate_submission function in library.train handles the inference loop,
+    # inverse scaling, and CSV writing.
+    submission_path = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    generate_submission(
+        model=model,
+        loader=test_loader,
+        device=DEVICE,
+        comp_scaler=comp_scaler,
+        target_scaler=target_scaler,
+        output_path=submission_path,
+    )
+
+    print("Prediction process completed successfully.")
+=======
+from library.model import CrystalGraphConvNet
+from library.train import generate_submission
+
+
+def set_seed(seed):
+    """
+    Sets random seeds for reproducibility.
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def generate_predictions(load_cached_data=True, debug_sample_size=None):
+    """
+    Generates predictions for the test set using the best trained model.
+
+    Args:
+        load_cached_data (bool): Whether to load pre-processed graph data from cache.
+        debug_sample_size (int, optional): If set, limits the number of test samples for debugging.
+    """
+    set_seed(SEED)
+
+    # Apply debug limit to the data processing module if requested
+    if debug_sample_size is not None:
+        library.data.DEBUG_SAMPLE_SIZE = debug_sample_size
+        print(f"Debug mode enabled: limiting test set to {debug_sample_size} samples.")
+
+    # 1. Load Fitted Scalers
+    # These must exist from the training phase
+    print("Loading scalers from cache...")
+    comp_scaler_path = os.path.join(CACHE_DIR, "global_scaler.npz")
+    target_scaler_path = os.path.join(CACHE_DIR, "target_scaler.npz")
+
+    if not os.path.exists(comp_scaler_path) or not os.path.exists(target_scaler_path):
+        raise FileNotFoundError(
+            f"Scalers not found in {CACHE_DIR}. Please run training first to generate them."
+        )
+
+    # We load comp_scaler just to pass it to generate_submission, though it won't be used
+    comp_scaler = CompositionScaler()
+    comp_scaler.load(comp_scaler_path)
+
+    target_scaler = LogStandardScaler()
+    target_scaler.load(target_scaler_path)
+
+    # 2. Prepare Test Data
+    # We use the shared process_data function which handles caching internally
+    print("Processing/Loading test data...")
+    test_cache_path = os.path.join(CACHE_DIR, "test_graphs.npz")
+
+    # process_data returns a list of Data objects
+    test_data_list = process_data(
+        metadata_path=TEST_CSV,
+        cache_path=test_cache_path,
+        load_cached_data=load_cached_data,
+        is_test=True,
+    )
+
+    test_dataset = CrystalDataset(test_data_list)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 3. Load Model
+    print("Loading best model checkpoint...")
+    model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+
+    model = CrystalGraphConvNet().to(DEVICE)
+    state_dict = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+
+    # 4. Generate and Save Submission
+    # The generate_submission function in library.train handles the inference loop,
+    # inverse scaling, and CSV writing.
+    submission_path = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    generate_submission(
+        model=model,
+        loader=test_loader,
+        device=DEVICE,
+        comp_scaler=comp_scaler,
+        target_scaler=target_scaler,
+        output_path=submission_path,
+    )
+
+    print("Prediction process completed successfully.")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ACSRNet
+from library.utils import rmsle, CompositionScaler, LogStandardScaler
+
+
+def set_seed(seed):
+    """Sets random seeds for reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    # Set seed for reproducibility
+    set_seed(SEED)
+
+    # 1. Train the model
+    # We use 80 epochs to ensure fast execution while allowing convergence.
+    # The architecture is efficient, and the dataset is small (~2k samples).
+    print("Starting model training...")
+    run_training(num_epochs=80, load_cached_data=True)
+
+    # 2. Validation Assessment & Failure Analysis
+    print("Starting validation assessment and failure analysis...")
+
+    # Load DataLoaders
+    # We call get_dataloaders to ensure we get the exact same split and processing as training.
+    # This will also reload/refit scalers, ensuring consistency.
+    # We discard train/test loaders here as we only need val_loader for analysis.
+    _, val_loader, _, comp_scaler, target_scaler = get_dataloaders(
+        load_cached_data=True
+    )
+
+    # Load the best model saved during training
+    model = ACSRNet().to(DEVICE)
+    model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    # Run inference on validation set
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    print("Running inference on validation set...")
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(DEVICE)
+
+            # Prepare inputs
+            # Composition features for the MLP stream
+            composition = comp_scaler.transform(batch.composition)
+
+            # Forward pass
+            preds_scaled = model(composition, batch)
+
+            # Inverse transform predictions to original scale (eV)
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+
+            # Store results
+            all_preds.append(preds_original.cpu().numpy())
+            all_targets.append(batch.y.cpu().numpy())
+
+            # Handle IDs (can be tensor or list depending on loader collation)
+=======
+from library.model import CrystalGraphConvNet
+from library.utils import rmsle, CompositionScaler, LogStandardScaler
+
+
+def set_seed(seed):
+    """Sets random seeds for reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    # Set seed for reproducibility
+    set_seed(SEED)
+
+    # 1. Train the model
+    # We use 80 epochs to ensure fast execution while allowing convergence.
+    # The architecture is efficient, and the dataset is small (~2k samples).
+    print("Starting model training...")
+    run_training(num_epochs=80, load_cached_data=True)
+
+    # 2. Validation Assessment & Failure Analysis
+    print("Starting validation assessment and failure analysis...")
+
+    # Load DataLoaders
+    # We call get_dataloaders to ensure we get the exact same split and processing as training.
+    # This will also reload/refit scalers, ensuring consistency.
+    # We discard train/test loaders here as we only need val_loader for analysis.
+    _, val_loader, _, comp_scaler, target_scaler = get_dataloaders(
+        load_cached_data=True
+    )
+
+    # Load the best model saved during training
+    model = CrystalGraphConvNet().to(DEVICE)
+    model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at {model_path}")
+
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    # Run inference on validation set
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    print("Running inference on validation set...")
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(DEVICE)
+
+            # Forward pass (removed composition input)
+            preds_scaled = model(batch)
+
+            # Inverse transform predictions to original scale (eV)
+            preds_original = target_scaler.inverse_transform(preds_scaled)
+
+            # Store results
+            all_preds.append(preds_original.cpu().numpy())
+            all_targets.append(batch.y.cpu().numpy())
+
+            # Handle IDs (can be tensor or list depending on loader collation)
+>>>>>>> REPLACE
+```

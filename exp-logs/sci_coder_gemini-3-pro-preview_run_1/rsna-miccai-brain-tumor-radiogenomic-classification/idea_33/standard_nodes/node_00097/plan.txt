@@ -1,0 +1,393 @@
+My strategy is to revert the complex "ROI-Anchored Relative-Volumetric" (RARV) architecture back to the robust "Naive Middle Slice" baseline, which previously achieved the highest performance (AUC ~0.67).
+
+1.  **Simplify Input Representation**: I will modify `library/config.py` to set `ROI_DEPTHS = [0.5]` (selecting only the middle slice) and disable `INPUT_DROPOUT_PROB`. This reduces the input from 9 channels to 3 channels (FLAIR, T1wCE, T2w), avoiding the instability associated with stacking many volumetric slices (Cite {solution_lesson_node_00009}) and structured dropout on sparse signals (Cite {solution_lesson_node_00096}).
+2.  **Use Geometric Priors**: I will update `library/data_processing.py` to remove the pixel-based ROI detection logic. Instead, I will implement a naive geometric selection (middle of the file list), as heuristic priors often outperform unsupervised content selection on this dataset (Cite {solution_lesson_node_00036}, {solution_lesson_node_00006}). I will also update the cache filenames to ensure data is regenerated.
+3.  **Standardize Model Architecture**: I will modify `library/model.py` to remove the custom stem modification (Gaussian inflation) and input dropout layers. Using the standard, unmodified ImageNet-pretrained EfficientNet-B0 stem is more stable for 3-channel inputs on small datasets (Cite {solution_lesson_node_00025}).
+4.  **Training Configuration**: I will increase `max_epochs` to 15 in `runfile.py` to allow sufficient convergence for the cosine schedule.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Relative depths for sampling within the Brain ROI
+# 0.4 = 40%, 0.5 = Center, 0.6 = 60%
+ROI_DEPTHS = [0.4, 0.5, 0.6]
+
+# Total input channels = len(MODALITIES) * len(ROI_DEPTHS) = 9
+INPUT_CHANNELS = len(MODALITIES) * len(ROI_DEPTHS)
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+BACKBONE = "efficientnet_b0"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.3  # Classifier dropout
+INPUT_DROPOUT_PROB = 0.2  # Structured input dropout for RARV
+=======
+# Relative depths for sampling within the Brain ROI
+# 0.5 = Center (Naive Middle Slice)
+ROI_DEPTHS = [0.5]
+
+# Total input channels = len(MODALITIES) * len(ROI_DEPTHS) = 3
+INPUT_CHANNELS = len(MODALITIES) * len(ROI_DEPTHS)
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+BACKBONE = "efficientnet_b0"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.3  # Classifier dropout
+INPUT_DROPOUT_PROB = 0.0  # Disabled for single-slice baseline
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def get_roi_bounds(file_paths):
+    """
+    Determines the start and end indices of the brain ROI within a sorted list of file paths.
+    Scans from the start and end until non-zero pixels are found.
+    """
+    if not file_paths:
+        return 0, 0
+
+    n_files = len(file_paths)
+    start_idx = 0
+    end_idx = n_files - 1
+
+    # Find start: scan forward
+    # Limit scan to avoid infinite loops on empty volumes, though unlikely
+    found_start = False
+    for i in range(n_files):
+        img = read_dicom(file_paths[i])
+        if np.max(img) > 0:
+            start_idx = i
+            found_start = True
+            break
+
+    # Find end: scan backward
+    found_end = False
+    for i in range(n_files - 1, -1, -1):
+        img = read_dicom(file_paths[i])
+        if np.max(img) > 0:
+            end_idx = i
+            found_end = True
+            break
+
+    if not found_start or not found_end or end_idx < start_idx:
+        # Fallback to full range if volume is empty
+        return 0, n_files - 1
+
+    return start_idx, end_idx
+
+
+def prepare_slice_cache(df, cache_name, load_cached_data=True):
+    """
+    Generates or loads a cache containing the specific file paths for the
+    required relative depths (40%, 50%, 60%) for each subject and modality.
+    """
+    cache_path = os.path.join(WORKING_DIR, f"{cache_name}.parquet")
+
+    if load_cached_data and os.path.exists(cache_path):
+        logger.info(f"Loading cached slice paths from {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    logger.info(f"Generating slice cache for {cache_name}...")
+
+    cache_data = []
+
+    # Iterate over subjects
+    for idx, row in df.iterrows():
+        subject_id = row["BraTS21ID"]
+        record = {"BraTS21ID": subject_id}
+
+        # Preserve target if it exists
+        if "MGMT_value" in row:
+            record["MGMT_value"] = row["MGMT_value"]
+
+        # Process each modality
+        for mod in MODALITIES:  # FLAIR, T1wCE, T2w
+            # Construct full directory path
+            # metadata contains relative path e.g. 'train/00000/FLAIR'
+            rel_path = row[f"{mod.lower()}_path"]
+            mod_dir = os.path.join(INPUT_DIR, rel_path)
+
+            # List and sort files
+            if os.path.exists(mod_dir):
+                files = [f for f in os.listdir(mod_dir) if f.endswith(".dcm")]
+                # Sort by image number: Image-10.dcm -> 10
+                files.sort(key=lambda x: int(re.search(r"Image-(\d+)", x).group(1)))
+                full_paths = [os.path.join(mod_dir, f) for f in files]
+            else:
+                full_paths = []
+
+            # Determine ROI
+            if not full_paths:
+                # Missing directory handling: fill with None, will be handled in Dataset
+                for depth in ROI_DEPTHS:
+                    record[f"{mod}_{depth}_path"] = None
+                continue
+
+            start, end = get_roi_bounds(full_paths)
+            roi_len = end - start
+
+            # Calculate indices for 0.4, 0.5, 0.6
+            for depth in ROI_DEPTHS:
+                # Relative index from start
+                rel_idx = int(start + roi_len * depth)
+                # Clamp to bounds
+                rel_idx = max(0, min(len(full_paths) - 1, rel_idx))
+
+                record[f"{mod}_{depth}_path"] = full_paths[rel_idx]
+
+        cache_data.append(record)
+
+        if (idx + 1) % 50 == 0:
+            logger.info(f"Processed {idx + 1}/{len(df)} subjects")
+
+    df_cache = pd.DataFrame(cache_data)
+    df_cache.to_parquet(cache_path, index=False)
+    logger.info(f"Saved slice cache to {cache_path}")
+
+    return df_cache
+=======
+def prepare_slice_cache(df, cache_name, load_cached_data=True):
+    """
+    Generates or loads a cache containing the specific file paths for the
+    required relative depths for each subject and modality.
+    Uses naive geometric selection (middle of file list) as per Lesson 00036.
+    """
+    cache_path = os.path.join(WORKING_DIR, f"{cache_name}.parquet")
+
+    if load_cached_data and os.path.exists(cache_path):
+        logger.info(f"Loading cached slice paths from {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    logger.info(f"Generating slice cache for {cache_name}...")
+
+    cache_data = []
+
+    # Iterate over subjects
+    for idx, row in df.iterrows():
+        subject_id = row["BraTS21ID"]
+        record = {"BraTS21ID": subject_id}
+
+        # Preserve target if it exists
+        if "MGMT_value" in row:
+            record["MGMT_value"] = row["MGMT_value"]
+
+        # Process each modality
+        for mod in MODALITIES:  # FLAIR, T1wCE, T2w
+            # Construct full directory path
+            rel_path = row[f"{mod.lower()}_path"]
+            mod_dir = os.path.join(INPUT_DIR, rel_path)
+
+            # List and sort files
+            if os.path.exists(mod_dir):
+                files = [f for f in os.listdir(mod_dir) if f.endswith(".dcm")]
+                # Sort by image number: Image-10.dcm -> 10
+                files.sort(key=lambda x: int(re.search(r"Image-(\d+)", x).group(1)))
+                full_paths = [os.path.join(mod_dir, f) for f in files]
+            else:
+                full_paths = []
+
+            # Determine Slice Index (Naive Geometric)
+            if not full_paths:
+                for depth in ROI_DEPTHS:
+                    record[f"{mod}_{depth}_path"] = None
+                continue
+
+            # Naive selection: just pick the index at the relative depth of the list
+            n_files = len(full_paths)
+            for depth in ROI_DEPTHS:
+                # 0.5 -> Middle of the list
+                rel_idx = int(n_files * depth)
+                # Clamp to bounds
+                rel_idx = max(0, min(n_files - 1, rel_idx))
+
+                record[f"{mod}_{depth}_path"] = full_paths[rel_idx]
+
+        cache_data.append(record)
+
+        if (idx + 1) % 50 == 0:
+            logger.info(f"Processed {idx + 1}/{len(df)} subjects")
+
+    df_cache = pd.DataFrame(cache_data)
+    df_cache.to_parquet(cache_path, index=False)
+    logger.info(f"Saved slice cache to {cache_path}")
+
+    return df_cache
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+        # Structured Input Dropout (Training Only)
+        if self.is_train and np.random.rand() < self.input_dropout_prob:
+            # 50% chance: Drop Center (Ch 3-5)
+            # 50% chance: Drop Peripherals (Ch 0-2, 6-8)
+            if np.random.rand() < 0.5:
+                # Drop Center
+                image[3:6, :, :] = 0
+            else:
+                # Drop Peripherals
+                image[0:3, :, :] = 0
+                image[6:9, :, :] = 0
+
+        # Get Label
+=======
+        # Get Label
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+    # 2. Prepare Slice Caches (ROI Detection)
+    # This step is computationally intensive on first run, so it's cached.
+    df_train_cache = prepare_slice_cache(
+        df_train_meta, "roi_cache_train", load_cached_data
+    )
+    df_val_cache = prepare_slice_cache(df_val_meta, "roi_cache_val", load_cached_data)
+    df_test_cache = prepare_slice_cache(
+        df_test_meta, "roi_cache_test", load_cached_data
+    )
+=======
+    # 2. Prepare Slice Caches (Naive Geometric)
+    # Using new cache names to force regeneration with naive heuristic
+    df_train_cache = prepare_slice_cache(
+        df_train_meta, "naive_cache_train", load_cached_data
+    )
+    df_val_cache = prepare_slice_cache(df_val_meta, "naive_cache_val", load_cached_data)
+    df_test_cache = prepare_slice_cache(
+        df_test_meta, "naive_cache_test", load_cached_data
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RARVEfficientNet(nn.Module):
+    def __init__(self):
+        super(RARVEfficientNet, self).__init__()
+
+        # Initialize the backbone using timm
+        # efficientnet_b0 is used as per configuration
+        self.backbone = timm.create_model(
+            BACKBONE, pretrained=True, num_classes=NUM_CLASSES, drop_rate=DROPOUT_RATE
+        )
+
+        # Adapt the first layer for 9-channel input
+        self.modify_first_layer()
+
+    def modify_first_layer(self):
+        """
+        Replaces the first convolutional layer (conv_stem) to accept 9 input channels.
+        Initializes weights using Gaussian Weight Inflation:
+        - Center channels (3-5) get 50% of original weights.
+        - Peripheral channels (0-2, 6-8) get 25% of original weights.
+        """
+        old_conv = self.backbone.conv_stem
+        old_weights = old_conv.weight.data  # Shape: (Out, 3, K, K)
+
+        # Create new convolutional layer
+        # Check if bias exists (EfficientNet usually has bias=False in stem)
+        use_bias = old_conv.bias is not None
+
+        new_conv = nn.Conv2d(
+            in_channels=INPUT_CHANNELS,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=use_bias,
+        )
+
+        # Initialize new weights with zeros
+        new_weights = torch.zeros_like(new_conv.weight.data)  # Shape: (Out, 9, K, K)
+
+        # Apply Gaussian Weight Inflation
+        # Channels 0-2: Peripheral (Depth 0.4) -> 25% energy
+        new_weights[:, 0:3, :, :] = old_weights * 0.25
+
+        # Channels 3-5: Center (Depth 0.5) -> 50% energy
+        new_weights[:, 3:6, :, :] = old_weights * 0.50
+
+        # Channels 6-8: Peripheral (Depth 0.6) -> 25% energy
+        new_weights[:, 6:9, :, :] = old_weights * 0.25
+
+        # Assign weights to the new layer
+        new_conv.weight.data = new_weights
+
+        # Copy bias if it existed
+        if use_bias:
+            new_conv.bias.data = old_conv.bias.data
+
+        # Replace the layer in the backbone
+        self.backbone.conv_stem = new_conv
+
+    def structured_input_dropout(self, x):
+        """
+        Applies structured dropout to input channels during training.
+        Randomly zeros out either the center triplet or the peripheral triplets.
+        """
+        if not self.training:
+            return x
+
+        # Check if we should apply dropout based on probability
+        if torch.rand(1).item() < INPUT_DROPOUT_PROB:
+            # 50% chance to drop Center vs Peripherals
+            if torch.rand(1).item() < 0.5:
+                # Drop Center Triplet (Channels 3, 4, 5)
+                x[:, 3:6, :, :] = 0
+            else:
+                # Drop Peripheral Triplets (Channels 0, 1, 2 and 6, 7, 8)
+                x[:, 0:3, :, :] = 0
+                x[:, 6:9, :, :] = 0
+
+        return x
+
+    def forward(self, x):
+        # Apply Structured Input Dropout
+        x = self.structured_input_dropout(x)
+
+        # Pass through the backbone
+        # The backbone includes the global pooling and classifier head
+        x = self.backbone(x)
+
+        return x
+=======
+class RARVEfficientNet(nn.Module):
+    def __init__(self):
+        super(RARVEfficientNet, self).__init__()
+
+        # Initialize the backbone using timm
+        # efficientnet_b0 is used as per configuration
+        # Standard input is 3 channels, which matches our configuration now.
+        self.backbone = timm.create_model(
+            BACKBONE, pretrained=True, num_classes=NUM_CLASSES, drop_rate=DROPOUT_RATE
+        )
+
+    def forward(self, x):
+        # Pass through the backbone
+        x = self.backbone(x)
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # We limit epochs to 10 to ensure the baseline runs quickly within the time limit.
+    # The trainer handles data loading, model initialization, and the training loop.
+    logger.info("Starting Training Phase...")
+    run_training(load_cached_data=True, max_epochs=10)
+=======
+    # We limit epochs to 10 to ensure the baseline runs quickly within the time limit.
+    # The trainer handles data loading, model initialization, and the training loop.
+    logger.info("Starting Training Phase...")
+    run_training(load_cached_data=True, max_epochs=15)
+>>>>>>> REPLACE
+```

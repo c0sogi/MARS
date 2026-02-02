@@ -1,0 +1,440 @@
+Based on the analysis of the previous solution and the provided lessons, I will optimize the solution by reverting to the robust "DeBERTa-v3 + CNN Head" architecture (Cite solution_lesson_node_00011) and removing the complex "kitchen sink" optimizations (AWP, LLRD, Auxiliary Head) that led to performance regression (Cite solution_lesson_node_00015).
+
+**Strategy:**
+1.  **Configuration**: Disable Adversarial Weight Perturbation (AWP) and the Auxiliary Loss.
+2.  **Model**: Remove the Auxiliary Dense Head to focus the model capacity entirely on the span extraction task.
+3.  **Engine**: 
+    -   Update `loss_fn` to compute only the Span extraction loss (KL Divergence).
+    -   Simplify `get_optimizer_params` to remove Layer-wise Learning Rate Decay (LLRD) (Cite solution_lesson_node_00014), using a standard parameter grouping (Backbone vs. Head) with Weight Decay.
+    -   Remove AWP logic from the training loop.
+    -   Update `eval_fn` and `predict_fn` to handle the removal of the auxiliary output.
+4.  **Runfile**: Adjust the learning rate strategy to use a consistent learning rate for both the encoder and decoder, avoiding aggressive scaling that may destabilize training.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================
+    # Advanced Strategies
+    # ==========================
+    # Layer-wise Learning Rate Decay
+    llrd_decay = 0.9
+
+    # Adversarial Weight Perturbation (AWP)
+    use_awp = True
+    awp_start_epoch = 2  # Start AWP after the first epoch (1-based count logic)
+    awp_eps = 1e-2
+    awp_lr = 1e-4
+
+    # Loss & Targets
+    gaussian_sigma = 1.0  # Sigma for Gaussian smoothing of start/end targets
+    aux_loss_weight = 0.5  # Weight for the auxiliary dense binary classification head
+=======
+    # ==========================
+    # Advanced Strategies
+    # ==========================
+    # Layer-wise Learning Rate Decay
+    llrd_decay = 1.0
+
+    # Adversarial Weight Perturbation (AWP)
+    use_awp = False
+    awp_start_epoch = 2  # Start AWP after the first epoch (1-based count logic)
+    awp_eps = 1e-2
+    awp_lr = 1e-4
+
+    # Loss & Targets
+    gaussian_sigma = 1.0  # Sigma for Gaussian smoothing of start/end targets
+    aux_loss_weight = 0.0  # Weight for the auxiliary dense binary classification head
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        self.span_head = nn.Linear(self.config.hidden_size, 2)
+
+        # Auxiliary Dense Head
+        self.aux_head = nn.Linear(self.config.hidden_size, 1)
+
+        self.dropout = nn.Dropout(Config.dropout)
+
+        # Initialize custom layers
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        """Initialize weights for custom layers."""
+        for module in [self.conv, self.span_head, self.aux_head]:
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+=======
+        self.span_head = nn.Linear(self.config.hidden_size, 2)
+
+        self.dropout = nn.Dropout(Config.dropout)
+
+        # Initialize custom layers
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        """Initialize weights for custom layers."""
+        for module in [self.conv, self.span_head]:
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        start_logits, end_logits = span_logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)  # (Batch, Seq)
+        end_logits = end_logits.squeeze(-1)  # (Batch, Seq)
+
+        # --- Auxiliary Dense Head ---
+        aux_logits = self.aux_head(feature).squeeze(-1)  # (Batch, Seq)
+
+        return start_logits, end_logits, aux_logits
+=======
+        start_logits, end_logits = span_logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)  # (Batch, Seq)
+        end_logits = end_logits.squeeze(-1)  # (Batch, Seq)
+
+        return start_logits, end_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.utils import AverageMeter, jaccard
+from library.awp import AWP
+
+
+def loss_fn(
+    start_logits, end_logits, aux_logits, start_targets, end_targets, span_masks
+):
+    """
+    Computes the combined loss:
+    1. KL Divergence for Start/End Span (Soft Targets)
+    2. BCEWithLogits for Auxiliary Dense Head (Binary Mask)
+    """
+    # KL Divergence expects log-probabilities as input
+    start_log_probs = torch.log_softmax(start_logits, dim=1)
+    end_log_probs = torch.log_softmax(end_logits, dim=1)
+
+    # nn.KLDivLoss(reduction='batchmean') is standard for probability distributions
+    kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+
+    loss_start = kl_loss_fn(start_log_probs, start_targets)
+    loss_end = kl_loss_fn(end_log_probs, end_targets)
+
+    span_loss = (loss_start + loss_end) / 2.0
+
+    # Auxiliary Loss
+    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+    # aux_logits: (Batch, Seq), span_masks: (Batch, Seq)
+    # Mask out padding tokens from loss calculation if necessary,
+    # but since span_masks are 0 for padding and logits handle it,
+    # we can compute over the whole tensor or mask by attention_mask.
+    # Here we assume standard BCE over the sequence.
+    aux_loss = bce_loss_fn(aux_logits, span_masks)
+
+    total_loss = span_loss + (Config.aux_loss_weight * aux_loss)
+    return total_loss
+
+
+def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+    """
+    Applies Layer-wise Learning Rate Decay (LLRD) to the model parameters.
+    """
+    # Parameters for the custom heads (Decoder)
+    param_optimizer = list(model.named_parameters())
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+
+    optimizer_parameters = []
+
+    # Group 1: Custom Heads (Pooling, Conv, Linear layers) - Highest LR
+    head_params = [p for n, p in model.named_parameters() if "backbone" not in n]
+    optimizer_parameters.append(
+        {"params": head_params, "lr": decoder_lr, "weight_decay": weight_decay}
+    )
+
+    # Group 2: Backbone Layers with Decay
+    # DeBERTa-v3-base has embeddings + 12 layers (0-11)
+    layers = [model.backbone.embeddings] + list(model.backbone.encoder.layer)
+    layers.reverse()  # Process from top (Layer 11) to bottom (Embeddings)
+
+    lr = encoder_lr
+    for layer in layers:
+        optimizer_parameters.append(
+            {
+                "params": [
+                    p
+                    for n, p in layer.named_parameters()
+                    if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": weight_decay,
+                "lr": lr,
+            }
+        )
+        optimizer_parameters.append(
+            {
+                "params": [
+                    p
+                    for n, p in layer.named_parameters()
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+                "lr": lr,
+            }
+        )
+        lr *= Config.llrd_decay
+
+    return optimizer_parameters
+
+
+def train_fn(train_loader, model, optimizer, epoch, scheduler, device):
+    model.train()
+    losses = AverageMeter()
+
+    # Initialize AWP
+    awp = AWP(
+        model,
+        optimizer,
+        adv_lr=Config.awp_lr,
+        adv_eps=Config.awp_eps,
+        start_epoch=Config.awp_start_epoch,
+    )
+
+    # Progress bar
+    # pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.epochs}", leave=False)
+
+    for step, batch in enumerate(train_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        start_targets = batch["start_targets"].to(device)
+        end_targets = batch["end_targets"].to(device)
+        span_masks = batch["span_masks"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward Pass
+        start_logits, end_logits, aux_logits = model(input_ids, attention_mask)
+
+        loss = loss_fn(
+            start_logits, end_logits, aux_logits, start_targets, end_targets, span_masks
+        )
+
+        # Backward Pass
+        loss.backward()
+
+        # Adversarial Weight Perturbation (AWP)
+        if Config.use_awp and (epoch >= Config.awp_start_epoch):
+            awp.attack()  # Save original weights and perturb
+
+            # Forward pass with perturbed weights
+            start_logits_adv, end_logits_adv, aux_logits_adv = model(
+                input_ids, attention_mask
+            )
+            loss_adv = loss_fn(
+                start_logits_adv,
+                end_logits_adv,
+                aux_logits_adv,
+                start_targets,
+                end_targets,
+                span_masks,
+            )
+
+            # Backward pass for adversarial loss
+            loss_adv.backward()
+
+            awp._restore()  # Restore original weights
+
+        # Optimizer Step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        losses.update(loss.item(), batch_size)
+
+        if (step + 1) % Config.print_freq == 0:
+            print(f"Epoch {epoch+1} | Step {step+1} | Loss: {losses.avg:.5f}")
+
+    return losses.avg
+=======
+from library.config import Config
+from library.utils import AverageMeter, jaccard
+
+
+def loss_fn(start_logits, end_logits, start_targets, end_targets):
+    """
+    Computes the KL Divergence for Start/End Span (Soft Targets)
+    """
+    # KL Divergence expects log-probabilities as input
+    start_log_probs = torch.log_softmax(start_logits, dim=1)
+    end_log_probs = torch.log_softmax(end_logits, dim=1)
+
+    # nn.KLDivLoss(reduction='batchmean') is standard for probability distributions
+    kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+
+    loss_start = kl_loss_fn(start_log_probs, start_targets)
+    loss_end = kl_loss_fn(end_log_probs, end_targets)
+
+    span_loss = (loss_start + loss_end) / 2.0
+    return span_loss
+
+
+def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+    """
+    Standard Optimizer Parameters with Weight Decay handling.
+    Separates Backbone (Encoder) and Head (Decoder).
+    """
+    # Parameters for the custom heads (Decoder)
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    optimizer_parameters = []
+
+    # Group 1: Custom Heads (Pooling, Conv, Linear layers)
+    head_params = [p for n, p in model.named_parameters() if "backbone" not in n]
+    optimizer_parameters.append(
+        {
+            "params": [
+                p for p in head_params if not any(nd in getattr(p, "_name", "") for nd in no_decay)
+            ],
+            "weight_decay": weight_decay,
+            "lr": decoder_lr,
+        }
+    )
+    optimizer_parameters.append(
+        {
+            "params": [
+                p for p in head_params if any(nd in getattr(p, "_name", "") for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+            "lr": decoder_lr,
+        }
+    )
+
+    # Group 2: Backbone Layers
+    backbone_params = [p for n, p in model.named_parameters() if "backbone" in n]
+    optimizer_parameters.append(
+        {
+            "params": [
+                p for p in backbone_params if not any(nd in getattr(p, "_name", "") for nd in no_decay)
+            ],
+            "weight_decay": weight_decay,
+            "lr": encoder_lr,
+        }
+    )
+    optimizer_parameters.append(
+        {
+            "params": [
+                p for p in backbone_params if any(nd in getattr(p, "_name", "") for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+            "lr": encoder_lr,
+        }
+    )
+
+    return optimizer_parameters
+
+
+def train_fn(train_loader, model, optimizer, epoch, scheduler, device):
+    model.train()
+    losses = AverageMeter()
+
+    for step, batch in enumerate(train_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        start_targets = batch["start_targets"].to(device)
+        end_targets = batch["end_targets"].to(device)
+        # span_masks are unused
+
+        batch_size = input_ids.size(0)
+
+        # Forward Pass
+        start_logits, end_logits = model(input_ids, attention_mask)
+
+        loss = loss_fn(start_logits, end_logits, start_targets, end_targets)
+
+        # Backward Pass
+        loss.backward()
+
+        # Optimizer Step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        losses.update(loss.item(), batch_size)
+
+        if (step + 1) % Config.print_freq == 0:
+            print(f"Epoch {epoch+1} | Step {step+1} | Loss: {losses.avg:.5f}")
+
+    return losses.avg
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Assuming this is used for validation where targets exist.
+            target_texts = batch.get("selected_text", None)
+
+            start_logits, end_logits, _ = model(input_ids, attention_mask)
+
+            start_probs = torch.softmax(start_logits, dim=1).cpu().numpy()
+            end_probs = torch.softmax(end_logits, dim=1).cpu().numpy()
+=======
+            # Assuming this is used for validation where targets exist.
+            target_texts = batch.get("selected_text", None)
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+
+            start_probs = torch.softmax(start_logits, dim=1).cpu().numpy()
+            end_probs = torch.softmax(end_logits, dim=1).cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # We will return a list of strings, and the caller (main script) maps them to IDs.
+
+            start_logits, end_logits, _ = model(input_ids, attention_mask)
+
+            start_probs = torch.softmax(start_logits, dim=1).cpu().numpy()
+            end_probs = torch.softmax(end_logits, dim=1).cpu().numpy()
+=======
+            # We will return a list of strings, and the caller (main script) maps them to IDs.
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+
+            start_probs = torch.softmax(start_logits, dim=1).cpu().numpy()
+            end_probs = torch.softmax(end_logits, dim=1).cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Optimizer and Scheduler
+    optimizer_parameters = get_optimizer_params(
+        model,
+        encoder_lr=Config.learning_rate,
+        decoder_lr=Config.learning_rate * 5,  # Higher LR for custom heads
+        weight_decay=Config.weight_decay,
+    )
+=======
+    # 4. Optimizer and Scheduler
+    optimizer_parameters = get_optimizer_params(
+        model,
+        encoder_lr=Config.learning_rate,
+        decoder_lr=Config.learning_rate,  # Unified LR for stability
+        weight_decay=Config.weight_decay,
+    )
+>>>>>>> REPLACE
+```

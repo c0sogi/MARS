@@ -1,0 +1,304 @@
+Based on the analysis of the previous solution and the provided lessons, I will optimize the model by reverting the structural distance encoding from Radial Basis Functions (RBF) to **Sinusoidal Positional Embeddings** and simplifying the aggregation head.
+
+**Optimization Strategy:**
+1.  **Replace RBF with Sinusoidal Encoding**: As detailed in **Lesson ID: solution_lesson_node_00042**, Sinusoidal encodings are superior to RBFs for 1D sequence distances because they provide a continuous, multi-scale representation that naturally captures arithmetic relationships (periodicity, relative scale) without the sparsity issues of RBFs. I will implement a `SinusoidalPositionalEmbedding` class that handles the signed distances provided by the dataset (preserving directionality as per **Lesson ID: solution_lesson_node_00024**).
+2.  **Remove Scalar Mixture Aggregation**: **Lesson ID: solution_lesson_node_00033** warns against global pooling or complex aggregation mechanisms that might interfere with local sequence dynamics in dense regression tasks. The previous solution's `ScalarMixtureHead` added unnecessary complexity. I will revert to using the output of the final residual block directly, which aligns with the successful "Current Best Solution" architecture.
+3.  **Maintain Wide Residual Stream**: I will preserve the `WideResBiGRU` architecture (**Lesson ID: solution_lesson_node_00041**) and Pre-LayerNorm configuration (**Lesson ID: solution_lesson_node_00017**), as these were identified as critical for training deep recurrent networks on this task.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+class ModelConfig:
+    hidden_dim = 384
+    num_layers = 6
+    num_rbf = 128
+    batch_size = 32
+    learning_rate = 1e-3
+    num_epochs = 20
+
+    # Paths
+    train_file = "./metadata/train.parquet"
+    val_file = "./metadata/val.parquet"
+    test_file = "./metadata/test.parquet"
+    output_dir = "./working/idea_17"
+    submission_file = "./submission/submission.csv"
+=======
+class ModelConfig:
+    hidden_dim = 384
+    num_layers = 6
+    batch_size = 32
+    learning_rate = 1e-3
+    num_epochs = 20
+
+    # Paths
+    train_file = "./metadata/train.parquet"
+    val_file = "./metadata/val.parquet"
+    test_file = "./metadata/test.parquet"
+    output_dir = "./working/idea_18"
+    submission_file = "./submission/submission.csv"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GaussianRBFLayer(nn.Module):
+    """
+    Projects signed distances into a continuous embedding space using a bank of
+    Gaussian Radial Basis Functions with learnable centers and widths.
+    """
+
+    def __init__(self, num_rbf, max_dist=110):
+        super().__init__()
+        self.num_rbf = num_rbf
+        # Initialize centers uniformly spanning the range [-max_dist, max_dist]
+        centers = torch.linspace(-max_dist, max_dist, num_rbf)
+        self.centers = nn.Parameter(centers)
+
+        # Initialize widths (sigma) proportional to the spacing between centers
+        sigma = torch.ones(num_rbf) * (2 * max_dist / num_rbf)
+        self.sigma = nn.Parameter(sigma)
+
+    def forward(self, dists):
+        """
+        Args:
+            dists: (Batch, Seq_Len) tensor of signed distances.
+        Returns:
+            (Batch, Seq_Len, num_rbf) tensor of RBF features.
+        """
+        # Expand dimensions for broadcasting: (B, L, 1) vs (1, 1, num_rbf)
+        d = dists.unsqueeze(-1)
+        c = self.centers.view(1, 1, -1)
+        s = self.sigma.view(1, 1, -1)
+
+        # Gaussian RBF: exp( - (x - mu)^2 / sigma^2 )
+        rbf = torch.exp(-((d - c) ** 2) / (s**2))
+        return rbf
+=======
+class SinusoidalPositionalEmbedding(nn.Module):
+    """
+    Encodes signed distances using continuous sinusoidal functions.
+    Cite solution_lesson_node_00042: Prefer Sinusoidal Encodings Over RBF for 1D Sequence Distances.
+    Cite solution_lesson_node_00024: Preserve Directionality in Structural Distance Encodings.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        # Standard Transformer frequencies: 10000^(-2i/d)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2).float() * -(np.log(10000.0) / dim)
+        )
+        self.register_buffer("div_term", div_term)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (Batch, Seq_Len) tensor of signed distances.
+        Returns:
+            (Batch, Seq_Len, dim) tensor of positional embeddings.
+        """
+        # (B, L, 1) * (1, 1, dim/2) -> (B, L, dim/2)
+        args = x.unsqueeze(-1) * self.div_term.view(1, 1, -1)
+
+        emb = torch.zeros(x.size(0), x.size(1), self.dim, device=x.device)
+        emb[..., 0::2] = torch.sin(args)
+        emb[..., 1::2] = torch.cos(args)
+        return emb
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ScalarMixtureHead(nn.Module):
+    """
+    Aggregates hidden states from multiple layers using learnable scalar weights.
+    Implements a 'Gradient Superhighway' from the loss to all layers.
+    """
+
+    def __init__(self, num_layers):
+        super().__init__()
+        # We aggregate (num_layers) residual blocks + 1 initial projection
+        self.num_states = num_layers + 1
+        self.weights = nn.Parameter(torch.zeros(self.num_states))
+
+    def forward(self, states):
+        """
+        Args:
+            states: List of tensors, each (Batch, Seq_Len, Dim). Length = num_layers + 1.
+        Returns:
+            Weighted sum tensor (Batch, Seq_Len, Dim).
+        """
+        # Softmax normalization ensures weights sum to 1
+        w = F.softmax(self.weights, dim=0)
+
+        # Weighted sum
+        out = 0
+        for i, state in enumerate(states):
+            out = out + w[i] * state
+
+        return out
+
+
+class RNARegressor(nn.Module):
+    """
+    Main architecture: RBF-Encoded Deep Residual BiGRU with Layer Aggregation.
+    """
+
+    def __init__(self, config=ModelConfig):
+        super().__init__()
+        self.hidden_dim = config.hidden_dim
+        self.num_layers = config.num_layers
+        self.num_rbf = config.num_rbf
+
+        # --- 1. Embeddings ---
+        # Nucleotide Embedding (A, G, U, C)
+        self.seq_embed = nn.Embedding(4, self.hidden_dim // 2)
+
+        # Loop Type Embedding (S, M, I, B, H, E, X)
+        self.loop_embed = nn.Embedding(7, self.hidden_dim // 2)
+
+        # RBF Distance Encoding
+        self.rbf_layer = GaussianRBFLayer(self.num_rbf)
+        self.rbf_proj = nn.Linear(self.num_rbf, self.hidden_dim // 2)
+
+        # --- 2. Wide Stream Projection ---
+        # Concatenated Input: (H/2) [Seq] + (H/2) [Loop] + (H/2) [RBF] = 1.5 * H
+        # Project to Wide Stream: 2 * H
+        input_feat_dim = (self.hidden_dim // 2) * 3
+        self.input_proj = nn.Linear(input_feat_dim, 2 * self.hidden_dim)
+
+        # --- 3. Backbone (Stack of WideResBiGRU) ---
+        self.layers = nn.ModuleList(
+            [WideResBiGRU(self.hidden_dim) for _ in range(self.num_layers)]
+        )
+
+        # --- 4. Layer Aggregation ---
+        self.aggregator = ScalarMixtureHead(self.num_layers)
+
+        # --- 5. Output Head ---
+        # Projects from wide stream (2*H) to 3 target channels
+        self.head = nn.Linear(2 * self.hidden_dim, 3)
+
+    def forward(self, seq, loop, dist, mask):
+        """
+        Args:
+            seq: (B, L) LongTensor - Sequence tokens
+            loop: (B, L) LongTensor - Loop type tokens
+            dist: (B, L) FloatTensor - Signed pair distances
+            mask: (B, L) FloatTensor - 1.0 if paired, 0.0 if unpaired
+        Returns:
+            logits: (B, L, 3) FloatTensor - Predicted degradation rates
+        """
+        # Embeddings
+        x_seq = self.seq_embed(seq)  # (B, L, H/2)
+        x_loop = self.loop_embed(loop)  # (B, L, H/2)
+
+        # RBF Features
+        x_rbf = self.rbf_layer(dist)  # (B, L, num_rbf)
+        x_rbf = self.rbf_proj(x_rbf)  # (B, L, H/2)
+
+        # Apply mask to RBF features (zero out features for unpaired bases)
+        x_rbf = x_rbf * mask.unsqueeze(-1)
+
+        # Concatenate all features
+        x = torch.cat([x_seq, x_loop, x_rbf], dim=-1)  # (B, L, 1.5*H)
+
+        # Project to Wide Stream
+        x = self.input_proj(x)  # (B, L, 2*H)
+
+        # Store states for aggregation (including the initial projection)
+        states = [x]
+
+        # Pass through Residual Backbone
+        curr = x
+        for layer in self.layers:
+            curr = layer(curr)
+            states.append(curr)
+
+        # Aggregate states
+        out_agg = self.aggregator(states)  # (B, L, 2*H)
+
+        # Final Projection
+        logits = self.head(out_agg)  # (B, L, 3)
+
+        return logits
+=======
+class RNARegressor(nn.Module):
+    """
+    Main architecture: Sinusoidal-Encoded Deep Residual BiGRU.
+    Cite solution_lesson_node_00041: Residual Stream Width in Bidirectional Recurrent Networks.
+    Cite solution_lesson_node_00033: Avoid global pooling/aggregation (removed ScalarMixture).
+    """
+
+    def __init__(self, config=ModelConfig):
+        super().__init__()
+        self.hidden_dim = config.hidden_dim
+        self.num_layers = config.num_layers
+
+        # --- 1. Embeddings ---
+        # Nucleotide Embedding (A, G, U, C)
+        self.seq_embed = nn.Embedding(4, self.hidden_dim // 2)
+
+        # Loop Type Embedding (S, M, I, B, H, E, X)
+        self.loop_embed = nn.Embedding(7, self.hidden_dim // 2)
+
+        # Sinusoidal Distance Encoding
+        # We project the embedding dimension (hidden_dim // 2) directly
+        self.dist_embed = SinusoidalPositionalEmbedding(self.hidden_dim // 2)
+
+        # --- 2. Wide Stream Projection ---
+        # Concatenated Input: (H/2) [Seq] + (H/2) [Loop] + (H/2) [Dist] = 1.5 * H
+        # Project to Wide Stream: 2 * H
+        input_feat_dim = (self.hidden_dim // 2) * 3
+        self.input_proj = nn.Linear(input_feat_dim, 2 * self.hidden_dim)
+
+        # --- 3. Backbone (Stack of WideResBiGRU) ---
+        self.layers = nn.ModuleList(
+            [WideResBiGRU(self.hidden_dim) for _ in range(self.num_layers)]
+        )
+
+        # --- 4. Output Head ---
+        # Projects from wide stream (2*H) to 3 target channels
+        self.head = nn.Linear(2 * self.hidden_dim, 3)
+
+    def forward(self, seq, loop, dist, mask):
+        """
+        Args:
+            seq: (B, L) LongTensor - Sequence tokens
+            loop: (B, L) LongTensor - Loop type tokens
+            dist: (B, L) FloatTensor - Signed pair distances
+            mask: (B, L) FloatTensor - 1.0 if paired, 0.0 if unpaired
+        Returns:
+            logits: (B, L, 3) FloatTensor - Predicted degradation rates
+        """
+        # Embeddings
+        x_seq = self.seq_embed(seq)  # (B, L, H/2)
+        x_loop = self.loop_embed(loop)  # (B, L, H/2)
+
+        # Distance Features
+        x_dist = self.dist_embed(dist)  # (B, L, H/2)
+
+        # Apply mask to distance features (zero out features for unpaired bases)
+        x_dist = x_dist * mask.unsqueeze(-1)
+
+        # Concatenate all features
+        x = torch.cat([x_seq, x_loop, x_dist], dim=-1)  # (B, L, 1.5*H)
+
+        # Project to Wide Stream
+        x = self.input_proj(x)  # (B, L, 2*H)
+
+        # Pass through Residual Backbone
+        curr = x
+        for layer in self.layers:
+            curr = layer(curr)
+
+        # Final Projection (using only the final layer output)
+        logits = self.head(curr)  # (B, L, 3)
+
+        return logits
+>>>>>>> REPLACE
+```

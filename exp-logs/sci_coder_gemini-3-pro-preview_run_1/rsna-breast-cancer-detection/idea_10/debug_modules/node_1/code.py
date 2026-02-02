@@ -1,0 +1,183 @@
+import os
+import sys
+import torch
+import numpy as np
+import pandas as pd
+import shutil
+
+# Ensure the library modules can be imported
+sys.path.append(".")
+
+from library.config import Config
+from library.utils import seed_everything, probabilistic_f1
+from library.data import get_dataloaders
+from library.model import PyramidSymmetryDifferenceModel
+from library.train import run_training
+from library.inference import predict_and_submit
+
+
+def run_demo():
+    print("==== Starting Breast Cancer Detection Pipeline Demo ====")
+
+    # ---------------------------------------------------------
+    # 1. Configuration Override for Speed
+    # ---------------------------------------------------------
+    print("\n[1] Configuring runtime parameters for demo...")
+
+    # Modify Config attributes at runtime to speed up the demo
+    Config.BATCH_SIZE = 4
+    Config.NUM_WORKERS = 2  # Reduce workers to minimize overhead
+    Config.NUM_EPOCHS = 1
+    Config.DEBUG = True  # Use subset of data
+    Config.DEBUG_SAMPLES = 50  # Very small subset
+
+    # Use a specific cache directory for this demo to avoid conflicts
+    Config.CACHE_DIR = os.path.join(Config.WORKING_DIR, "demo_execution")
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    # Ensure device is set (GPU if available)
+    device = torch.device(Config.DEVICE)
+    print(f"    Device: {device}")
+    print(f"    Batch Size: {Config.BATCH_SIZE}")
+    print(f"    Debug Mode: {Config.DEBUG}")
+
+    # ---------------------------------------------------------
+    # 2. Data Loading Verification
+    # ---------------------------------------------------------
+    print("\n[2] Verifying Data Loading...")
+
+    # Initialize Dataloaders
+    # We set load_cached_data=False to force processing logic to run at least once for demo purposes
+    train_loader, val_loader, test_loader = get_dataloaders(
+        debug=Config.DEBUG, load_cached_data=False
+    )
+
+    print(f"    Train Batches: {len(train_loader)}")
+    print(f"    Val Batches:   {len(val_loader)}")
+
+    # Fetch one batch to inspect structure
+    batch = next(iter(train_loader))
+
+    # Assertions
+    assert "image" in batch, "Batch missing 'image' key"
+    assert "contra_image" in batch, "Batch missing 'contra_image' key"
+    assert "label" in batch, "Batch missing 'label' key"
+
+    img_target = batch["image"]
+    img_contra = batch["contra_image"]
+    labels = batch["label"]
+
+    # Check Shapes: (B, 3, H, W)
+    expected_shape = (Config.BATCH_SIZE, 3, Config.IMG_SIZE[0], Config.IMG_SIZE[1])
+    assert (
+        img_target.shape == expected_shape
+    ), f"Target Image shape mismatch. Got {img_target.shape}, expected {expected_shape}"
+    assert (
+        img_contra.shape == expected_shape
+    ), f"Contralateral Image shape mismatch. Got {img_contra.shape}, expected {expected_shape}"
+    assert labels.shape[0] == Config.BATCH_SIZE, "Label batch size mismatch"
+
+    print("    Data Loading verification passed. Shapes are correct.")
+
+    # ---------------------------------------------------------
+    # 3. Model Architecture Verification
+    # ---------------------------------------------------------
+    print("\n[3] Verifying Model Architecture...")
+
+    model = PyramidSymmetryDifferenceModel().to(device)
+
+    # Move batch to device
+    t_in = img_target.to(device)
+    c_in = img_contra.to(device)
+
+    # Forward Pass
+    logits = model(t_in, c_in)
+
+    # Assert Output Shape: (B, 1)
+    assert logits.shape == (
+        Config.BATCH_SIZE,
+        1,
+    ), f"Model output shape mismatch. Got {logits.shape}"
+
+    print("    Forward pass successful. Output shape is correct.")
+
+    # ---------------------------------------------------------
+    # 4. Training Pipeline Execution
+    # ---------------------------------------------------------
+    print("\n[4] Executing Training Pipeline (1 Epoch)...")
+
+    # Run the training function provided in library.train
+    # This handles the loop, validation, and model saving
+    run_training(debug=Config.DEBUG, epochs=Config.NUM_EPOCHS)
+
+    # Verify model was saved
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    assert os.path.exists(
+        best_model_path
+    ), "Best model file was not saved after training."
+
+    print("    Training execution completed successfully.")
+
+    # ---------------------------------------------------------
+    # 5. Inference Pipeline Execution
+    # ---------------------------------------------------------
+    print("\n[5] Executing Inference Pipeline...")
+
+    # Run inference using the saved model
+    submission_df = predict_and_submit(debug=Config.DEBUG, load_cached_data=True)
+
+    # Verify Submission
+    assert not submission_df.empty, "Submission DataFrame is empty."
+    assert Config.ID_COL in submission_df.columns, f"Submission missing {Config.ID_COL}"
+    assert (
+        Config.TARGET_COL in submission_df.columns
+    ), f"Submission missing {Config.TARGET_COL}"
+
+    # Check file on disk
+    assert os.path.exists(
+        Config.SUBMISSION_PATH
+    ), "Submission CSV file not found on disk."
+
+    print("    Inference execution completed. Submission generated.")
+
+    # ---------------------------------------------------------
+    # 6. Metric Logic Verification
+    # ---------------------------------------------------------
+    print("\n[6] Verifying Metric Logic (Probabilistic F1)...")
+
+    # Test Case 1: Perfect Prediction
+    y_true = np.array([0, 1, 0, 1])
+    y_pred_perfect = np.array([0.0, 1.0, 0.0, 1.0])
+    score_perfect = probabilistic_f1(y_true, y_pred_perfect)
+    # Precision=1, Recall=1 -> F1=1
+    assert np.isclose(
+        score_perfect, 1.0
+    ), f"Metric failed perfect case. Got {score_perfect}"
+
+    # Test Case 2: All Zeros (Recall should be 0)
+    y_pred_zeros = np.array([0.0, 0.0, 0.0, 0.0])
+    score_zeros = probabilistic_f1(y_true, y_pred_zeros)
+    assert np.isclose(score_zeros, 0.0), f"Metric failed zero case. Got {score_zeros}"
+
+    # Test Case 3: Mixed
+    # y_true: [0, 1]
+    # y_pred: [0.2, 0.8]
+    # pTP = 0*0.2 + 1*0.8 = 0.8
+    # pFP = 0.2*(1-0) + 0.8*(1-1) = 0.2 + 0 = 0.2
+    # TotalPos = 1
+    # pPrec = 0.8 / (0.8 + 0.2) = 0.8
+    # pRec = 0.8 / 1 = 0.8
+    # pF1 = 2 * (0.8*0.8) / (0.8+0.8) = 1.28 / 1.6 = 0.8
+    y_t_mix = np.array([0, 1])
+    y_p_mix = np.array([0.2, 0.8])
+    score_mix = probabilistic_f1(y_t_mix, y_p_mix)
+    assert np.isclose(score_mix, 0.8), f"Metric failed mixed case. Got {score_mix}"
+
+    print("    Metric verification passed.")
+    print("\n==== Demo Completed Successfully ====")
+
+
+if __name__ == "__main__":
+    # Set seed for reproducibility of the demo script itself
+    seed_everything(42)
+    run_demo()

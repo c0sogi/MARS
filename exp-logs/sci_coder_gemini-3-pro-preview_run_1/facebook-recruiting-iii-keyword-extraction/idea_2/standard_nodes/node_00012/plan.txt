@@ -1,0 +1,623 @@
+The following changes implement the optimization strategy by leveraging the full dataset and separating the Title and Body embedding streams.
+
+1.  **`library/tokenizer.py`**: Added `encode_single` to support independent tokenization of text fields.
+2.  **`library/dataset.py`**: Updated `__getitem__` and `collate_fn` to yield separate tensors for Title and Body.
+3.  **`library/model.py`**: Modified `FastTextClassifier` to accept two inputs, compute embeddings separately, and concatenate them before the hidden layer (Cite `solution_lesson_node_00011`).
+4.  **`library/trainer.py`**: Updated training and evaluation loops to handle the new batch structure.
+5.  **`runfile.py`**: Removed data subsampling (Cite `solution_lesson_node_00010`) and updated the final validation loop and failure analysis to work with the dual-input model.
+
+```diff
+library/tokenizer.py
+<<<<<<< SEARCH
+    def encode_text(self, titles: List[str], bodies: List[str]) -> List[List[int]]:
+        """
+        Tokenizes and maps text to integers.
+        Combines Title and Body.
+        """
+        encoded_batch = []
+
+        for t, b in zip(titles, bodies):
+            # Combine
+            text = (str(t) if t else "") + " " + (str(b) if b else "")
+            tokens = self._clean_text(text)
+
+            # Map to indices
+            indices = [self.word_to_idx.get(token, self.unk_idx) for token in tokens]
+
+            # Handle empty sequences
+            if not indices:
+                indices = [self.pad_idx]
+
+            # Truncate to MAX_LEN
+            if len(indices) > Config.MAX_LEN:
+                indices = indices[: Config.MAX_LEN]
+
+            encoded_batch.append(indices)
+
+        return encoded_batch
+=======
+    def encode_single(self, text: str, max_len: int = Config.MAX_LEN) -> List[int]:
+        """
+        Tokenizes and maps a single text string to integers.
+        """
+        tokens = self._clean_text(text)
+        indices = [self.word_to_idx.get(token, self.unk_idx) for token in tokens]
+
+        if not indices:
+            indices = [self.pad_idx]
+
+        if len(indices) > max_len:
+            indices = indices[:max_len]
+
+        return indices
+
+    def encode_text(self, titles: List[str], bodies: List[str]) -> List[List[int]]:
+        """
+        Legacy method for compatibility, though we prefer separate encoding now.
+        """
+        encoded_batch = []
+        for t, b in zip(titles, bodies):
+            text = (str(t) if t else "") + " " + (str(b) if b else "")
+            encoded_batch.append(self.encode_single(text))
+        return encoded_batch
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx: int) -> Tuple[List[int], np.ndarray, int]:
+        """
+        Returns:
+            indices (List[int]): Token indices for Title + Body.
+            target (np.ndarray): Multi-hot encoded tags (or zeros if test).
+            id (int): Question ID.
+        """
+        row = self.data.iloc[int(idx)]
+
+        title = str(row["Title"])
+        body = str(row["Body"])
+        q_id = int(row["Id"])
+
+        # Tokenize (returns list of lists, we take the first one)
+        # We pass single items as lists to reuse the batch encoding method
+        indices = self.tokenizer.encode_text([title], [body])[0]
+
+        if self.has_tags:
+            tags_str = str(row["Tags"])
+            # encode_tags returns (batch_size, num_tags), take first
+            target = self.tokenizer.encode_tags([tags_str])[0]
+        else:
+            # Zero vector for test set
+            num_tags = self.tokenizer.get_num_tags()
+            target = np.zeros(num_tags, dtype=np.float32)
+
+        return indices, target, q_id
+
+    @staticmethod
+    def collate_fn(
+        batch: List[Tuple[List[int], np.ndarray, int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Custom collate function for EmbeddingBag.
+
+        Args:
+            batch: List of tuples (indices, target, id)
+
+        Returns:
+            text_indices: 1D Tensor of concatenated indices.
+            offsets: 1D Tensor of starting positions.
+            targets: 2D Tensor of targets (batch_size, num_tags).
+            ids: 1D Tensor of question IDs.
+        """
+        indices_list = [item[0] for item in batch]
+        targets_list = [item[1] for item in batch]
+        ids_list = [item[2] for item in batch]
+
+        # 1. Create offsets and flat indices
+        # EmbeddingBag requires a 1D tensor of all indices and a 1D tensor of offsets
+        offsets = [0]
+        for seq in indices_list[:-1]:
+            offsets.append(offsets[-1] + len(seq))
+
+        offsets_tensor = torch.tensor(offsets, dtype=torch.long)
+
+        # Flatten indices
+        flat_indices = [idx for seq in indices_list for idx in seq]
+        text_indices_tensor = torch.tensor(flat_indices, dtype=torch.long)
+
+        # 2. Stack targets
+        targets_tensor = torch.tensor(np.array(targets_list), dtype=torch.float32)
+
+        # 3. Stack IDs
+        ids_tensor = torch.tensor(ids_list, dtype=torch.long)
+
+        return text_indices_tensor, offsets_tensor, targets_tensor, ids_tensor
+=======
+    def __getitem__(self, idx: int) -> Tuple[List[int], List[int], np.ndarray, int]:
+        """
+        Returns:
+            title_indices (List[int]): Token indices for Title.
+            body_indices (List[int]): Token indices for Body.
+            target (np.ndarray): Multi-hot encoded tags.
+            id (int): Question ID.
+        """
+        row = self.data.iloc[int(idx)]
+
+        title = str(row["Title"])
+        body = str(row["Body"])
+        q_id = int(row["Id"])
+
+        # Cite solution_lesson_node_00011: Separate embedding streams
+        title_indices = self.tokenizer.encode_single(title)
+        body_indices = self.tokenizer.encode_single(body)
+
+        if self.has_tags:
+            tags_str = str(row["Tags"])
+            target = self.tokenizer.encode_tags([tags_str])[0]
+        else:
+            num_tags = self.tokenizer.get_num_tags()
+            target = np.zeros(num_tags, dtype=np.float32)
+
+        return title_indices, body_indices, target, q_id
+
+    @staticmethod
+    def collate_fn(batch):
+        """
+        Custom collate function for Dual-Input EmbeddingBag.
+        """
+        title_indices_list = [item[0] for item in batch]
+        body_indices_list = [item[1] for item in batch]
+        targets_list = [item[2] for item in batch]
+        ids_list = [item[3] for item in batch]
+
+        def pack_sequence(indices_list):
+            offsets = [0]
+            for seq in indices_list[:-1]:
+                offsets.append(offsets[-1] + len(seq))
+            offsets_tensor = torch.tensor(offsets, dtype=torch.long)
+            flat_indices = [idx for seq in indices_list for idx in seq]
+            indices_tensor = torch.tensor(flat_indices, dtype=torch.long)
+            return indices_tensor, offsets_tensor
+
+        title_text, title_offsets = pack_sequence(title_indices_list)
+        body_text, body_offsets = pack_sequence(body_indices_list)
+
+        targets_tensor = torch.tensor(np.array(targets_list), dtype=torch.float32)
+        ids_tensor = torch.tensor(ids_list, dtype=torch.long)
+
+        return (
+            title_text,
+            title_offsets,
+            body_text,
+            body_offsets,
+            targets_tensor,
+            ids_tensor,
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Cite solution_lesson_node_00005: Deep Averaging Network (DAN) structure
+        # Embedding -> Linear -> ReLU -> Dropout -> Linear
+        self.hidden = nn.Linear(embedding_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights to small uniform values to aid convergence.
+        """
+        initrange = 0.5
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.hidden.weight.data.uniform_(-initrange, initrange)
+        self.hidden.bias.data.zero_()
+        self.fc.weight.data.uniform_(-initrange, initrange)
+        self.fc.bias.data.zero_()
+
+    def forward(self, text: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the model.
+        """
+        # 1. Compute averaged embeddings
+        embedded = self.embedding(text, offsets)
+
+        # 2. Hidden Layer (Non-linearity)
+        h = self.hidden(embedded)
+        h = self.relu(h)
+        h = self.dropout(h)
+
+        # 3. Project to output space
+        logits = self.fc(h)
+
+        return logits
+=======
+        # Cite solution_lesson_node_00005: Deep Averaging Network (DAN) structure
+        # Cite solution_lesson_node_00011: Separate embedding streams (Title + Body)
+        # We concatenate two embeddings, so input to hidden is embedding_dim * 2
+        self.hidden = nn.Linear(embedding_dim * 2, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights to small uniform values to aid convergence.
+        """
+        initrange = 0.5
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.hidden.weight.data.uniform_(-initrange, initrange)
+        self.hidden.bias.data.zero_()
+        self.fc.weight.data.uniform_(-initrange, initrange)
+        self.fc.bias.data.zero_()
+
+    def forward(
+        self,
+        title_text: torch.Tensor,
+        title_offsets: torch.Tensor,
+        body_text: torch.Tensor,
+        body_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass with separate embeddings for Title and Body.
+        """
+        # 1. Compute averaged embeddings separately
+        e_title = self.embedding(title_text, title_offsets)
+        e_body = self.embedding(body_text, body_offsets)
+
+        # 2. Concatenate embeddings (Late Fusion)
+        embedded = torch.cat([e_title, e_body], dim=1)
+
+        # 3. Hidden Layer (Non-linearity)
+        h = self.hidden(embedded)
+        h = self.relu(h)
+        h = self.dropout(h)
+
+        # 4. Project to output space
+        logits = self.fc(h)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def train_epoch(self) -> float:
+        """
+        Runs one epoch of training.
+        Returns:
+            float: Average training loss for the epoch.
+        """
+        self.model.train()
+        running_loss = 0.0
+        n_batches = len(self.train_loader)
+
+        for text, offsets, targets, _ in self.train_loader:
+            text = text.to(self.device)
+            offsets = offsets.to(self.device)
+            targets = targets.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            logits = self.model(text, offsets)
+            loss = self.criterion(logits, targets)
+
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item()
+
+        return running_loss / n_batches if n_batches > 0 else 0.0
+
+    def validate(self) -> tuple:
+        """
+        Evaluates the model on the validation set.
+        Returns:
+            tuple: (average_loss, f1_score)
+        """
+        self.model.eval()
+        running_loss = 0.0
+        all_preds = []
+        all_targets = []
+        n_batches = len(self.val_loader)
+
+        total_f1 = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for text, offsets, targets, _ in self.val_loader:
+                text = text.to(self.device)
+                offsets = offsets.to(self.device)
+                targets = targets.to(self.device)
+
+                logits = self.model(text, offsets)
+                loss = self.criterion(logits, targets)
+                running_loss += loss.item()
+
+                # Apply sigmoid to get probabilities
+                probs = torch.sigmoid(logits)
+
+                # Threshold probabilities to get binary predictions
+                # Using Config.TAG_THRESHOLD defined in config
+                preds = (probs > Config.TAG_THRESHOLD).float()
+
+                # Calculate F1 for this batch to avoid storing full dataset in memory
+                batch_f1 = calculate_f1_score(targets, preds, average="samples")
+                batch_size = targets.size(0)
+
+                total_f1 += batch_f1 * batch_size
+                total_samples += batch_size
+
+        avg_loss = running_loss / n_batches if n_batches > 0 else 0.0
+        avg_f1 = total_f1 / total_samples if total_samples > 0 else 0.0
+
+        return avg_loss, avg_f1
+=======
+    def train_epoch(self) -> float:
+        """
+        Runs one epoch of training.
+        Returns:
+            float: Average training loss for the epoch.
+        """
+        self.model.train()
+        running_loss = 0.0
+        n_batches = len(self.train_loader)
+
+        for (
+            title_text,
+            title_offsets,
+            body_text,
+            body_offsets,
+            targets,
+            _,
+        ) in self.train_loader:
+            title_text = title_text.to(self.device)
+            title_offsets = title_offsets.to(self.device)
+            body_text = body_text.to(self.device)
+            body_offsets = body_offsets.to(self.device)
+            targets = targets.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            logits = self.model(title_text, title_offsets, body_text, body_offsets)
+            loss = self.criterion(logits, targets)
+
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item()
+
+        return running_loss / n_batches if n_batches > 0 else 0.0
+
+    def validate(self) -> tuple:
+        """
+        Evaluates the model on the validation set.
+        Returns:
+            tuple: (average_loss, f1_score)
+        """
+        self.model.eval()
+        running_loss = 0.0
+        n_batches = len(self.val_loader)
+
+        total_f1 = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for (
+                title_text,
+                title_offsets,
+                body_text,
+                body_offsets,
+                targets,
+                _,
+            ) in self.val_loader:
+                title_text = title_text.to(self.device)
+                title_offsets = title_offsets.to(self.device)
+                body_text = body_text.to(self.device)
+                body_offsets = body_offsets.to(self.device)
+                targets = targets.to(self.device)
+
+                logits = self.model(title_text, title_offsets, body_text, body_offsets)
+                loss = self.criterion(logits, targets)
+                running_loss += loss.item()
+
+                # Apply sigmoid to get probabilities
+                probs = torch.sigmoid(logits)
+
+                # Threshold probabilities to get binary predictions
+                preds = (probs > Config.TAG_THRESHOLD).float()
+
+                # Calculate F1 for this batch
+                batch_f1 = calculate_f1_score(targets, preds, average="samples")
+                batch_size = targets.size(0)
+
+                total_f1 += batch_f1 * batch_size
+                total_samples += batch_size
+
+        avg_loss = running_loss / n_batches if n_batches > 0 else 0.0
+        avg_f1 = total_f1 / total_samples if total_samples > 0 else 0.0
+
+        return avg_loss, avg_f1
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        print(f"Generating predictions for test set using threshold {threshold}...")
+        with torch.no_grad():
+            for text, offsets, _, ids in test_loader:
+                text = text.to(self.device)
+                offsets = offsets.to(self.device)
+
+                logits = self.model(text, offsets)
+                probs = torch.sigmoid(logits)
+
+                # Decode tags using the tokenizer
+=======
+        print(f"Generating predictions for test set using threshold {threshold}...")
+        with torch.no_grad():
+            for (
+                title_text,
+                title_offsets,
+                body_text,
+                body_offsets,
+                _,
+                ids,
+            ) in test_loader:
+                title_text = title_text.to(self.device)
+                title_offsets = title_offsets.to(self.device)
+                body_text = body_text.to(self.device)
+                body_offsets = body_offsets.to(self.device)
+
+                logits = self.model(title_text, title_offsets, body_text, body_offsets)
+                probs = torch.sigmoid(logits)
+
+                # Decode tags using the tokenizer
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Deep Averaging Network: Increase training samples for better generalization
+    # Cite solution_lesson_node_00005
+    MAX_TRAIN_SAMPLES = 2000000
+    if len(train_dataset) > MAX_TRAIN_SAMPLES:
+        print(
+            f"Subsampling training set from {len(train_dataset)} to {MAX_TRAIN_SAMPLES} for DAN..."
+        )
+        indices = torch.randperm(len(train_dataset))[:MAX_TRAIN_SAMPLES]
+        train_dataset = Subset(train_dataset, indices)
+
+    train_loader = DataLoader(
+=======
+    # Cite solution_lesson_node_00010: Use full dataset for averaging architectures
+    # We remove subsampling to maximize data volume.
+    print(f"Training on full dataset: {len(train_dataset)} samples.")
+
+    train_loader = DataLoader(
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for text, offsets, targets, _ in val_loader:
+            text = text.to(device)
+            offsets = offsets.to(device)
+            targets = targets.to(device)
+
+            logits = model(text, offsets)
+            probs = torch.sigmoid(logits)
+            preds = (probs > Config.TAG_THRESHOLD).float()
+
+            # Calculate per-sample F1 manually to avoid storing dense matrices
+            p = preds.cpu().numpy()
+            t = targets.cpu().numpy()
+
+            intersection = (p * t).sum(axis=1)
+            union_sum = p.sum(axis=1) + t.sum(axis=1)
+
+            # F1 = 2*TP / (P+T). If P+T is 0, F1 is 0.
+            batch_f1s = np.divide(
+                2 * intersection,
+                union_sum,
+                out=np.zeros_like(intersection),
+                where=union_sum != 0,
+            )
+            all_sample_f1s.append(batch_f1s)
+
+            # Calculate sequence lengths from offsets
+            # Offsets are start indices. Length[i] = Offset[i+1] - Offset[i]
+            # Total length of 'text' is needed for the last element
+            batch_offsets = offsets.cpu().numpy()
+            total_tokens = text.size(0)
+
+            # Append total_tokens to calculate the length of the last sequence
+            extended_offsets = np.append(batch_offsets, total_tokens)
+            lengths = extended_offsets[1:] - extended_offsets[:-1]
+            all_lengths.append(lengths)
+=======
+    with torch.no_grad():
+        for (
+            title_text,
+            title_offsets,
+            body_text,
+            body_offsets,
+            targets,
+            _,
+        ) in val_loader:
+            title_text = title_text.to(device)
+            title_offsets = title_offsets.to(device)
+            body_text = body_text.to(device)
+            body_offsets = body_offsets.to(device)
+            targets = targets.to(device)
+
+            logits = model(title_text, title_offsets, body_text, body_offsets)
+            probs = torch.sigmoid(logits)
+            preds = (probs > Config.TAG_THRESHOLD).float()
+
+            # Calculate per-sample F1 manually
+            p = preds.cpu().numpy()
+            t = targets.cpu().numpy()
+
+            intersection = (p * t).sum(axis=1)
+            union_sum = p.sum(axis=1) + t.sum(axis=1)
+
+            batch_f1s = np.divide(
+                2 * intersection,
+                union_sum,
+                out=np.zeros_like(intersection),
+                where=union_sum != 0,
+            )
+            all_sample_f1s.append(batch_f1s)
+
+            # Calculate sequence lengths (use combined length for analysis)
+            # Title lengths
+            t_offsets = title_offsets.cpu().numpy()
+            t_total = title_text.size(0)
+            t_extended = np.append(t_offsets, t_total)
+            t_lens = t_extended[1:] - t_extended[:-1]
+
+            # Body lengths
+            b_offsets = body_offsets.cpu().numpy()
+            b_total = body_text.size(0)
+            b_extended = np.append(b_offsets, b_total)
+            b_lens = b_extended[1:] - b_extended[:-1]
+
+            all_lengths.append(t_lens + b_lens)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 8. Submission
+    # Only generate submission if metric meets the threshold
+    TARGET_METRIC = 0.5189948081970215
+    if final_f1 > TARGET_METRIC:
+        print(f"Metric {final_f1} > {TARGET_METRIC}. Generating Submission...")
+=======
+    # 8. Submission
+    # Only generate submission if metric meets the threshold
+    TARGET_METRIC = 0.6000850796699524
+    if final_f1 > TARGET_METRIC:
+        print(f"Metric {final_f1} > {TARGET_METRIC}. Generating Submission...")
+>>>>>>> REPLACE
+```

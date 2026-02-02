@@ -1,0 +1,593 @@
+I will optimize the solution by reverting the aggressive regularization techniques (Mixup, SWA) that proved detrimental to this small SAR dataset (Cite solution_lesson_node_00030) and returning to a robust single-split validation strategy (Cite solution_lesson_node_00020). I will implement Label Smoothing (Cite solution_lesson_node_00005) and TTA-aware checkpointing (Cite solution_lesson_node_00025) to maximize performance and calibration.
+
+Here are the changes:
+
+1.  **`library/config.py`**: Disable Mixup and SWA, enable Label Smoothing, and adjust training hyperparameters.
+2.  **`library/train.py`**: Refactor the training loop to remove Mixup/SWA logic, implement Label Smoothing in the loss calculation, and simplify the validation routine to focus on a single split.
+3.  **`runfile.py`**: Update the execution flow to load the pre-defined stratified split from metadata and train a single robust model instead of a K-Fold ensemble.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    N_FOLDS = 5
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 35  # Total training epochs (Standard + SWA)
+    LEARNING_RATE = 1e-4  # Initial learning rate for AdamW
+    WEIGHT_DECAY = 0.01  # Weight decay for regularization
+    PATIENCE = 10  # Early stopping patience (active during standard phase)
+
+    # --------------------------------------------------------------------------
+    # Regularization & Optimization Strategies
+    # --------------------------------------------------------------------------
+    # Mixup Regularization
+    USE_MIXUP = True
+    MIXUP_ALPHA = 0.4  # Beta distribution parameter for mixing
+
+    # Stochastic Weight Averaging (SWA)
+    USE_SWA = True
+    SWA_START_EPOCH = 25  # Epoch to switch from standard training to SWA
+    SWA_LR = 1e-5  # Constant learning rate for the SWA phase
+=======
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    N_FOLDS = 1
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 35
+    LEARNING_RATE = 1e-4  # Initial learning rate for AdamW
+    WEIGHT_DECAY = 0.01  # Weight decay for regularization
+    PATIENCE = 12  # Early stopping patience
+
+    # --------------------------------------------------------------------------
+    # Regularization & Optimization Strategies
+    # --------------------------------------------------------------------------
+    # Label Smoothing (Cite solution_lesson_node_00005)
+    LABEL_SMOOTHING = 0.05
+
+    # Mixup Regularization (Disabled - Cite solution_lesson_node_00030)
+    USE_MIXUP = False
+    MIXUP_ALPHA = 0.4
+
+    # Stochastic Weight Averaging (Disabled - Cite solution_lesson_node_00030)
+    USE_SWA = False
+    SWA_START_EPOCH = 25
+    SWA_LR = 1e-5
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.data import (
+    process_and_cache_data,
+    IcebergDataset,
+    get_transforms,
+    mixup_data,
+    mixup_criterion,
+)
+from library.model import IcebergResNet18
+
+
+def custom_update_bn(loader, model, device):
+    """
+    Custom update_bn to handle models with multiple inputs (image + angle).
+    Standard torch.optim.swa_utils.update_bn only passes the first element of the batch.
+    """
+    momenta = {}
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.running_mean = torch.zeros_like(module.running_mean)
+            module.running_var = torch.ones_like(module.running_var)
+            momenta[module] = module.momentum
+
+    if not momenta:
+        return
+
+    was_training = model.training
+    model.train()
+    for module in momenta.keys():
+        module.momentum = None
+        module.num_batches_tracked *= 0
+
+    with torch.no_grad():
+        for batch in loader:
+            # Handle both labeled (img, ang, lbl) and unlabeled (img, ang) loaders
+            if len(batch) == 3:
+                images, angles, _ = batch
+            else:
+                images, angles = batch
+
+            images = images.to(device)
+            angles = angles.to(device)
+            model(images, angles)
+
+    for bn_module in momenta.keys():
+        bn_module.momentum = momenta[bn_module]
+    model.train(was_training)
+
+
+def train_one_epoch(loader, model, optimizer, device, epoch):
+    model.train()
+    losses = AverageMeter()
+    criterion = nn.BCEWithLogitsLoss()
+
+    for batch_idx, (images, angles, labels) in enumerate(loader):
+        images = images.to(device)
+        angles = angles.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        optimizer.zero_grad()
+
+        if Config.USE_MIXUP:
+            images, angles, labels_a, labels_b, lam = mixup_data(
+                images, angles, labels, Config.MIXUP_ALPHA
+            )
+            outputs = model(images, angles)
+            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+        else:
+            outputs = model(images, angles)
+            loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+
+    return losses.avg
+=======
+from library.data import (
+    process_and_cache_data,
+    IcebergDataset,
+    get_transforms,
+)
+from library.model import IcebergResNet18
+
+
+def train_one_epoch(loader, model, optimizer, device, epoch):
+    model.train()
+    losses = AverageMeter()
+    criterion = nn.BCEWithLogitsLoss()
+    smoothing = Config.LABEL_SMOOTHING
+
+    for batch_idx, (images, angles, labels) in enumerate(loader):
+        images = images.to(device)
+        angles = angles.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        # Apply Label Smoothing (Cite solution_lesson_node_00005)
+        # y_ls = y * (1 - alpha) + 0.5 * alpha
+        labels_smoothed = labels * (1.0 - smoothing) + 0.5 * smoothing
+
+        optimizer.zero_grad()
+        outputs = model(images, angles)
+        loss = criterion(outputs, labels_smoothed)
+
+        loss.backward()
+        optimizer.step()
+
+        losses.update(loss.item(), images.size(0))
+
+    return losses.avg
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def run_fold(fold, train_idx, val_idx, data, output_dir):
+    print(f"\n=== Starting Fold {fold} ===")
+
+    # Prepare Data
+    X_train = data["train_images"][train_idx]
+    ang_train = data["train_angles"][train_idx]
+    y_train = data["train_labels"][train_idx]
+
+    X_val = data["train_images"][val_idx]
+    ang_val = data["train_angles"][val_idx]
+    y_val = data["train_labels"][val_idx]
+
+    # Debug Subset
+    if Config.DEBUG:
+        limit = min(Config.DEBUG_SUBSET_SIZE, len(X_train))
+        X_train, ang_train, y_train = (
+            X_train[:limit],
+            ang_train[:limit],
+            y_train[:limit],
+        )
+        X_val, ang_val, y_val = X_val[:limit], ang_val[:limit], y_val[:limit]
+        print(f"DEBUG: Truncated data to {limit} samples.")
+
+    # Datasets
+    train_dataset = IcebergDataset(
+        X_train, ang_train, y_train, transform=get_transforms("train")
+    )
+    val_dataset = IcebergDataset(
+        X_val, ang_val, y_val, transform=get_transforms("valid")
+    )
+
+    # Loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,  # Important for BN stability
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Model Setup
+    device = Config.DEVICE
+    model = IcebergResNet18(
+        pretrained=Config.PRETRAINED, dropout_rate=Config.DROPOUT_RATE
+    )
+    model = model.to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Schedulers
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.1, patience=Config.PATIENCE
+    )
+
+    # SWA Setup
+    swa_model = AveragedModel(model)
+    swa_scheduler = SWALR(optimizer, swa_lr=Config.SWA_LR)
+
+    best_loss = float("inf")
+    best_model_path = os.path.join(output_dir, f"model_fold_{fold}_best.pth")
+    swa_model_path = os.path.join(output_dir, f"model_fold_{fold}_swa.pth")
+
+    for epoch in range(Config.NUM_EPOCHS):
+        start_time = time.time()
+
+        # Train
+        train_loss = train_one_epoch(train_loader, model, optimizer, device, epoch)
+
+        # SWA Logic
+        is_swa_phase = (epoch >= Config.SWA_START_EPOCH) and Config.USE_SWA
+
+        if is_swa_phase:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+
+            # Validate base model to track progress
+            val_loss = validate_tta(val_loader, model, device)
+            phase_str = "SWA"
+            lr = swa_scheduler.get_last_lr()[0]
+        else:
+            val_loss = validate_tta(val_loader, model, device)
+            scheduler.step(val_loss)
+
+            # Checkpoint Best Standard Model
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save(model.state_dict(), best_model_path)
+
+            phase_str = "STD"
+            lr = optimizer.param_groups[0]["lr"]
+
+        elapsed = time.time() - start_time
+        print(
+            f"Fold {fold} | Epoch {epoch+1}/{Config.NUM_EPOCHS} | {phase_str} | "
+            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+            f"LR: {lr:.2e} | Time: {elapsed:.1f}s"
+        )
+
+    # Finalize SWA
+    if Config.USE_SWA:
+        print("Finalizing SWA Model (Updating BN)...")
+        custom_update_bn(train_loader, swa_model, device=device)
+
+        # Validate SWA Model
+        swa_val_loss = validate_tta(val_loader, swa_model, device)
+        print(f"Fold {fold} SWA Final Val Loss: {swa_val_loss:.6f}")
+
+        torch.save(swa_model.state_dict(), swa_model_path)
+        return swa_model_path
+    else:
+        return best_model_path
+=======
+def train_single_model(train_idx, val_idx, data, output_dir):
+    """
+    Trains a single model on the specified split.
+    Uses TTA-aware checkpointing (Cite solution_lesson_node_00025).
+    """
+    print(f"\n=== Starting Single Model Training ===")
+
+    # Prepare Data
+    X_train = data["train_images"][train_idx]
+    ang_train = data["train_angles"][train_idx]
+    y_train = data["train_labels"][train_idx]
+
+    X_val = data["train_images"][val_idx]
+    ang_val = data["train_angles"][val_idx]
+    y_val = data["train_labels"][val_idx]
+
+    # Debug Subset
+    if Config.DEBUG:
+        limit = min(Config.DEBUG_SUBSET_SIZE, len(X_train))
+        X_train, ang_train, y_train = (
+            X_train[:limit],
+            ang_train[:limit],
+            y_train[:limit],
+        )
+        X_val, ang_val, y_val = X_val[:limit], ang_val[:limit], y_val[:limit]
+        print(f"DEBUG: Truncated data to {limit} samples.")
+
+    # Datasets
+    train_dataset = IcebergDataset(
+        X_train, ang_train, y_train, transform=get_transforms("train")
+    )
+    val_dataset = IcebergDataset(
+        X_val, ang_val, y_val, transform=get_transforms("valid")
+    )
+
+    # Loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Model Setup
+    device = Config.DEVICE
+    model = IcebergResNet18(
+        pretrained=Config.PRETRAINED, dropout_rate=Config.DROPOUT_RATE
+    )
+    model = model.to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.1, patience=Config.PATIENCE // 2
+    )
+
+    best_loss = float("inf")
+    best_model_path = os.path.join(output_dir, "model_best.pth")
+
+    for epoch in range(Config.NUM_EPOCHS):
+        start_time = time.time()
+
+        # Train
+        train_loss = train_one_epoch(train_loader, model, optimizer, device, epoch)
+
+        # Validate with TTA (Cite solution_lesson_node_00025)
+        val_loss = validate_tta(val_loader, model, device)
+        scheduler.step(val_loss)
+
+        # Checkpoint Best Model
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(model.state_dict(), best_model_path)
+
+        lr = optimizer.param_groups[0]["lr"]
+        elapsed = time.time() - start_time
+        print(
+            f"Epoch {epoch+1}/{Config.NUM_EPOCHS} | "
+            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+            f"LR: {lr:.2e} | Time: {elapsed:.1f}s"
+        )
+
+    return best_model_path
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import run_fold, predict_test
+
+
+def load_model_for_inference(model_path, device):
+    """
+    Loads a model state dict, handling potential key mismatches from SWA/DataParallel.
+    """
+    model = IcebergResNet18(pretrained=False)
+    state_dict = torch.load(model_path, map_location=device)
+
+    # Clean state_dict keys
+    if "n_averaged" in state_dict:
+        del state_dict["n_averaged"]
+
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+
+    model.load_state_dict(new_state_dict)
+    model.to(device)
+    model.eval()
+    return model
+=======
+from library.train import train_single_model, predict_test
+
+
+def load_model_for_inference(model_path, device):
+    """
+    Loads a model state dict.
+    """
+    model = IcebergResNet18(pretrained=False)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Stratified K-Fold Training
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    oof_preds = np.zeros(len(y_train_all))
+    saved_model_paths = []
+
+    print(f"Starting {Config.N_FOLDS}-Fold Cross-Validation...")
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_all, y_train_all)):
+        # Run training for this fold
+        # run_fold handles the training loop, SWA, and saving the best model
+        model_path = run_fold(fold, train_idx, val_idx, data, Config.WORKING_DIR)
+        saved_model_paths.append(model_path)
+
+        # --- Validation Inference for OOF ---
+        print(f"Generating OOF predictions for Fold {fold}...")
+
+        # Prepare Validation Loader
+        X_val = X_train_all[val_idx]
+        ang_val = ang_train_all[val_idx]
+        y_val = y_train_all[val_idx]
+
+        val_dataset = IcebergDataset(
+            X_val, ang_val, y_val, transform=get_transforms("valid")
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Load Model
+        model = load_model_for_inference(model_path, device)
+
+        # Predict
+        fold_preds = predict_with_tta(model, val_loader, device)
+        oof_preds[val_idx] = fold_preds
+
+        # Fold Metric
+        fold_loss = log_loss(y_val, fold_preds)
+        print(f"Fold {fold} Log Loss: {fold_loss:.6f}")
+=======
+    # 3. Single Split Training (Cite solution_lesson_node_00020)
+    print("Loading metadata for split...")
+    df_train_meta = pd.read_csv(Config.TRAIN_META_PATH)
+    df_val_meta = pd.read_csv(Config.VAL_META_PATH)
+
+    train_idx = df_train_meta["sample_index"].values
+    val_idx = df_val_meta["sample_index"].values
+
+    print(f"Train size: {len(train_idx)}, Val size: {len(val_idx)}")
+
+    # Train Single Model
+    model_path = train_single_model(train_idx, val_idx, data, Config.WORKING_DIR)
+    saved_model_paths = [model_path]
+
+    # --- Validation Inference ---
+    print(f"Generating predictions for Validation Set...")
+
+    # Prepare Validation Loader
+    X_val = X_train_all[val_idx]
+    ang_val = ang_train_all[val_idx]
+    y_val = y_train_all[val_idx]
+
+    val_dataset = IcebergDataset(
+        X_val, ang_val, y_val, transform=get_transforms("valid")
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # Load Model
+    model = load_model_for_inference(model_path, device)
+
+    # Predict
+    oof_preds = np.zeros(len(y_train_all))
+    val_preds = predict_with_tta(model, val_loader, device)
+    
+    # Fill oof_preds only for validation indices for metric calculation
+    # We only care about the validation subset metric
+    oof_preds_subset = val_preds
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Global Evaluation
+    final_metric = log_loss(y_train_all, oof_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate Error Magnitude
+    errors = np.abs(y_train_all - oof_preds)
+
+    # Extract Features for correlation
+    # 1. Incidence Angle (use original raw values if possible, but normalized is fine for correlation magnitude)
+    # We use the normalized angles from data['train_angles']
+    feat_angle = ang_train_all
+
+    # 2. Image Stats (Mean and Std of the first channel - HH)
+    # X_train_all is (N, 224, 224, 3) after processing.
+    # Note: process_and_cache_data scales images. We use these scaled values.
+    feat_img_mean = np.mean(X_train_all[:, :, :, 0], axis=(1, 2))
+    feat_img_std = np.std(X_train_all[:, :, :, 0], axis=(1, 2))
+
+    # Calculate Correlations
+    # Handle NaN in angles if any (though they should be imputed by now)
+    valid_mask = ~np.isnan(feat_angle)
+
+    corr_angle, _ = pearsonr(feat_angle[valid_mask], errors[valid_mask])
+    corr_mean, _ = pearsonr(feat_img_mean, errors)
+    corr_std, _ = pearsonr(feat_img_std, errors)
+=======
+    # 4. Global Evaluation
+    # We calculate metric only on the validation set
+    final_metric = log_loss(y_val, oof_preds_subset)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate Error Magnitude on Validation Set
+    errors = np.abs(y_val - oof_preds_subset)
+
+    # Extract Features for correlation (Validation Set Only)
+    feat_angle = ang_val
+    feat_img_mean = np.mean(X_val[:, :, :, 0], axis=(1, 2))
+    feat_img_std = np.std(X_val[:, :, :, 0], axis=(1, 2))
+
+    # Calculate Correlations
+    valid_mask = ~np.isnan(feat_angle)
+
+    corr_angle, _ = pearsonr(feat_angle[valid_mask], errors[valid_mask])
+    corr_mean, _ = pearsonr(feat_img_mean, errors)
+    corr_std, _ = pearsonr(feat_img_std, errors)
+>>>>>>> REPLACE
+```

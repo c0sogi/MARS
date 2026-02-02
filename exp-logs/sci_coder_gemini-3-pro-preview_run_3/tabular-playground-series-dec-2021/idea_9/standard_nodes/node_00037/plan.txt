@@ -1,0 +1,502 @@
+Based on the lessons learned, specifically `solution_lesson_node_00036` and `solution_lesson_node_00029`, I will optimize the solution by reverting the deep branch of the architecture from an SE-ResNet to a standard ResNet and extending the training duration. While Squeeze-and-Excitation (SE) blocks accelerated convergence in the previous run, they saturated at a lower accuracy (0.9623) compared to the standard ResNet baseline (0.9625) observed in prior experiments (Cite `solution_lesson_node_00036`). The standard ResNet architecture, while slower to converge, has demonstrated better generalization capacity on this dataset when trained for sufficient epochs (Cite `solution_lesson_node_00029`). Therefore, I will replace the `SEBlock` with a standard `ResidualBlock`, remove the `SE_REDUCTION_RATIO` parameter, and increase the training epochs from 15 to 50 to ensure the model reaches its global minimum.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Model Checkpoint Path
+MODEL_SAVE_PATH = os.path.join(WORKING_DIR, "parallel_dcn_se_resnet.pth")
+
+# Submission Directory
+=======
+# Model Checkpoint Path
+MODEL_SAVE_PATH = os.path.join(WORKING_DIR, "parallel_dcn_resnet.pth")
+
+# Submission Directory
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    SE_REDUCTION_RATIO,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+)
+from library.utils import seed_everything, ModelCheckpoint
+
+# =============================================================================
+# Model Components
+# =============================================================================
+
+
+class CrossNetVector(nn.Module):
+    """
+    Vector-based Cross Network (DCN v1 style formulation).
+    Formula: x_{l+1} = x_0 * (x_l^T w) + b + x_l
+    This performs explicit feature interaction mixing using a learned scalar projection.
+    """
+
+    def __init__(self, input_dim, num_layers):
+        super(CrossNetVector, self).__init__()
+        self.num_layers = num_layers
+        # Parameters: w and b for each layer
+        # w: (num_layers, input_dim)
+        # b: (num_layers, input_dim)
+        self.w = nn.Parameter(torch.randn(num_layers, input_dim))
+        self.b = nn.Parameter(torch.zeros(num_layers, input_dim))
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.w)
+
+    def forward(self, x0):
+        # x0: (Batch, Input_Dim)
+        xl = x0
+        for i in range(self.num_layers):
+            # Term: x_l^T w
+            # x_l: (Batch, D), w[i]: (D)
+            # Dot product for each sample: (Batch, 1)
+            w_i = self.w[i]  # (D)
+            b_i = self.b[i]  # (D)
+
+            # Efficient dot product computation
+            dot_prod = (xl * w_i).sum(dim=1, keepdim=True)  # (Batch, 1)
+
+            # Update formula: x_{l+1} = x_0 * dot_prod + b + x_l
+            xl = x0 * dot_prod + b_i + xl
+
+        return xl
+
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Residual Block for 1D tabular data.
+    Structure:
+    Input -> Dense -> BN -> ReLU -> Dropout -> Dense -> BN -> SE -> Add Input -> ReLU
+    """
+
+    def __init__(self, input_dim, hidden_dim, reduction_ratio, dropout_rate):
+        super(SEBlock, self).__init__()
+
+        # Main path
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.act1 = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        # SE Module (Excitation)
+        # For 1D vectors, the "Squeeze" (Global Average Pooling) is implicit/identity.
+        # We model channel-wise dependencies directly.
+        reduced_dim = max(1, hidden_dim // reduction_ratio)
+        self.se_fc1 = nn.Linear(hidden_dim, reduced_dim)
+        self.se_act = nn.ReLU()
+        self.se_fc2 = nn.Linear(reduced_dim, hidden_dim)
+        self.se_sigmoid = nn.Sigmoid()
+
+        # Shortcut handling for residual connection
+        if input_dim != hidden_dim:
+            self.shortcut = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim), nn.BatchNorm1d(hidden_dim)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+        self.final_act = nn.ReLU()
+
+    def forward(self, x):
+        # Main Path
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.act1(out)
+        out = self.dropout(out)
+
+        out = self.fc2(out)
+        out = self.bn2(out)
+
+        # SE Path (Attention)
+        se = self.se_fc1(out)
+        se = self.se_act(se)
+        se = self.se_fc2(se)
+        se_weights = self.se_sigmoid(se)  # (Batch, Hidden)
+
+        # Scale Output
+        out = out * se_weights
+
+        # Residual connection
+        res = self.shortcut(x)
+        out = out + res
+
+        out = self.final_act(out)
+        return out
+
+
+class ParallelDCNSEResNet(nn.Module):
+    """
+    Hybrid architecture combining a Vector-DCN branch for explicit interactions
+    and an SE-ResNet branch for deep implicit feature learning.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        num_classes,
+        hidden_dim,
+        num_cross_layers,
+        se_reduction,
+        dropout,
+    ):
+        super(ParallelDCNSEResNet, self).__init__()
+
+        # Branch 1: Vector DCN (Explicit Interactions)
+        # Keeps dimension same as input_dim throughout
+        self.dcn = CrossNetVector(input_dim, num_cross_layers)
+
+        # Branch 2: SE-ResNet (Deep Implicit Features)
+        # Project to hidden space then apply residual blocks
+        self.resnet_input_proj = nn.Linear(input_dim, hidden_dim)
+        self.resnet_blocks = nn.Sequential(
+            SEBlock(hidden_dim, hidden_dim, se_reduction, dropout),
+            SEBlock(hidden_dim, hidden_dim, se_reduction, dropout),
+        )
+
+        # Combination Head
+        # Concatenate DCN output (input_dim) and ResNet output (hidden_dim)
+        concat_dim = input_dim + hidden_dim
+
+        self.head = nn.Sequential(
+            nn.Linear(concat_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Input_Dim)
+
+        # Branch 1
+        x_dcn = self.dcn(x)
+
+        # Branch 2
+        x_res = self.resnet_input_proj(x)
+        x_res = self.resnet_blocks(x_res)
+
+        # Combine
+        x_concat = torch.cat([x_dcn, x_res], dim=1)
+
+        logits = self.head(x_concat)
+        return logits
+=======
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+)
+from library.utils import seed_everything, ModelCheckpoint
+
+# =============================================================================
+# Model Components
+# =============================================================================
+
+
+class CrossNetVector(nn.Module):
+    """
+    Vector-based Cross Network (DCN v1 style formulation).
+    Formula: x_{l+1} = x_0 * (x_l^T w) + b + x_l
+    This performs explicit feature interaction mixing using a learned scalar projection.
+    """
+
+    def __init__(self, input_dim, num_layers):
+        super(CrossNetVector, self).__init__()
+        self.num_layers = num_layers
+        # Parameters: w and b for each layer
+        # w: (num_layers, input_dim)
+        # b: (num_layers, input_dim)
+        self.w = nn.Parameter(torch.randn(num_layers, input_dim))
+        self.b = nn.Parameter(torch.zeros(num_layers, input_dim))
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.w)
+
+    def forward(self, x0):
+        # x0: (Batch, Input_Dim)
+        xl = x0
+        for i in range(self.num_layers):
+            # Term: x_l^T w
+            # x_l: (Batch, D), w[i]: (D)
+            # Dot product for each sample: (Batch, 1)
+            w_i = self.w[i]  # (D)
+            b_i = self.b[i]  # (D)
+
+            # Efficient dot product computation
+            dot_prod = (xl * w_i).sum(dim=1, keepdim=True)  # (Batch, 1)
+
+            # Update formula: x_{l+1} = x_0 * dot_prod + b + x_l
+            xl = x0 * dot_prod + b_i + xl
+
+        return xl
+
+
+class ResidualBlock(nn.Module):
+    """
+    Standard Residual Block for 1D tabular data.
+    Structure:
+    Input -> Dense -> BN -> ReLU -> Dropout -> Dense -> BN -> Add Input -> ReLU
+    """
+
+    def __init__(self, input_dim, hidden_dim, dropout_rate):
+        super(ResidualBlock, self).__init__()
+
+        # Main path
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.act1 = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        # Shortcut handling for residual connection
+        if input_dim != hidden_dim:
+            self.shortcut = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim), nn.BatchNorm1d(hidden_dim)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+        self.final_act = nn.ReLU()
+
+    def forward(self, x):
+        # Main Path
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.act1(out)
+        out = self.dropout(out)
+
+        out = self.fc2(out)
+        out = self.bn2(out)
+
+        # Residual connection
+        res = self.shortcut(x)
+        out = out + res
+
+        out = self.final_act(out)
+        return out
+
+
+class ParallelDCNResNet(nn.Module):
+    """
+    Hybrid architecture combining a Vector-DCN branch for explicit interactions
+    and a Standard ResNet branch for deep implicit feature learning.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        num_classes,
+        hidden_dim,
+        num_cross_layers,
+        dropout,
+    ):
+        super(ParallelDCNResNet, self).__init__()
+
+        # Branch 1: Vector DCN (Explicit Interactions)
+        # Keeps dimension same as input_dim throughout
+        self.dcn = CrossNetVector(input_dim, num_cross_layers)
+
+        # Branch 2: Standard ResNet (Deep Implicit Features)
+        # Project to hidden space then apply residual blocks
+        self.resnet_input_proj = nn.Linear(input_dim, hidden_dim)
+        self.resnet_blocks = nn.Sequential(
+            ResidualBlock(hidden_dim, hidden_dim, dropout),
+            ResidualBlock(hidden_dim, hidden_dim, dropout),
+        )
+
+        # Combination Head
+        # Concatenate DCN output (input_dim) and ResNet output (hidden_dim)
+        concat_dim = input_dim + hidden_dim
+
+        self.head = nn.Sequential(
+            nn.Linear(concat_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Input_Dim)
+
+        # Branch 1
+        x_dcn = self.dcn(x)
+
+        # Branch 2
+        x_res = self.resnet_input_proj(x)
+        x_res = self.resnet_blocks(x_res)
+
+        # Combine
+        x_concat = torch.cat([x_dcn, x_res], dim=1)
+
+        logits = self.head(x_concat)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Model
+    model = ParallelDCNSEResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        se_reduction=SE_REDUCTION_RATIO,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+=======
+    # Model
+    model = ParallelDCNResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    SE_REDUCTION_RATIO,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+    MODEL_SAVE_PATH,
+    SUBMISSION_PATH,
+)
+from library.utils import seed_everything, ModelCheckpoint
+from library.model import ParallelDCNSEResNet
+from library.data_loader import get_dataloaders
+=======
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+    MODEL_SAVE_PATH,
+    SUBMISSION_PATH,
+)
+from library.utils import seed_everything, ModelCheckpoint
+from library.model import ParallelDCNResNet
+from library.data_loader import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = ParallelDCNSEResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        se_reduction=SE_REDUCTION_RATIO,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+=======
+    # 3. Model Initialization
+    model = ParallelDCNResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    SE_REDUCTION_RATIO,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+    MODEL_SAVE_PATH,
+    SUBMISSION_PATH,
+)
+from library.utils import seed_everything, ModelCheckpoint
+from library.model import ParallelDCNSEResNet
+from library.data_loader import get_dataloaders
+from library.train import train_one_epoch, validate, predict_and_submit
+
+
+def main():
+    # 1. Setup
+    seed_everything(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Fast baseline settings: Reduced epochs to ensure completion within time limit
+    FAST_EPOCHS = 15
+
+    # 2. Data Loading
+    # Using cached data if available for speed
+    train_loader, val_loader, test_loader, input_dim, test_ids = get_dataloaders(
+        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = ParallelDCNSEResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        se_reduction=SE_REDUCTION_RATIO,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+=======
+    HIDDEN_DIM,
+    NUM_CROSS_LAYERS,
+    DROPOUT_RATE,
+    NUM_CLASSES,
+    MODEL_SAVE_PATH,
+    SUBMISSION_PATH,
+)
+from library.utils import seed_everything, ModelCheckpoint
+from library.model import ParallelDCNResNet
+from library.data_loader import get_dataloaders
+from library.train import train_one_epoch, validate, predict_and_submit
+
+
+def main():
+    # 1. Setup
+    seed_everything(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Extended training to ensure convergence for standard ResNet
+    FAST_EPOCHS = 50
+
+    # 2. Data Loading
+    # Using cached data if available for speed
+    train_loader, val_loader, test_loader, input_dim, test_ids = get_dataloaders(
+        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = ParallelDCNResNet(
+        input_dim=input_dim,
+        num_classes=NUM_CLASSES,
+        hidden_dim=HIDDEN_DIM,
+        num_cross_layers=NUM_CROSS_LAYERS,
+        dropout=DROPOUT_RATE,
+    ).to(device)
+>>>>>>> REPLACE
+```

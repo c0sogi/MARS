@@ -1,0 +1,301 @@
+The previous implementation of `read_dicom_manual` failed because it relied on a limited set of heuristics (only checking for JPEG start markers `\xff\xd8` and raw pixel tags) which were insufficient for the dataset, likely containing JPEG 2000 compressed images or other variations. This caused the data loader to return dummy images, leading to a model that learned nothing (Cite debug_lesson_1: Implement Low-Level Binary Parsing Fallbacks).
+
+To fix this, I will update `library/dicom_utils.py` to:
+1.  Import `rasterio`, `io`, and `PIL.Image`.
+2.  Implement a robust multi-strategy parsing function that first attempts to use `rasterio` (which often has GDAL bindings for DICOM).
+3.  Enhance the manual binary fallback to detect JPEG 2000 signatures (`\xff\x4f\xff\x51`) in addition to standard JPEG.
+4.  Use `PIL.Image` via `io.BytesIO` for decoding the extracted byte streams, as it offers broader support for compressed formats than `cv2.imdecode` in this environment.
+
+```diff
+library/dicom_utils.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import cv2
+from library.config import Config
+
+
+def read_dicom_manual(file_path):
+    """
+    Manually parses a DICOM file to extract pixel data without relying on pydicom.
+    Handles both Encapsulated (JPEG) and Native (Raw) pixel data.
+    Cite debug_lesson_1: Implement Low-Level Binary Parsing Fallbacks.
+
+    Args:
+        file_path (str): Full path to the DICOM file.
+
+    Returns:
+        np.ndarray: The image data (2D or 3D).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"DICOM file not found: {file_path}")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    img = None
+
+    # Strategy 1: Magic Byte Search for Encapsulated JPEG (Common in DICOM)
+    # JPEG Start of Image (SOI) marker is FF D8.
+    # We scan for this signature to find the start of the image stream.
+    # This bypasses the need to correctly parse the variable-length DICOM header.
+
+    soi_marker = b"\xff\xd8"
+    start = 0
+
+    # Try up to 5 potential JPEG starts to avoid thumbnails or false positives
+    attempts = 0
+    while attempts < 5:
+        idx = data.find(soi_marker, start)
+        if idx == -1:
+            break
+
+        # Try to decode from this point
+        b = np.frombuffer(data[idx:], dtype=np.uint8)
+        try:
+            decoded = cv2.imdecode(b, cv2.IMREAD_UNCHANGED)
+            if decoded is not None and decoded.size > 0:
+                # Sanity check: X-rays should be reasonably large (e.g., > 64x64)
+                if decoded.shape[0] > 64 and decoded.shape[1] > 64:
+                    img = decoded
+                    break
+        except Exception:
+            pass
+
+        start = idx + 2
+        attempts += 1
+
+    # Strategy 2: Structural Tag Search (Fallback for uncompressed/raw)
+    if img is None:
+        # Pixel Data Tag: 7FE0,0010 -> Little Endian: E0 7F 10 00
+        pixel_data_tag = b"\xe0\x7f\x10\x00"
+        tag_idx = data.find(pixel_data_tag)
+
+        if tag_idx != -1:
+            # Metadata extraction (Rows/Cols) needed for raw
+            def find_val(tag, data):
+                idx = data.find(tag)
+                if idx != -1 and idx + 10 <= len(data):
+                    # We try a few offsets for the value (Implicit vs Explicit VR)
+                    for off in [8, 6, 10]:
+                        try:
+                            return int.from_bytes(
+                                data[idx + off : idx + off + 2], "little"
+                            )
+                        except:
+                            pass
+                return None
+
+            rows = find_val(b"\x28\x00\x10\x00", data)  # Rows
+            cols = find_val(b"\x28\x00\x11\x00", data)  # Cols
+
+            if rows and cols:
+                # Assume 16-bit or 8-bit raw
+                # Try offsets after tag
+                for offset in [8, 12, 20]:  # Common header lengths
+                    start_px = tag_idx + offset
+                    expected_size = rows * cols
+
+                    # Try 16-bit
+                    if start_px + expected_size * 2 <= len(data):
+                        raw = np.frombuffer(
+                            data[start_px : start_px + expected_size * 2],
+                            dtype=np.uint16,
+                        )
+                        if raw.size == expected_size:
+                            img = raw.reshape((rows, cols))
+                            break
+
+                    # Try 8-bit
+                    if start_px + expected_size <= len(data):
+                        raw = np.frombuffer(
+                            data[start_px : start_px + expected_size], dtype=np.uint8
+                        )
+                        if raw.size == expected_size:
+                            img = raw.reshape((rows, cols))
+                            break
+
+    # Strategy 3: Direct OpenCV Read (Last Resort)
+    if img is None:
+        try:
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            pass
+
+    if img is None:
+        raise ValueError(f"Failed to parse pixel data from {file_path}")
+
+    # Handle Photometric Interpretation
+    # If 'MONOCHROME1' is present, 0 is White and Max is Black. We need to invert.
+    # We search the binary header for this string.
+    if b"MONOCHROME1" in data[:2048]:  # Header is usually at the beginning
+        # Invert the image
+        if img.dtype == np.uint8:
+            img = 255 - img
+        elif img.dtype == np.uint16:
+            img = 65535 - img
+        else:
+            img = np.max(img) - img
+
+    return img
+=======
+import os
+import numpy as np
+import cv2
+import io
+import rasterio
+from PIL import Image
+from library.config import Config
+
+
+def read_dicom_manual(file_path):
+    """
+    Manually parses a DICOM file to extract pixel data without relying on pydicom.
+    Leverages rasterio and PIL for robust format support.
+    Cite debug_lesson_1: Implement Low-Level Binary Parsing Fallbacks.
+
+    Args:
+        file_path (str): Full path to the DICOM file.
+
+    Returns:
+        np.ndarray: The image data (2D or 3D).
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"DICOM file not found: {file_path}")
+
+    # Strategy 1: Rasterio (GDAL backend)
+    # Rasterio is robust for many geospatial and medical formats if drivers are present.
+    try:
+        with rasterio.open(file_path) as src:
+            # Read the first band
+            img = src.read(1)
+            if img is not None and img.size > 0:
+                return img
+    except Exception:
+        pass
+
+    # Read binary data for manual extraction
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    img = None
+
+    # Strategy 2: Encapsulated Stream Extraction (JPEG / JPEG 2000)
+    # We look for Start of Image (SOI) markers.
+    # JPEG SOI: FF D8
+    # JPEG 2000 SOC: FF 4F FF 51
+    
+    signatures = [
+        (b"\xff\xd8", "JPEG"),
+        (b"\xff\x4f\xff\x51", "JP2")
+    ]
+
+    for sig, fmt in signatures:
+        start = 0
+        attempts = 0
+        # Try finding the signature within the first few KB or throughout
+        # DICOM headers can be variable length, so we search.
+        while attempts < 5:
+            idx = data.find(sig, start)
+            if idx == -1:
+                break
+            
+            # Extract potential stream from here to end
+            # PIL is usually smart enough to stop reading at EOI
+            stream = data[idx:]
+            
+            try:
+                # Use PIL to open the bytes
+                with Image.open(io.BytesIO(stream)) as pil_img:
+                    # Convert to numpy
+                    decoded = np.array(pil_img)
+                    
+                    if decoded is not None and decoded.size > 0:
+                        # Sanity check dimensions (X-rays are usually large)
+                        if decoded.shape[0] > 64 and decoded.shape[1] > 64:
+                            img = decoded
+                            break
+            except Exception:
+                pass
+            
+            start = idx + 2
+            attempts += 1
+        
+        if img is not None:
+            break
+
+    # Strategy 3: Structural Tag Search (Fallback for uncompressed/raw)
+    if img is None:
+        # Pixel Data Tag: 7FE0,0010 -> Little Endian: E0 7F 10 00
+        pixel_data_tag = b"\xe0\x7f\x10\x00"
+        tag_idx = data.find(pixel_data_tag)
+
+        if tag_idx != -1:
+            # Metadata extraction (Rows/Cols) needed for raw
+            def find_val(tag, data):
+                idx = data.find(tag)
+                if idx != -1 and idx + 10 <= len(data):
+                    # We try a few offsets for the value (Implicit vs Explicit VR)
+                    for off in [8, 6, 10]:
+                        try:
+                            return int.from_bytes(
+                                data[idx + off : idx + off + 2], "little"
+                            )
+                        except:
+                            pass
+                return None
+
+            rows = find_val(b"\x28\x00\x10\x00", data)  # Rows
+            cols = find_val(b"\x28\x00\x11\x00", data)  # Cols
+
+            if rows and cols:
+                # Assume 16-bit or 8-bit raw
+                # Try offsets after tag
+                for offset in [8, 12, 20]:  # Common header lengths
+                    start_px = tag_idx + offset
+                    expected_size = rows * cols
+
+                    # Try 16-bit
+                    if start_px + expected_size * 2 <= len(data):
+                        raw = np.frombuffer(
+                            data[start_px : start_px + expected_size * 2],
+                            dtype=np.uint16,
+                        )
+                        if raw.size == expected_size:
+                            img = raw.reshape((rows, cols))
+                            break
+
+                    # Try 8-bit
+                    if start_px + expected_size <= len(data):
+                        raw = np.frombuffer(
+                            data[start_px : start_px + expected_size], dtype=np.uint8
+                        )
+                        if raw.size == expected_size:
+                            img = raw.reshape((rows, cols))
+                            break
+
+    # Strategy 4: Direct OpenCV Read (Last Resort)
+    if img is None:
+        try:
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            pass
+
+    if img is None:
+        raise ValueError(f"Failed to parse pixel data from {file_path}")
+
+    # Handle Photometric Interpretation
+    # If 'MONOCHROME1' is present, 0 is White and Max is Black. We need to invert.
+    # We search the binary header for this string.
+    if b"MONOCHROME1" in data[:2048]:  # Header is usually at the beginning
+        # Invert the image
+        if img.dtype == np.uint8:
+            img = 255 - img
+        elif img.dtype == np.uint16:
+            img = 65535 - img
+        else:
+            img = np.max(img) - img
+
+    return img
+>>>>>>> REPLACE
+```

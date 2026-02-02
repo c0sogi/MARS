@@ -1,0 +1,300 @@
+I will optimize the solution by reverting the unstable Semi-Supervised Learning (SSL) approach to a robust, fully supervised pipeline, incorporating key lessons learned from previous iterations.
+
+**Implementation Strategy:**
+1.  **Remove Semi-Supervised Learning (SSL):** Phase 2 of the previous run failed due to numerical instability (`NaN` losses) caused by training on pseudo-labels in mixed precision (Cite `solution_lesson_node_00045`, `solution_lesson_node_00043`). I will remove the pseudo-label generation and the secondary training phase entirely.
+2.  **Extend Supervised Training:** The previous supervised phase was truncated to 15 epochs, which is insufficient for the Lovasz-Hinge loss to fully converge and optimize the IoU metric (Cite `solution_lesson_node_00020`). I will extend the training to 50 epochs.
+3.  **Normalize Deep Supervision Loss:** I will modify the loss calculation to average the contributions from the auxiliary heads instead of summing them. This ensures consistent gradient scaling regardless of the decoder depth, stabilizing the optimization (Cite `solution_lesson_node_00038`).
+4.  **Prioritize Single Model Convergence:** I will stick to training a single fold (Fold 0) to full convergence rather than attempting an ensemble or multi-fold approach within the time limit (Cite `solution_lesson_node_00024`).
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+                # Calculate loss for each auxiliary head
+                loss = 0.0
+                for output in outputs:
+                    loss += criterion(output, targets)
+
+                # Normalize loss by number of heads if necessary,
+                # but strategy implies equal weights summing to higher gradient signal.
+                # We stick to sum as per "Equal Weights (1.0)".
+
+            self.scaler.scale(loss).backward()
+=======
+                # Calculate loss for each auxiliary head
+                loss = 0.0
+                for output in outputs:
+                    loss += criterion(output, targets)
+
+                # Normalize loss by number of heads to ensure consistent gradient scale
+                # regardless of architecture depth. Cite solution_lesson_node_00038
+                loss /= len(outputs)
+
+            self.scaler.scale(loss).backward()
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # --------------------
+    FOLDS = 5
+    EPOCHS = 80
+    BATCH_SIZE = 64
+=======
+    # Training Hyperparameters
+    # --------------------
+    FOLDS = 5
+    EPOCHS = 50  # Optimized for 2h runtime while ensuring convergence Cite solution_lesson_node_00020
+    BATCH_SIZE = 64
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Fast Baseline Overrides
+    PHASE1_EPOCHS = 15
+    PHASE2_EPOCHS = 5
+    FOLD_TO_RUN = 0
+
+    device = torch.device(Config.DEVICE)
+    print(f"Device: {device}")
+
+    # -------------------------------------------------------------------------
+    # 2. Phase 1: Supervised Training (Fold 0)
+    # -------------------------------------------------------------------------
+    print(f"\n--- Phase 1: Supervised Training (Fold {FOLD_TO_RUN}) ---")
+
+    # Get Loaders
+    train_loader, val_loader = get_loaders(fold=FOLD_TO_RUN, load_cached_data=True)
+
+    # Initialize Model
+    model = SaltUNetPlusPlus(
+        encoder_name=Config.ENCODER,
+        encoder_weights=Config.ENCODER_WEIGHTS,
+        in_channels=Config.CHANNELS,
+        classes=1,
+    ).to(device)
+
+    # Optimizer & Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3
+    )
+
+    # Engine
+    engine = SaltEngine(model, device, optimizer, scheduler)
+
+    # Train Phase 1
+    phase1_ckpt = os.path.join(Config.CHECKPOINT_DIR, f"fold_{FOLD_TO_RUN}_phase1.pth")
+    engine.fit(
+        train_loader,
+        val_loader,
+        epochs=PHASE1_EPOCHS,
+        save_path=phase1_ckpt,
+        phase2=False,
+        patience=5,
+    )
+
+    # Load Best Phase 1 Weights
+    print("Loading best Phase 1 model for pseudo-labeling...")
+    model.load_state_dict(torch.load(phase1_ckpt, map_location=device))
+
+    # -------------------------------------------------------------------------
+    # 3. Pseudo-Label Generation
+    # -------------------------------------------------------------------------
+    print("\n--- Generating Pseudo-Labels for Test Set ---")
+    test_loader = get_test_loader(load_cached_data=True)
+
+    # Predict on Test Set (Returns Soft Probabilities)
+    test_results = predict_with_tta(model, test_loader, device)
+    soft_pseudo_labels = test_results["preds"]  # (N_test, 101, 101)
+
+    # -------------------------------------------------------------------------
+    # 4. Phase 2: Semi-Supervised Self-Training
+    # -------------------------------------------------------------------------
+    print(f"\n--- Phase 2: Semi-Supervised Training (Fold {FOLD_TO_RUN}) ---")
+
+    # Construct Combined Dataset
+    # 1. Retrieve original training data arrays
+    train_ds = train_loader.dataset
+    train_images = train_ds.images
+    train_masks = train_ds.masks.astype(np.float32)  # Hard masks as float
+    train_depths = train_ds.depths
+    train_ids = train_ds.ids
+
+    # 2. Retrieve test data arrays
+    test_ds = test_loader.dataset
+    test_images = test_ds.images
+    test_depths = test_ds.depths
+    test_ids = test_ds.ids
+
+    # 3. Concatenate
+    combined_images = np.concatenate([train_images, test_images], axis=0)
+    combined_masks = np.concatenate([train_masks, soft_pseudo_labels], axis=0)
+    combined_depths = np.concatenate([train_depths, test_depths], axis=0)
+    combined_ids = np.concatenate([train_ids, test_ids], axis=0)
+
+    # 4. Create Combined Dataset
+    combined_dataset = SaltDataset(
+        images=combined_images,
+        masks=None,  # We use pseudo_labels argument for unified handling
+        depths=combined_depths,
+        ids=combined_ids,
+        phase="train",
+        transform=get_transforms("train"),
+        pseudo_labels=combined_masks,
+    )
+
+    combined_loader = DataLoader(
+        combined_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    # Re-init Optimizer for Fine-tuning (Lower LR)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=Config.LEARNING_RATE * 0.5,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2
+    )
+    engine = SaltEngine(model, device, optimizer, scheduler)
+
+    # Train Phase 2
+    phase2_ckpt = os.path.join(Config.CHECKPOINT_DIR, f"fold_{FOLD_TO_RUN}_best.pth")
+    engine.fit(
+        combined_loader,
+        val_loader,
+        epochs=PHASE2_EPOCHS,
+        save_path=phase2_ckpt,
+        phase2=True,
+        patience=3,
+    )
+
+    # Load Best Phase 2 Weights
+    print("Loading best Phase 2 model for final evaluation...")
+    model.load_state_dict(torch.load(phase2_ckpt, map_location=device))
+=======
+    # Configuration
+    FOLD_TO_RUN = 0
+    device = torch.device(Config.DEVICE)
+    print(f"Device: {device}")
+
+    # -------------------------------------------------------------------------
+    # 2. Supervised Training (Fold 0)
+    # -------------------------------------------------------------------------
+    print(f"\n--- Supervised Training (Fold {FOLD_TO_RUN}) ---")
+
+    # Get Loaders
+    train_loader, val_loader = get_loaders(fold=FOLD_TO_RUN, load_cached_data=True)
+
+    # Initialize Model
+    model = SaltUNetPlusPlus(
+        encoder_name=Config.ENCODER,
+        encoder_weights=Config.ENCODER_WEIGHTS,
+        in_channels=Config.CHANNELS,
+        classes=1,
+    ).to(device)
+
+    # Optimizer & Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
+
+    # Engine
+    engine = SaltEngine(model, device, optimizer, scheduler)
+
+    # Train
+    # We remove SSL (Phase 2) as it causes instability in mixed precision (Cite solution_lesson_node_00045)
+    # We extend training to 50 epochs to allow Lovasz loss to converge (Cite solution_lesson_node_00020)
+    best_model_path = os.path.join(Config.CHECKPOINT_DIR, f"fold_{FOLD_TO_RUN}_best.pth")
+    engine.fit(
+        train_loader,
+        val_loader,
+        epochs=Config.EPOCHS,
+        save_path=best_model_path,
+        phase2=False,
+        patience=10,
+    )
+
+    # Load Best Weights
+    print("Loading best model for final evaluation...")
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+
+    # Load test loader for submission
+    test_loader = get_test_loader(load_cached_data=True)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 5. Validation & Failure Analysis
+    # -------------------------------------------------------------------------
+    print("\n--- Final Validation & Failure Analysis ---")
+=======
+    # -------------------------------------------------------------------------
+    # 3. Validation & Failure Analysis
+    # -------------------------------------------------------------------------
+    print("\n--- Final Validation & Failure Analysis ---")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 6. Submission
+    # -------------------------------------------------------------------------
+    if final_metric > 0.827:
+        print("\n--- Generating Submission ---")
+
+        # Optimize Threshold
+        best_threshold = optimize_threshold(val_preds, val_targets)
+
+        # Predict on Test Set (Phase 2 Model)
+        # Note: We already have soft_pseudo_labels from Phase 1, but Phase 2 model is better.
+        test_results_final = predict_with_tta(model, test_loader, device)
+
+        # Generate CSV
+        generate_submission(
+            test_results_final["preds"],
+            test_results_final["ids"],
+            best_threshold,
+            Config.SUBMISSION_PATH,
+        )
+=======
+    # -------------------------------------------------------------------------
+    # 4. Submission
+    # -------------------------------------------------------------------------
+    if final_metric > 0.827:
+        print("\n--- Generating Submission ---")
+
+        # Optimize Threshold
+        best_threshold = optimize_threshold(val_preds, val_targets)
+
+        # Predict on Test Set
+        test_results_final = predict_with_tta(model, test_loader, device)
+
+        # Generate CSV
+        generate_submission(
+            test_results_final["preds"],
+            test_results_final["ids"],
+            best_threshold,
+            Config.SUBMISSION_PATH,
+        )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,138 @@
+import torch
+import torch.nn as nn
+from library.config import Config
+
+
+class InputAttention(nn.Module):
+    """
+    Input Attention Block.
+    Applies a Squeeze-and-Excitation style gating mechanism to the feature dimension.
+    Projects input to a bottleneck, then back to input dim with Sigmoid to generate a mask.
+    """
+
+    def __init__(self, input_dim, bottleneck_dim=64):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, bottleneck_dim),
+            nn.ReLU(),
+            nn.Linear(bottleneck_dim, input_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, input_dim)
+        Returns:
+            Re-weighted input tensor of shape (batch_size, input_dim)
+        """
+        mask = self.attention(x)
+        return x * mask
+
+
+class SwishFunnelNet(nn.Module):
+    """
+    Input-Attentive Swish Funnel Network.
+
+    Architecture:
+    1. Entity Embeddings for categorical variables.
+    2. Concatenation of Continuous features and Flattened Embeddings.
+    3. Input Attention mechanism to re-weight the combined feature vector.
+    4. Funnel MLP backbone with Swish (SiLU) activations and Dropout.
+    5. No Batch Normalization or Layer Normalization.
+    """
+
+    def __init__(
+        self,
+        num_continuous,
+        categorical_vocab_sizes,
+        embedding_dim=Config.EMBEDDING_DIM,
+        hidden_layers=Config.HIDDEN_LAYERS,
+        dropout_rate=Config.DROPOUT_RATE,
+        attn_bottleneck_dim=Config.ATTN_BOTTLENECK_DIM,
+        output_dim=Config.OUTPUT_DIM,
+    ):
+        """
+        Args:
+            num_continuous (int): Number of continuous input features.
+            categorical_vocab_sizes (list[int]): List containing the vocabulary size for each categorical feature.
+            embedding_dim (int): Dimension of the embedding space for categorical features.
+            hidden_layers (list[int]): List of hidden layer sizes for the backbone.
+            dropout_rate (float): Dropout probability.
+            attn_bottleneck_dim (int): Bottleneck dimension for the Input Attention block.
+            output_dim (int): Dimension of the output (usually 1 for binary classification logits).
+        """
+        super().__init__()
+
+        # 1. Embeddings
+        # Create an embedding layer for each categorical feature
+        self.embeddings = nn.ModuleList(
+            [
+                nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim)
+                for vocab_size in categorical_vocab_sizes
+            ]
+        )
+
+        # Calculate total input dimension for the backbone
+        # Continuous features + (Number of categorical features * Embedding dimension)
+        total_input_dim = num_continuous + (
+            len(categorical_vocab_sizes) * embedding_dim
+        )
+
+        # 2. Input Attention
+        self.input_attention = InputAttention(
+            total_input_dim, bottleneck_dim=attn_bottleneck_dim
+        )
+
+        # 3. Swish Funnel Backbone
+        layers = []
+        in_dim = total_input_dim
+
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.SiLU())  # Swish activation
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = hidden_dim
+
+        self.backbone = nn.Sequential(*layers)
+
+        # 4. Output Head
+        # Direct connection from last hidden layer to output
+        self.head = nn.Linear(in_dim, output_dim)
+
+    def forward(self, x_cont, x_cat):
+        """
+        Forward pass.
+
+        Args:
+            x_cont (torch.Tensor): Continuous features, shape (batch, num_continuous)
+            x_cat (torch.Tensor): Categorical features (indices), shape (batch, num_categorical)
+
+        Returns:
+            logits (torch.Tensor): Output logits, shape (batch, output_dim)
+        """
+        # Process Embeddings
+        # x_cat is (batch, num_cat). We need to slice it for each embedding layer.
+        embedded_list = []
+        for i, emb_layer in enumerate(self.embeddings):
+            # Extract the i-th categorical column
+            # Assume x_cat is LongTensor
+            col_indices = x_cat[:, i]
+            embedded_list.append(emb_layer(col_indices))
+
+        # Concatenate all embeddings: Result shape (batch, num_cat * emb_dim)
+        x_emb = torch.cat(embedded_list, dim=1)
+
+        # Concatenate with continuous features: Result shape (batch, total_input_dim)
+        x = torch.cat([x_cont, x_emb], dim=1)
+
+        # Apply Input Attention to the combined vector
+        x = self.input_attention(x)
+
+        # Pass through Backbone
+        x = self.backbone(x)
+
+        # Output Head
+        logits = self.head(x)
+
+        return logits

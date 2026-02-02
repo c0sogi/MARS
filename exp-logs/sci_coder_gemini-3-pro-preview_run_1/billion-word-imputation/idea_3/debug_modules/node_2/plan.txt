@@ -1,0 +1,232 @@
+The issue is a tensor shape mismatch in `library/trainer.py` (and potentially `library/inference.py`) caused by the model truncating input sequences that exceed `Config.MAX_LEN` (set to 32 in the demo). The `Trainer` calculates targets and masks based on the original batch sequence length (e.g., 42), while the model returns logits for the truncated length (32). This causes a `ValueError` in loss calculation and dimension mismatches in operations involving `attention_mask`.
+
+To fix this, I will:
+1.  Update `train_epoch` and `validate` in `library/trainer.py` to derive `seq_len` from the model's output (`loc_logits.size(1)`) rather than the input batch.
+2.  Truncate `attention_mask` to match this output length.
+3.  Filter targets (`gap_idxs`, `target_ids`) to exclude samples where the gap position falls outside the truncated sequence, ensuring loss and accuracy are only calculated for valid predictions within the model's effective window.
+4.  Apply similar truncation to `attention_mask` in `generate_submission` and `library/inference.py` to prevent broadcasting errors during inference.
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            batch_size = input_ids.size(0)
+            seq_len = input_ids.size(1)
+
+            # Forward Pass
+            self.optimizer.zero_grad()
+            loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+            # --- Localization Loss ---
+            # Target: (B, L) with 1.0 at gap_idx
+            loc_targets = torch.zeros((batch_size, seq_len), device=self.device)
+            loc_targets.scatter_(1, gap_idxs.unsqueeze(1), 1.0)
+
+            loc_loss = self.loc_criterion(loc_logits, loc_targets)
+
+            # --- Identification Loss ---
+            # We only care about the prediction at the gap index.
+            # Select logits corresponding to the gap position: (B, V)
+            batch_indices = torch.arange(batch_size, device=self.device)
+            pred_logits_at_gap = id_logits[batch_indices, gap_idxs, :]
+
+            id_loss = self.id_criterion(pred_logits_at_gap, target_ids)
+
+            # --- Total Loss ---
+            loss = (Config.LAMBDA_LOC * loc_loss) + (Config.LAMBDA_ID * id_loss)
+
+            # Backward Pass
+            loss.backward()
+            clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            if self.scheduler:
+                self.scheduler.step()
+
+            # --- Metrics Tracking ---
+            total_loss += loss.item() * batch_size
+            total_loc_loss += loc_loss.item() * batch_size
+            total_id_loss += id_loss.item() * batch_size
+
+            # Loc Accuracy
+            # Mask padding for argmax to ensure we don't predict padding as gap
+            masked_loc_logits = loc_logits.clone()
+            masked_loc_logits[attention_mask == 0] = float("-inf")
+            pred_gaps = torch.argmax(masked_loc_logits, dim=1)
+            correct_loc += (pred_gaps == gap_idxs).sum().item()
+
+            # Id Accuracy
+            pred_ids = torch.argmax(pred_logits_at_gap, dim=1)
+            correct_id += (pred_ids == target_ids).sum().item()
+=======
+            batch_size = input_ids.size(0)
+            
+            # Forward Pass
+            self.optimizer.zero_grad()
+            loc_logits, id_logits = self.model(input_ids, attention_mask)
+            
+            # Update seq_len to match model output (potentially truncated)
+            seq_len = loc_logits.size(1)
+            
+            # Truncate attention_mask if necessary
+            if attention_mask.size(1) > seq_len:
+                attention_mask = attention_mask[:, :seq_len]
+
+            # --- Localization Loss ---
+            # Target: (B, L) with 1.0 at gap_idx
+            loc_targets = torch.zeros((batch_size, seq_len), device=self.device)
+            
+            # Handle valid gaps (within truncated sequence)
+            valid_gap_mask = gap_idxs < seq_len
+            batch_indices = torch.arange(batch_size, device=self.device)
+            
+            if valid_gap_mask.any():
+                loc_targets[batch_indices[valid_gap_mask], gap_idxs[valid_gap_mask]] = 1.0
+
+            loc_loss = self.loc_criterion(loc_logits, loc_targets)
+
+            # --- Identification Loss ---
+            # Only calculate for valid gaps
+            if valid_gap_mask.any():
+                pred_logits_at_gap = id_logits[batch_indices[valid_gap_mask], gap_idxs[valid_gap_mask], :]
+                id_loss = self.id_criterion(pred_logits_at_gap, target_ids[valid_gap_mask])
+            else:
+                id_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+            # --- Total Loss ---
+            loss = (Config.LAMBDA_LOC * loc_loss) + (Config.LAMBDA_ID * id_loss)
+
+            # Backward Pass
+            loss.backward()
+            clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            if self.scheduler:
+                self.scheduler.step()
+
+            # --- Metrics Tracking ---
+            total_loss += loss.item() * batch_size
+            total_loc_loss += loc_loss.item() * batch_size
+            total_id_loss += id_loss.item() * batch_size
+
+            # Loc Accuracy
+            # Mask padding for argmax to ensure we don't predict padding as gap
+            masked_loc_logits = loc_logits.clone()
+            masked_loc_logits[attention_mask == 0] = float("-inf")
+            pred_gaps = torch.argmax(masked_loc_logits, dim=1)
+            correct_loc += (pred_gaps == gap_idxs).sum().item()
+
+            # Id Accuracy
+            if valid_gap_mask.any():
+                pred_ids = torch.argmax(pred_logits_at_gap, dim=1)
+                correct_id += (pred_ids == target_ids[valid_gap_mask]).sum().item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                batch_size = input_ids.size(0)
+                seq_len = input_ids.size(1)
+
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+                # Loc Loss
+                loc_targets = torch.zeros((batch_size, seq_len), device=self.device)
+                loc_targets.scatter_(1, gap_idxs.unsqueeze(1), 1.0)
+                loc_loss = self.loc_criterion(loc_logits, loc_targets)
+
+                # Id Loss
+                batch_indices = torch.arange(batch_size, device=self.device)
+                pred_logits_at_gap = id_logits[batch_indices, gap_idxs, :]
+                id_loss = self.id_criterion(pred_logits_at_gap, target_ids)
+
+                loss = (Config.LAMBDA_LOC * loc_loss) + (Config.LAMBDA_ID * id_loss)
+
+                total_loss += loss.item() * batch_size
+
+                # Metrics
+                masked_loc_logits = loc_logits.clone()
+                masked_loc_logits[attention_mask == 0] = float("-inf")
+                pred_gaps = torch.argmax(masked_loc_logits, dim=1)
+                correct_loc += (pred_gaps == gap_idxs).sum().item()
+
+                pred_ids = torch.argmax(pred_logits_at_gap, dim=1)
+                correct_id += (pred_ids == target_ids).sum().item()
+=======
+                batch_size = input_ids.size(0)
+                
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+                
+                # Update seq_len and truncate attention_mask
+                seq_len = loc_logits.size(1)
+                if attention_mask.size(1) > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
+
+                # Loc Loss
+                loc_targets = torch.zeros((batch_size, seq_len), device=self.device)
+                valid_gap_mask = gap_idxs < seq_len
+                batch_indices = torch.arange(batch_size, device=self.device)
+                
+                if valid_gap_mask.any():
+                    loc_targets[batch_indices[valid_gap_mask], gap_idxs[valid_gap_mask]] = 1.0
+                
+                loc_loss = self.loc_criterion(loc_logits, loc_targets)
+
+                # Id Loss
+                if valid_gap_mask.any():
+                    pred_logits_at_gap = id_logits[batch_indices[valid_gap_mask], gap_idxs[valid_gap_mask], :]
+                    id_loss = self.id_criterion(pred_logits_at_gap, target_ids[valid_gap_mask])
+                else:
+                    id_loss = torch.tensor(0.0, device=self.device)
+
+                loss = (Config.LAMBDA_LOC * loc_loss) + (Config.LAMBDA_ID * id_loss)
+
+                total_loss += loss.item() * batch_size
+
+                # Metrics
+                masked_loc_logits = loc_logits.clone()
+                masked_loc_logits[attention_mask == 0] = float("-inf")
+                pred_gaps = torch.argmax(masked_loc_logits, dim=1)
+                correct_loc += (pred_gaps == gap_idxs).sum().item()
+
+                if valid_gap_mask.any():
+                    pred_ids = torch.argmax(pred_logits_at_gap, dim=1)
+                    correct_id += (pred_ids == target_ids[valid_gap_mask]).sum().item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+                # Calculate Joint Score Matrix S = P(Loc) * P(Word)
+=======
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+                # Truncate attention_mask if necessary
+                if attention_mask.size(1) > loc_logits.size(1):
+                    attention_mask = attention_mask[:, :loc_logits.size(1)]
+
+                # Calculate Joint Score Matrix S = P(Loc) * P(Word)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                # Forward Pass
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+                # --- Joint Scoring Strategy ---
+=======
+                # Forward Pass
+                loc_logits, id_logits = self.model(input_ids, attention_mask)
+
+                # Truncate attention_mask if necessary
+                if attention_mask.size(1) > loc_logits.size(1):
+                    attention_mask = attention_mask[:, :loc_logits.size(1)]
+
+                # --- Joint Scoring Strategy ---
+>>>>>>> REPLACE
+```

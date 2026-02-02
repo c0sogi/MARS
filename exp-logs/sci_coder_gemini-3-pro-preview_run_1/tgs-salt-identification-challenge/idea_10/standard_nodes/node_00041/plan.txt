@@ -1,0 +1,565 @@
+I will optimize the solution by removing the classification gating mechanism and extending the training duration to enable effective snapshot ensembling. This strategy is based on Lesson 39, which advises against explicit gating for this task, and Lesson 35, which demonstrates the benefits of snapshot ensembling with cyclic learning rates. I will revert the model to a `DeepResUNet` (Lesson 21), simplify the loss function to exclude the classification component, and increase training to 150 epochs to capture snapshots from multiple cosine annealing cycles.
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class CompoundLoss(nn.Module):
+    def __init__(self):
+        super(CompoundLoss, self).__init__()
+        self.bce_seg = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+        self.lovasz = LovaszHingeLoss()
+        self.bce_cls = nn.BCEWithLogitsLoss()
+
+    def forward(self, outputs, targets):
+        """
+        outputs: Dictionary containing:
+            - 'logits': Segmentation logits (B, 1, H, W)
+            - 'cls': Classification logits (B, 1)
+        targets: Ground truth masks (B, 1, H, W) or (B, H, W)
+        """
+        seg_logits = outputs["logits"]
+        cls_logits = outputs["cls"]
+
+        # Ensure targets are (B, 1, H, W) float for BCE/Dice
+        if targets.dim() == 3:
+            targets = targets.unsqueeze(1)
+        targets = targets.float()
+
+        # 1. Segmentation Losses
+        # BCE
+        l_bce = self.bce_seg(seg_logits, targets)
+
+        # Dice (expects logits, applies sigmoid internally)
+        l_dice = self.dice(seg_logits, targets)
+
+        # Lovasz (expects logits, handles flattening internally)
+        l_lovasz = self.lovasz(seg_logits, targets)
+
+        # Combined Segmentation Loss
+        l_seg = l_bce + l_dice + 0.1 * l_lovasz
+
+        # 2. Classification Loss
+        # Derive targets: 1 if salt exists in mask, 0 otherwise
+        # targets is (B, 1, H, W) -> flatten to (B, -1) -> sum -> check > 0
+        batch_size = targets.size(0)
+        has_salt = targets.view(batch_size, -1).sum(1) > 0
+        cls_targets = has_salt.float().view(batch_size, 1)
+
+        l_cls = self.bce_cls(cls_logits, cls_targets)
+
+        # 3. Total Loss
+        total_loss = l_seg + 0.05 * l_cls
+
+        return total_loss
+=======
+class CompoundLoss(nn.Module):
+    def __init__(self):
+        super(CompoundLoss, self).__init__()
+        self.bce_seg = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+        self.lovasz = LovaszHingeLoss()
+
+    def forward(self, outputs, targets):
+        """
+        outputs: Dictionary containing:
+            - 'logits': Segmentation logits (B, 1, H, W)
+        targets: Ground truth masks (B, 1, H, W) or (B, H, W)
+        """
+        seg_logits = outputs["logits"]
+
+        # Ensure targets are (B, 1, H, W) float for BCE/Dice
+        if targets.dim() == 3:
+            targets = targets.unsqueeze(1)
+        targets = targets.float()
+
+        # 1. Segmentation Losses
+        # BCE
+        l_bce = self.bce_seg(seg_logits, targets)
+
+        # Dice (expects logits, applies sigmoid internally)
+        l_dice = self.dice(seg_logits, targets)
+
+        # Lovasz (expects logits, handles flattening internally)
+        l_lovasz = self.lovasz(seg_logits, targets)
+
+        # Combined Segmentation Loss
+        l_seg = l_bce + l_dice + 0.1 * l_lovasz
+
+        return l_seg
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GlobalContextBlock(nn.Module):
+    def __init__(self, in_channels, ratio=16):
+        super(GlobalContextBlock, self).__init__()
+        self.conv_mask = nn.Conv2d(in_channels, 1, kernel_size=1)
+        self.softmax = nn.Softmax(dim=1)
+
+        self.channel_add_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // ratio, kernel_size=1),
+            nn.LayerNorm([in_channels // ratio, 1, 1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // ratio, in_channels, kernel_size=1),
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        # Context Modeling
+        input_x = x
+        input_x = input_x.view(b, c, h * w)
+        context_mask = self.conv_mask(x)
+        context_mask = context_mask.view(b, 1, h * w)
+        context_mask = self.softmax(context_mask)
+        context_mask = context_mask.permute(0, 2, 1)  # (B, HW, 1)
+
+        context = torch.matmul(input_x, context_mask)  # (B, C, 1)
+        context = context.view(b, c, 1, 1)
+
+        # Transform
+        context_transform = self.channel_add_conv(context)
+
+        # Fusion
+        return x + context_transform
+
+
+class SCSEBlock(nn.Module):
+=======
+class SCSEBlock(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClassificationGatedResUNet(nn.Module):
+    def __init__(self, in_channels=2, classes=1):
+        super(ClassificationGatedResUNet, self).__init__()
+
+        # Encoder
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )  # 128x128
+
+        self.enc1 = ResBlock(64, 128, stride=2)  # 64x64
+        self.enc2 = ResBlock(128, 256, stride=2)  # 32x32
+        self.enc3 = ResBlock(256, 512, stride=2)  # 16x16
+        self.enc4 = ResBlock(512, 1024, stride=2)  # 8x8
+
+        # Bottleneck
+        self.gcb = GlobalContextBlock(1024)
+
+        # Classification Head
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(1024, 1)
+        )
+
+        # Decoder
+        self.up4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up4 = nn.Conv2d(1024, 512, 3, padding=1)
+        self.dec4 = ResBlock(1024, 512)
+        self.scse4 = SCSEBlock(512)
+
+        self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up3 = nn.Conv2d(512, 256, 3, padding=1)
+        self.dec3 = ResBlock(512, 256)
+        self.scse3 = SCSEBlock(256)
+        self.aux_head2 = nn.Conv2d(256, classes, 1)  # 32x32
+
+        self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up2 = nn.Conv2d(256, 128, 3, padding=1)
+        self.dec2 = ResBlock(256, 128)
+        self.scse2 = SCSEBlock(128)
+        self.aux_head1 = nn.Conv2d(128, classes, 1)  # 64x64
+
+        self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up1 = nn.Conv2d(128, 64, 3, padding=1)
+        self.dec1 = ResBlock(128, 64)
+        self.scse1 = SCSEBlock(64)
+
+        self.final_conv = nn.Conv2d(64, classes, 1)  # 128x128
+
+    def forward(self, x):
+        # Encoder
+        x0 = self.init_conv(x)
+        x1 = self.enc1(x0)
+        x2 = self.enc2(x1)
+        x3 = self.enc3(x2)
+        x4 = self.enc4(x3)
+
+        # Bottleneck
+        x4 = self.gcb(x4)
+        cls_logits = self.cls_head(x4)
+
+        # Decoder
+        d4 = self.up4(x4)
+        d4 = self.conv_up4(d4)
+        d4 = torch.cat([d4, x3], dim=1)
+        d4 = self.dec4(d4)
+        d4 = self.scse4(d4)
+
+        d3 = self.up3(d4)
+        d3 = self.conv_up3(d3)
+        d3 = torch.cat([d3, x2], dim=1)
+        d3 = self.dec3(d3)
+        d3 = self.scse3(d3)
+        aux2 = self.aux_head2(d3)
+
+        d2 = self.up2(d3)
+        d2 = self.conv_up2(d2)
+        d2 = torch.cat([d2, x1], dim=1)
+        d2 = self.dec2(d2)
+        d2 = self.scse2(d2)
+        aux1 = self.aux_head1(d2)
+
+        d1 = self.up1(d2)
+        d1 = self.conv_up1(d1)
+        d1 = torch.cat([d1, x0], dim=1)
+        d1 = self.dec1(d1)
+        d1 = self.scse1(d1)
+
+        logits = self.final_conv(d1)
+
+        return {"logits": logits, "cls": cls_logits, "aux_32": aux2, "aux_64": aux1}
+=======
+class DeepResUNet(nn.Module):
+    def __init__(self, in_channels=2, classes=1):
+        super(DeepResUNet, self).__init__()
+
+        # Encoder
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )  # 128x128
+
+        self.enc1 = ResBlock(64, 128, stride=2)  # 64x64
+        self.enc2 = ResBlock(128, 256, stride=2)  # 32x32
+        self.enc3 = ResBlock(256, 512, stride=2)  # 16x16
+        self.enc4 = ResBlock(512, 1024, stride=2)  # 8x8
+
+        # Decoder
+        self.up4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up4 = nn.Conv2d(1024, 512, 3, padding=1)
+        self.dec4 = ResBlock(1024, 512)
+        self.scse4 = SCSEBlock(512)
+
+        self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up3 = nn.Conv2d(512, 256, 3, padding=1)
+        self.dec3 = ResBlock(512, 256)
+        self.scse3 = SCSEBlock(256)
+        self.aux_head2 = nn.Conv2d(256, classes, 1)  # 32x32
+
+        self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up2 = nn.Conv2d(256, 128, 3, padding=1)
+        self.dec2 = ResBlock(256, 128)
+        self.scse2 = SCSEBlock(128)
+        self.aux_head1 = nn.Conv2d(128, classes, 1)  # 64x64
+
+        self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv_up1 = nn.Conv2d(128, 64, 3, padding=1)
+        self.dec1 = ResBlock(128, 64)
+        self.scse1 = SCSEBlock(64)
+
+        self.final_conv = nn.Conv2d(64, classes, 1)  # 128x128
+
+    def forward(self, x):
+        # Encoder
+        x0 = self.init_conv(x)
+        x1 = self.enc1(x0)
+        x2 = self.enc2(x1)
+        x3 = self.enc3(x2)
+        x4 = self.enc4(x3)
+
+        # Decoder
+        d4 = self.up4(x4)
+        d4 = self.conv_up4(d4)
+        d4 = torch.cat([d4, x3], dim=1)
+        d4 = self.dec4(d4)
+        d4 = self.scse4(d4)
+
+        d3 = self.up3(d4)
+        d3 = self.conv_up3(d3)
+        d3 = torch.cat([d3, x2], dim=1)
+        d3 = self.dec3(d3)
+        d3 = self.scse3(d3)
+        aux2 = self.aux_head2(d3)
+
+        d2 = self.up2(d3)
+        d2 = self.conv_up2(d2)
+        d2 = torch.cat([d2, x1], dim=1)
+        d2 = self.dec2(d2)
+        d2 = self.scse2(d2)
+        aux1 = self.aux_head1(d2)
+
+        d1 = self.up1(d2)
+        d1 = self.conv_up1(d1)
+        d1 = torch.cat([d1, x0], dim=1)
+        d1 = self.dec1(d1)
+        d1 = self.scse1(d1)
+
+        logits = self.final_conv(d1)
+
+        return {"logits": logits, "aux_32": aux2, "aux_64": aux1}
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import ClassificationGatedResUNet
+=======
+from library.model import DeepResUNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # 2. Model Setup
+        print("Initializing Model...")
+        model = ClassificationGatedResUNet(in_channels=2, classes=1).to(self.device)
+
+        # 3. Optimization
+=======
+        # 2. Model Setup
+        print("Initializing Model...")
+        model = DeepResUNet(in_channels=2, classes=1).to(self.device)
+
+        # 3. Optimization
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+                    # Inference Logic for Metric
+                    logits = outputs["logits"]
+                    cls_logits = outputs["cls"]
+
+                    probs = torch.sigmoid(logits)
+                    cls_probs = torch.sigmoid(cls_logits).view(-1, 1, 1, 1)
+
+                    # Gating: Suppress masks if classification says "Empty"
+                    final_probs = probs * cls_probs
+
+                    # Unpad: 128x128 -> 101x101
+                    # Padding was: Top=13, Bottom=14, Left=13, Right=14
+                    # Indices: [13 : 128-14] -> [13 : 114]
+                    final_probs_cropped = final_probs[:, :, 13:114, 13:114]
+                    masks_cropped = masks[:, :, 13:114, 13:114]
+=======
+                    # Inference Logic for Metric
+                    logits = outputs["logits"]
+                    probs = torch.sigmoid(logits)
+
+                    # Unpad: 128x128 -> 101x101
+                    # Padding was: Top=13, Bottom=14, Left=13, Right=14
+                    # Indices: [13 : 128-14] -> [13 : 114]
+                    final_probs_cropped = probs[:, :, 13:114, 13:114]
+                    masks_cropped = masks[:, :, 13:114, 13:114]
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import ClassificationGatedResUNet
+=======
+from library.model import DeepResUNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        # This path usually shouldn't be reached in a valid evaluation run
+        model = ClassificationGatedResUNet(in_channels=2, classes=1).to(device)
+        models = [model]
+
+    models = []
+    for p in model_paths:
+        m = ClassificationGatedResUNet(in_channels=2, classes=1).to(device)
+        # Load weights
+        state_dict = torch.load(p, map_location=device)
+=======
+        # This path usually shouldn't be reached in a valid evaluation run
+        model = DeepResUNet(in_channels=2, classes=1).to(device)
+        models = [model]
+
+    models = []
+    for p in model_paths:
+        m = DeepResUNet(in_channels=2, classes=1).to(device)
+        # Load weights
+        state_dict = torch.load(p, map_location=device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+            for model in models:
+                # Forward pass - Original
+                out = model(images)
+                # Forward pass - Flipped
+                out_flip = model(images_flip)
+
+                # Extract Logits
+                logits = out["logits"]
+                cls_logits = out["cls"]
+
+                logits_flip = out_flip["logits"]
+                cls_logits_flip = out_flip["cls"]
+
+                # Sigmoid
+                probs = torch.sigmoid(logits)
+                cls_probs = torch.sigmoid(cls_logits).view(-1, 1, 1, 1)
+
+                probs_flip = torch.sigmoid(logits_flip)
+                cls_probs_flip = torch.sigmoid(cls_logits_flip).view(-1, 1, 1, 1)
+
+                # Revert Flip for spatial maps
+                probs_flip = torch.flip(probs_flip, dims=[3])
+
+                # TTA Averaging for this model
+                avg_prob = (probs + probs_flip) / 2.0
+                avg_cls = (cls_probs + cls_probs_flip) / 2.0
+
+                batch_seg_probs.append(avg_prob)
+                batch_cls_probs.append(avg_cls)
+
+            # Ensemble Averaging
+            # Stack: (Num_Models, B, 1, H, W) -> Mean -> (B, 1, H, W)
+            ensemble_seg_prob = torch.stack(batch_seg_probs).mean(dim=0)
+            ensemble_cls_prob = torch.stack(batch_cls_probs).mean(dim=0)
+
+            # Classification Gating
+            # P_final = P_mask * P_class
+            final_prob = ensemble_seg_prob * ensemble_cls_prob
+=======
+            for model in models:
+                # Forward pass - Original
+                out = model(images)
+                # Forward pass - Flipped
+                out_flip = model(images_flip)
+
+                # Extract Logits
+                logits = out["logits"]
+                logits_flip = out_flip["logits"]
+
+                # Sigmoid
+                probs = torch.sigmoid(logits)
+                probs_flip = torch.sigmoid(logits_flip)
+
+                # Revert Flip for spatial maps
+                probs_flip = torch.flip(probs_flip, dims=[3])
+
+                # TTA Averaging for this model
+                avg_prob = (probs + probs_flip) / 2.0
+                batch_seg_probs.append(avg_prob)
+
+            # Ensemble Averaging
+            # Stack: (Num_Models, B, 1, H, W) -> Mean -> (B, 1, H, W)
+            final_prob = torch.stack(batch_seg_probs).mean(dim=0)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ClassificationGatedResUNet
+=======
+from library.model import DeepResUNet
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            outputs = model(images)
+
+            logits = outputs["logits"]
+            cls_logits = outputs["cls"]
+
+            probs = torch.sigmoid(logits)
+            cls_probs = torch.sigmoid(cls_logits).view(-1, 1, 1, 1)
+
+            # Gating
+            final_probs = probs * cls_probs
+
+            # Unpad: 128 -> 101. Indices [13:114]
+            final_probs_cropped = final_probs[:, :, 13:114, 13:114]
+            masks_cropped = masks[:, :, 13:114, 13:114]
+=======
+            outputs = model(images)
+
+            logits = outputs["logits"]
+            probs = torch.sigmoid(logits)
+
+            # Unpad: 128 -> 101. Indices [13:114]
+            final_probs_cropped = probs[:, :, 13:114, 13:114]
+            masks_cropped = masks[:, :, 13:114, 13:114]
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Training
+    # We use 50 epochs to complete one full cosine cycle (T_0=50).
+    # This is fast enough on A100 (approx 5-10 mins) and ensures good convergence.
+    print("Initializing training...")
+    trainer = Trainer(
+        epochs=50,
+        batch_size=32,
+        num_workers=4,
+        lr=1e-3,
+        checkpoint_dir=checkpoint_dir,
+        cache_dir=cache_dir,
+        debug=False,  # Use full dataset
+    )
+
+    trainer.fit()
+
+    # 3. Validation & Failure Analysis
+    print("Loading best model for validation...")
+    best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
+
+    if not os.path.exists(best_model_path):
+        print("Error: Best model checkpoint not found.")
+        return
+
+    model = ClassificationGatedResUNet(in_channels=2, classes=1).to(device)
+=======
+    # 2. Training
+    # We use 150 epochs to complete three full cosine cycles (T_0=50).
+    # This enables Snapshot Ensembling (Cite solution_lesson_node_00035).
+    print("Initializing training...")
+    trainer = Trainer(
+        epochs=150,
+        batch_size=32,
+        num_workers=4,
+        lr=1e-3,
+        checkpoint_dir=checkpoint_dir,
+        cache_dir=cache_dir,
+        debug=False,  # Use full dataset
+    )
+
+    trainer.fit()
+
+    # 3. Validation & Failure Analysis
+    print("Loading best model for validation...")
+    best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
+
+    if not os.path.exists(best_model_path):
+        print("Error: Best model checkpoint not found.")
+        return
+
+    model = DeepResUNet(in_channels=2, classes=1).to(device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,257 @@
+The issue stems from the inference loop generating a study-level prediction row for every image, rather than aggregating predictions by study. Since studies can contain multiple images, this produces duplicate rows and incorrect IDs (using image IDs instead of study IDs), causing the submission length mismatch.
+
+To fix this:
+1.  Modify `SIIMDataset` in `library/dataset.py` to return the `StudyInstanceUID` in test mode so the inference loop can associate images with their studies.
+2.  Update `Engine.inference` in `library/engine.py` to:
+    *   Accept the `study_id` from the data loader.
+    *   Accumulate study-level predictions in a dictionary keyed by `StudyInstanceUID`.
+    *   Aggregate these predictions (taking the highest confidence prediction across all images in a study) to ensure exactly one row per study.
+    *   Generate image-level predictions as before (one row per image).
+    *   Combine both sets of predictions into the final submission dataframe with the correct ID suffixes (`_study` and `_image`).
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        else:
+            # Test mode
+            self.image_ids = self.df["image_id"].values
+            self.file_paths = self.df["file_path"].values
+
+    def __len__(self):
+=======
+        else:
+            # Test mode
+            self.image_ids = self.df["image_id"].values
+            self.file_paths = self.df["file_path"].values
+            self.study_ids = self.df["StudyInstanceUID"].values
+
+    def __len__(self):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        else:
+            # Test Mode
+            if self.transforms:
+                # Only image transforms (Resize, Normalize, ToTensor)
+                transformed = self.transforms(image=image, bboxes=[], labels=[])
+                image = transformed["image"]
+
+            return image, self.image_ids[idx]
+=======
+        else:
+            # Test Mode
+            if self.transforms:
+                # Only image transforms (Resize, Normalize, ToTensor)
+                transformed = self.transforms(image=image, bboxes=[], labels=[])
+                image = transformed["image"]
+
+            return image, self.image_ids[idx], self.study_ids[idx]
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    @torch.no_grad()
+    def inference(self, test_loader, model_path):
+        print("Starting inference...")
+
+        # Load best model
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            print(f"Loaded model from {model_path}")
+        else:
+            print(
+                f"Warning: Model path {model_path} does not exist. Using current model weights."
+            )
+
+        self.model.eval()
+        self.model.to(self.device)
+
+        results = []
+
+        # Threshold for keeping a box
+        detection_threshold = Config.DETECTION_THRESHOLD
+
+        for images, image_ids in test_loader:
+            images = list(img.to(self.device) for img in images)
+
+            # Forward pass returns list of dicts: [{'boxes':..., 'labels':..., 'scores':...}, ...]
+            outputs = self.model(images)
+
+            # Move to CPU for processing
+            outputs = [{k: v.cpu().numpy() for k, v in t.items()} for t in outputs]
+
+            for i, output in enumerate(outputs):
+                image_id = image_ids[i]
+
+                boxes = output["boxes"]
+                scores = output["scores"]
+                labels = output["labels"]
+
+                # Filter by threshold
+                mask = scores >= detection_threshold
+                boxes = boxes[mask]
+                scores = scores[mask]
+                labels = labels[mask]
+
+                # --- 1. Study Level Prediction ---
+                # Logic:
+                # If no boxes -> "negative 1 0 0 1 1"
+                # Else -> find max score box, map its class to study label.
+                # Format: "{label} {score} 0 0 1 1"
+
+                study_id = f"{image_id}_study"
+
+                if len(boxes) == 0:
+                    study_pred = "negative 1 0 0 1 1"
+                else:
+                    # Find box with max score
+                    max_idx = np.argmax(scores)
+                    max_score = scores[max_idx]
+                    max_label_id = labels[max_idx]
+
+                    # Map ID to string (1: typical, 2: indeterminate, 3: atypical)
+                    # Note: If model predicts 0 (background) or something else, fallback to negative
+                    label_str = CLASS_ID_TO_LABEL.get(max_label_id, "negative")
+
+                    if label_str == "negative":
+                        study_pred = "negative 1 0 0 1 1"
+                    else:
+                        study_pred = f"{label_str} {max_score:.6f} 0 0 1 1"
+
+                results.append({"id": study_id, "PredictionString": study_pred})
+
+                # --- 2. Image Level Prediction ---
+                # Logic:
+                # If no boxes -> "none 1 0 0 1 1"
+                # Else -> All boxes are "opacity".
+                # Format: "opacity {score} {xmin} {ymin} {xmax} {ymax} ..."
+
+                img_pred_id = f"{image_id}_image"
+
+                if len(boxes) == 0:
+                    image_pred = "none 1 0 0 1 1"
+                else:
+                    # Create lists for formatter
+                    # Class is always "opacity" for image level
+                    pred_labels = ["opacity"] * len(boxes)
+                    pred_scores = scores.tolist()
+                    pred_boxes = boxes.tolist()  # [xmin, ymin, xmax, ymax]
+
+                    image_pred = format_prediction_string(
+                        pred_labels, pred_boxes, pred_scores
+                    )
+
+                results.append({"id": img_pred_id, "PredictionString": image_pred})
+=======
+    @torch.no_grad()
+    def inference(self, test_loader, model_path):
+        print("Starting inference...")
+
+        # Load best model
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            print(f"Loaded model from {model_path}")
+        else:
+            print(
+                f"Warning: Model path {model_path} does not exist. Using current model weights."
+            )
+
+        self.model.eval()
+        self.model.to(self.device)
+
+        results = []
+        study_preds = {}  # Store list of (score, pred_string) for each study_id
+
+        # Threshold for keeping a box
+        detection_threshold = Config.DETECTION_THRESHOLD
+
+        for images, image_ids, study_ids in test_loader:
+            images = list(img.to(self.device) for img in images)
+
+            # Forward pass returns list of dicts: [{'boxes':..., 'labels':..., 'scores':...}, ...]
+            outputs = self.model(images)
+
+            # Move to CPU for processing
+            outputs = [{k: v.cpu().numpy() for k, v in t.items()} for t in outputs]
+
+            for i, output in enumerate(outputs):
+                image_id = image_ids[i]
+                study_id = study_ids[i]
+
+                boxes = output["boxes"]
+                scores = output["scores"]
+                labels = output["labels"]
+
+                # Filter by threshold
+                mask = scores >= detection_threshold
+                boxes = boxes[mask]
+                scores = scores[mask]
+                labels = labels[mask]
+
+                # --- 1. Study Level Prediction Accumulation ---
+                # We collect predictions from all images in a study and aggregate later.
+                if len(boxes) == 0:
+                    # Negative prediction with 0 score (placeholder to not override positives)
+                    study_preds.setdefault(study_id, []).append(
+                        (0.0, "negative 1 0 0 1 1")
+                    )
+                else:
+                    # Find box with max score
+                    max_idx = np.argmax(scores)
+                    max_score = scores[max_idx]
+                    max_label_id = labels[max_idx]
+
+                    # Map ID to string (1: typical, 2: indeterminate, 3: atypical)
+                    label_str = CLASS_ID_TO_LABEL.get(max_label_id, "negative")
+
+                    if label_str == "negative":
+                        study_preds.setdefault(study_id, []).append(
+                            (0.0, "negative 1 0 0 1 1")
+                        )
+                    else:
+                        pred_str = f"{label_str} {max_score:.6f} 0 0 1 1"
+                        study_preds.setdefault(study_id, []).append(
+                            (max_score, pred_str)
+                        )
+
+                # --- 2. Image Level Prediction ---
+                # Logic:
+                # If no boxes -> "none 1 0 0 1 1"
+                # Else -> All boxes are "opacity".
+                # Format: "opacity {score} {xmin} {ymin} {xmax} {ymax} ..."
+
+                img_pred_id = f"{image_id}_image"
+
+                if len(boxes) == 0:
+                    image_pred = "none 1 0 0 1 1"
+                else:
+                    # Create lists for formatter
+                    # Class is always "opacity" for image level
+                    pred_labels = ["opacity"] * len(boxes)
+                    pred_scores = scores.tolist()
+                    pred_boxes = boxes.tolist()  # [xmin, ymin, xmax, ymax]
+
+                    image_pred = format_prediction_string(
+                        pred_labels, pred_boxes, pred_scores
+                    )
+
+                results.append({"id": img_pred_id, "PredictionString": image_pred})
+
+        # --- Aggregate Study Predictions ---
+        for study_id, preds in study_preds.items():
+            # Sort by score descending.
+            # If any positive prediction exists (score > 0), it will be at the top.
+            # If all are negative (score 0), the first one is picked.
+            preds.sort(key=lambda x: x[0], reverse=True)
+            best_pred = preds[0][1]
+
+            results.append(
+                {"id": f"{study_id}_study", "PredictionString": best_pred}
+            )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,295 @@
+To optimize the model performance, I will implement a **Stabilized Wide-Stream Residual BiLSTM** architecture, reverting the problematic changes introduced in the previous solution and adhering to the lessons learned from the "Current Best" configurations.
+
+**Strategy:**
+
+1.  **Switch Backbone to BiLSTM (Cite Lesson 00150, 00108):** The previous solution used a BiGRU, but empirical evidence suggests that standard BiLSTMs outperform BiGRUs in this specific low-data, noisy regression task due to their robust cell state. I will replace all GRU layers with LSTM layers.
+2.  **Remove Sequence Gating (Cite Lesson 00154):** The previous solution re-injected raw sequence embeddings into deep layers via gating, which caused overfitting by preventing the model from learning abstract hierarchical features. I will remove the `SequenceGatedBlock` and use a standard `ResidualBiLSTMBlock`.
+3.  **Optimize Dropout (Cite Lesson 00112):** I will reduce the dropout rate from 0.2 to 0.1, as higher dropout rates have been shown to degrade performance in this specific architecture setup.
+4.  **Enforce Pre-LayerNorm Topology (Cite Lesson 00135):** I will ensure the residual blocks follow the `x + Dropout(LSTM(LayerNorm(x)))` pattern, which stabilizes gradient flow in deep recurrent networks.
+5.  **Preserve Stem Signal (Cite Lesson 00109):** I will ensure no dropout is applied immediately after the initial Stem LSTM layer to preserve the fidelity of the input projection.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Using 'idea_62' to isolate this experiment's artifacts
+    WORKING_DIR = "./working/idea_62"
+
+    # Submission directory
+=======
+    # Using 'idea_optimized' to isolate this experiment's artifacts
+    WORKING_DIR = "./working/idea_optimized"
+
+    # Submission directory
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Regularization
+    DROPOUT = 0.2  # Inter-Layer Dropout
+=======
+    # Regularization
+    DROPOUT = 0.1  # Inter-Layer Dropout
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SequenceGatedBlock(nn.Module):
+    """
+    Residual Block with Pre-LayerNorm BiGRU and Sequence-Aware Gating.
+    """
+
+    def __init__(self, hidden_dim, seq_embed_dim, dropout):
+        super(SequenceGatedBlock, self).__init__()
+
+        self.norm = nn.LayerNorm(hidden_dim)
+
+        # BiGRU: Input hidden_dim -> Output hidden_dim (2 * hidden_dim//2)
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Gating projection: Maps Atomic Sequence Embedding to Hidden Dim
+        self.gate_proj = nn.Linear(seq_embed_dim, hidden_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, seq_emb):
+        """
+        Args:
+            x: Input tensor (batch, seq_len, hidden_dim)
+            seq_emb: Atomic sequence embeddings (batch, seq_len, seq_embed_dim)
+        """
+        residual = x
+
+        # Pre-LayerNorm
+        x_norm = self.norm(x)
+
+        # BiGRU
+        rnn_out, _ = self.gru(x_norm)
+
+        # Sequence Gating
+        # Project sequence embedding to gate logits
+        gate_logits = self.gate_proj(seq_emb)
+        gate = torch.sigmoid(gate_logits)
+
+        # Apply gate: Modulate RNN features by sequence context
+        h_gated = rnn_out * gate
+
+        # Dropout
+        out = self.dropout(h_gated)
+
+        # Residual Connection
+        return residual + out
+
+
+class RNA_Model(nn.Module):
+    """
+    Sequence-Gated Wide-Stream Residual BiGRU Model.
+    """
+
+    def __init__(self):
+        super(RNA_Model, self).__init__()
+
+        # 1. Embeddings
+        # Atomic Sequence
+        self.seq_embed = nn.Embedding(4, Config.EMBED_DIM_SEQ)
+
+        # Predicted Loop Type
+        self.loop_embed = nn.Embedding(7, Config.EMBED_DIM_LOOP)
+
+        # Distance Features are passed as pre-computed sinusoidal encodings (float)
+        # Total Input Dimension
+        input_dim = Config.EMBED_DIM_SEQ + Config.EMBED_DIM_LOOP + Config.EMBED_DIM_DIST
+
+        # 2. BiGRU Stem
+        # Projects concatenated inputs to the residual stream width
+        self.stem_gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone: Stack of Sequence-Gated Residual Blocks
+        self.layers = nn.ModuleList(
+            [
+                SequenceGatedBlock(
+                    hidden_dim=Config.HIDDEN_DIM,
+                    seq_embed_dim=Config.EMBED_DIM_SEQ,
+                    dropout=Config.DROPOUT,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Scalar Mixture Aggregation
+        # Aggregates outputs from Stem + all Layers
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # 5. Output Head
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.OUTPUT_DIM)
+
+    def forward(self, seq, loop, dist):
+        """
+        Args:
+            seq: (batch, seq_len) LongTensor
+            loop: (batch, seq_len) LongTensor
+            dist: (batch, seq_len, dist_dim) FloatTensor
+        """
+        # Embeddings
+        emb_seq = self.seq_embed(seq)  # (B, L, 128)
+        emb_loop = self.loop_embed(loop)  # (B, L, 64)
+
+        # Concatenate (Fusion)
+        # dist is (B, L, 64)
+        x = torch.cat([emb_seq, emb_loop, dist], dim=-1)  # (B, L, 256)
+
+        # Stem
+        stem_out, _ = self.stem_gru(x)  # (B, L, 384)
+
+        # Backbone
+        layer_outputs = [stem_out]
+        current_x = stem_out
+
+        for layer in self.layers:
+            # Pass sequence embedding for gating
+            current_x = layer(current_x, emb_seq)
+            layer_outputs.append(current_x)
+
+        # Aggregation
+        agg_out = self.mixture(layer_outputs)  # (B, L, 384)
+
+        # Head
+        logits = self.head(agg_out)  # (B, L, 3)
+
+        return logits
+=======
+class ResidualBiLSTMBlock(nn.Module):
+    """
+    Residual Block with Pre-LayerNorm BiLSTM.
+    Cite solution_lesson_node_00135 (Pre-LayerNorm)
+    Cite solution_lesson_node_00150 (LSTM vs GRU)
+    """
+
+    def __init__(self, hidden_dim, dropout):
+        super(ResidualBiLSTMBlock, self).__init__()
+
+        self.norm = nn.LayerNorm(hidden_dim)
+
+        # BiLSTM: Input hidden_dim -> Output hidden_dim (2 * hidden_dim//2)
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor (batch, seq_len, hidden_dim)
+        """
+        residual = x
+
+        # Pre-LayerNorm
+        x_norm = self.norm(x)
+
+        # BiLSTM
+        rnn_out, _ = self.lstm(x_norm)
+
+        # Dropout
+        out = self.dropout(rnn_out)
+
+        # Residual Connection
+        return residual + out
+
+
+class RNA_Model(nn.Module):
+    """
+    Wide-Stream Residual BiLSTM Model.
+    Cite solution_lesson_node_00154 (Remove Sequence Gating)
+    Cite solution_lesson_node_00150 (LSTM Backbone)
+    """
+
+    def __init__(self):
+        super(RNA_Model, self).__init__()
+
+        # 1. Embeddings
+        # Atomic Sequence
+        self.seq_embed = nn.Embedding(4, Config.EMBED_DIM_SEQ)
+
+        # Predicted Loop Type
+        self.loop_embed = nn.Embedding(7, Config.EMBED_DIM_LOOP)
+
+        # Distance Features are passed as pre-computed sinusoidal encodings (float)
+        # Total Input Dimension
+        input_dim = Config.EMBED_DIM_SEQ + Config.EMBED_DIM_LOOP + Config.EMBED_DIM_DIST
+
+        # 2. BiLSTM Stem
+        # Projects concatenated inputs to the residual stream width
+        # Cite solution_lesson_node_00109 (No Stem Dropout)
+        self.stem_lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=Config.HIDDEN_DIM // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone: Stack of Residual BiLSTM Blocks
+        self.layers = nn.ModuleList(
+            [
+                ResidualBiLSTMBlock(
+                    hidden_dim=Config.HIDDEN_DIM,
+                    dropout=Config.DROPOUT,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Scalar Mixture Aggregation
+        # Aggregates outputs from Stem + all Layers
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # 5. Output Head
+        self.head = nn.Linear(Config.HIDDEN_DIM, Config.OUTPUT_DIM)
+
+    def forward(self, seq, loop, dist):
+        """
+        Args:
+            seq: (batch, seq_len) LongTensor
+            loop: (batch, seq_len) LongTensor
+            dist: (batch, seq_len, dist_dim) FloatTensor
+        """
+        # Embeddings
+        emb_seq = self.seq_embed(seq)  # (B, L, 128)
+        emb_loop = self.loop_embed(loop)  # (B, L, 64)
+
+        # Concatenate (Fusion)
+        # dist is (B, L, 64)
+        x = torch.cat([emb_seq, emb_loop, dist], dim=-1)  # (B, L, 256)
+
+        # Stem
+        stem_out, _ = self.stem_lstm(x)  # (B, L, 384)
+
+        # Backbone
+        layer_outputs = [stem_out]
+        current_x = stem_out
+
+        for layer in self.layers:
+            current_x = layer(current_x)
+            layer_outputs.append(current_x)
+
+        # Aggregation
+        agg_out = self.mixture(layer_outputs)  # (B, L, 384)
+
+        # Head
+        logits = self.head(agg_out)  # (B, L, 3)
+
+        return logits
+>>>>>>> REPLACE
+```

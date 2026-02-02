@@ -1,0 +1,348 @@
+import os
+import torch
+import pandas as pd
+import numpy as np
+import torch.nn.functional as F
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from library.config import Config
+from library.models import LocatorModel, InfillerModel
+from library.utils import setup_logger
+
+
+class BeamSearchPipeline:
+    """
+    Implements the Probabilistic Beam-Search Cascade for inference.
+
+    Pipeline Steps:
+    1. Locator (DeBERTa-v3): Predicts Top-K likely positions for the missing word.
+    2. Hypothesis Expansion: Generates K candidate sentences with <mask> tokens.
+    3. Infiller (RoBERTa-Large): Predicts the missing word for each candidate.
+    4. Joint Ranking: Selects the best (Position, Word) pair based on P(loc) * P(word).
+    """
+
+    def __init__(self):
+        self.logger = setup_logger(
+            "Inference", os.path.join(Config.WORKING_DIR, "inference.log")
+        )
+        self.device = Config.DEVICE
+
+        # Load Tokenizers
+        self.logger.info("Loading tokenizers...")
+        self.tokenizer_loc = AutoTokenizer.from_pretrained(
+            Config.LOCATOR_MODEL_NAME, use_fast=True
+        )
+        self.tokenizer_inf = AutoTokenizer.from_pretrained(
+            Config.INFILLER_MODEL_NAME, use_fast=True
+        )
+
+        # Load Models
+        self.logger.info("Loading models...")
+        self.locator = LocatorModel().to(self.device)
+        self.infiller = InfillerModel().to(self.device)
+
+        # Load Weights
+        if os.path.exists(Config.BEST_LOCATOR_PATH):
+            self.locator.load_state_dict(
+                torch.load(Config.BEST_LOCATOR_PATH, map_location=self.device)
+            )
+            self.logger.info(f"Loaded Locator weights from {Config.BEST_LOCATOR_PATH}")
+        else:
+            self.logger.warning(
+                f"Locator weights not found at {Config.BEST_LOCATOR_PATH}. Using random init (expect poor performance)."
+            )
+
+        if os.path.exists(Config.BEST_INFILLER_PATH):
+            # The InfillerModel wraps AutoModelForMaskedLM. The state dict keys should match.
+            self.infiller.load_state_dict(
+                torch.load(Config.BEST_INFILLER_PATH, map_location=self.device)
+            )
+            self.logger.info(
+                f"Loaded Infiller weights from {Config.BEST_INFILLER_PATH}"
+            )
+        else:
+            self.logger.warning(
+                f"Infiller weights not found at {Config.BEST_INFILLER_PATH}. Using random init."
+            )
+
+        self.locator.eval()
+        self.infiller.eval()
+
+    def predict(self, test_loader):
+        """
+        Runs the full inference pipeline on the test set.
+
+        Args:
+            test_loader (DataLoader): DataLoader providing test samples.
+
+        Returns:
+            pd.DataFrame: DataFrame containing 'id' and 'sentence' (predicted).
+        """
+        results = []
+
+        self.logger.info(f"Starting inference with Beam Width = {Config.BEAM_WIDTH}...")
+
+        # Disable gradients for inference
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Predicting"):
+                # -------------------------------------------------------
+                # Stage 1: Locator (Find Top-K Gap Positions)
+                # -------------------------------------------------------
+                raw_texts = batch["raw_text"]
+                sample_ids = batch["id"]
+
+                # We re-tokenize here to ensure we have offset mappings,
+                # which are crucial for mapping token indices back to character positions.
+                loc_encoding = self.tokenizer_loc(
+                    raw_texts,
+                    max_length=Config.MAX_LEN,
+                    padding="max_length",
+                    truncation=True,
+                    return_offsets_mapping=True,
+                    return_tensors="pt",
+                )
+
+                loc_input_ids = loc_encoding["input_ids"].to(self.device)
+                loc_attention_mask = loc_encoding["attention_mask"].to(self.device)
+                loc_offsets = loc_encoding["offset_mapping"].cpu().numpy()
+
+                # Get Locator Logits
+                loc_logits = self.locator(
+                    loc_input_ids, loc_attention_mask
+                )  # (Batch, Seq)
+                loc_probs = torch.sigmoid(loc_logits)  # (Batch, Seq)
+
+                # Beam Search: Get Top-K indices per sentence
+                # We mask out padding tokens and special tokens (CLS/SEP) to avoid selecting them
+                # DeBERTa special tokens: [CLS] at 0, [SEP] at end.
+                # We can just rely on the model learning this, or enforce it.
+                # Enforcing mask on 0 and padding helps.
+                seq_len = loc_input_ids.shape[1]
+                valid_mask = loc_attention_mask.clone()
+                valid_mask[:, 0] = 0  # Mask CLS
+
+                # Apply mask to probs (set invalid to -1)
+                masked_probs = loc_probs.clone()
+                masked_probs[valid_mask == 0] = -1.0
+
+                topk_probs, topk_indices = torch.topk(
+                    masked_probs, k=Config.BEAM_WIDTH, dim=1
+                )
+
+                topk_probs = topk_probs.cpu().numpy()
+                topk_indices = topk_indices.cpu().numpy()
+
+                # -------------------------------------------------------
+                # Stage 2: Hypothesis Expansion & Infiller Scoring
+                # -------------------------------------------------------
+
+                # Prepare batch for Infiller
+                # We will flatten the beam: Batch_Size * Beam_Width samples
+                infiller_texts = []
+                metadata_map = (
+                    []
+                )  # To map back to (batch_idx, beam_idx, insertion_char_idx)
+
+                for b_idx in range(len(raw_texts)):
+                    text = raw_texts[b_idx]
+                    offsets = loc_offsets[b_idx]
+
+                    for k in range(Config.BEAM_WIDTH):
+                        token_idx = topk_indices[b_idx, k]
+                        loc_score = topk_probs[b_idx, k]
+
+                        # Find character insertion point
+                        # The Locator predicts the token *after* which the gap exists.
+                        # So we look at the end offset of the predicted token.
+                        # Handle truncation/padding edge cases safely
+                        if token_idx >= len(offsets):
+                            token_idx = len(offsets) - 1
+
+                        start, end = offsets[token_idx]
+
+                        # If [SEP] or padding selected (should be rare due to masking), fallback to end of string
+                        if end == 0 and start == 0:
+                            insertion_idx = len(text)
+                        else:
+                            insertion_idx = end
+
+                        # Construct candidate: Insert " <mask>"
+                        # Note: Infiller (RoBERTa) expects <mask>. We add a space for natural separation.
+                        # If insertion is at end, " <mask>". If middle, " <mask>".
+                        # We reconstruct: text[:idx] + " " + mask + text[idx:]
+                        # But we must be careful about existing spaces.
+                        # The task removed a word. Usually implies spaces around it were merged or one remains.
+                        # Standard approach: Insert " <mask>" (space + mask).
+
+                        candidate_text = (
+                            text[:insertion_idx]
+                            + " "
+                            + self.tokenizer_inf.mask_token
+                            + text[insertion_idx:]
+                        )
+
+                        infiller_texts.append(candidate_text)
+                        metadata_map.append(
+                            {
+                                "batch_idx": b_idx,
+                                "loc_score": loc_score,
+                                "insertion_idx": insertion_idx,
+                                "original_text": text,
+                                "sample_id": sample_ids[b_idx].item(),
+                            }
+                        )
+
+                # Tokenize for Infiller
+                inf_encoding = self.tokenizer_inf(
+                    infiller_texts,
+                    max_length=Config.MAX_LEN,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                inf_input_ids = inf_encoding["input_ids"].to(self.device)
+                inf_attention_mask = inf_encoding["attention_mask"].to(self.device)
+
+                # Run Infiller
+                inf_outputs = self.infiller(inf_input_ids, inf_attention_mask)
+                inf_logits = inf_outputs.logits  # (Batch*Beam, Seq, Vocab)
+
+                # Extract prediction at <mask> position
+                mask_token_id = self.tokenizer_inf.mask_token_id
+
+                # Find mask indices
+                # torch.where returns (indices_dim0, indices_dim1)
+                mask_locs = (inf_input_ids == mask_token_id).nonzero()
+
+                # We need exactly one prediction per sample.
+                # If truncation removed the mask (rare), we handle it.
+
+                # Create a tensor to store best word prob and id for each beam candidate
+                beam_word_probs = torch.zeros(len(infiller_texts), device=self.device)
+                beam_word_ids = torch.zeros(
+                    len(infiller_texts), dtype=torch.long, device=self.device
+                )
+
+                # Map mask locations to the batch
+                # mask_locs[:, 0] is the batch index in the flattened infiller batch
+                # mask_locs[:, 1] is the sequence index
+
+                # We only take the first mask occurrence per sequence if multiple exist (shouldn't happen with our construction)
+                seen_seqs = set()
+                for i in range(mask_locs.shape[0]):
+                    seq_idx = mask_locs[i, 0].item()
+                    token_pos = mask_locs[i, 1].item()
+
+                    if seq_idx in seen_seqs:
+                        continue
+                    seen_seqs.add(seq_idx)
+
+                    # Get logits for this position
+                    vocab_logits = inf_logits[seq_idx, token_pos, :]
+                    probs = torch.softmax(vocab_logits, dim=0)
+
+                    max_prob, max_id = torch.max(probs, dim=0)
+
+                    beam_word_probs[seq_idx] = max_prob
+                    beam_word_ids[seq_idx] = max_id
+
+                # -------------------------------------------------------
+                # Stage 3: Joint Ranking & Reconstruction
+                # -------------------------------------------------------
+
+                # Group by original batch index to select best candidate
+                # metadata_map aligns 1:1 with infiller_texts and beam_word_* tensors
+
+                batch_candidates = (
+                    {}
+                )  # Map batch_idx -> list of (score, word_str, insertion_idx)
+
+                beam_word_probs_cpu = beam_word_probs.cpu().numpy()
+                beam_word_ids_cpu = beam_word_ids.cpu().numpy()
+
+                for i, meta in enumerate(metadata_map):
+                    b_idx = meta["batch_idx"]
+                    loc_score = meta["loc_score"]
+                    word_prob = beam_word_probs_cpu[i]
+                    word_id = beam_word_ids_cpu[i]
+
+                    # Joint Score
+                    # We can use product of probabilities
+                    joint_score = loc_score * word_prob
+
+                    # Decode word
+                    # decode returns string. strip() to remove extra spaces if any.
+                    predicted_word = self.tokenizer_inf.decode([word_id]).strip()
+
+                    if b_idx not in batch_candidates:
+                        batch_candidates[b_idx] = []
+
+                    batch_candidates[b_idx].append(
+                        {
+                            "score": joint_score,
+                            "word": predicted_word,
+                            "insertion_idx": meta["insertion_idx"],
+                            "original_text": meta["original_text"],
+                            "sample_id": meta["sample_id"],
+                        }
+                    )
+
+                # Select best for each sample in batch
+                for b_idx in range(len(raw_texts)):
+                    cands = batch_candidates.get(b_idx, [])
+                    if not cands:
+                        # Fallback if something failed (e.g. mask truncated)
+                        # Append original sentence
+                        results.append((sample_ids[b_idx].item(), raw_texts[b_idx]))
+                        continue
+
+                    # Sort by score descending
+                    best_cand = sorted(cands, key=lambda x: x["score"], reverse=True)[0]
+
+                    # Reconstruct Sentence
+                    # text[:idx] + " " + word + text[idx:]
+                    # We ensure exactly one space padding
+                    orig = best_cand["original_text"]
+                    idx = best_cand["insertion_idx"]
+                    word = best_cand["word"]
+
+                    # Heuristic for clean spacing:
+                    # If idx is at end, add space before word.
+                    # If idx is middle, ensure spaces around.
+                    # Our insertion logic was: text[:idx] + " " + mask + text[idx:]
+                    # So we replicate:
+                    final_sent = f"{orig[:idx]} {word}{orig[idx:]}"
+
+                    # Clean up potential double spaces
+                    final_sent = " ".join(final_sent.split())
+
+                    results.append((best_cand["sample_id"], final_sent))
+
+        # Convert to DataFrame
+        df_results = pd.DataFrame(results, columns=["id", "sentence"])
+        return df_results
+
+    def generate_submission(self, test_loader):
+        """
+        Generates predictions and saves them to the submission file.
+        """
+        df_preds = self.predict(test_loader)
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(Config.SUBMISSION_PATH), exist_ok=True)
+
+        # Save to CSV with specific quoting to match requirements
+        # Requirement: id,"sentence"
+        # Pandas to_csv with quoting=1 (QUOTE_ALL) gives "id","sentence"
+        # We need id,"sentence". We can achieve this by manually formatting or using csv module options.
+        # However, standard CSV readers handle "id" or id fine. The prompt example shows id,"sentence".
+        # We will use QUOTE_NONNUMERIC (2) which quotes non-numbers. ID is int, sentence is str.
+        import csv
+
+        df_preds.to_csv(
+            Config.SUBMISSION_PATH, index=False, quoting=csv.QUOTE_NONNUMERIC
+        )
+
+        self.logger.info(f"Submission saved to {Config.SUBMISSION_PATH}")
+        self.logger.info(f"Generated {len(df_preds)} predictions.")

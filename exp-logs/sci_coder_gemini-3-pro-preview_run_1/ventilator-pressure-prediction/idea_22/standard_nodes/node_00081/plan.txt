@@ -1,0 +1,348 @@
+My optimization strategy focuses on refining the "Deep Context Injection" mechanism based on Lessons 00066 and 00076. The previous solution indiscriminately injected all raw features (including high-frequency noise like `u_in` and its derivatives) into every layer of the deep LSTM backbone. Lesson 00066 explicitly warns that this degrades performance by bypassing the network's temporal hierarchy. Lesson 00076 advises injecting only static system parameters (`R`, `C`) and derived physical interaction terms (`R*u_in`, `Vol/C`).
+
+Therefore, I will modify the model to filter the injection inputs. The `MultiScaleStem` will still process the full feature set to extract local temporal patterns, but the deep `CompositeBlock`s will only receive the curated physics context (`R`, `C`, `R_u_in`, `vol_C`) concatenated to the latent state. This should reduce noise in the deep layers and help the model focus on solving the physical equation of motion. I will also update the configuration to use a new working directory `idea_23` to avoid cache conflicts.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working Directory for Caching and Models
+    # Using specific idea folder to prevent cache collisions
+    WORKING_DIR = "./working/idea_22/"
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+=======
+    # Working Directory for Caching and Models
+    # Using specific idea folder to prevent cache collisions
+    WORKING_DIR = "./working/idea_23/"
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CompositeBlock(nn.Module):
+    """
+    Wide-State Identity Block.
+    Injects physics context at every step, applies Bi-LSTM mixing, and uses
+    strict identity residuals without LayerNorm to preserve pressure magnitude.
+    """
+
+    def __init__(self, model_dim, input_dim, lstm_hidden, dropout, expansion=2):
+        super().__init__()
+
+        # 1. Wide-State Temporal Mixing (Bi-LSTM)
+        # Input: Latent State (model_dim) + Physics Context (input_dim)
+        # Output: 2 * lstm_hidden. We expect 2*lstm_hidden == model_dim.
+        self.lstm = nn.LSTM(
+            input_size=model_dim + input_dim,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # 2. Pointwise Channel Mixing (FFN)
+        ffn_dim = int(model_dim * expansion)
+        self.ffn = nn.Sequential(
+            nn.Linear(model_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, model_dim)
+        )
+
+    def forward(self, h, x_context):
+        """
+        Args:
+            h: Latent state tensor of shape (Batch, Seq, Model_Dim)
+            x_context: Raw/Engineered feature tensor of shape (Batch, Seq, Input_Dim)
+        """
+        # Curated Physics Injection: Concatenate context to latent state
+        lstm_input = torch.cat([h, x_context], dim=-1)
+
+        # LSTM Mixing
+        lstm_out, _ = self.lstm(lstm_input)
+
+        # Strict Identity Residual 1 (No weights, no norm)
+        h = h + self.dropout(lstm_out)
+
+        # FFN Mixing
+        ffn_out = self.ffn(h)
+
+        # Strict Identity Residual 2 (No weights, no norm)
+        h = h + self.dropout(ffn_out)
+
+        return h
+
+
+class WideProjectedNet(nn.Module):
+    """
+    Wide-Projected Physics-Composite Network.
+    Implements a Bottleneck-to-Wide topology with deep supervision.
+    """
+
+    def __init__(self, input_dim):
+        super().__init__()
+
+        self.stem_dim = Config.STEM_DIM
+        self.model_dim = Config.MODEL_DIM
+        self.lstm_hidden = Config.LSTM_HIDDEN
+        self.dropout_rate = Config.DROPOUT
+        self.aux_idx = Config.AUX_LAYER_INDEX
+
+        # 1. Stem (Bottleneck Initialization)
+        self.stem = MultiScaleStem(input_dim, self.stem_dim)
+
+        # 2. Wide Projection Adapter
+        # Projects compressed stem features to high-capacity model dimension
+        self.projection = nn.Linear(self.stem_dim, self.model_dim)
+
+        # 3. Backbone (Composite Blocks)
+        self.layers = nn.ModuleList(
+            [
+                CompositeBlock(
+                    model_dim=self.model_dim,
+                    input_dim=input_dim,
+                    lstm_hidden=self.lstm_hidden,
+                    dropout=self.dropout_rate,
+                    expansion=Config.FFN_EXPANSION,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Heads
+        self.aux_head = nn.Linear(self.model_dim, 1)
+        self.head = nn.Linear(self.model_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights for stability.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        nn.init.zeros_(param.data)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq, Input_Dim)
+        Returns:
+            final_out: Prediction from the last block (Batch, Seq, 1)
+            aux_out: Prediction from the auxiliary block (Batch, Seq, 1)
+        """
+        # Stem
+        stem_out = self.stem(x)
+
+        # Projection to Wide State
+        h = self.projection(stem_out)
+
+        aux_out = None
+
+        # Backbone
+        for i, layer in enumerate(self.layers):
+            # Pass both latent state and physics context
+            h = layer(h, x)
+
+            # Deep Supervision
+            if i == self.aux_idx:
+                aux_out = self.aux_head(h)
+
+        # Final Prediction
+        final_out = self.head(h)
+
+        return final_out, aux_out
+=======
+class CompositeBlock(nn.Module):
+    """
+    Wide-State Identity Block.
+    Injects physics context at every step, applies Bi-LSTM mixing, and uses
+    strict identity residuals without LayerNorm to preserve pressure magnitude.
+    """
+
+    def __init__(self, model_dim, context_dim, lstm_hidden, dropout, expansion=2):
+        super().__init__()
+
+        # 1. Wide-State Temporal Mixing (Bi-LSTM)
+        # Input: Latent State (model_dim) + Physics Context (context_dim)
+        # Output: 2 * lstm_hidden. We expect 2*lstm_hidden == model_dim.
+        # Cite Lesson 00035: Deep Context Injection
+        # Cite Lesson 00055: Don't bottleneck Bi-LSTMs
+        self.lstm = nn.LSTM(
+            input_size=model_dim + context_dim,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        # 2. Pointwise Channel Mixing (FFN)
+        # Cite Lesson 00040: Pointwise FFNs
+        # Cite Lesson 00052: Keep expansion modest (2x) without LayerNorm
+        ffn_dim = int(model_dim * expansion)
+        self.ffn = nn.Sequential(
+            nn.Linear(model_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, model_dim)
+        )
+
+    def forward(self, h, x_context):
+        """
+        Args:
+            h: Latent state tensor of shape (Batch, Seq, Model_Dim)
+            x_context: Curated Physics Context tensor of shape (Batch, Seq, Context_Dim)
+        """
+        # Curated Physics Injection: Concatenate context to latent state
+        lstm_input = torch.cat([h, x_context], dim=-1)
+
+        # LSTM Mixing
+        lstm_out, _ = self.lstm(lstm_input)
+
+        # Strict Identity Residual 1 (No weights, no norm)
+        # Cite Lesson 00024: Dropout only on residual branch
+        # Cite Lesson 00044: Avoid LayerNorm in residual stream
+        h = h + self.dropout(lstm_out)
+
+        # FFN Mixing
+        ffn_out = self.ffn(h)
+
+        # Strict Identity Residual 2 (No weights, no norm)
+        h = h + self.dropout(ffn_out)
+
+        return h
+
+
+class WideProjectedNet(nn.Module):
+    """
+    Wide-Projected Physics-Composite Network.
+    Implements a Bottleneck-to-Wide topology with deep supervision and filtered context injection.
+    """
+
+    def __init__(self, input_dim, context_indices):
+        super().__init__()
+
+        self.stem_dim = Config.STEM_DIM
+        self.model_dim = Config.MODEL_DIM
+        self.lstm_hidden = Config.LSTM_HIDDEN
+        self.dropout_rate = Config.DROPOUT
+        self.aux_idx = Config.AUX_LAYER_INDEX
+        self.context_indices = context_indices
+        context_dim = len(context_indices)
+
+        # 1. Stem (Bottleneck Initialization)
+        # Cite Lesson 00073: Bottleneck Initialization
+        self.stem = MultiScaleStem(input_dim, self.stem_dim)
+
+        # 2. Wide Projection Adapter
+        # Projects compressed stem features to high-capacity model dimension
+        # Cite Lesson 00027: Projection shortcuts
+        self.projection = nn.Linear(self.stem_dim, self.model_dim)
+
+        # 3. Backbone (Composite Blocks)
+        self.layers = nn.ModuleList(
+            [
+                CompositeBlock(
+                    model_dim=self.model_dim,
+                    context_dim=context_dim,
+                    lstm_hidden=self.lstm_hidden,
+                    dropout=self.dropout_rate,
+                    expansion=Config.FFN_EXPANSION,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # 4. Heads
+        self.aux_head = nn.Linear(self.model_dim, 1)
+        self.head = nn.Linear(self.model_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize weights for stability.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        nn.init.zeros_(param.data)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq, Input_Dim)
+        Returns:
+            final_out: Prediction from the last block (Batch, Seq, 1)
+            aux_out: Prediction from the auxiliary block (Batch, Seq, 1)
+        """
+        # Stem
+        stem_out = self.stem(x)
+
+        # Projection to Wide State
+        h = self.projection(stem_out)
+
+        # Extract Curated Context for Injection
+        # Cite Lesson 00066: Filter deep injections (don't inject raw dynamic noise)
+        # Cite Lesson 00076: Explicit Injection of Derived Physical Interactions
+        x_context = x[:, :, self.context_indices]
+
+        aux_out = None
+
+        # Backbone
+        for i, layer in enumerate(self.layers):
+            # Pass both latent state and curated physics context
+            h = layer(h, x_context)
+
+            # Deep Supervision
+            # Cite Lesson 00039: Deep Supervision
+            if i == self.aux_idx:
+                aux_out = self.aux_head(h)
+
+        # Final Prediction
+        final_out = self.head(h)
+
+        return final_out, aux_out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = WideProjectedNet(input_dim=input_dim).to(device)
+=======
+    # 3. Model Initialization
+    # Define Context Indices for filtered injection.
+    # Order in features.py: [time_step, u_in, R, C, volume, R_u_in, vol_C, lags..., diffs...]
+    # Indices: R=2, C=3, R_u_in=5, vol_C=6
+    # Cite Lesson 00066: Filter deep injections
+    # Cite Lesson 00076: Inject derived interactions
+    context_indices = [2, 3, 5, 6]
+    print(f"Injecting Context Features at indices: {context_indices}")
+    
+    model = WideProjectedNet(input_dim=input_dim, context_indices=context_indices).to(device)
+>>>>>>> REPLACE
+```

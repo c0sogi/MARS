@@ -1,0 +1,370 @@
+My implementation strategy focuses on transitioning from the Output-Space Fusion architecture (RODSNet) to a Latent-Space Fusion architecture (DSPRNet), which has been identified as the "Current Best" approach in the lessons.
+
+1.  **Architecture Upgrade (DSPRNet)**:
+    *   **Latent Fusion (Cite Lesson 00052, 00060)**: Instead of summing predictions at the end, I will sum 64-dimensional latent vectors from the Clinical and Visual streams before the final projection. This allows the model to learn a shared representation space where the visual features act as a residual correction to the clinical embedding.
+    *   **Context Visibility (Cite Lesson 00139)**: I will ensure the Visual Stream receives both the image embeddings and the tabular features (Baseline FVC, etc.) to model complex interactions (e.g., fibrosis patterns conditioned on baseline severity).
+    *   **Dimensionality Balance (Cite Lesson 00146)**: I will project the high-dimensional EfficientNet features (1408 dim) to a lower dimension (64 dim) *before* concatenating with the tabular features, preventing the image signal from drowning out the clinical signal.
+    *   **Standard Initialization (Cite Lesson 00118)**: I will remove the zero-initialization from the Visual Stream's final layer, as this has been shown to degrade performance in latent fusion architectures.
+    *   **Remove Dropout (Cite Lesson 00126)**: I will remove Dropout from the Visual Stream to preserve the weak residual signal, relying on weight decay for regularization.
+
+2.  **Hyperparameter Tuning**:
+    *   **Regularization**: I will increase `WEIGHT_DECAY` from `0.01` to `0.05` to combat the rapid overfitting observed in the previous run (where validation peaked at Epoch 3).
+    *   **Learning Rate**: I will keep the learning rates consistent but rely on the increased weight decay to stabilize the head.
+
+3.  **Code Structure**:
+    *   I will replace `RODSNet` with `DSPRNet` in `library/model.py`.
+    *   I will update `library/config.py`, `library/train.py`, and `runfile.py` to reflect these changes.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Optimizer
+    LR_BACKBONE = 1e-4
+    LR_HEAD = 1e-3
+    WEIGHT_DECAY = 1e-2
+
+    # Model / Architecture
+=======
+    # Optimizer
+    LR_BACKBONE = 1e-4
+    LR_HEAD = 1e-3
+    WEIGHT_DECAY = 5e-2  # Increased to 0.05 to combat early overfitting
+
+    # Model / Architecture
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalStream(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor (The Base Learner).
+    Learns the baseline disease trajectory based on clinical scalars.
+    Input: 5 Clinical Features
+    Output: Base Mean, Base Raw Sigma
+    """
+
+    def __init__(self, input_dim=5):
+        super(ClinicalStream, self).__init__()
+        # Architecture: Linear(Input -> 128) -> ReLU -> Linear(128 -> 64) -> ReLU -> Linear(64 -> 2)
+        # We include ReLU after the 128->64 layer to ensure it functions as a proper MLP hidden layer.
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VisualStream(nn.Module):
+    """
+    Stream B: Regularized Visual Residual (The Correction).
+    Uses EfficientNet-B2 to learn residual corrections to the clinical baseline.
+    Input: Image (Batch, 3, H, W), Tabular (Batch, 5)
+    Output: Residual Mean, Residual Raw Sigma
+    """
+
+    def __init__(self, tabular_dim=5):
+        super(VisualStream, self).__init__()
+
+        # Backbone: EfficientNet-B2
+        # num_classes=0 ensures we get the Global Average Pooled features (1408 dim)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, in_chans=3, num_classes=0
+        )
+
+        # Feature dimension for EfficientNet-B2
+        self.backbone_dim = self.backbone.num_features
+
+        # Unfreezing Logic: Freeze all, then unfreeze top two convolutional stages
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the last two blocks (stages) in the EfficientNet hierarchy
+        # timm stores blocks in a Sequential named 'blocks'
+        if hasattr(self.backbone, "blocks"):
+            # Unfreeze last 2 stages
+            for stage in self.backbone.blocks[-2:]:
+                for param in stage.parameters():
+                    param.requires_grad = True
+
+        # Unfreeze the conv_head and bn2 (top-most layers before pooling)
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Bottleneck Projection: 1408 -> 64
+        self.projection = nn.Linear(self.backbone_dim, 64)
+
+        # MLP Head with Context Injection
+        # Input: Projected Image (64) + Clinical Scalars (5)
+        fused_dim = 64 + tabular_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(fused_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, 64),
+            nn.Dropout(p=0.2),
+            nn.Linear(64, 2),
+        )
+
+        # Zero-Initialization: Initialize final layer weights/bias to 0
+        # This ensures the residual stream starts with 0 output (Boosting paradigm)
+        final_layer = self.mlp[-1]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.zeros_(final_layer.bias)
+
+    def forward(self, img, tabular):
+        # 1. Extract Visual Features
+        features = self.backbone(img)  # (Batch, 1408)
+
+        # 2. Project to lower dimension
+        proj = self.projection(features)  # (Batch, 64)
+
+        # 3. Context Injection: Concatenate with clinical scalars
+        fused = torch.cat([proj, tabular], dim=1)  # (Batch, 69)
+
+        # 4. Predict Residuals
+        out = self.mlp(fused)  # (Batch, 2)
+        return out
+
+
+class RODSNet(nn.Module):
+    """
+    Regularized Output-Space Dual-Stream Network.
+    Fuses Clinical Anchor and Visual Residual via summation.
+    """
+
+    def __init__(self):
+        super(RODSNet, self).__init__()
+        self.clinical_stream = ClinicalStream(input_dim=5)
+        self.visual_stream = VisualStream(tabular_dim=5)
+
+    def forward(self, img, tabular):
+        """
+        Args:
+            img (torch.Tensor): CT Image slices (Batch, 3, H, W)
+            tabular (torch.Tensor): Clinical features (Batch, 5)
+
+        Returns:
+            torch.Tensor: Combined output (Batch, 2) -> [Mean, Raw_Sigma]
+        """
+        # Stream A: Clinical Anchor (Base Prediction)
+        base_out = self.clinical_stream(tabular)
+
+        # Stream B: Visual Residual (Correction)
+        residual_out = self.visual_stream(img, tabular)
+
+        # Output Fusion: Summation in the raw output space
+        # Mean_final = Mean_base + Mean_residual
+        # Raw_Sigma_final = Raw_Sigma_base + Raw_Sigma_residual
+        # The loss function handles the Softplus conversion for Sigma.
+        return base_out + residual_out
+=======
+class ClinicalEncoder(nn.Module):
+    """
+    Stream A: Clinical Latent Encoder.
+    Maps clinical features to a latent space.
+    Input: 5 Clinical Features
+    Output: 64-dim Latent Vector
+    """
+
+    def __init__(self, input_dim=5, latent_dim=64):
+        super(ClinicalEncoder, self).__init__()
+        # Over-parameterized MLP (Cite Lesson 00060)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VisualEncoder(nn.Module):
+    """
+    Stream B: Visual Interaction Encoder.
+    Maps Images + Tabular Context to a latent space.
+    Input: Image (Batch, 3, H, W), Tabular (Batch, 5)
+    Output: 64-dim Latent Vector
+    """
+
+    def __init__(self, tabular_dim=5, latent_dim=64):
+        super(VisualEncoder, self).__init__()
+
+        # Backbone: EfficientNet-B2
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, in_chans=3, num_classes=0
+        )
+        self.backbone_dim = self.backbone.num_features
+
+        # Unfreezing Logic
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        if hasattr(self.backbone, "blocks"):
+            for stage in self.backbone.blocks[-2:]:
+                for param in stage.parameters():
+                    param.requires_grad = True
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Bottleneck Projection (Cite Lesson 00146)
+        # Project high-dim image features before concatenating with low-dim tabular
+        self.projection = nn.Linear(self.backbone_dim, latent_dim)
+
+        # Interaction MLP (Cite Lesson 00139 - Context Visibility)
+        # Input: Projected Image (64) + Clinical Scalars (5)
+        fused_input_dim = latent_dim + tabular_dim
+        
+        # Removed Dropout (Cite Lesson 00126 - Avoid dropout on residual branch)
+        self.mlp = nn.Sequential(
+            nn.Linear(fused_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_dim),
+        )
+
+    def forward(self, img, tabular):
+        # 1. Extract Visual Features
+        features = self.backbone(img)  # (Batch, 1408)
+
+        # 2. Project to lower dimension
+        proj = self.projection(features)  # (Batch, 64)
+
+        # 3. Context Injection
+        fused = torch.cat([proj, tabular], dim=1)  # (Batch, 69)
+
+        # 4. Compute Latent Representation
+        out = self.mlp(fused)  # (Batch, 64)
+        return out
+
+
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (Latent Fusion).
+    Fuses Clinical and Visual streams in latent space before final projection.
+    Cite Lesson 00052, 00118.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+        self.latent_dim = 64
+        self.clinical_encoder = ClinicalEncoder(input_dim=5, latent_dim=self.latent_dim)
+        self.visual_encoder = VisualEncoder(tabular_dim=5, latent_dim=self.latent_dim)
+        
+        # Final Head
+        # Maps fused latent (64) to Output (2)
+        # Standard Initialization (Cite Lesson 00118)
+        self.head = nn.Linear(self.latent_dim, 2)
+
+    def forward(self, img, tabular):
+        # Stream A: Clinical Latent
+        clinical_latent = self.clinical_encoder(tabular)
+
+        # Stream B: Visual Latent
+        visual_latent = self.visual_encoder(img, tabular)
+
+        # Latent Fusion (Summation)
+        # Acts as a residual connection: Total = Clinical + Correction(Visual)
+        fused_latent = clinical_latent + visual_latent
+
+        # Final Projection
+        out = self.head(fused_latent)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import RODSNet
+
+
+def train_one_epoch(epoch, model, loader, criterion, optimizer, device):
+=======
+from library.model import DSPRNet
+
+
+def train_one_epoch(epoch, model, loader, criterion, optimizer, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Model
+    device = torch.device(Config.DEVICE)
+    model = RODSNet().to(device)
+
+    # Optimizer with Differential Learning Rates
+    # Group 1: Backbone parameters (frozen then unfrozen parts)
+    backbone_params = list(model.visual_stream.backbone.parameters())
+    backbone_ids = list(map(id, backbone_params))
+
+    # Group 2: Head parameters (Clinical stream + Visual stream MLP/Projection)
+    head_params = filter(lambda p: id(p) not in backbone_ids, model.parameters())
+=======
+    # Model
+    device = torch.device(Config.DEVICE)
+    model = DSPRNet().to(device)
+
+    # Optimizer with Differential Learning Rates
+    # Group 1: Backbone parameters (frozen then unfrozen parts)
+    backbone_params = list(model.visual_encoder.backbone.parameters())
+    backbone_ids = list(map(id, backbone_params))
+
+    # Group 2: Head parameters (Clinical stream + Visual stream MLP/Projection)
+    head_params = filter(lambda p: id(p) not in backbone_ids, model.parameters())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RODSNet
+from library.loss import LaplaceNLLLoss
+from library.train import train_one_epoch, validate
+=======
+from library.model import DSPRNet
+from library.loss import LaplaceNLLLoss
+from library.train import train_one_epoch, validate
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = RODSNet().to(device)
+
+    # 4. Optimizer & Scheduler Setup
+    # Group 1: Backbone parameters
+    backbone_params = list(model.visual_stream.backbone.parameters())
+    backbone_ids = list(map(id, backbone_params))
+    # Group 2: Head parameters
+    head_params = filter(lambda p: id(p) not in backbone_ids, model.parameters())
+=======
+    # 3. Model Initialization
+    model = DSPRNet().to(device)
+
+    # 4. Optimizer & Scheduler Setup
+    # Group 1: Backbone parameters
+    backbone_params = list(model.visual_encoder.backbone.parameters())
+    backbone_ids = list(map(id, backbone_params))
+    # Group 2: Head parameters
+    head_params = filter(lambda p: id(p) not in backbone_ids, model.parameters())
+>>>>>>> REPLACE
+```

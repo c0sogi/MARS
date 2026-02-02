@@ -1,0 +1,349 @@
+My optimization strategy involves restructuring the model architecture into a **Dual-Stream Point-Wise Residual Network (DSPR-Net)**, leveraging specific lessons to address the observed overfitting and improve generalization.
+
+1.  **Architecture Change (Cite Lesson 00052, 00060)**: I will replace the cascaded architecture with two parallel streams:
+    *   **Prior Stream**: A linear branch that projects the dominant autoregressive features (`Baseline_FVC` and `Rel_Time`) into a latent space. This "over-parameterized" linear path (Lesson 00060) ensures the model robustly captures the strong linear trend without bottlenecking.
+    *   **Interaction Stream**: A deep branch fusing image features and all clinical metadata via projections (Lesson 00008) to learn non-linear residuals.
+    *   These streams are summed before the final head, ensuring the uncertainty estimate is conditioned on both the strong priors and the deep features (Lesson 00055).
+
+2.  **Hyperparameter Tuning**:
+    *   **Dropout**: I will remove Dropout (`0.0`) from the architecture, as Lesson 00007 indicates it destabilizes uncertainty calibration in regression heads.
+    *   **Learning Rate**: I will reduce `LR_HEAD` from `1e-3` to `5e-4` to slow down the fitting of the MLP layers, aiming to reduce the rapid overfitting seen in the previous run.
+
+3.  **Code Updates**: I will update `library/model.py` with the new class, and adjust `library/train.py` and `runfile.py` to use it.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BACKBONE_NAME = "tf_efficientnet_b2_ns"
+    LATENT_DIM = 64
+    DROPOUT = 0.2
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 50
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4
+
+    # Optimization
+    LR_BACKBONE = 1e-4  # Lower LR for fine-tuning feature extractor
+    LR_HEAD = 1e-3  # Higher LR for MLPs
+    WEIGHT_DECAY = 1e-2
+=======
+    BACKBONE_NAME = "tf_efficientnet_b2_ns"
+    LATENT_DIM = 64
+    DROPOUT = 0.0  # Cite Lesson 00007: Dropout degrades uncertainty calibration
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 50
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4
+
+    # Optimization
+    LR_BACKBONE = 1e-4  # Lower LR for fine-tuning feature extractor
+    LR_HEAD = 5e-4  # Reduced to mitigate overfitting
+    WEIGHT_DECAY = 1e-2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalStream(nn.Module):
+    """
+    Stream A: The Clinical Anchor.
+    Processes clinical metadata into a latent vector representing the expected trajectory.
+    """
+
+    def __init__(self, input_dim=9, hidden_dim=64, output_dim=64):
+        super(ClinicalStream, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VisualResidualStream(nn.Module):
+    """
+    Stream B: The Conditional Visual Stream.
+    Takes image features and the clinical latent vector to predict a residual correction.
+    """
+
+    def __init__(self, img_dim=64, clin_dim=64, hidden_dim=64, output_dim=64):
+        super(VisualResidualStream, self).__init__()
+        input_dim = img_dim + clin_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, img_embed, clin_embed):
+        # Concatenate along feature dimension
+        x = torch.cat([img_embed, clin_embed], dim=1)
+        return self.net(x)
+
+
+class CLRNet(nn.Module):
+    """
+    Cascaded Latent-Residual Network (CLR-Net).
+
+    Architecture:
+    1. EfficientNet-B2 Backbone (Top 2 stages unfrozen) -> Image Features
+    2. Clinical MLP -> Clinical Latent (H_clin)
+    3. Visual MLP(Image + H_clin) -> Residual Latent (H_resid)
+    4. H_final = H_clin + H_resid
+    5. Head(H_final) -> mu, sigma
+    """
+
+    def __init__(self):
+        super(CLRNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # 1. Image Branch (Backbone)
+        # ---------------------------------------------------------------------
+        # Load pretrained EfficientNet-B2
+        # num_classes=0 removes the classifier
+        # global_pool='' ensures we get spatial features for custom pooling
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool=""
+        )
+
+        # Feature dimension for EfficientNet-B2 is 1408
+        self.num_features = self.backbone.num_features
+
+        # Freezing Logic
+        # Freeze everything first
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze Top Layers
+        # EfficientNet structure in timm: conv_stem, bn1, blocks (0-6), conv_head, bn2
+
+        # Unfreeze Head components
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Unfreeze last 2 blocks of the 'blocks' container
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            # Unfreeze the last 2 blocks (stages)
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        # Pooling and Projection
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.img_project = nn.Linear(self.num_features, Config.LATENT_DIM)
+
+        # ---------------------------------------------------------------------
+        # 2. Clinical Stream
+        # ---------------------------------------------------------------------
+        # Input features: Base_FVC, Percent, Age, Rel_Time, Sex(2), Smoke(3) -> 9
+        self.clinical_stream = ClinicalStream(
+            input_dim=9, hidden_dim=64, output_dim=Config.LATENT_DIM
+        )
+
+        # ---------------------------------------------------------------------
+        # 3. Visual Residual Stream
+        # ---------------------------------------------------------------------
+        self.visual_stream = VisualResidualStream(
+            img_dim=Config.LATENT_DIM,
+            clin_dim=Config.LATENT_DIM,
+            hidden_dim=64,
+            output_dim=Config.LATENT_DIM,
+        )
+
+        # ---------------------------------------------------------------------
+        # 4. Prediction Head
+        # ---------------------------------------------------------------------
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+        # Dropout for regularization
+        self.dropout = nn.Dropout(Config.DROPOUT)
+
+    def forward(self, img, clin_data):
+        """
+        Args:
+            img (torch.Tensor): (B, 3, H, W)
+            clin_data (torch.Tensor): (B, 9)
+
+        Returns:
+            torch.Tensor: (B, 2) -> [mean, raw_sigma]
+        """
+        # --- Image Path ---
+        # Extract features
+        features = self.backbone.forward_features(img)  # (B, C, H, W)
+        pooled = self.global_pool(features).flatten(1)  # (B, C)
+        img_lat = self.img_project(pooled)  # (B, 64)
+        img_lat = F.relu(img_lat)
+        img_lat = self.dropout(img_lat)
+
+        # --- Clinical Path ---
+        clin_lat = self.clinical_stream(clin_data)  # (B, 64)
+
+        # --- Cascaded Residual Path ---
+        # Pass processed clinical latent into visual stream along with image latent
+        resid_lat = self.visual_stream(img_lat, clin_lat)  # (B, 64)
+
+        # --- Fusion ---
+        # H_final = H_clin + H_resid
+        # This enforces the residual learning paradigm
+        final_lat = clin_lat + resid_lat
+
+        # --- Prediction ---
+        out = self.head(final_lat)
+
+        return out
+=======
+class PriorStream(nn.Module):
+    """
+    Stream A: Linear Residual (Cite Lesson 00052, 00060).
+    Projects dominant autoregressive features (Base_FVC, Time) into latent space.
+    """
+
+    def __init__(self, input_dim=2, output_dim=64):
+        super(PriorStream, self).__init__()
+        # Over-parameterize linear baseline (Cite Lesson 00060)
+        self.net = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class InteractionStream(nn.Module):
+    """
+    Stream B: Deep Interaction (Cite Lesson 00052).
+    Fuses Image and Clinical Metadata to learn non-linear corrections.
+    """
+
+    def __init__(self, img_dim, clin_dim=9, latent_dim=64):
+        super(InteractionStream, self).__init__()
+        # Pre-fusion projection (Cite Lesson 00008)
+        self.img_proj = nn.Linear(img_dim, latent_dim)
+        self.clin_proj = nn.Linear(clin_dim, latent_dim)
+
+        self.fusion = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+
+    def forward(self, img_feat, clin_data):
+        i = self.img_proj(img_feat)
+        c = self.clin_proj(clin_data)
+        # Fuse
+        combined = torch.cat([i, c], dim=1)
+        return self.fusion(combined)
+
+
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPR-Net).
+    Combines a strong linear prior stream with a deep interaction stream.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # 1. Image Branch (Backbone)
+        # ---------------------------------------------------------------------
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool=""
+        )
+        self.num_features = self.backbone.num_features
+
+        # Freezing Logic (Cite Lesson 00027)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # ---------------------------------------------------------------------
+        # 2. Streams
+        # ---------------------------------------------------------------------
+        # Prior Stream: Base_FVC, Rel_Time
+        self.prior_stream = PriorStream(input_dim=2, output_dim=Config.LATENT_DIM)
+
+        # Interaction Stream: Image + All Clinical
+        self.interaction_stream = InteractionStream(
+            img_dim=self.num_features, clin_dim=9, latent_dim=Config.LATENT_DIM
+        )
+
+        # ---------------------------------------------------------------------
+        # 3. Prediction Head
+        # ---------------------------------------------------------------------
+        # No Dropout in regression head (Cite Lesson 00007)
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+    def forward(self, img, clin_data):
+        # Image Features
+        feat = self.backbone.forward_features(img)
+        feat = self.global_pool(feat).flatten(1)
+
+        # Prior Stream Inputs: Base_FVC (idx 0), Rel_Time (idx 3)
+        prior_in = clin_data[:, [0, 3]]
+        h_prior = self.prior_stream(prior_in)
+
+        # Interaction Stream
+        h_deep = self.interaction_stream(feat, clin_data)
+
+        # Fusion (Summation) - Cite Lesson 00052
+        h_final = h_prior + h_deep
+
+        return self.head(h_final)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    net = model.CLRNet().to(device)
+
+    # 4. Optimizer with Differential Learning Rates
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    net = model.DSPRNet().to(device)
+
+    # 4. Optimizer with Differential Learning Rates
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Best Model
+    net = model.CLRNet().to(device)
+    checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+=======
+    # Load Best Model
+    net = model.DSPRNet().to(device)
+    checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+>>>>>>> REPLACE
+```

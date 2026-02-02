@@ -1,0 +1,386 @@
+import os
+import gc
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.metrics import roc_auc_score
+
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+class Config:
+    SEED = 42
+    BATCH_SIZE = 1024
+    EPOCHS = 50
+    MAX_LR = 1e-2
+    EMBED_DIM = 16
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    TRAIN_PATH = "./metadata/train.csv"
+    VAL_PATH = "./metadata/val.csv"
+    TEST_PATH = "./metadata/test.csv"
+    CACHE_DIR = "./working/idea_26/"
+    SUBMISSION_DIR = "./submission/"
+    SUBMISSION_FILE = "./submission/submission.csv"
+
+    # Stream Configurations: Heterogeneous Parallel Funnel Ensemble (HPFE)
+    # Cite solution_lesson_node_00066: Structural Diversity
+    # Cite solution_lesson_node_00077: Safety Floor (Dropout 0.15-0.25)
+    STREAMS = [
+        {"name": "anchor_1", "layers": [512, 256, 128], "dropout": 0.20, "wd": 1e-5},
+        {"name": "anchor_2", "layers": [512, 256, 128], "dropout": 0.20, "wd": 1e-5},
+        {"name": "capacity", "layers": [1024, 512, 256], "dropout": 0.25, "wd": 1e-5},
+        {"name": "reg_high", "layers": [512, 256, 128], "dropout": 0.25, "wd": 1e-5},
+        {"name": "reg_low", "layers": [512, 256, 128], "dropout": 0.15, "wd": 1e-5},
+    ]
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ==========================================
+# DATA PROCESSING
+# ==========================================
+def process_data(load_cached_data=True):
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    train_parquet = os.path.join(Config.CACHE_DIR, "train_processed.parquet")
+    val_parquet = os.path.join(Config.CACHE_DIR, "val_processed.parquet")
+    test_parquet = os.path.join(Config.CACHE_DIR, "test_processed.parquet")
+    meta_path = os.path.join(Config.CACHE_DIR, "metadata.npy")
+
+    # Check cache
+    if (
+        load_cached_data
+        and os.path.exists(train_parquet)
+        and os.path.exists(val_parquet)
+        and os.path.exists(test_parquet)
+        and os.path.exists(meta_path)
+    ):
+        print("Loading cached data...")
+        train_df = pd.read_parquet(train_parquet)
+        val_df = pd.read_parquet(val_parquet)
+        test_df = pd.read_parquet(test_parquet)
+        meta_dict = np.load(meta_path, allow_pickle=True).item()
+        return train_df, val_df, test_df, meta_dict
+
+    print("Processing data from scratch...")
+
+    # Load raw data
+    df_train = pd.read_csv(Config.TRAIN_PATH)
+    df_val = pd.read_csv(Config.VAL_PATH)
+    df_test = pd.read_csv(Config.TEST_PATH)
+
+    # Feature Engineering
+    def engineer_features(df):
+        # Decompose f_27 into characters
+        chars = df["f_27"].apply(lambda x: list(x))
+        char_df = pd.DataFrame(
+            chars.tolist(), columns=[f"char_{i}" for i in range(10)], index=df.index
+        )
+
+        # Unique character count signal
+        unique_counts = df["f_27"].apply(lambda x: len(set(x)))
+
+        # Concatenate and clean
+        df_eng = pd.concat([df, char_df], axis=1)
+        df_eng["unique_char_count"] = unique_counts
+        df_eng = df_eng.drop(columns=["f_27"])
+        return df_eng
+
+    print("Engineering features...")
+    df_train = engineer_features(df_train)
+    df_val = engineer_features(df_val)
+    df_test = engineer_features(df_test)
+
+    # Identify columns
+    # Categorical: char_0..char_9, f_29, f_30
+    cat_cols = [f"char_{i}" for i in range(10)] + ["f_29", "f_30"]
+    # Continuous: All others except id, target, source_path
+    exclude = cat_cols + ["id", "target", "source_path"]
+    cont_cols = [c for c in df_train.columns if c not in exclude]
+
+    # Transductive Ordinal Encoding
+    print("Encoding categorical features...")
+    all_cat = pd.concat(
+        [df_train[cat_cols], df_val[cat_cols], df_test[cat_cols]], axis=0
+    )
+
+    # Ensure string type for mixed columns if any
+    for col in cat_cols:
+        all_cat[col] = all_cat[col].astype(str)
+        df_train[col] = df_train[col].astype(str)
+        df_val[col] = df_val[col].astype(str)
+        df_test[col] = df_test[col].astype(str)
+
+    encoder = OrdinalEncoder(
+        handle_unknown="use_encoded_value", unknown_value=-1, dtype=np.int64
+    )
+    encoder.fit(all_cat)
+
+    df_train[cat_cols] = encoder.transform(df_train[cat_cols])
+    df_val[cat_cols] = encoder.transform(df_val[cat_cols])
+    df_test[cat_cols] = encoder.transform(df_test[cat_cols])
+
+    # Calculate vocab sizes (max index + 1)
+    vocab_sizes = {col: int(all_cat[col].nunique()) for col in cat_cols}
+
+    # Standard Scaling
+    print("Scaling continuous features...")
+    scaler = StandardScaler()
+    scaler.fit(df_train[cont_cols])
+
+    df_train[cont_cols] = scaler.transform(df_train[cont_cols]).astype(np.float32)
+    df_val[cont_cols] = scaler.transform(df_val[cont_cols]).astype(np.float32)
+    df_test[cont_cols] = scaler.transform(df_test[cont_cols]).astype(np.float32)
+
+    # Save to cache
+    print("Saving to cache...")
+    df_train.to_parquet(train_parquet)
+    df_val.to_parquet(val_parquet)
+    df_test.to_parquet(test_parquet)
+
+    meta_dict = {
+        "cat_cols": cat_cols,
+        "cont_cols": cont_cols,
+        "vocab_sizes": vocab_sizes,
+    }
+    np.save(meta_path, meta_dict)
+
+    return df_train, df_val, df_test, meta_dict
+
+
+# ==========================================
+# DATASET
+# ==========================================
+class TabularDataset(Dataset):
+    def __init__(self, df, cat_cols, cont_cols, target_col=None):
+        self.cat_data = df[cat_cols].values.astype(np.int64)
+        self.cont_data = df[cont_cols].values.astype(np.float32)
+        self.targets = (
+            df[target_col].values.astype(np.float32)
+            if target_col in df.columns
+            else None
+        )
+
+    def __len__(self):
+        return len(self.cat_data)
+
+    def __getitem__(self, idx):
+        cat = torch.from_numpy(self.cat_data[idx])
+        cont = torch.from_numpy(self.cont_data[idx])
+
+        if self.targets is not None:
+            target = torch.tensor(self.targets[idx])
+            return cat, cont, target
+        else:
+            return cat, cont
+
+
+# ==========================================
+# MODEL ARCHITECTURE
+# ==========================================
+class StreamNet(nn.Module):
+    def __init__(self, input_dim, hidden_layers, dropout_rate, vocab_sizes, embed_dim):
+        super().__init__()
+
+        # Independent Embeddings for this stream
+        self.embeddings = nn.ModuleList(
+            [
+                nn.Embedding(num_embeddings=v_size, embedding_dim=embed_dim)
+                for v_size in vocab_sizes
+            ]
+        )
+
+        layers = []
+        in_dim = input_dim
+
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = h_dim
+
+        layers.append(nn.Linear(in_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, cat, cont):
+        emb_list = [emb(cat[:, i]) for i, emb in enumerate(self.embeddings)]
+        x_emb = torch.cat(emb_list, dim=1)
+        x = torch.cat([x_emb, cont], dim=1)
+        return self.mlp(x)
+
+
+class MORPE(nn.Module):
+    def __init__(self, vocab_sizes_list, num_cont, embed_dim, stream_configs):
+        super().__init__()
+        self.streams = nn.ModuleList()
+
+        total_embed_dim = len(vocab_sizes_list) * embed_dim
+        input_dim = num_cont + total_embed_dim
+
+        for cfg in stream_configs:
+            stream = StreamNet(
+                input_dim=input_dim,
+                hidden_layers=cfg["layers"],
+                dropout_rate=cfg["dropout"],
+                vocab_sizes=vocab_sizes_list,
+                embed_dim=embed_dim,
+            )
+            self.streams.append(stream)
+
+    def forward(self, cat, cont):
+        return [stream(cat, cont) for stream in self.streams]
+
+
+# ==========================================
+# TRAINING LOOP
+# ==========================================
+def train_and_predict():
+    set_seed(Config.SEED)
+
+    # 1. Process Data
+    df_train, df_val, df_test, meta_dict = process_data(load_cached_data=True)
+
+    cat_cols = meta_dict["cat_cols"]
+    cont_cols = meta_dict["cont_cols"]
+    vocab_sizes_dict = meta_dict["vocab_sizes"]
+    vocab_sizes = [vocab_sizes_dict[c] for c in cat_cols]
+
+    # 2. Loaders
+    train_ds = TabularDataset(df_train, cat_cols, cont_cols, "target")
+    val_ds = TabularDataset(df_val, cat_cols, cont_cols, "target")
+    test_ds = TabularDataset(df_test, cat_cols, cont_cols, None)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # 3. Model
+    model = MORPE(
+        vocab_sizes_list=vocab_sizes,
+        num_cont=len(cont_cols),
+        embed_dim=Config.EMBED_DIM,
+        stream_configs=Config.STREAMS,
+    ).to(Config.DEVICE)
+
+    # 4. Optimizer Groups (Heterogeneous Weight Decay)
+    param_groups = []
+    for i, stream in enumerate(model.streams):
+        param_groups.append(
+            {"params": stream.parameters(), "weight_decay": Config.STREAMS[i]["wd"]}
+        )
+
+    optimizer = optim.AdamW(param_groups, lr=Config.MAX_LR)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=Config.MAX_LR,
+        epochs=Config.EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # 5. Train
+    print(f"Training MORPE on {Config.DEVICE}...")
+    best_auc = 0.0
+
+    for epoch in range(Config.EPOCHS):
+        model.train()
+        total_loss = 0
+
+        for cat, cont, target in train_loader:
+            cat, cont = cat.to(Config.DEVICE), cont.to(Config.DEVICE)
+            target = target.to(Config.DEVICE).unsqueeze(1)
+
+            optimizer.zero_grad()
+            outputs = model(cat, cont)
+
+            loss = sum(criterion(out, target) for out in outputs)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+
+        # Validation
+        model.eval()
+        val_preds = []
+        val_targets = []
+
+        with torch.no_grad():
+            for cat, cont, target in val_loader:
+                cat, cont = cat.to(Config.DEVICE), cont.to(Config.DEVICE)
+                outputs = model(cat, cont)
+
+                # Average probabilities across streams
+                probs = torch.stack([torch.sigmoid(out) for out in outputs]).mean(dim=0)
+                val_preds.append(probs.cpu().numpy())
+                val_targets.append(target.numpy())
+
+        val_preds = np.concatenate(val_preds)
+        val_targets = np.concatenate(val_targets)
+        auc = roc_auc_score(val_targets, val_preds)
+
+        print(
+            f"Epoch {epoch+1:02d} | Loss: {total_loss/len(train_loader):.5f} | Val AUC: {auc:.10f}"
+        )
+
+        if auc > best_auc:
+            best_auc = auc
+            # Save best model logic could go here
+
+    print(f"Best Validation AUC: {best_auc:.10f}")
+
+    # 6. Inference
+    print("Generating predictions...")
+    model.eval()
+    test_preds = []
+
+    with torch.no_grad():
+        for cat, cont in test_loader:
+            cat, cont = cat.to(Config.DEVICE), cont.to(Config.DEVICE)
+            outputs = model(cat, cont)
+            probs = torch.stack([torch.sigmoid(out) for out in outputs]).mean(dim=0)
+            test_preds.append(probs.cpu().numpy())
+
+    final_preds = np.concatenate(test_preds).flatten()
+
+    # 7. Submission
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+    submission = pd.DataFrame({"id": df_test["id"], "target": final_preds})
+    submission.to_csv(Config.SUBMISSION_FILE, index=False)
+    print(f"Submission saved to {Config.SUBMISSION_FILE}")
+
+
+# Execute the pipeline
+# train_and_predict()

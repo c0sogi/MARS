@@ -1,0 +1,196 @@
+import sys
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from scipy.stats import pearsonr
+
+# Import from the provided library files
+from library.config import Config
+from library.utils import set_seed, get_logger
+from library.data import get_dataloaders
+from library.modules import SiameseFPNModel
+from library.train import train_one_epoch, validate
+
+
+def main():
+    # -------------------------------------------------------------------------
+    # 1. Configuration for Fast Baseline
+    # -------------------------------------------------------------------------
+    # Override Config defaults to ensure execution within time limits
+    Config.NUM_EPOCHS = 2
+    Config.DEBUG = True
+    Config.DEBUG_SUBSET_SIZE = 2000  # Train on a small subset for speed
+    Config.BATCH_SIZE = 8
+
+    # Setup directories and seeds
+    Config.setup()
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    logger = get_logger("runfile")
+    logger.info("Configuration set for fast baseline execution.")
+
+    # -------------------------------------------------------------------------
+    # 2. Data Loading
+    # -------------------------------------------------------------------------
+    logger.info("Loading dataloaders...")
+    # load_cached_data=True utilizes preprocessed parquet files if available
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # -------------------------------------------------------------------------
+    # 3. Model Initialization
+    # -------------------------------------------------------------------------
+    logger.info("Initializing Siamese FPN Model...")
+    model = SiameseFPNModel().to(device)
+
+    # Loss function with positive weighting for class imbalance
+    pos_weight = torch.tensor([Config.POS_WEIGHT]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # Optimizer and Scheduler
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.NUM_EPOCHS, eta_min=Config.ETA_MIN
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. Training Loop
+    # -------------------------------------------------------------------------
+    best_pf1 = -1.0
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+
+    logger.info("Starting training...")
+    for epoch in range(Config.NUM_EPOCHS):
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+        val_loss, val_pf1 = validate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        logger.info(
+            f"Epoch {epoch+1}/{Config.NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val pF1: {val_pf1:.4f}"
+        )
+
+        if val_pf1 > best_pf1:
+            best_pf1 = val_pf1
+            torch.save(model.state_dict(), best_model_path)
+            logger.info(f"New best model saved with pF1: {best_pf1:.4f}")
+
+    # -------------------------------------------------------------------------
+    # 5. Final Validation & Metric
+    # -------------------------------------------------------------------------
+    logger.info("Loading best model for final evaluation...")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+
+    val_loss, final_pf1 = validate(model, val_loader, criterion, device)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {final_pf1}")
+
+    # -------------------------------------------------------------------------
+    # 6. Failure Analysis
+    # -------------------------------------------------------------------------
+    logger.info("Performing failure analysis...")
+    model.eval()
+
+    # Collect predictions and labels for the entire validation set
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            target_img, contra_img, labels = batch
+            target_img = target_img.to(device)
+            contra_img = contra_img.to(device)
+
+            logits = model(target_img, contra_img)
+            probs = torch.sigmoid(logits).cpu().numpy().flatten()
+
+            all_preds.extend(probs)
+            all_labels.extend(labels.cpu().numpy().flatten())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    # Calculate Error Magnitude
+    errors = np.abs(all_labels - all_preds)
+
+    # Load Metadata for Correlation Analysis
+    # We load the processed parquet to ensure alignment with the dataloader
+    val_parquet_path = os.path.join(Config.CACHE_DIR, "processed_val.parquet")
+    if os.path.exists(val_parquet_path):
+        df_val = pd.read_parquet(val_parquet_path)
+    else:
+        # Fallback if cache is missing (should not happen with load_cached_data=True)
+        df_val = pd.read_csv(Config.VAL_METADATA_PATH)
+        if Config.DEBUG:
+            df_val = df_val.head(Config.DEBUG_SUBSET_SIZE)
+
+    # Ensure lengths match (truncate if necessary, though they should match)
+    min_len = min(len(df_val), len(errors))
+    df_val = df_val.iloc[:min_len]
+    errors = errors[:min_len]
+
+    # Correlation: Error vs Age
+    if "age" in df_val.columns:
+        ages = df_val["age"].fillna(df_val["age"].mean())
+        corr_age, _ = pearsonr(errors, ages)
+        print(f"Correlation (Error vs Age): {corr_age:.4f}")
+
+    # Correlation: Error vs Density
+    if "density" in df_val.columns:
+        # Map categorical density to ordinal
+        density_map = {"A": 1, "B": 2, "C": 3, "D": 4}
+        # Fill missing with mode (B/2) or similar
+        densities = df_val["density"].map(density_map).fillna(2)
+        corr_density, _ = pearsonr(errors, densities)
+        print(f"Correlation (Error vs Density): {corr_density:.4f}")
+
+    # -------------------------------------------------------------------------
+    # 7. Submission
+    # -------------------------------------------------------------------------
+    THRESHOLD = 0.04510747791831479
+
+    if final_pf1 > THRESHOLD:
+        logger.info(f"Metric {final_pf1} > {THRESHOLD}. Generating submission...")
+
+        results = []
+        model.eval()
+        with torch.no_grad():
+            for batch in test_loader:
+                target_img, contra_img, prediction_ids = batch
+                target_img = target_img.to(device)
+                contra_img = contra_img.to(device)
+
+                logits = model(target_img, contra_img)
+                probs = torch.sigmoid(logits).cpu().numpy().flatten()
+
+                for pid, prob in zip(prediction_ids, probs):
+                    results.append({"prediction_id": pid, "cancer": prob})
+
+        df_results = pd.DataFrame(results)
+
+        if not df_results.empty:
+            # Aggregate by taking MAX probability per prediction_id
+            df_sub = df_results.groupby("prediction_id", as_index=False)["cancer"].max()
+
+            os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+            df_sub.to_csv(Config.SUBMISSION_PATH, index=False)
+            logger.info(
+                f"Submission saved to {Config.SUBMISSION_PATH} with {len(df_sub)} rows."
+            )
+    else:
+        logger.info(
+            f"Metric {final_pf1} <= {THRESHOLD}. Skipping submission generation."
+        )
+
+
+if __name__ == "__main__":
+    main()

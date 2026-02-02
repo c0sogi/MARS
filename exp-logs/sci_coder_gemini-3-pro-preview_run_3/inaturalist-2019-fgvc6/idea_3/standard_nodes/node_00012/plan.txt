@@ -1,0 +1,243 @@
+The previous implementation failed with a `torch.OutOfMemoryError` because the configuration assumed access to the full 40GB of an A100 GPU (using a batch size of 64 for `convnext_base`), whereas the runtime environment only provided ~16GB of effective VRAM. Additionally, the training loop used standard single-precision (FP32), which consumes more memory.
+
+To fix this, I will:
+1.  **Reduce Batch Sizes**: Update `library/config.py` to lower the batch sizes for Phase 1 (64 → 32), Phase 2 (32 → 16), and Inference (64 → 32) to fit within the 16GB limit.
+2.  **Implement Mixed Precision Training**: Update `library/engine.py` to use `torch.amp.autocast` and `GradScaler` to reduce memory usage and accelerate training.
+3.  **Integrate Scaler**: Update `runfile.py` to initialize the `GradScaler` and pass it to the training function.
+
+These changes directly apply the guidance from **debug_lesson_2** ("Verify Effective VRAM Capacity and Implement Mixed Precision Training").
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PHASE_1 = {
+        "name": "phase_1",
+        "img_size": 224,
+        "batch_size": 64,  # Fits in A100 40GB
+        "epochs": 20,
+=======
+    PHASE_1 = {
+        "name": "phase_1",
+        "img_size": 224,
+        "batch_size": 32,  # Fits in ~16GB VRAM
+        "epochs": 20,
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PHASE_2 = {
+        "name": "phase_2",
+        "img_size": 384,
+        "batch_size": 32,  # Reduced batch size for larger resolution
+        "epochs": 10,
+=======
+    PHASE_2 = {
+        "name": "phase_2",
+        "img_size": 384,
+        "batch_size": 16,  # Reduced batch size for larger resolution and 16GB VRAM
+        "epochs": 10,
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    INFERENCE = {
+        "batch_size": 64,
+        "tta": True,  # Enable Test Time Augmentation (Horizontal Flip)
+=======
+    INFERENCE = {
+        "batch_size": 32,
+        "tta": True,  # Enable Test Time Augmentation (Horizontal Flip)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, loader, optimizer, device, epoch, mixup_fn=None):
+    """
+    Trains the model for one epoch.
+
+    Args:
+        model: PyTorch model.
+        loader: DataLoader for training data.
+        optimizer: Optimizer.
+        device: Device to train on.
+        epoch: Current epoch number.
+        mixup_fn: Mixup function (optional).
+
+    Returns:
+        dict: Averaged metrics for the epoch.
+    """
+    model.train()
+    metric_monitor = MetricMonitor()
+
+    # Select loss function based on Mixup activation
+    # If Mixup is active, targets are soft (probabilities), so we use SoftTargetCrossEntropy.
+    # If Mixup is inactive, targets are indices, so we use LabelSmoothingCrossEntropy.
+    if mixup_fn is not None:
+        criterion = SoftTargetCrossEntropy()
+    else:
+        # Config specifies label_smoothing=0.1 for both phases
+        criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+
+    for batch_idx, (images, targets) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, targets)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        # Calculate accuracy
+=======
+def train_one_epoch(model, loader, optimizer, device, epoch, mixup_fn=None, scaler=None):
+    """
+    Trains the model for one epoch.
+
+    Args:
+        model: PyTorch model.
+        loader: DataLoader for training data.
+        optimizer: Optimizer.
+        device: Device to train on.
+        epoch: Current epoch number.
+        mixup_fn: Mixup function (optional).
+        scaler: GradScaler for mixed precision training (optional).
+
+    Returns:
+        dict: Averaged metrics for the epoch.
+    """
+    model.train()
+    metric_monitor = MetricMonitor()
+
+    # Select loss function based on Mixup activation
+    # If Mixup is active, targets are soft (probabilities), so we use SoftTargetCrossEntropy.
+    # If Mixup is inactive, targets are indices, so we use LabelSmoothingCrossEntropy.
+    if mixup_fn is not None:
+        criterion = SoftTargetCrossEntropy()
+    else:
+        # Config specifies label_smoothing=0.1 for both phases
+        criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+
+    for batch_idx, (images, targets) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, targets)
+
+        optimizer.zero_grad()
+        
+        with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+        
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        # Calculate accuracy
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=Config.PHASE_1["lr"],
+        weight_decay=Config.PHASE_1["weight_decay"],
+    )
+
+    # Cosine Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.PHASE_1["epochs"]
+    )
+
+    best_metric = float("inf")
+
+    for epoch in range(1, Config.PHASE_1["epochs"] + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, mixup_fn
+        )
+        val_metrics = validate(model, val_loader, device)
+=======
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=Config.PHASE_1["lr"],
+        weight_decay=Config.PHASE_1["weight_decay"],
+    )
+
+    scaler = torch.cuda.amp.GradScaler()
+
+    # Cosine Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.PHASE_1["epochs"]
+    )
+
+    best_metric = float("inf")
+
+    for epoch in range(1, Config.PHASE_1["epochs"] + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, mixup_fn, scaler
+        )
+        val_metrics = validate(model, val_loader, device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Re-initialize Optimizer with lower LR
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=Config.PHASE_2["lr"],
+        weight_decay=Config.PHASE_2["weight_decay"],
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.PHASE_2["epochs"]
+    )
+
+    best_metric_p2 = float("inf")
+
+    for epoch in range(1, Config.PHASE_2["epochs"] + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, mixup_fn
+        )
+        val_metrics = validate(model, val_loader, device)
+=======
+    # Re-initialize Optimizer with lower LR
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=Config.PHASE_2["lr"],
+        weight_decay=Config.PHASE_2["weight_decay"],
+    )
+
+    scaler = torch.cuda.amp.GradScaler()
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.PHASE_2["epochs"]
+    )
+
+    best_metric_p2 = float("inf")
+
+    for epoch in range(1, Config.PHASE_2["epochs"] + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, mixup_fn, scaler
+        )
+        val_metrics = validate(model, val_loader, device)
+>>>>>>> REPLACE
+```

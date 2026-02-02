@@ -1,0 +1,417 @@
+Based on the provided lessons and the analysis of the previous solution's underperformance (Validation MCRMSE ~0.74 vs Baseline ~0.62), I will implement the following optimizations:
+
+1.  **Simplify the Architecture (Remove Structure Injection):** I will remove the "Structure Injection" mechanism where structural embeddings were concatenated to the input of every residual block. Lesson `solution_lesson_node_00154` indicates that re-injecting raw or static inputs into deep layers hinders hierarchical feature learning and leads to overfitting. I will switch to a standard "Stem -> Backbone" design where inputs are processed once at the beginning.
+2.  **Switch from LSTM to GRU:** I will replace the BiLSTM backbone with a BiGRU backbone. Lesson `solution_lesson_node_00108` suggests that GRUs are more parameter-efficient and generalize better than LSTMs in low-data regimes (~2k samples).
+3.  **Optimize Model Width:** I will reduce the `HIDDEN_SIZE` from 512 to 384. Lesson `solution_lesson_node_00108` and `solution_lesson_node_00131` highlight that excessive capacity on small datasets can lead to optimization difficulties and underfitting/overfitting.
+4.  **Preserve Stem Fidelity:** I will ensure no dropout is applied immediately after the initial Stem BiGRU, as recommended in Lesson `solution_lesson_node_00109`.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Backbone
+    HIDDEN_SIZE = 512  # Wide stream width
+    NUM_LAYERS = 6  # Number of residual blocks
+=======
+    # Backbone
+    HIDDEN_SIZE = 384  # Wide stream width (Cite solution_lesson_node_00108)
+    NUM_LAYERS = 6  # Number of residual blocks
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StructureInjectedBlock(nn.Module):
+    """
+    A Residual Block that re-injects static structural context into the processing stream.
+
+    Architecture:
+    x_norm = LayerNorm(x)
+    h_in = Concat(x_norm, structural_context)
+    h_rnn = BiLSTM(h_in)
+    out = x + Dropout(h_rnn)
+    """
+
+    def __init__(self, stream_dim, struct_dim, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(stream_dim)
+
+        # Input to LSTM is the residual stream width + structural embedding width
+        # We project back to stream_dim (bidirectional: hidden_size = stream_dim // 2)
+        self.lstm = nn.LSTM(
+            input_size=stream_dim + struct_dim,
+            hidden_size=stream_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, struct_emb):
+        """
+        Args:
+            x: Residual stream tensor (N, L, stream_dim)
+            struct_emb: Static structural context tensor (N, L, struct_dim)
+        """
+        # Pre-LayerNorm configuration
+        norm_x = self.norm(x)
+
+        # Inject Structure: Concatenate static structure to dynamic stream
+        h_in = torch.cat([norm_x, struct_emb], dim=-1)
+
+        # BiLSTM Processing
+        h_rnn, _ = self.lstm(h_in)
+
+        # Residual Connection
+        return x + self.dropout(h_rnn)
+
+
+class StructureInjectedWideResBiLSTM(nn.Module):
+    """
+    Structure-Injected Wide-Stream Residual BiLSTM.
+
+    Features:
+    - Heterogeneous Embeddings (Seq, Loop, Dist)
+    - Wide Residual Stream (512 dim)
+    - Structure Injection at every block
+    - Scalar Mixture Aggregation
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # --- 1. Embeddings ---
+        self.seq_embed = nn.Embedding(Config.SEQ_VOCAB_SIZE, Config.SEQ_EMBED_DIM)
+        self.loop_embed = nn.Embedding(Config.LOOP_VOCAB_SIZE, Config.LOOP_EMBED_DIM)
+        # Distance embedding is functional (sinusoidal), so no learnable embedding layer needed.
+
+        # Dimensions
+        self.struct_dim = Config.LOOP_EMBED_DIM + Config.DIST_EMBED_DIM
+        self.input_dim = Config.SEQ_EMBED_DIM + self.struct_dim
+        self.stream_dim = Config.HIDDEN_SIZE  # 512
+
+        # --- 2. High-Fidelity Recurrent Stem ---
+        # Projects full input (Seq + Structure) to the residual stream width
+        self.stem = nn.LSTM(
+            input_size=self.input_dim,
+            hidden_size=self.stream_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+        # Note: No dropout applied to stem output
+
+        # --- 3. Backbone: Structure-Injected Residual Blocks ---
+        self.blocks = nn.ModuleList(
+            [
+                StructureInjectedBlock(
+                    stream_dim=self.stream_dim,
+                    struct_dim=self.struct_dim,
+                    dropout=Config.DROPOUT,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # --- 4. Aggregation: Scalar Mixture ---
+        # Aggregates outputs from Stem + 6 Blocks (Total 7 layers)
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # --- 5. Output Head ---
+        self.head = nn.Linear(self.stream_dim, Config.NUM_CLASSES)
+
+    def forward(self, seq, loop, dist):
+        """
+        Args:
+            seq: Sequence indices (N, L)
+            loop: Loop type indices (N, L)
+            dist: Signed distance values (N, L)
+        """
+        # 1. Generate Embeddings
+        e_seq = self.seq_embed(seq)  # (N, L, 128)
+        e_loop = self.loop_embed(loop)  # (N, L, 64)
+        e_dist = get_sinusoidal_encoding(dist, Config.DIST_EMBED_DIM)  # (N, L, 64)
+
+        # 2. Construct Structural Context Vector
+        # This vector represents the static topology and is used in Stem and all Blocks
+        e_struct = torch.cat([e_loop, e_dist], dim=-1)  # (N, L, 128)
+
+        # 3. Stem Execution
+        # Input: Sequence + Structure
+        x_in = torch.cat([e_seq, e_struct], dim=-1)  # (N, L, 256)
+        x_stem, _ = self.stem(x_in)  # (N, L, 512)
+
+        # 4. Backbone Execution
+        # Collect outputs for scalar mixture
+        layer_outputs = [x_stem]
+        x = x_stem
+
+        for block in self.blocks:
+            # Pass structural context to every block
+            x = block(x, e_struct)
+            layer_outputs.append(x)
+
+        # 5. Aggregation
+        # Combine Stem and Block outputs
+        x_agg = self.mixture(layer_outputs)  # (N, L, 512)
+
+        # 6. Prediction
+        logits = self.head(x_agg)  # (N, L, 3)
+
+        return logits
+=======
+class ResidualBiGRUBlock(nn.Module):
+    """
+    Standard Pre-LayerNorm Residual BiGRU Block.
+    Cite solution_lesson_node_00154 (Avoid re-injection)
+    Cite solution_lesson_node_00135 (Pre-LayerNorm)
+    Cite solution_lesson_node_00108 (GRU vs LSTM)
+    """
+
+    def __init__(self, hidden_size, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size)
+        self.gru = nn.GRU(
+            input_size=hidden_size,
+            hidden_size=hidden_size // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Pre-LayerNorm
+        out = self.norm(x)
+        # BiGRU
+        out, _ = self.gru(out)
+        # Residual
+        return x + self.dropout(out)
+
+
+class StabilizedWideResBiGRU(nn.Module):
+    """
+    Stabilized Wide-Stream Residual BiGRU.
+    
+    Features:
+    - BiGRU Backbone (Cite solution_lesson_node_00108)
+    - No Structure Injection in blocks (Cite solution_lesson_node_00154)
+    - Stem Fidelity (No dropout after stem) (Cite solution_lesson_node_00109)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # --- 1. Embeddings ---
+        self.seq_embed = nn.Embedding(Config.SEQ_VOCAB_SIZE, Config.SEQ_EMBED_DIM)
+        self.loop_embed = nn.Embedding(Config.LOOP_VOCAB_SIZE, Config.LOOP_EMBED_DIM)
+        
+        # Dimensions
+        self.struct_dim = Config.LOOP_EMBED_DIM + Config.DIST_EMBED_DIM
+        self.input_dim = Config.SEQ_EMBED_DIM + self.struct_dim
+        self.hidden_size = Config.HIDDEN_SIZE
+
+        # --- 2. Stem ---
+        # Projects full input (Seq + Structure) to the residual stream width
+        self.stem = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.hidden_size // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+        # Note: No dropout applied to stem output (Cite solution_lesson_node_00109)
+
+        # --- 3. Backbone ---
+        self.blocks = nn.ModuleList(
+            [
+                ResidualBiGRUBlock(
+                    hidden_size=self.hidden_size,
+                    dropout=Config.DROPOUT,
+                )
+                for _ in range(Config.NUM_LAYERS)
+            ]
+        )
+
+        # --- 4. Aggregation ---
+        self.mixture = ScalarMixture(Config.NUM_LAYERS + 1)
+
+        # --- 5. Output Head ---
+        self.head = nn.Linear(self.hidden_size, Config.NUM_CLASSES)
+
+    def forward(self, seq, loop, dist):
+        # 1. Generate Embeddings
+        e_seq = self.seq_embed(seq)
+        e_loop = self.loop_embed(loop)
+        e_dist = get_sinusoidal_encoding(dist, Config.DIST_EMBED_DIM)
+
+        # 2. Construct Input Vector
+        # Concatenate all features (Early Fusion)
+        x_in = torch.cat([e_seq, e_loop, e_dist], dim=-1)
+
+        # 3. Stem Execution
+        x_stem, _ = self.stem(x_in)
+
+        # 4. Backbone Execution
+        layer_outputs = [x_stem]
+        x = x_stem
+
+        for block in self.blocks:
+            x = block(x)
+            layer_outputs.append(x)
+
+        # 5. Aggregation
+        x_agg = self.mixture(layer_outputs)
+
+        # 6. Prediction
+        logits = self.head(x_agg)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import StructureInjectedWideResBiLSTM
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+=======
+from library.model import StabilizedWideResBiGRU
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch):
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def generate_submission(model_path, device):
+    """
+    Generates the submission file using the trained model.
+
+    Args:
+        model_path: Path to the saved best model checkpoint.
+        device: 'cuda' or 'cpu'.
+    """
+    # 1. Load Model
+    model = StructureInjectedWideResBiLSTM()
+    model.to(device)
+=======
+def generate_submission(model_path, device):
+    """
+    Generates the submission file using the trained model.
+
+    Args:
+        model_path: Path to the saved best model checkpoint.
+        device: 'cuda' or 'cpu'.
+    """
+    # 1. Load Model
+    model = StabilizedWideResBiGRU()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_model(max_epochs=Config.EPOCHS, max_samples=None):
+    """
+    Main function to train the model.
+
+    Args:
+        max_epochs: Number of epochs to train.
+        max_samples: Limit dataset size for debugging.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 1. Data Loaders
+    train_loader = get_dataloaders(
+        split="train", batch_size=Config.BATCH_SIZE, max_samples=max_samples
+    )
+    val_loader = get_dataloaders(
+        split="val", batch_size=Config.BATCH_SIZE, max_samples=max_samples
+    )
+
+    # 2. Model
+    model = StructureInjectedWideResBiLSTM()
+    model.to(device)
+=======
+def train_model(max_epochs=Config.EPOCHS, max_samples=None):
+    """
+    Main function to train the model.
+
+    Args:
+        max_epochs: Number of epochs to train.
+        max_samples: Limit dataset size for debugging.
+    """
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 1. Data Loaders
+    train_loader = get_dataloaders(
+        split="train", batch_size=Config.BATCH_SIZE, max_samples=max_samples
+    )
+    val_loader = get_dataloaders(
+        split="val", batch_size=Config.BATCH_SIZE, max_samples=max_samples
+    )
+
+    # 2. Model
+    model = StabilizedWideResBiGRU()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import StructureInjectedWideResBiLSTM
+from library.engine import train_one_epoch, validate, generate_submission
+=======
+from library.model import StabilizedWideResBiGRU
+from library.engine import train_one_epoch, validate, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Limit epochs for fast baseline execution
+    MAX_EPOCHS = 15
+
+    print(f"Initializing run on {device}...")
+
+    # 2. Data Loaders
+    # Using load_cached_data=True to leverage preprocessed files
+    train_loader = get_dataloaders(
+        split="train", batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+    val_loader = get_dataloaders(
+        split="val", batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = StructureInjectedWideResBiLSTM()
+    model.to(device)
+=======
+    # Limit epochs for fast baseline execution
+    MAX_EPOCHS = 20
+
+    print(f"Initializing run on {device}...")
+
+    # 2. Data Loaders
+    # Using load_cached_data=True to leverage preprocessed files
+    train_loader = get_dataloaders(
+        split="train", batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+    val_loader = get_dataloaders(
+        split="val", batch_size=Config.BATCH_SIZE, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = StabilizedWideResBiGRU()
+    model.to(device)
+>>>>>>> REPLACE
+```

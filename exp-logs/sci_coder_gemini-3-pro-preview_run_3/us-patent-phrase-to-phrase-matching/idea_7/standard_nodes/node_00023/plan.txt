@@ -1,0 +1,273 @@
+To resolve the `torch.OutOfMemoryError` caused by the memory-intensive DeBERTa-Large model and Adversarial Weight Perturbation (AWP), I will implement two key optimizations: **Mixed Precision Training (AMP)** and **Gradient Checkpointing**.
+
+1.  **Mixed Precision (AMP)**: I will modify `library/engine.py` to wrap the forward pass in `torch.amp.autocast('cuda')` and use `torch.amp.GradScaler` to scale gradients. This significantly reduces memory usage for activations.
+2.  **Gradient Checkpointing**: I will enable gradient checkpointing on the model backbone in `runfile.py`. Crucially, I will enforce `use_reentrant=False` to prevent the "backward through graph a second time" error (Cite `debug_lesson_7`) and explicitly disable `use_cache` to avoid conflicts with the checkpointing mechanism (Cite `debug_lesson_5`).
+
+These changes will reduce the memory footprint, allowing the model to train with AWP on the available hardware.
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_fn(
+    model,
+    dataloader,
+    optimizer,
+    scheduler,
+    device,
+    epoch,
+    config,
+    awp=None,
+    ema=None,
+    loss_fn=None,
+):
+    """
+    Training loop for one epoch.
+    """
+    model.train()
+
+    running_loss = 0.0
+    running_mse = 0.0
+    running_ce = 0.0
+    running_pearson = 0.0
+    dataset_size = 0
+
+    start_time = time.time()
+
+    for step, batch in enumerate(dataloader):
+        # Move batch to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch.get("token_type_ids", None)
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(device)
+
+        targets = batch["target"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward Pass
+        reg_logits, cls_logits = model(input_ids, attention_mask, token_type_ids)
+
+        # Calculate Loss
+        loss, metrics = loss_fn(reg_logits, cls_logits, targets)
+
+        # Backward Pass
+        loss.backward()
+
+        # Adversarial Weight Perturbation (AWP)
+        if config.use_awp and awp is not None and epoch >= config.awp_start_epoch:
+            # Perturb weights
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            reg_logits_adv, cls_logits_adv = model(
+                input_ids, attention_mask, token_type_ids
+            )
+            loss_adv, _ = loss_fn(reg_logits_adv, cls_logits_adv, targets)
+
+            # Backward pass for adversarial loss
+            loss_adv.backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+
+        # Optimizer Step
+        optimizer.step()
+
+        # Scheduler Step
+        if scheduler is not None:
+            scheduler.step()
+
+        # EMA Update
+        if config.use_ema and ema is not None:
+            ema.update(model)
+
+        # Zero Gradients
+        optimizer.zero_grad()
+=======
+def train_fn(
+    model,
+    dataloader,
+    optimizer,
+    scheduler,
+    device,
+    epoch,
+    config,
+    awp=None,
+    ema=None,
+    loss_fn=None,
+    scaler=None,
+):
+    """
+    Training loop for one epoch.
+    """
+    model.train()
+
+    running_loss = 0.0
+    running_mse = 0.0
+    running_ce = 0.0
+    running_pearson = 0.0
+    dataset_size = 0
+
+    start_time = time.time()
+
+    for step, batch in enumerate(dataloader):
+        # Move batch to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        token_type_ids = batch.get("token_type_ids", None)
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(device)
+
+        targets = batch["target"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward Pass
+        with torch.amp.autocast('cuda'):
+            reg_logits, cls_logits = model(input_ids, attention_mask, token_type_ids)
+            loss, metrics = loss_fn(reg_logits, cls_logits, targets)
+
+        # Backward Pass
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Adversarial Weight Perturbation (AWP)
+        if config.use_awp and awp is not None and epoch >= config.awp_start_epoch:
+            # Perturb weights
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            with torch.amp.autocast('cuda'):
+                reg_logits_adv, cls_logits_adv = model(
+                    input_ids, attention_mask, token_type_ids
+                )
+                loss_adv, _ = loss_fn(reg_logits_adv, cls_logits_adv, targets)
+
+            # Backward pass for adversarial loss
+            if scaler is not None:
+                scaler.scale(loss_adv).backward()
+            else:
+                loss_adv.backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # Gradient Clipping & Optimizer Step
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            optimizer.step()
+
+        # Scheduler Step
+        if scheduler is not None:
+            scheduler.step()
+
+        # EMA Update
+        if config.use_ema and ema is not None:
+            ema.update(model)
+
+        # Zero Gradients
+        optimizer.zero_grad()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Forward Pass
+            reg_logits, cls_logits = model(input_ids, attention_mask, token_type_ids)
+
+            # Compute Loss (for monitoring)
+            loss, _ = loss_fn(reg_logits, cls_logits, targets)
+=======
+            # Forward Pass
+            with torch.amp.autocast('cuda'):
+                reg_logits, cls_logits = model(input_ids, attention_mask, token_type_ids)
+                loss, _ = loss_fn(reg_logits, cls_logits, targets)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+            # Forward Pass
+            reg_logits, _ = model(input_ids, attention_mask, token_type_ids)
+
+            preds = reg_logits.view(-1).cpu().numpy()
+=======
+            # Forward Pass
+            with torch.amp.autocast('cuda'):
+                reg_logits, _ = model(input_ids, attention_mask, token_type_ids)
+
+            preds = reg_logits.view(-1).cpu().float().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = CustomDeberta(model_path=conf.model_backbone, pretrained=True)
+    model.to(conf.device)
+
+    # Optimizer (Layer-wise learning rates could be implemented, but using grouped params for simplicity/speed)
+=======
+    # Initialize Model
+    model = CustomDeberta(model_path=conf.model_backbone, pretrained=True)
+    model.to(conf.device)
+
+    # Enable Gradient Checkpointing and Mixed Precision to prevent OOM
+    # Cite debug_lesson_7: Enforce Non-Reentrant Gradient Checkpointing
+    # Cite debug_lesson_5: Disable use_cache when using gradient checkpointing
+    model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.backbone.config.use_cache = False
+
+    scaler = torch.amp.GradScaler('cuda')
+
+    # Optimizer (Layer-wise learning rates could be implemented, but using grouped params for simplicity/speed)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Train
+        train_loss = train_fn(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            conf.device,
+            epoch,
+            conf,
+            awp,
+            ema,
+            loss_fn,
+        )
+=======
+        # Train
+        train_loss = train_fn(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            conf.device,
+            epoch,
+            conf,
+            awp,
+            ema,
+            loss_fn,
+            scaler,
+        )
+>>>>>>> REPLACE
+```

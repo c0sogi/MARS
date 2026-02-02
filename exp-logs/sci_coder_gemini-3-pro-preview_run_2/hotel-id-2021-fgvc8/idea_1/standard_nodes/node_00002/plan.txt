@@ -1,0 +1,284 @@
+To optimize the model for the high-cardinality (7,770 classes) and long-tail nature of the dataset, I will pivot from standard Cross-Entropy classification to a **Metric Learning** approach using **ArcFace**, as recommended in the lessons (Cite solution_lesson_node_00001). Standard Softmax struggles with such distributions, whereas ArcFace enforces a margin in the angular space, promoting better intra-class compactness and inter-class separability.
+
+My implementation strategy includes:
+1.  **Configuration (`library/config.py`)**: Update hyperparameters. I will increase `BATCH_SIZE` to 128 (A100 can handle it), set `NUM_EPOCHS` to 8 for sufficient convergence with the new loss, and add ArcFace-specific parameters (`ARC_S=30.0`, `ARC_M=0.50`).
+2.  **Model (`library/model.py`)**: Upgrade the backbone from ResNet-18 to **ResNet-50** for richer feature extraction. I will implement an `ArcMarginProduct` head that takes embeddings and labels to compute the additive angular margin loss. The forward pass will handle both training (with labels) and inference (without labels, returning scaled cosine similarities).
+3.  **Engine (`library/engine.py`)**: Update the training loop to pass labels to the model's forward method (required for ArcFace margin calculation).
+4.  **Execution (`runfile.py`)**: Implement the requirement to only generate the submission file if the validation MAP@5 exceeds the previous baseline of ~0.0042.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 256  # Large batch size for A100 GPU
+    LEARNING_RATE = 1e-3  # Standard starting LR for Adam
+    NUM_EPOCHS = 15  # Max epochs (subject to early stopping)
+    LABEL_SMOOTHING = 0.1  # Helps with high cardinality classification
+    PATIENCE = 3  # Early stopping patience
+
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    MODEL_NAME = "resnet18"
+    PRETRAINED = True
+    DROPOUT = 0.2  # Dropout rate for the final layer
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 128  # Adjusted for ResNet50 on A100
+    LEARNING_RATE = 1e-3  # Standard starting LR for Adam
+    NUM_EPOCHS = 8  # Sufficient for ArcFace convergence
+    LABEL_SMOOTHING = 0.0  # Not typically used with ArcFace
+    PATIENCE = 3  # Early stopping patience
+
+    # ArcFace Hyperparameters
+    ARC_S = 30.0
+    ARC_M = 0.50
+
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    MODEL_NAME = "resnet50"
+    PRETRAINED = True
+    DROPOUT = 0.2  # Dropout rate for the final layer
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights
+from library.config import Config
+
+
+class HotelClassifier(nn.Module):
+    """
+    Hotel ID Classifier using a ResNet-18 backbone.
+
+    The architecture consists of a pre-trained ResNet-18 model where the
+    final fully connected layer is replaced to map the 512-dimensional
+    feature vector to the specific number of hotel classes.
+    """
+
+    def __init__(
+        self,
+        n_classes: int = Config.NUM_CLASSES,
+        pretrained: bool = Config.PRETRAINED,
+        dropout: float = Config.DROPOUT,
+    ):
+        """
+        Initialize the HotelClassifier.
+
+        Args:
+            n_classes (int): Number of target classes (hotels). Defaults to Config.NUM_CLASSES.
+            pretrained (bool): Whether to use ImageNet pre-trained weights. Defaults to Config.PRETRAINED.
+            dropout (float): Dropout probability for the final layer. Defaults to Config.DROPOUT.
+        """
+        super(HotelClassifier, self).__init__()
+
+        # Select weights based on pretrained flag
+        if pretrained:
+            weights = ResNet18_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        # Load the ResNet-18 backbone
+        self.backbone = resnet18(weights=weights)
+
+        # Get the input dimension of the original fully connected layer (usually 512 for ResNet18)
+        in_features = self.backbone.fc.in_features
+
+        # Replace the final fully connected layer
+        # We include Dropout for regularization as specified in the configuration strategy
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(p=dropout), nn.Linear(in_features, n_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the network.
+
+        Args:
+            x (torch.Tensor): Input batch of images. Shape (B, C, H, W).
+
+        Returns:
+            torch.Tensor: Raw logits for each class. Shape (B, n_classes).
+        """
+        return self.backbone(x)
+=======
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights
+from library.config import Config
+
+
+class ArcMarginProduct(nn.Module):
+    """
+    ArcFace output layer (Cite solution_lesson_node_00001).
+    """
+    def __init__(self, in_features, out_features, s=30.0, m=0.50):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, input, label=None):
+        # Normalize features and weights
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        
+        # If inference (no label), return scaled cosine similarity
+        if label is None:
+            return cosine * self.s
+            
+        # Training: Add margin
+        # clamp for numerical stability
+        cosine = torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7)
+        theta = torch.acos(cosine)
+        target_logits = torch.cos(theta + self.m)
+        
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        output = cosine * (1 - one_hot) + target_logits * one_hot
+        output *= self.s
+        return output
+
+
+class HotelClassifier(nn.Module):
+    """
+    Hotel ID Classifier using a ResNet-50 backbone with ArcFace head.
+    """
+
+    def __init__(
+        self,
+        n_classes: int = Config.NUM_CLASSES,
+        pretrained: bool = Config.PRETRAINED,
+        dropout: float = Config.DROPOUT,
+    ):
+        super(HotelClassifier, self).__init__()
+
+        # Select weights based on pretrained flag
+        if pretrained:
+            weights = ResNet50_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+
+        # Load the ResNet-50 backbone
+        self.backbone = resnet50(weights=weights)
+
+        # Get the input dimension of the original fully connected layer (2048 for ResNet50)
+        in_features = self.backbone.fc.in_features
+        
+        # Remove original FC
+        self.backbone.fc = nn.Identity()
+
+        # Embedding layer
+        self.embedding = nn.Sequential(
+            nn.Linear(in_features, 512),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p=dropout)
+        )
+        
+        # ArcFace Head
+        self.arc = ArcMarginProduct(512, n_classes, s=Config.ARC_S, m=Config.ARC_M)
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass of the network.
+        
+        Args:
+            x: Input images
+            labels: Ground truth labels (optional, for training only)
+        """
+        x = self.backbone(x)
+        x = self.embedding(x)
+        return self.arc(x, labels)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+=======
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Pass labels to model for ArcFace margin calculation
+        logits = model(images, labels)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_model(
+    model, train_loader, val_loader, optimizer, scheduler, device, num_epochs, patience
+):
+    """
+    Main training loop with Early Stopping.
+    """
+    # Use Label Smoothing as defined in Config
+    criterion = nn.CrossEntropyLoss(label_smoothing=Config.LABEL_SMOOTHING)
+
+    best_val_map = -1.0
+=======
+def train_model(
+    model, train_loader, val_loader, optimizer, scheduler, device, num_epochs, patience
+):
+    """
+    Main training loop with Early Stopping.
+    """
+    # Standard CrossEntropyLoss (ArcFace handles margin internally)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_map = -1.0
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 8. Submission
+    predict_and_submit(model, test_loader, classes, device)
+=======
+    # 8. Submission
+    # Requirement: Only submit if validation metric is higher than 0.004247584426088712
+    BASELINE_METRIC = 0.004247584426088712
+    
+    if final_map > BASELINE_METRIC:
+        print(f"Validation metric ({final_map}) improved over baseline ({BASELINE_METRIC}). Generating submission...")
+        predict_and_submit(model, test_loader, classes, device)
+    else:
+        print(f"Validation metric ({final_map}) did not improve over baseline ({BASELINE_METRIC}). Skipping submission.")
+>>>>>>> REPLACE
+```

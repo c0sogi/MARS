@@ -1,0 +1,592 @@
+The following code modifications optimize the solution by:
+1.  **Switching to Single Model Training**: Replacing the 5-fold cross-validation ensemble with a single model trained on the provided train/val split. This allows for significantly longer training (80 epochs vs 30) to ensure convergence of the Lovasz-Hinge loss, which is critical for maximizing the IoU metric (Cite solution_lesson_node_00024, solution_lesson_node_00020).
+2.  **Using Pre-defined Splits**: Avoiding recursive splitting of the training data by using the provided `train_metadata.csv` and `val_metadata.csv` directly. This maximizes the effective training set size and ensures stable validation (Cite solution_lesson_node_00025).
+3.  **Dynamic Threshold Optimization**: Implementing a threshold sweep during validation to select the optimal binarization threshold for the mAP metric, rather than relying on a fixed 0.5 threshold. This ensures the scheduler and checkpointing are driven by the model's best possible performance (Cite solution_lesson_node_00011).
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def get_dataloaders(
+    fold_idx=0,
+    n_folds=5,
+    batch_size=32,
+    load_cached_data=True,
+    num_workers=2,
+    debug=False,
+):
+    """
+    Creates train and validation dataloaders for a specific fold.
+    """
+    # Load all training data
+    images, masks, depths, ids, classes = load_or_create_data(
+        mode="train", load_cached_data=load_cached_data, debug=debug
+    )
+
+    # Stratified Split
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    # Dummy X, we split based on classes
+    dummy_X = np.zeros(len(classes))
+    splits = list(skf.split(dummy_X, classes))
+
+    train_idx, val_idx = splits[fold_idx]
+
+    # Create Datasets
+    train_dataset = SaltDataset(
+        images[train_idx],
+        depths[train_idx],
+        ids[train_idx],
+        masks[train_idx],
+        transform=get_transforms("train"),
+    )
+
+    val_dataset = SaltDataset(
+        images[val_idx],
+        depths[val_idx],
+        ids[val_idx],
+        masks[val_idx],
+        transform=get_transforms("val"),
+    )
+=======
+def get_dataloaders(
+    fold_idx=0,
+    n_folds=5,
+    batch_size=32,
+    load_cached_data=True,
+    num_workers=2,
+    debug=False,
+    use_predefined_split=False,
+):
+    """
+    Creates train and validation dataloaders.
+    If use_predefined_split is True, uses the fixed split from metadata files (Train vs Val).
+    Otherwise, uses StratifiedKFold.
+    """
+    # Load all training data (Merged Train + Val)
+    images, masks, depths, ids, classes = load_or_create_data(
+        mode="train", load_cached_data=load_cached_data, debug=debug
+    )
+
+    if use_predefined_split:
+        # We know load_or_create_data concats train then val.
+        # We need the length of the train set to split.
+        df_train = pd.read_csv(os.path.join(METADATA_DIR, "train_metadata.csv"))
+        n_train = len(df_train)
+
+        if debug:
+            n_train = int(len(images) * 0.8)
+
+        train_idx = np.arange(n_train)
+        val_idx = np.arange(n_train, len(images))
+    else:
+        # Stratified Split
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+        # Dummy X, we split based on classes
+        dummy_X = np.zeros(len(classes))
+        splits = list(skf.split(dummy_X, classes))
+
+        train_idx, val_idx = splits[fold_idx]
+
+    # Create Datasets
+    train_dataset = SaltDataset(
+        images[train_idx],
+        depths[train_idx],
+        ids[train_idx],
+        masks[train_idx],
+        transform=get_transforms("train"),
+    )
+
+    val_dataset = SaltDataset(
+        images[val_idx],
+        depths[val_idx],
+        ids[val_idx],
+        masks[val_idx],
+        transform=get_transforms("val"),
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_map = np.mean(val_scores)
+
+    return epoch_loss, epoch_map
+=======
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_map = np.mean(val_scores)
+
+    return epoch_loss, epoch_map
+
+
+def validate_one_epoch_optimized(model, loader, criterion, device):
+    """
+    Performs one epoch of validation with TTA and Dynamic Threshold Optimization.
+    """
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_masks = []
+
+    # Cropping indices
+    target_size = 128
+    orig_size = 101
+    start_idx = (target_size - orig_size) // 2
+    end_idx = start_idx + orig_size
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+
+            # Loss (No TTA)
+            logits = model(images)
+            loss = criterion(logits, masks)
+            running_loss += loss.item() * images.size(0)
+
+            # TTA for Metrics
+            probs_normal = torch.sigmoid(logits)
+
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip = model(images_flip)
+            probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+            probs_avg = (probs_normal + probs_flip) / 2.0
+
+            # Crop
+            preds_cropped = probs_avg[:, :, start_idx:end_idx, start_idx:end_idx]
+            masks_cropped = masks[:, :, start_idx:end_idx, start_idx:end_idx]
+
+            all_preds.append(preds_cropped.cpu().numpy())
+            all_masks.append(masks_cropped.cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+
+    # Concatenate
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_masks = np.concatenate(all_masks, axis=0)
+
+    # Threshold Sweep (Cite solution_lesson_node_00011)
+    thresholds = np.arange(0.3, 0.8, 0.05)
+    best_score = 0.0
+    best_thresh = 0.5
+
+    for t in thresholds:
+        score = calculate_map_score(all_preds, all_masks, decision_threshold=t)
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+
+    return epoch_loss, best_score, best_thresh
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.engine import train_one_epoch, validate_one_epoch
+
+# --- Configuration ---
+SEED = 42
+NUM_FOLDS = 5
+EPOCHS = 30  # 15 Warmup + 15 Finetune
+SWITCH_EPOCH = 15
+BATCH_SIZE = 64
+NUM_WORKERS = 2
+LR_WARMUP = 1e-3
+LR_FINETUNE = 5e-5  # Conservative LR for Lovasz
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SUBMISSION_THRESHOLD = 0.827
+OUTPUT_DIR = "./working"
+=======
+from library.engine import train_one_epoch, validate_one_epoch_optimized
+
+# --- Configuration ---
+SEED = 42
+NUM_FOLDS = 1  # Single model training (Cite solution_lesson_node_00024)
+EPOCHS = 80  # Extended training for Lovasz convergence (Cite solution_lesson_node_00020)
+SWITCH_EPOCH = 20
+BATCH_SIZE = 64
+NUM_WORKERS = 2
+LR_WARMUP = 1e-3
+LR_FINETUNE = 5e-5
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SUBMISSION_THRESHOLD = 0.827
+OUTPUT_DIR = "./working"
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- Cross-Validation Loop ---
+    for fold in range(NUM_FOLDS):
+        print(f"\n{'='*20} Fold {fold+1}/{NUM_FOLDS} {'='*20}")
+
+        # 1. Data Loaders
+        train_loader, val_loader = get_dataloaders(
+            fold_idx=fold,
+            n_folds=NUM_FOLDS,
+            batch_size=BATCH_SIZE,
+            load_cached_data=True,
+            num_workers=NUM_WORKERS,
+        )
+
+        # 2. Model Initialization
+        model = SaltUNetPlusPlus(
+            encoder_name="resnext50_32x4d",
+            in_channels=3,
+            classes=1,
+            deep_supervision=True,
+        ).to(DEVICE)
+
+        # 3. Optimizer & Scaler
+        optimizer = optim.AdamW(model.parameters(), lr=LR_WARMUP, weight_decay=1e-4)
+        scaler = GradScaler()
+
+        # 4. Schedulers
+        # We use ReduceLROnPlateau, but we also manually intervene at SWITCH_EPOCH
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3
+        )
+
+        # 5. Loss Functions
+        criterion_bce = BCEDiceLoss().to(DEVICE)
+        criterion_lovasz = LovaszHingeLoss().to(DEVICE)
+        current_criterion = criterion_bce
+
+        best_map = 0.0
+        best_model_path = os.path.join(CHECKPOINT_DIR, f"fold_{fold}_best.pth")
+
+        # --- Training Loop ---
+        for epoch in range(1, EPOCHS + 1):
+            # Curriculum Switch
+            if epoch == SWITCH_EPOCH + 1:
+                print(
+                    f"   [Curriculum] Switching to Lovasz-Hinge Loss & Resetting LR to {LR_FINETUNE}"
+                )
+                current_criterion = criterion_lovasz
+                # Re-initialize optimizer or set param groups
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = LR_FINETUNE
+
+            # Train
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, scaler, current_criterion, DEVICE
+            )
+
+            # Validate
+            val_loss, val_map = validate_one_epoch(
+                model, val_loader, current_criterion, DEVICE
+            )
+
+            # Scheduler Step
+            scheduler.step(val_map)
+
+            # Save Best
+            if val_map > best_map:
+                best_map = val_map
+                torch.save(model.state_dict(), best_model_path)
+
+            # Logging (Minimal)
+            # print(f"   Epoch {epoch}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val mAP: {val_map:.4f}")
+
+        print(f"   Best mAP for Fold {fold}: {best_map:.4f}")
+        fold_scores.append(best_map)
+
+        # --- Generate OOF Predictions for this Fold ---
+        # Load best model
+        model.load_state_dict(
+            torch.load(best_model_path, map_location=DEVICE, weights_only=False)
+        )
+        model.eval()
+        model.deep_supervision = False  # Disable for inference
+
+        # Cropping indices (128 -> 101)
+        start_idx = (128 - 101) // 2
+        end_idx = start_idx + 101
+
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch["image"].to(DEVICE)
+                masks = batch["mask"].to(DEVICE)  # (B, 1, 128, 128)
+                ids = batch["id"]
+
+                # Forward (TTA)
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+
+                logits_flip = model(torch.flip(images, dims=[3]))
+                probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+                avg_probs = (probs + probs_flip) / 2.0
+
+                # Crop
+                preds_cropped = (
+                    avg_probs[:, :, start_idx:end_idx, start_idx:end_idx].cpu().numpy()
+                )
+                masks_cropped = (
+                    masks[:, :, start_idx:end_idx, start_idx:end_idx].cpu().numpy()
+                )
+
+                # Store
+                for i, img_id in enumerate(ids):
+                    oof_preds_dict[img_id] = preds_cropped[i, 0]
+                    oof_targets_dict[img_id] = masks_cropped[i, 0]
+                    oof_ids_list.append(img_id)
+=======
+    # --- Single Model Training ---
+    # We use the pre-defined split (Train on train_metadata, Val on val_metadata)
+    # This avoids recursive splitting and maximizes training data (Cite solution_lesson_node_00025)
+    print(f"\n{'='*20} Training Single Model (80 Epochs) {'='*20}")
+
+    # 1. Data Loaders
+    train_loader, val_loader = get_dataloaders(
+        fold_idx=0,
+        n_folds=1,
+        batch_size=BATCH_SIZE,
+        load_cached_data=True,
+        num_workers=NUM_WORKERS,
+        use_predefined_split=True,
+    )
+
+    # 2. Model Initialization
+    model = SaltUNetPlusPlus(
+        encoder_name="resnext50_32x4d",
+        in_channels=3,
+        classes=1,
+        deep_supervision=True,
+    ).to(DEVICE)
+
+    # 3. Optimizer & Scaler
+    optimizer = optim.AdamW(model.parameters(), lr=LR_WARMUP, weight_decay=1e-4)
+    scaler = GradScaler()
+
+    # 4. Schedulers
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
+
+    # 5. Loss Functions
+    criterion_bce = BCEDiceLoss().to(DEVICE)
+    criterion_lovasz = LovaszHingeLoss().to(DEVICE)
+    current_criterion = criterion_bce
+
+    best_map = 0.0
+    best_threshold = 0.5
+    best_model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+    # --- Training Loop ---
+    for epoch in range(1, EPOCHS + 1):
+        # Curriculum Switch
+        if epoch == SWITCH_EPOCH + 1:
+            print(
+                f"   [Curriculum] Switching to Lovasz-Hinge Loss & Resetting LR to {LR_FINETUNE}"
+            )
+            current_criterion = criterion_lovasz
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = LR_FINETUNE
+
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, scaler, current_criterion, DEVICE
+        )
+
+        # Validate with Dynamic Thresholding
+        val_loss, val_map, val_thresh = validate_one_epoch_optimized(
+            model, val_loader, current_criterion, DEVICE
+        )
+
+        # Scheduler Step
+        scheduler.step(val_map)
+
+        # Save Best
+        if val_map > best_map:
+            best_map = val_map
+            best_threshold = val_thresh
+            torch.save(model.state_dict(), best_model_path)
+
+    print(f"   Best mAP: {best_map:.4f} at Threshold: {best_threshold:.2f}")
+
+    # --- Generate Predictions for Validation Set (for Analysis) ---
+    # Load best model
+    model.load_state_dict(
+        torch.load(best_model_path, map_location=DEVICE, weights_only=False)
+    )
+    model.eval()
+    model.deep_supervision = False
+
+    # Cropping indices
+    start_idx = (128 - 101) // 2
+    end_idx = start_idx + 101
+
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(DEVICE)
+            masks = batch["mask"].to(DEVICE)
+            ids = batch["id"]
+
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            logits_flip = model(torch.flip(images, dims=[3]))
+            probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+            avg_probs = (probs + probs_flip) / 2.0
+
+            preds_cropped = avg_probs[:, :, start_idx:end_idx, start_idx:end_idx].cpu().numpy()
+            masks_cropped = masks[:, :, start_idx:end_idx, start_idx:end_idx].cpu().numpy()
+
+            for i, img_id in enumerate(ids):
+                oof_preds_dict[img_id] = preds_cropped[i, 0]
+                oof_targets_dict[img_id] = masks_cropped[i, 0]
+                oof_ids_list.append(img_id)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- Global Threshold Optimization ---
+    print("\n" + "=" * 20 + " Global Optimization " + "=" * 20)
+
+    # Convert OOF dicts to arrays aligned by ID
+    sorted_ids = sorted(oof_ids_list)
+    all_preds = np.array([oof_preds_dict[i] for i in sorted_ids])
+    all_targets = np.array([oof_targets_dict[i] for i in sorted_ids])
+
+    # Flatten for metric calculation efficiency
+    # But calculate_map_score expects (B, H, W)
+
+    thresholds = np.arange(0.3, 0.8, 0.05)
+    best_global_threshold = 0.5
+    best_global_score = 0.0
+
+    # We can use a subset or batching if memory is tight, but 3000x101x101 is small (~30MB)
+    # Perform sweep
+    for t in thresholds:
+        score = calculate_map_score(all_preds, all_targets, decision_threshold=t)
+        if score > best_global_score:
+            best_global_score = score
+            best_global_threshold = t
+
+    print(f"Optimal Threshold: {best_global_threshold:.2f}")
+    print(f"Final Validation Metric: {best_global_score:.10f}")
+=======
+    # --- Global Optimization ---
+    print("\n" + "=" * 20 + " Global Optimization " + "=" * 20)
+
+    sorted_ids = sorted(oof_ids_list)
+    all_preds = np.array([oof_preds_dict[i] for i in sorted_ids])
+    all_targets = np.array([oof_targets_dict[i] for i in sorted_ids])
+
+    # Use the best threshold found during training as a starting point, but sweep again to confirm
+    thresholds = np.arange(0.3, 0.8, 0.05)
+    best_global_threshold = best_threshold
+    best_global_score = 0.0
+
+    for t in thresholds:
+        score = calculate_map_score(all_preds, all_targets, decision_threshold=t)
+        if score > best_global_score:
+            best_global_score = score
+            best_global_threshold = t
+
+    print(f"Optimal Threshold: {best_global_threshold:.2f}")
+    print(f"Final Validation Metric: {best_global_score:.10f}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Load all 5 models
+        models = []
+        for fold in range(NUM_FOLDS):
+            m = SaltUNetPlusPlus(
+                encoder_name="resnext50_32x4d",
+                in_channels=3,
+                classes=1,
+                deep_supervision=False,
+            ).to(DEVICE)
+            m.load_state_dict(
+                torch.load(
+                    os.path.join(CHECKPOINT_DIR, f"fold_{fold}_best.pth"),
+                    map_location=DEVICE,
+                    weights_only=False,
+                )
+            )
+            m.eval()
+            models.append(m)
+
+        submission_data = []
+
+        start_idx = (128 - 101) // 2
+        end_idx = start_idx + 101
+
+        with torch.no_grad():
+            for batch in test_loader:
+                images = batch["image"].to(DEVICE)
+                ids = batch["id"]
+
+                # Ensemble Prediction
+                batch_preds = 0.0
+
+                # TTA Flip
+                images_flip = torch.flip(images, dims=[3])
+
+                for m in models:
+                    # Normal
+                    logits = m(images)
+                    probs = torch.sigmoid(logits)
+
+                    # Flip
+                    logits_flip = m(images_flip)
+                    probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+                    batch_preds += (probs + probs_flip) / 2.0
+
+                batch_preds /= len(models)
+=======
+        # Load the single best model
+        model = SaltUNetPlusPlus(
+            encoder_name="resnext50_32x4d",
+            in_channels=3,
+            classes=1,
+            deep_supervision=False,
+        ).to(DEVICE)
+        model.load_state_dict(
+            torch.load(
+                best_model_path,
+                map_location=DEVICE,
+                weights_only=False,
+            )
+        )
+        model.eval()
+
+        submission_data = []
+
+        start_idx = (128 - 101) // 2
+        end_idx = start_idx + 101
+
+        with torch.no_grad():
+            for batch in test_loader:
+                images = batch["image"].to(DEVICE)
+                ids = batch["id"]
+
+                # TTA Flip
+                images_flip = torch.flip(images, dims=[3])
+
+                # Normal
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+
+                # Flip
+                logits_flip = model(images_flip)
+                probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+                batch_preds = (probs + probs_flip) / 2.0
+>>>>>>> REPLACE
+```

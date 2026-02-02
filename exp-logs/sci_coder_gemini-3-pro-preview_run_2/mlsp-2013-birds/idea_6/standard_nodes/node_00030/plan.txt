@@ -1,0 +1,309 @@
+To optimize performance, I will implement the following changes based on the provided lessons:
+
+1.  **Data Source & Preprocessing**: Switch from raw spectrograms to **filtered spectrograms** to improve the signal-to-noise ratio (Cite solution_lesson_node_00028). I will also load images in 3-channel color (replicating the grayscale channel) to natively fit the pretrained backbone, removing the need for delta computation (Cite solution_lesson_node_00027).
+2.  **Model Architecture**: Revert the backbone to **ResNet18** and replace the Multi-Sample Dropout head with a simpler **Global Average Pooling + Dropout + Linear** head. This architectural simplicity acts as a regularizer for the small dataset (Cite solution_lesson_node_00024, solution_lesson_node_00028).
+3.  **Training Configuration**: Increase training epochs to 40 to ensure convergence with Mixup (Cite solution_lesson_node_00013) and simplify the loss calculation to match the single-head output.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# ==========================================
+# Model Configuration
+# ==========================================
+BACKBONE = "resnet34"
+PRETRAINED = True
+
+# Multi-Sample Dropout settings (dropout rates for parallel branches)
+DROPOUT_RATES = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+# ==========================================
+# Training Configuration
+# ==========================================
+NUM_FOLDS = 5
+BATCH_SIZE = 32
+EPOCHS = 50
+=======
+# ==========================================
+# Model Configuration
+# ==========================================
+BACKBONE = "resnet18"
+PRETRAINED = True
+
+# ==========================================
+# Training Configuration
+# ==========================================
+NUM_FOLDS = 5
+BATCH_SIZE = 32
+EPOCHS = 40
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full path to the spectrogram
+        img_path = os.path.join(config.INPUT_DIR, row["file_path_spec"])
+
+        # Load image in grayscale
+        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+
+        # Handle missing files (robustness)
+        if image is None:
+            image = np.zeros((config.IMG_HEIGHT, config.IMG_WIDTH), dtype=np.uint8)
+
+        # Resize to target dimensions (Height, Width)
+        # Note: cv2.resize expects (Width, Height)
+        image = cv2.resize(image, (config.IMG_WIDTH, config.IMG_HEIGHT))
+
+        # Apply Albumentations (works on numpy arrays)
+        if self.transforms:
+            augmented = self.transforms(image=image)
+            image = augmented["image"]
+
+        # Normalize to [0, 1]
+        image = image.astype(np.float32) / 255.0
+
+        # Convert to Tensor (1, H, W)
+        image_tensor = torch.tensor(image).unsqueeze(0)
+
+        # Compute Deltas to get 3 channels (Spec, Delta, Delta-Delta)
+        # Result shape: (3, H, W)
+        final_tensor = utils.compute_deltas(image_tensor)
+
+        # Prepare Labels
+=======
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full path to the spectrogram
+        # Use filtered spectrograms for better SNR (Cite solution_lesson_node_00028)
+        rel_path = row["file_path_spec"].replace("spectrograms", "filtered_spectrograms")
+        img_path = os.path.join(config.INPUT_DIR, rel_path)
+
+        # Load image in color (3 channels) to simulate RGB input for ResNet
+        # This avoids architectural surgery (Cite solution_lesson_node_00027)
+        image = cv2.imread(img_path, cv2.IMREAD_COLOR)
+
+        # Handle missing files (robustness)
+        if image is None:
+            image = np.zeros((config.IMG_HEIGHT, config.IMG_WIDTH, 3), dtype=np.uint8)
+
+        # Resize to target dimensions (Height, Width)
+        image = cv2.resize(image, (config.IMG_WIDTH, config.IMG_HEIGHT))
+
+        # Apply Albumentations (works on numpy arrays)
+        if self.transforms:
+            augmented = self.transforms(image=image)
+            image = augmented["image"]
+
+        # Normalize to [0, 1]
+        image = image.astype(np.float32) / 255.0
+
+        # Convert to Tensor (C, H, W)
+        # OpenCV loads as (H, W, C), PyTorch expects (C, H, W)
+        image = image.transpose(2, 0, 1)
+        final_tensor = torch.tensor(image)
+
+        # Prepare Labels
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiSampleDropout(nn.Module):
+    """
+    Implements Multi-Sample Dropout (MSD).
+
+    This module applies multiple dropout masks with different rates to the same input features,
+    then passes each dropped-out version through a shared fully connected layer.
+
+    During training, it returns the logits for all branches (to compute average loss).
+    During inference, it returns the average of the logits (ensemble prediction).
+    """
+
+    def __init__(self, in_features, out_features, dropout_rates):
+        super(MultiSampleDropout, self).__init__()
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropout_rates])
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, In_Features).
+
+        Returns:
+            torch.Tensor:
+                - If training: (Batch, Num_Drops, Out_Features)
+                - If eval: (Batch, Out_Features)
+        """
+        # Apply each dropout mask and pass through the shared linear layer
+        logits_list = [self.linear(d(x)) for d in self.dropouts]
+
+        # Stack logits along a new dimension: (Batch, Num_Drops, Out_Features)
+        logits = torch.stack(logits_list, dim=1)
+
+        if self.training:
+            return logits
+        else:
+            # During inference, average the predictions across all dropout masks
+            return torch.mean(logits, dim=1)
+
+
+class BirdResNet(nn.Module):
+    """
+    ResNet34-based model for Bird Species Classification.
+
+    Features:
+    - Backbone: ResNet34 (Pretrained on ImageNet)
+    - Input: 3-Channel (Spectrogram, Delta, Delta-Delta)
+    - Head: Multi-Sample Dropout for robust regularization
+    """
+
+    def __init__(self, pretrained=config.PRETRAINED):
+        super(BirdResNet, self).__init__()
+
+        # Load Pretrained ResNet34
+        # weights="DEFAULT" corresponds to the best available weights (IMAGENET1K_V1)
+        weights = "DEFAULT" if pretrained else None
+        self.backbone = models.resnet34(weights=weights)
+
+        # Feature Extractor: Keep layers up to avgpool
+        # ResNet structure: conv1 -> bn1 -> relu -> maxpool -> layer1-4 -> avgpool -> fc
+        # We remove the final 'fc' layer.
+        layers = list(self.backbone.children())[:-1]
+        self.feature_extractor = nn.Sequential(*layers)
+
+        # Determine input features for the head (512 for ResNet34)
+        in_features = self.backbone.fc.in_features
+
+        # Classification Head with Multi-Sample Dropout
+        self.head = MultiSampleDropout(
+            in_features=in_features,
+            out_features=config.NUM_CLASSES,
+            dropout_rates=config.DROPOUT_RATES,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images of shape (Batch, 3, Height, Width).
+
+        Returns:
+            torch.Tensor: Logits.
+        """
+        # Extract features
+        # Output shape: (Batch, 512, 1, 1)
+        x = self.feature_extractor(x)
+
+        # Flatten
+        # Output shape: (Batch, 512)
+        x = torch.flatten(x, 1)
+
+        # Classification Head
+        # Output shape: (Batch, Num_Drops, Num_Classes) if training
+        #               (Batch, Num_Classes) if eval
+        x = self.head(x)
+
+        return x
+=======
+class BirdResNet(nn.Module):
+    """
+    ResNet18-based model for Bird Species Classification.
+
+    Features:
+    - Backbone: ResNet18 (Pretrained on ImageNet) (Cite solution_lesson_node_00028)
+    - Input: 3-Channel (Filtered Spectrogram RGB)
+    - Head: Global Average Pooling + Dropout + Linear (Cite solution_lesson_node_00024)
+    """
+
+    def __init__(self, pretrained=config.PRETRAINED):
+        super(BirdResNet, self).__init__()
+
+        # Load Pretrained ResNet18
+        weights = "DEFAULT" if pretrained else None
+        self.backbone = models.resnet18(weights=weights)
+
+        # Feature Extractor: Keep layers up to avgpool
+        layers = list(self.backbone.children())[:-1]
+        self.feature_extractor = nn.Sequential(*layers)
+
+        # Determine input features for the head (512 for ResNet18)
+        in_features = self.backbone.fc.in_features
+
+        # Simple Classification Head
+        self.head = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(in_features, config.NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images of shape (Batch, 3, Height, Width).
+
+        Returns:
+            torch.Tensor: Logits (Batch, Num_Classes).
+        """
+        # Extract features (Batch, 512, 1, 1)
+        x = self.feature_extractor(x)
+
+        # Flatten (Batch, 512)
+        x = torch.flatten(x, 1)
+
+        # Classification Head (Batch, Num_Classes)
+        x = self.head(x)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """
+    Calculates Mixup loss.
+    Handles Multi-Sample Dropout output: (Batch, Num_Drops, Num_Classes).
+    """
+    # pred shape: (Batch, Num_Drops, Num_Classes)
+    # y_a, y_b shape: (Batch, Num_Classes)
+
+    loss = 0
+    num_drops = pred.size(1)
+
+    # Iterate over each dropout head output
+    for i in range(num_drops):
+        # Calculate loss for this head against both targets
+        loss_a = criterion(pred[:, i, :], y_a)
+        loss_b = criterion(pred[:, i, :], y_b)
+        loss += lam * loss_a + (1 - lam) * loss_b
+
+    # Average loss across all dropout heads
+    return loss / num_drops
+=======
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """
+    Calculates Mixup loss for standard model output.
+    """
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 1. Configuration & Setup
+    # Override config for fast baseline execution
+    config.EPOCHS = 25
+    config.DEBUG = False
+=======
+    # 1. Configuration & Setup
+    # Override config for fast baseline execution
+    config.EPOCHS = 40  # Increased to 40 (Cite solution_lesson_node_00013)
+    config.DEBUG = False
+>>>>>>> REPLACE
+```

@@ -1,0 +1,514 @@
+I will implement the **Threshold Optimization** strategy as described in **solution_lesson_node_00002**. This approach replaces standard integer rounding with learned thresholds optimized via the Nelder-Mead algorithm to maximize the Quadratic Weighted Kappa (QWK) on the validation set. This directly addresses the "regression to the mean" problem where the Ridge model under-predicts extreme scores (1 and 6).
+
+Additionally, I will slightly tune the TF-IDF hyperparameters in `library/config.py` (increasing `max_features` and reducing `min_df`) to capture more lexical signals, leveraging the available compute resources.
+
+Here are the changes:
+
+1.  **`library/config.py`**: Increase vocabulary size and reduce minimum document frequency to capture more granular n-gram features.
+2.  **`library/model.py`**: Update `ScoreRegressor` to include `optimize_thresholds` (using `scipy.optimize.minimize`) and `predict_int` methods. Update persistence logic to save/load learned thresholds.
+3.  **`library/train.py`**: Update the evaluation step to use the optimized thresholds.
+4.  **`library/inference.py`**: Update the prediction step to use the optimized thresholds.
+5.  **`runfile.py`**: Implement the conditional submission logic based on the validation metric threshold (> 0.7427).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    TFIDF_PARAMS = {
+        "ngram_range": (1, 3),  # Unigrams, Bigrams, and Trigrams
+        "min_df": 5,  # Ignore terms appearing in < 5 documents
+        "max_df": 0.85,  # Ignore terms appearing in > 85% of documents
+        "max_features": 50000,  # Cap vocabulary size to manage memory and compute
+        "sublinear_tf": True,  # Apply 1 + log(tf) scaling to reduce impact of high freq words
+        "strip_accents": "unicode",  # Normalize characters
+=======
+    TFIDF_PARAMS = {
+        "ngram_range": (1, 3),  # Unigrams, Bigrams, and Trigrams
+        "min_df": 3,  # Ignore terms appearing in < 3 documents (Capture more rare signals)
+        "max_df": 0.90,  # Ignore terms appearing in > 90% of documents
+        "max_features": 60000,  # Cap vocabulary size to manage memory and compute
+        "sublinear_tf": True,  # Apply 1 + log(tf) scaling to reduce impact of high freq words
+        "strip_accents": "unicode",  # Normalize characters
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import numpy as np
+from sklearn.linear_model import Ridge, RidgeCV
+from library.config import Config
+from library.utils import save_artifact, load_artifact
+from library.metrics import compute_qwk
+
+
+class ScoreRegressor:
+    """
+    A wrapper class for Ridge Regression model to predict essay scores.
+    Implements training with hyperparameter tuning (alpha selection) and prediction with clipping.
+    """
+
+    def __init__(self, **kwargs):
+        """
+        Initializes the regressor.
+
+        Args:
+            kwargs: Arguments to override default Ridge parameters from Config.
+        """
+        self.model = None
+
+        # Load default parameters from Config
+        self.ridge_params = Config.RIDGE_PARAMS.copy()
+        self.ridge_params.update(kwargs)
+
+        # Separate alpha from other parameters as it might be tuned
+        if "alpha" in self.ridge_params:
+            self.default_alpha = self.ridge_params.pop("alpha")
+        else:
+            self.default_alpha = 1.0
+
+    def train(self, X_train, y_train, X_val=None, y_val=None):
+        """
+        Trains the model.
+
+        If validation data (X_val, y_val) is provided, it performs a grid search over
+        Config.ALPHA_GRID to find the alpha that maximizes the QWK score on the validation set.
+
+        If validation data is NOT provided, it uses RidgeCV with 5-fold cross-validation
+        to select the best alpha based on Mean Squared Error.
+
+        Args:
+            X_train: Training features (sparse matrix).
+            y_train: Training targets.
+            X_val: Validation features (sparse matrix), optional.
+            y_val: Validation targets, optional.
+
+        Returns:
+            self
+        """
+        alphas = Config.ALPHA_GRID
+
+        if X_val is not None and y_val is not None:
+            print(f"Training with validation set. Tuning alpha over: {alphas}")
+
+            best_score = -float("inf")
+            best_model = None
+            best_alpha = None
+
+            for alpha in alphas:
+                # Initialize Ridge with specific alpha and other config params
+                # We use the solver specified in Config (likely sparse-efficient)
+                model = Ridge(alpha=alpha, **self.ridge_params)
+
+                # Fit on training data
+                model.fit(X_train, y_train)
+
+                # Predict on validation data
+                y_pred_val = model.predict(X_val)
+
+                # Clip predictions to valid range [1, 6]
+                y_pred_val = np.clip(y_pred_val, Config.SCORE_MIN, Config.SCORE_MAX)
+
+                # Round to nearest integer for QWK calculation
+                y_pred_val_int = np.round(y_pred_val)
+
+                # Compute QWK
+                score = compute_qwk(y_val, y_pred_val_int)
+
+                print(f"Alpha: {alpha}, Val QWK: {score}")
+
+                if score > best_score:
+                    best_score = score
+                    best_model = model
+                    best_alpha = alpha
+
+            print(f"Best Alpha: {best_alpha}")
+            print(f"Best Val QWK: {best_score}")
+            self.model = best_model
+
+        else:
+            print("No validation set provided. Using RidgeCV with 5-fold CV.")
+            # Use RidgeCV for automatic tuning based on MSE
+            # RidgeCV does not accept 'solver' or 'random_state' in the same way as Ridge
+            # We pass alphas and cv.
+            self.model = RidgeCV(alphas=alphas, cv=5, scoring="neg_mean_squared_error")
+            self.model.fit(X_train, y_train)
+            print(f"RidgeCV selected alpha: {self.model.alpha_}")
+
+        return self
+
+    def predict(self, X):
+        """
+        Generates predictions for the input features.
+
+        Args:
+            X: Input features (sparse matrix).
+
+        Returns:
+            np.array: Predicted scores, clipped to [Config.SCORE_MIN, Config.SCORE_MAX].
+        """
+        if self.model is None:
+            raise ValueError("Model has not been trained yet.")
+
+        # Generate predictions
+        preds = self.model.predict(X)
+
+        # Clip to ensure valid range
+        preds = np.clip(preds, Config.SCORE_MIN, Config.SCORE_MAX)
+
+        return preds
+
+    def save(self, path):
+        """
+        Saves the trained underlying sklearn model to the specified path.
+
+        Args:
+            path (str): File path to save the model.
+        """
+        if self.model is None:
+            raise ValueError("Cannot save an untrained model.")
+        save_artifact(self.model, path)
+
+    @classmethod
+    def load(cls, path):
+        """
+        Loads a trained model from the specified path.
+
+        Args:
+            path (str): File path to load the model from.
+
+        Returns:
+            ScoreRegressor: An instance of ScoreRegressor with the loaded model.
+        """
+        sklearn_model = load_artifact(path)
+
+        # Create a new instance
+        instance = cls()
+        instance.model = sklearn_model
+
+        # Attempt to retrieve alpha if available (for info)
+        if hasattr(sklearn_model, "alpha_"):
+            instance.default_alpha = sklearn_model.alpha_
+        elif hasattr(sklearn_model, "alpha"):
+            instance.default_alpha = sklearn_model.alpha
+
+        return instance
+=======
+import numpy as np
+from sklearn.linear_model import Ridge, RidgeCV
+from scipy.optimize import minimize
+from library.config import Config
+from library.utils import save_artifact, load_artifact
+from library.metrics import compute_qwk
+
+
+class ScoreRegressor:
+    """
+    A wrapper class for Ridge Regression model to predict essay scores.
+    Implements training with hyperparameter tuning (alpha selection) and prediction with clipping.
+    Also implements threshold optimization for ordinal regression.
+    """
+
+    def __init__(self, **kwargs):
+        """
+        Initializes the regressor.
+
+        Args:
+            kwargs: Arguments to override default Ridge parameters from Config.
+        """
+        self.model = None
+        self.thresholds = [1.5, 2.5, 3.5, 4.5, 5.5]  # Default thresholds
+
+        # Load default parameters from Config
+        self.ridge_params = Config.RIDGE_PARAMS.copy()
+        self.ridge_params.update(kwargs)
+
+        # Separate alpha from other parameters as it might be tuned
+        if "alpha" in self.ridge_params:
+            self.default_alpha = self.ridge_params.pop("alpha")
+        else:
+            self.default_alpha = 1.0
+
+    def _kappa_loss(self, coef, X, y):
+        """
+        Loss function for threshold optimization: Negative QWK.
+        Cite solution_lesson_node_00002.
+        """
+        X_p = np.digitize(X, coef) + 1
+        return -compute_qwk(y, X_p)
+
+    def optimize_thresholds(self, X_preds, y_true):
+        """
+        Optimizes the thresholds to maximize QWK on the validation set.
+        Cite solution_lesson_node_00002.
+        """
+        print("Optimizing thresholds using Nelder-Mead...")
+        initial_coef = self.thresholds
+        
+        def loss_func(coef):
+            # Ensure thresholds are sorted for digitize
+            sorted_coef = np.sort(coef)
+            return self._kappa_loss(sorted_coef, X_preds, y_true)
+
+        res = minimize(loss_func, initial_coef, method='nelder-mead', tol=1e-4)
+        self.thresholds = np.sort(res.x).tolist()
+        print(f"Optimized Thresholds: {self.thresholds}")
+
+    def train(self, X_train, y_train, X_val=None, y_val=None):
+        """
+        Trains the model.
+
+        If validation data (X_val, y_val) is provided, it performs a grid search over
+        Config.ALPHA_GRID to find the alpha that maximizes the QWK score on the validation set.
+        Then, it optimizes the thresholds using the validation predictions.
+
+        If validation data is NOT provided, it uses RidgeCV with 5-fold cross-validation
+        to select the best alpha based on Mean Squared Error.
+
+        Args:
+            X_train: Training features (sparse matrix).
+            y_train: Training targets.
+            X_val: Validation features (sparse matrix), optional.
+            y_val: Validation targets, optional.
+
+        Returns:
+            self
+        """
+        alphas = Config.ALPHA_GRID
+
+        if X_val is not None and y_val is not None:
+            print(f"Training with validation set. Tuning alpha over: {alphas}")
+
+            best_score = -float("inf")
+            best_model = None
+            best_alpha = None
+
+            for alpha in alphas:
+                # Initialize Ridge with specific alpha and other config params
+                # We use the solver specified in Config (likely sparse-efficient)
+                model = Ridge(alpha=alpha, **self.ridge_params)
+
+                # Fit on training data
+                model.fit(X_train, y_train)
+
+                # Predict on validation data
+                y_pred_val = model.predict(X_val)
+
+                # Clip predictions to valid range [1, 6]
+                y_pred_val = np.clip(y_pred_val, Config.SCORE_MIN, Config.SCORE_MAX)
+
+                # Round to nearest integer for QWK calculation
+                y_pred_val_int = np.round(y_pred_val)
+
+                # Compute QWK
+                score = compute_qwk(y_val, y_pred_val_int)
+
+                print(f"Alpha: {alpha}, Val QWK: {score}")
+
+                if score > best_score:
+                    best_score = score
+                    best_model = model
+                    best_alpha = alpha
+
+            print(f"Best Alpha: {best_alpha}")
+            print(f"Best Val QWK (Standard Rounding): {best_score}")
+            self.model = best_model
+
+            # Optimize thresholds on validation set using the best model
+            # Use raw predictions for optimization to allow full range flexibility
+            val_preds = self.model.predict(X_val)
+            self.optimize_thresholds(val_preds, y_val)
+
+        else:
+            print("No validation set provided. Using RidgeCV with 5-fold CV.")
+            # Use RidgeCV for automatic tuning based on MSE
+            self.model = RidgeCV(alphas=alphas, cv=5, scoring="neg_mean_squared_error")
+            self.model.fit(X_train, y_train)
+            print(f"RidgeCV selected alpha: {self.model.alpha_}")
+
+        return self
+
+    def predict(self, X):
+        """
+        Generates continuous predictions for the input features.
+
+        Args:
+            X: Input features (sparse matrix).
+
+        Returns:
+            np.array: Predicted scores, clipped to [Config.SCORE_MIN, Config.SCORE_MAX].
+        """
+        if self.model is None:
+            raise ValueError("Model has not been trained yet.")
+
+        # Generate predictions
+        preds = self.model.predict(X)
+
+        # Clip to ensure valid range
+        preds = np.clip(preds, Config.SCORE_MIN, Config.SCORE_MAX)
+
+        return preds
+
+    def predict_int(self, X):
+        """
+        Generates integer predictions using optimized thresholds.
+
+        Args:
+            X: Input features.
+        
+        Returns:
+            np.array: Integer scores (1-6).
+        """
+        if self.model is None:
+            raise ValueError("Model has not been trained yet.")
+        
+        # Use raw predictions for thresholding
+        preds = self.model.predict(X)
+        return np.digitize(preds, self.thresholds) + 1
+
+    def save(self, path):
+        """
+        Saves the trained model and thresholds to the specified path.
+
+        Args:
+            path (str): File path to save the model.
+        """
+        if self.model is None:
+            raise ValueError("Cannot save an untrained model.")
+        
+        artifact = {
+            "model": self.model,
+            "thresholds": self.thresholds,
+            "default_alpha": self.default_alpha
+        }
+        save_artifact(artifact, path)
+
+    @classmethod
+    def load(cls, path):
+        """
+        Loads a trained model from the specified path.
+
+        Args:
+            path (str): File path to load the model from.
+
+        Returns:
+            ScoreRegressor: An instance of ScoreRegressor with the loaded model.
+        """
+        artifact = load_artifact(path)
+
+        # Create a new instance
+        instance = cls()
+
+        if isinstance(artifact, dict):
+            instance.model = artifact["model"]
+            instance.thresholds = artifact.get("thresholds", [1.5, 2.5, 3.5, 4.5, 5.5])
+            instance.default_alpha = artifact.get("default_alpha", 1.0)
+        else:
+            # Backward compatibility
+            instance.model = artifact
+            if hasattr(artifact, "alpha_"):
+                instance.default_alpha = artifact.alpha_
+            elif hasattr(artifact, "alpha"):
+                instance.default_alpha = artifact.alpha
+
+        return instance
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 6. Final Evaluation
+    print("Performing Final Validation Evaluation...")
+    # Generate predictions
+    y_pred_val = model.predict(X_val)
+
+    # Round to nearest integer for QWK calculation
+    y_pred_val_int = np.round(y_pred_val)
+
+    # Compute metric
+    final_qwk = compute_qwk(y_val, y_pred_val_int)
+
+    print(f"Final Validation QWK: {final_qwk}")
+=======
+    # 6. Final Evaluation
+    print("Performing Final Validation Evaluation...")
+    # Generate integer predictions using optimized thresholds
+    y_pred_val_int = model.predict_int(X_val)
+
+    # Compute metric
+    final_qwk = compute_qwk(y_val, y_pred_val_int)
+
+    print(f"Final Validation QWK (Optimized Thresholds): {final_qwk}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 5. Prediction
+    print("Generating Predictions...")
+    # model.predict handles clipping to [SCORE_MIN, SCORE_MAX]
+    preds = model.predict(X_test)
+
+    # Post-processing: Round to nearest integer for QWK metric requirements
+    # The regression outputs floats, but the submission requires integers 1-6
+    preds_int = np.round(preds).astype(int)
+
+    # 6. Create Submission File
+=======
+    # 5. Prediction
+    print("Generating Predictions...")
+    # Use predict_int to use optimized thresholds
+    preds_int = model.predict_int(X_test)
+
+    # 6. Create Submission File
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("Generating Validation Predictions...")
+    # Get continuous predictions
+    y_pred_val_continuous = model.predict(X_val)
+
+    # Round to nearest integer for QWK calculation
+    y_pred_val_int = np.round(y_pred_val_continuous).astype(int)
+
+    # Compute Metric
+    qwk_score = compute_qwk(y_val, y_pred_val_int)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {qwk_score}")
+
+    # 4. Failure Analysis
+    perform_failure_analysis(df_val, y_val, y_pred_val_continuous)
+
+    # 5. Generate Submission
+    # This handles loading test data, predicting, and saving the submission file.
+    generate_submission(load_cached_data=True)
+=======
+    print("Generating Validation Predictions...")
+    # Get continuous predictions for analysis
+    y_pred_val_continuous = model.predict(X_val)
+
+    # Get integer predictions using optimized thresholds
+    y_pred_val_int = model.predict_int(X_val)
+
+    # Compute Metric
+    qwk_score = compute_qwk(y_val, y_pred_val_int)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {qwk_score}")
+
+    # 4. Failure Analysis
+    perform_failure_analysis(df_val, y_val, y_pred_val_continuous)
+
+    # 5. Generate Submission
+    if qwk_score > 0.7427826800408626:
+        print("Metric check passed. Generating submission...")
+        generate_submission(load_cached_data=True)
+    else:
+        print(f"Metric {qwk_score} did not meet threshold 0.7427826800408626. Skipping submission.")
+>>>>>>> REPLACE
+```

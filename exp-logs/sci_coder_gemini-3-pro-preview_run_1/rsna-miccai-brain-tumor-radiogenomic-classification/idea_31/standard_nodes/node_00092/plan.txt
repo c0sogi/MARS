@@ -1,0 +1,495 @@
+I will optimize the solution by reverting to the robust "Current Best" configuration identified in the lessons, specifically targeting a 3-channel 2.5D CNN approach.
+
+**Strategy:**
+1.  **Input Simplification (Cite `solution_lesson_node_00009`, `solution_lesson_node_00031`):** I will reduce the input from 9 channels (3 depths x 3 modalities) to 3 channels (1 depth x 3 modalities). This avoids the instability caused by naively stacking volumetric depth and leverages "Early Fusion" of the FLAIR, T1wCE, and T2w modalities.
+2.  **Independent Slice Selection (Cite `solution_lesson_node_00036`):** I will replace the complex ROI-based depth alignment with a simple, robust heuristic: selecting the median index of each modality's file stack independently. This avoids errors from anatomical mismatches between modalities with different fields of view.
+3.  **Architecture Standardization (Cite `solution_lesson_node_00012`, `solution_lesson_node_00025`):** I will revert the model to a standard EfficientNet-B0 initialized with ImageNet weights, removing the custom "Gaussian Weight Inflation" and "Structured Dropout" layers which likely introduced noise. I will use the default dropout rate (0.2) as suggested by the lessons.
+4.  **Data Processing:** I will remove the ROI boundary calculation dependency from the training loop to streamline the pipeline, as the new slice selection heuristic relies only on file counts.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# RN-WIV Strategy Settings
+NUM_CHANNELS = 9
+ROI_DEPTHS = [0.4, 0.5, 0.6]  # Relative depths: 40%, 50%, 60%
+WEIGHT_INFLATION_RATIOS = {"center": 0.5, "periphery": 0.25}
+INPUT_DROPOUT_PROB = 0.2
+
+# Model Settings
+MODEL_NAME = "efficientnet_b0"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.3
+IMG_SIZE = 224
+=======
+# Model Settings
+NUM_CHANNELS = 3
+MODEL_NAME = "efficientnet_b0"
+NUM_CLASSES = 1
+DROPOUT_RATE = 0.2
+IMG_SIZE = 224
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from library.config import INPUT_DIR, IMG_SIZE, ROI_DEPTHS
+from library.data_processing import (
+    load_dicom_slice,
+    normalize_minmax,
+    get_relative_indices,
+)
+
+
+class RNWIVDataset(Dataset):
+    """
+    Relative-Norm Weight-Inflated Volumetric (RN-WIV) Dataset.
+
+    Constructs a 9-channel input tensor by sampling 3 modalities (FLAIR, T1wCE, T2w)
+    at 3 relative depths (40%, 50%, 60%) of the brain ROI.
+    """
+
+    def __init__(self, df, roi_df, transform=None, is_train=False):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe containing subject IDs and paths.
+            roi_df (pd.DataFrame): Dataframe containing ROI start/end/count for each subject/modality.
+            transform (albumentations.Compose): Augmentation pipeline.
+            is_train (bool): Flag indicating training mode.
+        """
+        self.df = df.reset_index(drop=True)
+        self.roi_df = roi_df.set_index("BraTS21ID")
+        self.transform = transform
+        self.is_train = is_train
+
+        # Modalities and depths defined by the RN-WIV strategy
+        # Order: 40% (FLAIR, T1wCE, T2w), 50% (FLAIR, T1wCE, T2w), 60% (FLAIR, T1wCE, T2w)
+        self.modalities = ["flair", "t1wce", "t2w"]
+        self.depths = ROI_DEPTHS  # Expected to be [0.4, 0.5, 0.6]
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        sid = row["BraTS21ID"]
+
+        # Retrieve ROI data from the provided dataframe (cached externally)
+        if sid in self.roi_df.index:
+            roi_data = self.roi_df.loc[sid]
+        else:
+            # Fallback for safety, though pipeline should ensure coverage
+            roi_data = {
+                f"{m}_{k}": 0
+                for m in self.modalities
+                for k in ["start", "end", "count"]
+            }
+
+        channels = []
+
+        # Iterate depth-first to create the channel structure:
+        # [D1_M1, D1_M2, D1_M3, D2_M1, D2_M2, D2_M3, D3_M1, D3_M2, D3_M3]
+        for depth in self.depths:
+            for mod in self.modalities:
+                # 1. Get Path Information
+                rel_path = row[f"{mod}_path"]
+                full_path = os.path.join(INPUT_DIR, rel_path)
+
+                # 2. Get ROI Information
+                start = roi_data[f"{mod}_start"]
+                end = roi_data[f"{mod}_end"]
+                count = roi_data[f"{mod}_count"]
+
+                # 3. Calculate Target Index
+                # get_relative_indices returns a list; we pass a single-item list
+                indices = get_relative_indices(start, end, count, [depth])
+                target_idx = indices[0]
+
+                # 4. Load Image
+                # We must list directory to map index to filename (Image-X.dcm)
+                img = None
+                if os.path.exists(full_path):
+                    # Sorting ensures alignment with the index logic
+                    files = sorted(
+                        [f for f in os.listdir(full_path) if f.endswith(".dcm")],
+                        key=lambda x: int(x.split("-")[-1].split(".")[0]),
+                    )
+
+                    if files and target_idx < len(files):
+                        file_path = os.path.join(full_path, files[target_idx])
+                        img = load_dicom_slice(file_path)
+
+                # 5. Normalize and Resize
+                if img is None:
+                    # Handle missing files or read errors with empty slice
+                    img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+                else:
+                    img = normalize_minmax(img)
+                    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+
+                channels.append(img)
+
+        # Stack channels to create (H, W, 9) volume
+        image = np.stack(channels, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]  # Albumentations ToTensorV2 returns (C, H, W)
+        else:
+            # Manual conversion if no transform provided
+            image = torch.from_numpy(image.transpose(2, 0, 1))
+
+        # Return Image and Target
+        if "MGMT_value" in row:
+            target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return image, target
+        else:
+            return image, torch.tensor(-1.0, dtype=torch.float32)
+=======
+from library.config import INPUT_DIR, IMG_SIZE
+from library.data_processing import (
+    load_dicom_slice,
+    normalize_minmax,
+)
+
+
+class RNWIVDataset(Dataset):
+    """
+    Simplified 2.5D Dataset (Cite solution_lesson_node_00002, solution_lesson_node_00036).
+    Selects the middle slice of FLAIR, T1wCE, and T2w modalities independently.
+    Constructs a 3-channel input tensor.
+    """
+
+    def __init__(self, df, transform=None, is_train=False):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe containing subject IDs and paths.
+            transform (albumentations.Compose): Augmentation pipeline.
+            is_train (bool): Flag indicating training mode.
+        """
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.is_train = is_train
+        # Cite solution_lesson_node_00031: Early Fusion (stacking channels)
+        self.modalities = ["flair", "t1wce", "t2w"]
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        channels = []
+
+        for mod in self.modalities:
+            rel_path = row[f"{mod}_path"]
+            full_path = os.path.join(INPUT_DIR, rel_path)
+            
+            img = None
+            if os.path.exists(full_path):
+                # Cite solution_lesson_node_00036: Independent heuristics (median index)
+                files = sorted(
+                    [f for f in os.listdir(full_path) if f.endswith(".dcm")],
+                    key=lambda x: int(x.split("-")[-1].split(".")[0]),
+                )
+                
+                if files:
+                    # Select middle slice
+                    mid_idx = len(files) // 2
+                    file_path = os.path.join(full_path, files[mid_idx])
+                    img = load_dicom_slice(file_path)
+
+            if img is None:
+                img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+            else:
+                # Cite solution_lesson_node_00023: Independent Channel Normalization
+                img = normalize_minmax(img)
+                img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+
+            channels.append(img)
+
+        # Stack to (H, W, 3)
+        image = np.stack(channels, axis=-1)
+
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            image = torch.from_numpy(image.transpose(2, 0, 1))
+
+        if "MGMT_value" in row:
+            target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return image, target
+        else:
+            return image, torch.tensor(-1.0, dtype=torch.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import timm
+from library.config import (
+    MODEL_NAME,
+    NUM_CLASSES,
+    INPUT_DROPOUT_PROB,
+    DROPOUT_RATE,
+    WEIGHT_INFLATION_RATIOS,
+    NUM_CHANNELS,
+)
+
+
+class StructuredInputDropout(nn.Module):
+    """
+    Applies structured dropout to the 9-channel volumetric input.
+
+    Logic:
+    With probability p, it masks out a specific anatomical group of channels.
+    - Group Center: Channels 3, 4, 5 (Relative Depth 50%)
+    - Group Periphery: Channels 0, 1, 2 (Depth 40%) AND 6, 7, 8 (Depth 60%)
+
+    This prevents the model from relying solely on the center slice or the periphery.
+    """
+
+    def __init__(self, p=INPUT_DROPOUT_PROB):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training or self.p == 0:
+            return x
+
+        # x shape: (Batch, Channels, Height, Width)
+        B, C, H, W = x.shape
+
+        # Create a mask of ones
+        mask = torch.ones_like(x)
+
+        # Iterate through batch to apply dropout independently per sample
+        # (Vectorized implementation is possible but loop is clearer for this specific logic)
+        for i in range(B):
+            if torch.rand(1).item() < self.p:
+                # Decide which group to drop
+                if torch.rand(1).item() < 0.5:
+                    # Drop Center (Channels 3, 4, 5)
+                    mask[i, 3:6, :, :] = 0.0
+                else:
+                    # Drop Periphery (Channels 0, 1, 2 AND 6, 7, 8)
+                    mask[i, 0:3, :, :] = 0.0
+                    mask[i, 6:9, :, :] = 0.0
+
+        return x * mask
+
+
+class RNWIVEfficientNet(nn.Module):
+    """
+    Relative-Norm Weight-Inflated Volumetric (RN-WIV) Network.
+
+    Uses EfficientNet-B0 backbone with a modified first layer to accept 9 channels.
+    Weights are initialized via Gaussian Weight Inflation from the pre-trained RGB weights.
+    """
+
+    def __init__(self, model_name=MODEL_NAME, num_classes=NUM_CLASSES, pretrained=True):
+        super().__init__()
+
+        # 1. Structured Input Dropout
+        self.input_dropout = StructuredInputDropout(p=INPUT_DROPOUT_PROB)
+
+        # 2. Backbone
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,  # Remove default classifier
+            in_chans=3,  # Load with standard 3 channels first to get pretrained weights
+        )
+
+        # 3. Modify First Layer (Gaussian Weight Inflation)
+        if hasattr(self.backbone, "conv_stem"):
+            old_conv = self.backbone.conv_stem
+
+            # Create new conv layer with 9 input channels
+            new_conv = nn.Conv2d(
+                in_channels=NUM_CHANNELS,
+                out_channels=old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+
+            # Weight Inflation Logic
+            # w_orig shape: (Out, 3, K, K)
+            w_orig = old_conv.weight.data
+
+            # w_new shape: (Out, 9, K, K)
+            w_new = torch.zeros_like(new_conv.weight.data)
+
+            # Center Channels (3, 4, 5) -> 50% energy
+            # Corresponds to indices 3:6
+            w_new[:, 3:6, :, :] = w_orig * WEIGHT_INFLATION_RATIOS["center"]
+
+            # Peripheral Channels (0, 1, 2) -> 25% energy
+            # Corresponds to indices 0:3
+            w_new[:, 0:3, :, :] = w_orig * WEIGHT_INFLATION_RATIOS["periphery"]
+
+            # Peripheral Channels (6, 7, 8) -> 25% energy
+            # Corresponds to indices 6:9
+            w_new[:, 6:9, :, :] = w_orig * WEIGHT_INFLATION_RATIOS["periphery"]
+
+            # Assign new weights
+            new_conv.weight.data = w_new
+
+            # Copy bias if it exists
+            if old_conv.bias is not None:
+                new_conv.bias.data = old_conv.bias.data
+
+            # Replace the layer in backbone
+            self.backbone.conv_stem = new_conv
+        else:
+            # Fallback or error if architecture changes (e.g. not EfficientNet)
+            raise AttributeError(f"Backbone {model_name} does not have 'conv_stem'.")
+
+        # 4. Classifier Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(DROPOUT_RATE), nn.Linear(self.backbone.num_features, num_classes)
+        )
+
+    def forward(self, x):
+        # x: (B, 9, H, W)
+        x = self.input_dropout(x)
+        features = self.backbone(x)
+        logits = self.classifier(features)
+        return logits
+=======
+import torch
+import torch.nn as nn
+import timm
+from library.config import (
+    MODEL_NAME,
+    NUM_CLASSES,
+    DROPOUT_RATE,
+    NUM_CHANNELS,
+)
+
+class RNWIVEfficientNet(nn.Module):
+    """
+    Standard EfficientNet-B0 with 3-channel input (Cite solution_lesson_node_00009).
+    Removed complex weight inflation and structured dropout (Cite solution_lesson_node_00025).
+    """
+
+    def __init__(self, model_name=MODEL_NAME, num_classes=NUM_CLASSES, pretrained=True):
+        super().__init__()
+
+        # Cite solution_lesson_node_00012: Use default architecture settings where possible
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=NUM_CHANNELS, # 3 channels
+            drop_rate=DROPOUT_RATE, # 0.2
+        )
+
+        self.classifier = nn.Linear(self.backbone.num_features, num_classes)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        logits = self.classifier(features)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+from library.data_processing import process_dataset_roi
+from library.dataset import RNWIVDataset, get_transforms
+from library.model import RNWIVEfficientNet
+=======
+from library.dataset import RNWIVDataset, get_transforms
+from library.model import RNWIVEfficientNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    # 2. Process/Load ROI Boundaries (Cached)
+    roi_df = process_dataset_roi(df_full, load_cached_data=True)
+
+    # 3. Cross-Validation Setup
+    skf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+
+    # 4. Training Loop
+    for fold, (train_idx, val_idx) in enumerate(
+        skf.split(df_full, df_full["MGMT_value"])
+    ):
+        print(f"\n=== Fold {fold} ===")
+
+        train_sub = df_full.iloc[train_idx].reset_index(drop=True)
+        val_sub = df_full.iloc[val_idx].reset_index(drop=True)
+
+        # Datasets & Loaders
+        train_ds = RNWIVDataset(
+            train_sub, roi_df, transform=get_transforms("train"), is_train=True
+        )
+        val_ds = RNWIVDataset(
+            val_sub, roi_df, transform=get_transforms("val"), is_train=False
+        )
+=======
+    # 2. Cross-Validation Setup
+    skf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+
+    # 3. Training Loop
+    for fold, (train_idx, val_idx) in enumerate(
+        skf.split(df_full, df_full["MGMT_value"])
+    ):
+        print(f"\n=== Fold {fold} ===")
+
+        train_sub = df_full.iloc[train_idx].reset_index(drop=True)
+        val_sub = df_full.iloc[val_idx].reset_index(drop=True)
+
+        # Datasets & Loaders
+        train_ds = RNWIVDataset(
+            train_sub, transform=get_transforms("train"), is_train=True
+        )
+        val_ds = RNWIVDataset(
+            val_sub, transform=get_transforms("val"), is_train=False
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    # Process ROIs for test set
+    roi_df = process_dataset_roi(df_test, load_cached_data=True)
+
+    test_ds = RNWIVDataset(
+        df_test, roi_df, transform=get_transforms("test"), is_train=False
+    )
+=======
+    test_ds = RNWIVDataset(
+        df_test, transform=get_transforms("test"), is_train=False
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Prepare Validation Data for this fold
+        val_sub = df_full.iloc[val_idx].reset_index(drop=True)
+        val_ds = RNWIVDataset(
+            val_sub, roi_df, transform=get_transforms("val"), is_train=False
+        )
+=======
+        # Prepare Validation Data for this fold
+        val_sub = df_full.iloc[val_idx].reset_index(drop=True)
+        val_ds = RNWIVDataset(
+            val_sub, transform=get_transforms("val"), is_train=False
+        )
+>>>>>>> REPLACE
+```

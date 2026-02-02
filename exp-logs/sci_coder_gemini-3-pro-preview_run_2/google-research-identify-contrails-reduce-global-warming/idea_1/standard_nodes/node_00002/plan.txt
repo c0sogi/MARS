@@ -1,0 +1,472 @@
+To optimize the solution, I will introduce several key improvements based on the lessons and standard practices for segmentation tasks:
+
+1.  **Model Architecture Upgrade**: I will replace the lightweight `MobileNetV3-Small` encoder with a `ResNet18` backbone. ResNet18 offers a better balance of capacity and trainability for this dataset size, allowing the model to capture more complex spatial features in the contrail structures. I will manually implement the U-Net architecture with ResNet18 features to ensure correct connectivity.
+2.  **Data Augmentation**: I will introduce geometric augmentations (flips, rotations) using the `albumentations` library during training. This is crucial for segmentation to prevent overfitting and improve generalization, especially given the rotational invariance of contrails.
+3.  **Training Scaling**: I will scale up the training from the previous "Fast Baseline" (5,000 samples, 5 epochs) to the full dataset (18,673 samples) and train for 20 epochs. I will also increase the batch size to 64 to utilize the A100 GPU efficiently.
+4.  **Submission Logic**: I will enforce the requirement to only generate a submission if the validation score improves upon the baseline (0.3626).
+
+These changes leverage the `solution_lesson_node_00001` regarding the effectiveness of the input features (which I preserve) while enhancing the model's ability to learn from them.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4  # Optimized for 12 vCPUs
+
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    EPOCHS = 15
+    EARLY_STOPPING_PATIENCE = 4
+
+    # Debugging: Set to an integer (e.g., 500) to limit dataset size
+    # for rapid testing. Set to None for full training.
+    DEBUG_SAMPLE_SIZE = None
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    ENCODER_NAME = "mobilenet_v3_small"
+    ENCODER_WEIGHTS = "imagenet"
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 64
+    NUM_WORKERS = 4  # Optimized for 12 vCPUs
+
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    EPOCHS = 20
+    EARLY_STOPPING_PATIENCE = 5
+
+    # Debugging: Set to an integer (e.g., 500) to limit dataset size
+    # for rapid testing. Set to None for full training.
+    DEBUG_SAMPLE_SIZE = None
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    ENCODER_NAME = "resnet18"
+    ENCODER_WEIGHTS = "imagenet"
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MobileNetUNet(nn.Module):
+    """
+    U-Net with MobileNetV3-Small Encoder for Contrail Segmentation.
+
+    Input: 6 Channels (Ash t=4, Difference t=4-t=3)
+    Output: 1 Channel (Logits)
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, num_classes=1):
+        super().__init__()
+
+        # Load Pretrained Backbone
+        # MobileNetV3-Small is lightweight and efficient
+        backbone = models.mobilenet_v3_small(weights="IMAGENET1K_V1")
+        features = backbone.features
+
+        # ----------------------------------------------------------------
+        # 1. Modify Input Layer
+        # ----------------------------------------------------------------
+        # Original first layer: Conv2d(3, 16, stride=2)
+        # We need Conv2d(6, 16, stride=2)
+        original_layer = features[0][0]
+
+        new_layer = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=original_layer.out_channels,
+            kernel_size=original_layer.kernel_size,
+            stride=original_layer.stride,
+            padding=original_layer.padding,
+            bias=original_layer.bias is not None,
+        )
+
+        # Initialize weights for the new layer
+        # Copy weights for the first 3 channels (RGB/Ash)
+        # Initialize the next 3 channels (Difference) with the same weights
+        # to provide a stable initialization for the motion features.
+        with torch.no_grad():
+            new_layer.weight[:, :3] = original_layer.weight
+            if in_channels > 3:
+                new_layer.weight[:, 3:6] = original_layer.weight
+
+        features[0][0] = new_layer
+
+        # ----------------------------------------------------------------
+        # 2. Define Encoder Stages
+        # ----------------------------------------------------------------
+        # Extract feature maps at different scales based on MobileNetV3 architecture
+        # Indices determined by analyzing stride locations in mobilenet_v3_small
+
+        self.enc0 = features[0]  # Stride 2 -> 1/2 scale (16 ch)
+        self.enc1 = features[1]  # Stride 2 -> 1/4 scale (16 ch)
+        self.enc2 = features[2:4]  # Stride 2 at idx 2 -> 1/8 scale (24 ch)
+        self.enc3 = features[4:9]  # Stride 2 at idx 4 -> 1/16 scale (48 ch)
+        self.enc4 = features[9:]  # Stride 2 at idx 9 -> 1/32 scale (576 ch at idx 12)
+
+        # ----------------------------------------------------------------
+        # 3. Define Decoder Stages
+        # ----------------------------------------------------------------
+        # Decoder 4: Up(1/32) + Skip(1/16) -> 1/16
+        # In: 576 (enc4) + 48 (enc3)
+        self.dec4 = DecoderBlock(in_c=576, skip_c=48, out_c=256)
+
+        # Decoder 3: Up(1/16) + Skip(1/8) -> 1/8
+        # In: 256 (dec4) + 24 (enc2)
+        self.dec3 = DecoderBlock(in_c=256, skip_c=24, out_c=128)
+
+        # Decoder 2: Up(1/8) + Skip(1/4) -> 1/4
+        # In: 128 (dec3) + 16 (enc1)
+        self.dec2 = DecoderBlock(in_c=128, skip_c=16, out_c=64)
+
+        # Decoder 1: Up(1/4) + Skip(1/2) -> 1/2
+        # In: 64 (dec2) + 16 (enc0)
+        self.dec1 = DecoderBlock(in_c=64, skip_c=16, out_c=32)
+
+        # ----------------------------------------------------------------
+        # 4. Final Head
+        # ----------------------------------------------------------------
+        # Upsample 1/2 -> 1/1
+        self.final_up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.final_conv = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        x0 = self.enc0(x)  # 1/2, 16ch
+        x1 = self.enc1(x0)  # 1/4, 16ch
+        x2 = self.enc2(x1)  # 1/8, 24ch
+        x3 = self.enc3(x2)  # 1/16, 48ch
+        x4 = self.enc4(x3)  # 1/32, 576ch
+
+        # --- Decoder ---
+        d4 = self.dec4(x4, x3)  # -> 1/16
+        d3 = self.dec3(d4, x2)  # -> 1/8
+        d2 = self.dec2(d3, x1)  # -> 1/4
+        d1 = self.dec1(d2, x0)  # -> 1/2
+
+        # --- Head ---
+        out = self.final_up(d1)  # -> 1/1
+        out = self.final_conv(out)
+
+        return out
+=======
+class ResNet18UNet(nn.Module):
+    """
+    U-Net with ResNet18 Encoder for Contrail Segmentation.
+    Cite solution_lesson_node_00001: Uses physics-informed 6-channel input.
+
+    Input: 6 Channels (Ash t=4, Difference t=4-t=3)
+    Output: 1 Channel (Logits)
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, num_classes=1):
+        super().__init__()
+
+        # Load Pretrained Backbone
+        self.base_model = models.resnet18(weights="IMAGENET1K_V1")
+
+        # ----------------------------------------------------------------
+        # 1. Modify Input Layer
+        # ----------------------------------------------------------------
+        original_layer = self.base_model.conv1
+        self.base_model.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=original_layer.out_channels,
+            kernel_size=original_layer.kernel_size,
+            stride=original_layer.stride,
+            padding=original_layer.padding,
+            bias=original_layer.bias is not None,
+        )
+
+        # Initialize weights for the new layer
+        with torch.no_grad():
+            self.base_model.conv1.weight[:, :3] = original_layer.weight
+            if in_channels > 3:
+                self.base_model.conv1.weight[:, 3:6] = original_layer.weight
+
+        self.encoder_layers = list(self.base_model.children())
+
+        # ----------------------------------------------------------------
+        # 2. Define Encoder Stages
+        # ----------------------------------------------------------------
+        # ResNet18 structure:
+        # layer0: conv1, bn1, relu (stride 2) -> 1/2, 64ch
+        # layer1: maxpool (stride 2) + layer1 (stride 1) -> 1/4, 64ch
+        # layer2: layer2 (stride 2) -> 1/8, 128ch
+        # layer3: layer3 (stride 2) -> 1/16, 256ch
+        # layer4: layer4 (stride 2) -> 1/32, 512ch
+
+        self.enc0 = nn.Sequential(*self.encoder_layers[:3])
+        self.enc1 = nn.Sequential(*self.encoder_layers[3:5])
+        self.enc2 = self.encoder_layers[5]
+        self.enc3 = self.encoder_layers[6]
+        self.enc4 = self.encoder_layers[7]
+
+        # ----------------------------------------------------------------
+        # 3. Define Decoder Stages
+        # ----------------------------------------------------------------
+        # Decoder 4: Up(1/32) + Skip(1/16) -> 1/16
+        # In: 512 (enc4) + 256 (enc3)
+        self.dec4 = DecoderBlock(in_c=512, skip_c=256, out_c=256)
+
+        # Decoder 3: Up(1/16) + Skip(1/8) -> 1/8
+        # In: 256 (dec4) + 128 (enc2)
+        self.dec3 = DecoderBlock(in_c=256, skip_c=128, out_c=128)
+
+        # Decoder 2: Up(1/8) + Skip(1/4) -> 1/4
+        # In: 128 (dec3) + 64 (enc1)
+        self.dec2 = DecoderBlock(in_c=128, skip_c=64, out_c=64)
+
+        # Decoder 1: Up(1/4) + Skip(1/2) -> 1/2
+        # In: 64 (dec2) + 64 (enc0)
+        self.dec1 = DecoderBlock(in_c=64, skip_c=64, out_c=32)
+
+        # ----------------------------------------------------------------
+        # 4. Final Head
+        # ----------------------------------------------------------------
+        # Upsample 1/2 -> 1/1
+        self.final_up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.final_conv = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # --- Encoder ---
+        x0 = self.enc0(x)  # 1/2, 64ch
+        x1 = self.enc1(x0)  # 1/4, 64ch
+        x2 = self.enc2(x1)  # 1/8, 128ch
+        x3 = self.enc3(x2)  # 1/16, 256ch
+        x4 = self.enc4(x3)  # 1/32, 512ch
+
+        # --- Decoder ---
+        d4 = self.dec4(x4, x3)  # -> 1/16
+        d3 = self.dec3(d4, x2)  # -> 1/8
+        d2 = self.dec2(d3, x1)  # -> 1/4
+        d1 = self.dec1(d2, x0)  # -> 1/2
+
+        # --- Head ---
+        out = self.final_up(d1)  # -> 1/1
+        out = self.final_conv(out)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+import os
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from library.config import Config
+from library.dataset import ContrailDataset
+from library.model import MobileNetUNet
+from library.utils import seed_everything, dice_coef
+=======
+import os
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import albumentations as A
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from library.config import Config
+from library.dataset import ContrailDataset
+from library.model import ResNet18UNet
+from library.utils import seed_everything, dice_coef
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Datasets & Loaders
+    train_dataset = ContrailDataset(train_df, split="train")
+    val_dataset = ContrailDataset(val_df, split="validation")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+=======
+    # 3. Datasets & Loaders
+    # Define augmentations for training
+    train_transform = A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5
+            ),
+            A.RandomBrightnessContrast(p=0.2),
+        ]
+    )
+
+    train_dataset = ContrailDataset(
+        train_df, split="train", transform=train_transform
+    )
+    val_dataset = ContrailDataset(val_df, split="validation")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Model, Loss, Optimizer
+    model = MobileNetUNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+    model.to(device)
+=======
+    # 4. Model, Loss, Optimizer
+    model = ResNet18UNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.dataset import ContrailDataset
+from library.model import MobileNetUNet
+from library.utils import rle_encode, seed_everything
+=======
+from library.config import Config
+from library.dataset import ContrailDataset
+from library.model import ResNet18UNet
+from library.utils import rle_encode, seed_everything
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+    # 4. Initialize Model and Load Weights
+    model = MobileNetUNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+
+    if not os.path.exists(model_path):
+=======
+    # 4. Initialize Model and Load Weights
+    model = ResNet18UNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+
+    if not os.path.exists(model_path):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.dataset import ContrailDataset
+from library.model import MobileNetUNet
+from library.train import run_training
+from library.predict import generate_submission
+=======
+from library.dataset import ContrailDataset
+from library.model import ResNet18UNet
+from library.train import run_training
+from library.predict import generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline execution
+    Config.EPOCHS = 5
+    Config.DEBUG_SAMPLE_SIZE = 5000  # Limit dataset size for speed
+    Config.BATCH_SIZE = 32
+
+    # Ensure reproducible results
+    Config.setup()
+    seed_everything(Config.SEED)
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Sample Size={Config.DEBUG_SAMPLE_SIZE}"
+    )
+=======
+    # Optimized Configuration for Full Training
+    Config.EPOCHS = 20
+    Config.DEBUG_SAMPLE_SIZE = None  # Use full dataset
+    Config.BATCH_SIZE = 64
+
+    # Ensure reproducible results
+    Config.setup()
+    seed_everything(Config.SEED)
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Sample Size={Config.DEBUG_SAMPLE_SIZE}"
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load the best trained model
+    model = MobileNetUNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.to(device)
+=======
+    # Load the best trained model
+    model = ResNet18UNet(in_channels=Config.IN_CHANNELS, num_classes=1)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 4. Submission
+    # ==========================================
+    print("\n--- Generating Submission ---")
+    generate_submission(best_model_path, device=device)
+=======
+    # ==========================================
+    # 4. Submission
+    # ==========================================
+    BASELINE_SCORE = 0.36264332920657316
+    
+    if final_global_dice > BASELINE_SCORE:
+        print(f"\nValidation Score ({final_global_dice:.6f}) improved over baseline ({BASELINE_SCORE:.6f}).")
+        print("--- Generating Submission ---")
+        generate_submission(best_model_path, device=device)
+    else:
+        print(f"\nValidation Score ({final_global_dice:.6f}) did not improve over baseline ({BASELINE_SCORE:.6f}).")
+        print("Skipping submission generation.")
+>>>>>>> REPLACE
+```

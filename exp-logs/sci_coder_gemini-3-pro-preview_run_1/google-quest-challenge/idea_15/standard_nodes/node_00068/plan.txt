@@ -1,0 +1,224 @@
+I will address the `torch.OutOfMemoryError` and the potential test set caching issue by modifying `library/data.py`, `library/train.py`, and `runfile.py`.
+
+1.  **`library/data.py`**: I will modify `prepare_loaders` to bypass the cache for the test dataset. This ensures that the code always reads from the runtime `./input/test.csv`, preventing shape mismatch errors if the test set is swapped (Cite debug_lesson_2).
+2.  **`library/train.py`**: I will update `train_fn` to support **Gradient Accumulation**. This involves normalizing the loss by `accumulation_steps`, stepping the optimizer only after a set number of batches, and managing gradient zeroing appropriately.
+3.  **`runfile.py`**: I will reduce the `BATCH_SIZE` from 8 to 4 to resolve the OOM error (Cite debug_lesson_6). To compensate and maintain the effective batch size, I will introduce `ACCUMULATION_STEPS = 2` and update the training loop and scheduler calculations accordingly.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # 1. Try Loading Cache
+    if load_cached_data:
+        try:
+            if (
+                os.path.exists(train_cache)
+                and os.path.exists(val_cache)
+                and os.path.exists(test_cache)
+            ):
+                print("Loading cached datasets from parquet...")
+                train_df = pd.read_parquet(train_cache)
+                val_df = pd.read_parquet(val_cache)
+                test_df = pd.read_parquet(test_cache)
+
+                # Validate schema (Cite debug_lesson_2)
+                if "question_text" not in train_df.columns:
+                    print(
+                        "Cache invalid (missing 'question_text'). Processing from scratch."
+                    )
+                    train_df, val_df, test_df = None, None, None
+            else:
+                print("Cache not found. Processing from scratch.")
+        except Exception as e:
+            print(f"Error loading cache: {e}. Processing from scratch.")
+
+    # 2. Process if not loaded
+    if train_df is None:
+        print("Loading metadata and processing...")
+        train_raw = pd.read_csv(os.path.join(METADATA_DIR, "train.csv"))
+        val_raw = pd.read_csv(os.path.join(METADATA_DIR, "val.csv"))
+        test_raw = pd.read_csv(os.path.join(METADATA_DIR, "test.csv"))
+
+        train_df = preprocess_df(train_raw)
+        val_df = preprocess_df(val_raw)
+        test_df = preprocess_df(test_raw)
+
+        # Save to cache
+        print("Saving processed datasets to cache...")
+        train_df.to_parquet(train_cache)
+        val_df.to_parquet(val_cache)
+        test_df.to_parquet(test_cache)
+=======
+    # 1. Try Loading Cache (Train/Val only)
+    if load_cached_data:
+        try:
+            if os.path.exists(train_cache) and os.path.exists(val_cache):
+                print("Loading cached train/val datasets from parquet...")
+                train_df = pd.read_parquet(train_cache)
+                val_df = pd.read_parquet(val_cache)
+
+                if "question_text" not in train_df.columns:
+                    print("Cache invalid. Processing from scratch.")
+                    train_df, val_df = None, None
+            else:
+                print("Cache not found. Processing from scratch.")
+        except Exception as e:
+            print(f"Error loading cache: {e}. Processing from scratch.")
+
+    # 2. Process Train/Val if not loaded
+    if train_df is None:
+        print("Loading metadata and processing train/val...")
+        train_raw = pd.read_csv(os.path.join(METADATA_DIR, "train.csv"))
+        val_raw = pd.read_csv(os.path.join(METADATA_DIR, "val.csv"))
+
+        train_df = preprocess_df(train_raw)
+        val_df = preprocess_df(val_raw)
+
+        print("Saving processed train/val to cache...")
+        train_df.to_parquet(train_cache)
+        val_df.to_parquet(val_cache)
+
+    # 3. Always Load Test from Input (Bypass Cache for Test)
+    # Cite debug_lesson_2: Bypass Caching for Runtime-Swapped Test Sets
+    print("Loading test data from ./input/test.csv...")
+    try:
+        test_raw = pd.read_csv("./input/test.csv")
+    except FileNotFoundError:
+        # Fallback for local testing if input/test.csv doesn't exist (e.g. only metadata exists)
+        print("Warning: ./input/test.csv not found, falling back to metadata/test.csv")
+        test_raw = pd.read_csv(os.path.join(METADATA_DIR, "test.csv"))
+    
+    test_df = preprocess_df(test_raw)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def train_fn(model, dataloader, optimizer, scheduler, device, loss_fn):
+    model.train()
+    total_loss = 0.0
+
+    for batch in dataloader:
+        # Move batch to device
+        q_input_ids = batch["q_input_ids"].to(device)
+        q_attention_mask = batch["q_attention_mask"].to(device)
+        a_input_ids = batch["a_input_ids"].to(device)
+        a_attention_mask = batch["a_attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(
+            q_input_ids=q_input_ids,
+            q_attention_mask=q_attention_mask,
+            a_input_ids=a_input_ids,
+            a_attention_mask=a_attention_mask,
+        )
+
+        loss = loss_fn(logits, labels)
+        loss.backward()
+
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+=======
+def train_fn(model, dataloader, optimizer, scheduler, device, loss_fn, accumulation_steps=1):
+    model.train()
+    total_loss = 0.0
+    
+    # Ensure gradients are zeroed at the start
+    optimizer.zero_grad()
+
+    for i, batch in enumerate(dataloader):
+        # Move batch to device
+        q_input_ids = batch["q_input_ids"].to(device)
+        q_attention_mask = batch["q_attention_mask"].to(device)
+        a_input_ids = batch["a_input_ids"].to(device)
+        a_attention_mask = batch["a_attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Forward pass
+        logits = model(
+            q_input_ids=q_input_ids,
+            q_attention_mask=q_attention_mask,
+            a_input_ids=a_input_ids,
+            a_attention_mask=a_attention_mask,
+        )
+
+        loss = loss_fn(logits, labels)
+        
+        # Normalize loss for accumulation
+        loss = loss / accumulation_steps
+        loss.backward()
+
+        # Step optimizer and scheduler only after accumulation steps
+        if (i + 1) % accumulation_steps == 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # We multiply by accumulation_steps to log the "real" loss for this batch
+        total_loss += loss.item() * accumulation_steps
+
+    return total_loss / len(dataloader)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+BATCH_SIZE = 8
+LEARNING_RATE = 1e-3  # Higher LR for LoRA
+=======
+# Cite debug_lesson_6: Halve Batch Size for Siamese Networks
+BATCH_SIZE = 4  # Reduced from 8 to 4 to fix OOM
+ACCUMULATION_STEPS = 2  # Added to maintain effective batch size of 8
+LEARNING_RATE = 1e-3  # Higher LR for LoRA
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    num_training_steps = len(train_loader) * EPOCHS
+    num_warmup_steps = int(0.1 * num_training_steps)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    # 5. Training Loop
+    best_score = -1.0
+    print(f"Starting training for {EPOCHS} epochs...")
+
+    for epoch in range(EPOCHS):
+        train_loss = train_fn(
+            model, train_loader, optimizer, scheduler, device, loss_fn
+        )
+=======
+    # Adjust num_training_steps for gradient accumulation
+    num_update_steps_per_epoch = len(train_loader) // ACCUMULATION_STEPS
+    num_training_steps = num_update_steps_per_epoch * EPOCHS
+    num_warmup_steps = int(0.1 * num_training_steps)
+    
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    # 5. Training Loop
+    best_score = -1.0
+    print(f"Starting training for {EPOCHS} epochs with Batch Size {BATCH_SIZE} and Accumulation {ACCUMULATION_STEPS}...")
+
+    for epoch in range(EPOCHS):
+        train_loss = train_fn(
+            model, train_loader, optimizer, scheduler, device, loss_fn, accumulation_steps=ACCUMULATION_STEPS
+        )
+>>>>>>> REPLACE
+```

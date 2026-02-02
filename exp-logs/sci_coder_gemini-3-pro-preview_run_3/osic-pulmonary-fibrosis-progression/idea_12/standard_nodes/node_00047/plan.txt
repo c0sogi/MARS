@@ -1,0 +1,305 @@
+To optimize the solution, I will implement the following changes based on the provided lessons and failure analysis:
+
+1.  **Increase Training Epochs**: The previous run was limited to 15 epochs via an override, which is insufficient for the convergence of the projection head and the uncertainty estimation (Cite {solution_lesson_node_00009}, {solution_lesson_node_00011}). I will remove this override and set the epochs to 30 in the config.
+2.  **Switch to EfficientNet-B0**: I will replace the EfficientNet-B2 backbone with EfficientNet-B0. Given the small dataset size (176 patients), B0 provides a better balance of capacity and regularization, reducing the risk of overfitting (Cite {solution_lesson_node_00018}).
+3.  **Simplify Fusion Architecture (Direct Fusion)**: I will modify `RSTCNet` to use a "Direct Fusion" strategy. Instead of separate "Deep" and "Wide" branches, I will concatenate the projected image features directly with the raw scalar tabular features (including Baseline FVC and Time) and pass them through a unified MLP. This ensures the model can directly leverage strong scalar predictors without unnecessary non-linear distortions from deep encoders (Cite {solution_lesson_node_00035}) while still maintaining non-linear mixing layers for cross-modal interactions (Cite {solution_lesson_node_00032}).
+4.  **Add Regularization**: I will add `Dropout(0.2)` to the image projection layer to prevent the high-dimensional image features from dominating the fusion layer (Cite {solution_lesson_node_00023}).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# ====================================================
+# Model Hyperparameters
+# ====================================================
+BACKBONE_NAME = "tf_efficientnet_b2"
+FEATURE_DIM = 128
+DROP_RATE = 0.0  # Explicitly 0.0 as per RSTC-Net design
+DO_BATCHNORM = False  # Explicitly False for the head as per RSTC-Net design
+
+# ====================================================
+# Training Hyperparameters
+# ====================================================
+EPOCHS = 50
+=======
+# ====================================================
+# Model Hyperparameters
+# ====================================================
+BACKBONE_NAME = "tf_efficientnet_b0"
+FEATURE_DIM = 128
+DROP_RATE = 0.2
+DO_BATCHNORM = False
+
+# ====================================================
+# Training Hyperparameters
+# ====================================================
+EPOCHS = 30
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RSTCNet(nn.Module):
+    """
+    Residual-Skipped Time-Conditioned Network (RSTC-Net).
+
+    A hybrid CNN-MLP architecture that fuses image features with tabular data using
+    a Wide-and-Deep approach.
+
+    Structure:
+    1. Image Branch: EfficientNet-B2 (Top 2 blocks unfrozen) -> Projection.
+    2. Deep Branch: MLP modeling interactions between Image, Tabular, and Time.
+    3. Wide Branch: Identity mapping of Tabular and Time features.
+    4. Head: Linear projection to mu and sigma.
+    """
+
+    def __init__(self, n_tabular_features=7):
+        """
+        Args:
+            n_tabular_features (int): Number of tabular features (excluding time).
+                                      Default is 7 based on DataProcessor (BaseFVC, Age, Sex*2, Smoke*3).
+        """
+        super(RSTCNet, self).__init__()
+
+        # ==========================
+        # 1. Image Branch (Backbone)
+        # ==========================
+        # Load backbone, remove classification head (num_classes=0 returns pooled features)
+        self.backbone = timm.create_model(
+            BACKBONE_NAME, pretrained=True, num_classes=0, in_chans=3
+        )
+
+        # --- Freeze / Unfreeze Logic ---
+        # Freeze entire backbone first
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze Head components (conv_head, bn2) if they exist
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Unfreeze the top two convolutional blocks
+        # In timm EfficientNet, blocks are stored in a ModuleList/Sequential named 'blocks'
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            # Unfreeze last 2 blocks
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        # Get backbone output dimension (num_features)
+        self.n_backbone_features = self.backbone.num_features
+
+        # Image Projection Layer
+        self.img_projector = nn.Linear(self.n_backbone_features, FEATURE_DIM)
+
+        # ==========================
+        # 2. Input Dimensions
+        # ==========================
+        # Tabular input includes the static features + relative time
+        self.input_tab_dim = n_tabular_features + 1
+
+        # ==========================
+        # 3. Deep Branch (Interaction)
+        # ==========================
+        # Input: Image Projection (128) + Tabular + Time
+        self.deep_in_dim = FEATURE_DIM + self.input_tab_dim
+        self.deep_hidden_dim = 64  # Bottleneck dimension
+
+        # MLP: Linear -> ReLU -> Linear
+        self.deep_branch = nn.Sequential(
+            nn.Linear(self.deep_in_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, self.deep_hidden_dim),
+        )
+
+        # ==========================
+        # 4. Wide Branch (Skip)
+        # ==========================
+        # Identity mapping of Tabular + Time
+        self.wide_in_dim = self.input_tab_dim
+
+        # ==========================
+        # 5. Final Head
+        # ==========================
+        # Input: Deep Output + Wide Output
+        self.final_in_dim = self.deep_hidden_dim + self.wide_in_dim
+
+        # Predict mu and sigma
+        self.head = nn.Linear(self.final_in_dim, 2)
+
+        # Initialize head weights
+        nn.init.xavier_uniform_(self.head.weight)
+        nn.init.constant_(self.head.bias, 0)
+
+    def forward(self, image, tabular, time):
+        """
+        Args:
+            image: (B, 3, H, W)
+            tabular: (B, n_tabular_features)
+            time: (B, 1)
+        Returns:
+            mu: (B, 1) Predicted FVC (standardized)
+            sigma: (B, 1) Predicted Confidence
+        """
+        # --- Image Processing ---
+        # Extract features from backbone
+        # Output shape: (B, num_features)
+        features = self.backbone(image)
+
+        # Project to lower dimension
+        img_embed = self.img_projector(features)  # (B, 128)
+
+        # --- Tabular Processing ---
+        # Concatenate static tabular features with time
+        tab_embed = torch.cat([tabular, time], dim=1)  # (B, 8)
+
+        # --- Deep Branch ---
+        # Concatenate Image and Tabular embeddings
+        deep_in = torch.cat([img_embed, tab_embed], dim=1)
+        deep_out = self.deep_branch(deep_in)  # (B, 64)
+
+        # --- Wide Branch ---
+        # Pass tabular data directly
+        wide_out = tab_embed  # (B, 8)
+
+        # --- Fusion ---
+        # Concatenate Deep and Wide outputs
+        final_in = torch.cat([deep_out, wide_out], dim=1)
+
+        # Predict
+        raw_out = self.head(final_in)  # (B, 2)
+
+        # Split into mu and sigma
+        mu = raw_out[:, 0].unsqueeze(1)
+        sigma_raw = raw_out[:, 1].unsqueeze(1)
+
+        # Enforce positivity for sigma using Softplus
+        # Add epsilon to prevent numerical instability
+        sigma = F.softplus(sigma_raw) + 1e-6
+
+        return mu, sigma
+=======
+class RSTCNet(nn.Module):
+    """
+    Direct Fusion Network.
+
+    A simplified architecture that fuses projected image features with raw tabular
+    features via direct concatenation followed by a deep MLP.
+    Cite {solution_lesson_node_00035}: Direct Concatenation of Strong Scalar Predictors.
+    Cite {solution_lesson_node_00032}: Non-Linear Mixing Layers are Critical.
+
+    Structure:
+    1. Image Branch: EfficientNet-B0 (Top 2 blocks unfrozen) -> Projection -> ReLU -> Dropout.
+    2. Fusion: Concatenate [Image_Embed, Tabular, Time].
+    3. Head: MLP(Fusion -> 128 -> ReLU -> 64 -> ReLU -> 2).
+    """
+
+    def __init__(self, n_tabular_features=7):
+        super(RSTCNet, self).__init__()
+
+        # ==========================
+        # 1. Image Branch (Backbone)
+        # ==========================
+        self.backbone = timm.create_model(
+            BACKBONE_NAME, pretrained=True, num_classes=0, in_chans=3
+        )
+
+        # --- Freeze / Unfreeze Logic ---
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            for i in range(num_blocks - 2, num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        self.n_backbone_features = self.backbone.num_features
+
+        # Image Projection Layer with Non-linearity and Dropout
+        # Cite {solution_lesson_node_00008}: Project high-dim features
+        self.img_projector = nn.Sequential(
+            nn.Linear(self.n_backbone_features, FEATURE_DIM),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        # ==========================
+        # 2. Fusion & Head
+        # ==========================
+        self.input_tab_dim = n_tabular_features + 1
+        
+        # Input: Image Projection (128) + Tabular + Time
+        self.fusion_dim = FEATURE_DIM + self.input_tab_dim
+
+        # MLP Head
+        self.head = nn.Sequential(
+            nn.Linear(self.fusion_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+        # Initialize head weights
+        for m in self.head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, image, tabular, time):
+        # --- Image Processing ---
+        features = self.backbone(image)
+        img_embed = self.img_projector(features)
+
+        # --- Tabular Processing ---
+        tab_embed = torch.cat([tabular, time], dim=1)
+
+        # --- Fusion ---
+        # Direct concatenation (Cite {solution_lesson_node_00035})
+        final_in = torch.cat([img_embed, tab_embed], dim=1)
+
+        # --- Prediction ---
+        raw_out = self.head(final_in)
+
+        mu = raw_out[:, 0].unsqueeze(1)
+        sigma_raw = raw_out[:, 1].unsqueeze(1)
+
+        # Enforce positivity for sigma
+        sigma = F.softplus(sigma_raw) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Override config for fast baseline execution
+import library.config
+
+library.config.EPOCHS = 15  # Reduce epochs for speed
+library.config.DEBUG = False
+
+from library.config import (
+=======
+# Override config for fast baseline execution
+import library.config
+
+library.config.DEBUG = False
+
+from library.config import (
+>>>>>>> REPLACE
+```

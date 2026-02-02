@@ -1,0 +1,558 @@
+To address the issues of invalid validation metrics and model collapse, I will update the codebase to correctly implement the competition metrics and support 3D volume construction.
+
+1.  **Metric Correction (`library/utils.py`)**:
+    *   I will modify `dice_coefficient` to return `0.0` when both ground truth and predictions are empty, complying with the task rules.
+    *   I will implement `hausdorff_distance_3d` using `scipy.spatial.distance.directed_hausdorff` to calculate the Hausdorff distance on 3D volumes (normalized by dimensions), as the previous 2D slice-averaged implementation was incorrect. Cite Debug Lesson (Metric Implementation) and (Dimensionality).
+
+2.  **Dataset Enhancement (`library/dataset.py`)**:
+    *   I will update `UWMadisonDataset` to extract and return metadata (`case`, `day`, `slice`) alongside images and masks. This metadata is essential for aggregating 2D slices into 3D volumes during validation.
+    *   I will disable default caching to ensure the new metadata columns are processed correctly.
+
+3.  **Model & Validation Logic (`library/model.py`)**:
+    *   I will update `train_one_epoch` to handle the new return signature of the dataset (unpacking metadata).
+    *   I will completely rewrite the `validate` function to aggregate predictions by `(case, day)`, construct 3D volumes, and compute the corrected volumetric metrics (3D Dice and 3D Hausdorff).
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+from sklearn.metrics import pairwise_distances
+
+
+def set_seed(seed=42):
+=======
+from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import directed_hausdorff
+
+
+def set_seed(seed=42):
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    """
+    Computes the Dice coefficient between ground truth and prediction.
+
+    Args:
+        y_true (numpy.ndarray or torch.Tensor): Ground truth mask.
+        y_pred (numpy.ndarray or torch.Tensor): Predicted mask.
+        smooth (float): Smoothing factor to prevent division by zero.
+
+    Returns:
+        float: The Dice coefficient score.
+    """
+    if torch.is_tensor(y_true):
+        y_true = y_true.detach().cpu().numpy()
+    if torch.is_tensor(y_pred):
+        y_pred = y_pred.detach().cpu().numpy()
+
+    y_true_f = y_true.flatten()
+    y_pred_f = y_pred.flatten()
+
+    intersection = np.sum(y_true_f * y_pred_f)
+    return (2.0 * intersection + smooth) / (
+        np.sum(y_true_f) + np.sum(y_pred_f) + smooth
+    )
+
+
+def hausdorff_distance(y_true, y_pred):
+    """
+    Computes the Hausdorff distance between two binary masks.
+    Coordinates are normalized by image dimensions to create a bounded score.
+    Uses contour extraction for efficiency.
+
+    Args:
+        y_true (numpy.ndarray or torch.Tensor): Ground truth mask (H, W).
+        y_pred (numpy.ndarray or torch.Tensor): Predicted mask (H, W).
+
+    Returns:
+        float: The normalized Hausdorff distance. Returns 0.0 if both are empty,
+               and 1.0 if only one is empty.
+    """
+    if torch.is_tensor(y_true):
+        y_true = y_true.detach().cpu().numpy()
+    if torch.is_tensor(y_pred):
+        y_pred = y_pred.detach().cpu().numpy()
+
+    # Ensure inputs are uint8 binary masks for cv2
+    y_true = (y_true > 0.5).astype(np.uint8)
+    y_pred = (y_pred > 0.5).astype(np.uint8)
+
+    h, w = y_true.shape
+
+    def get_contour_points(mask):
+        # Find contours to reduce the number of points for distance calculation
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return np.empty((0, 2))
+        return np.vstack(contours).reshape(-1, 2)
+
+    true_pts = get_contour_points(y_true)
+    pred_pts = get_contour_points(y_pred)
+
+    # Handle empty mask cases
+    if len(true_pts) == 0 and len(pred_pts) == 0:
+        return 0.0
+    if len(true_pts) == 0 or len(pred_pts) == 0:
+        return 1.0
+
+    # Normalize coordinates (x/width, y/height)
+    # Contour points are in (x, y) format
+    scaler = np.array([w, h], dtype=np.float32)
+    true_pts_norm = true_pts.astype(np.float32) / scaler
+    pred_pts_norm = pred_pts.astype(np.float32) / scaler
+
+    # Compute pairwise Euclidean distances between boundary points
+    dists = pairwise_distances(true_pts_norm, pred_pts_norm)
+
+    # Hausdorff distance = max(directed_A_B, directed_B_A)
+    # Directed A->B: max(min(d(a, B)))
+    hd_AB = np.max(np.min(dists, axis=1))
+    # Directed B->A: max(min(d(b, A)))
+    hd_BA = np.max(np.min(dists, axis=0))
+
+    return max(hd_AB, hd_BA)
+=======
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    """
+    Computes the Dice coefficient.
+    CRITICAL: Returns 0.0 if both y_true and y_pred are empty, as per task rules.
+    """
+    if torch.is_tensor(y_true):
+        y_true = y_true.detach().cpu().numpy()
+    if torch.is_tensor(y_pred):
+        y_pred = y_pred.detach().cpu().numpy()
+
+    y_true_f = y_true.flatten()
+    y_pred_f = y_pred.flatten()
+
+    sum_true = np.sum(y_true_f)
+    sum_pred = np.sum(y_pred_f)
+
+    # Task specific rule: 0 when both are empty
+    if sum_true == 0 and sum_pred == 0:
+        return 0.0
+
+    intersection = np.sum(y_true_f * y_pred_f)
+    return (2.0 * intersection + smooth) / (sum_true + sum_pred + smooth)
+
+
+def hausdorff_distance_3d(y_true, y_pred, spacing=None):
+    """
+    Computes 3D Hausdorff distance between two binary volumes.
+    Coordinates are normalized by volume dimensions (D, H, W) to [0, 1].
+
+    Args:
+        y_true: 3D numpy array (D, H, W)
+        y_pred: 3D numpy array (D, H, W)
+        spacing: tuple of (z_spacing, y_spacing, x_spacing). Ignored here as we normalize by shape.
+
+    Returns:
+        float: Normalized Hausdorff distance (0.0 to 1.0).
+    """
+    # Ensure binary
+    y_true = y_true > 0.5
+    y_pred = y_pred > 0.5
+
+    # Get coordinates of True pixels
+    # argwhere returns (N, 3) array of [z, y, x] indices
+    true_points = np.argwhere(y_true)
+    pred_points = np.argwhere(y_pred)
+
+    # Handle empty cases
+    if len(true_points) == 0 and len(pred_points) == 0:
+        return 0.0
+    if len(true_points) == 0 or len(pred_points) == 0:
+        return 1.0  # Max distance if one is missing
+
+    # Normalize coordinates to [0, 1]
+    # Shape is (D, H, W)
+    shape = np.array(y_true.shape, dtype=np.float32)
+
+    # Normalize points: divide each column by corresponding dimension
+    true_points_norm = true_points.astype(np.float32) / shape
+    pred_points_norm = pred_points.astype(np.float32) / shape
+
+    # Compute directed Hausdorff distances
+    # directed_hausdorff returns (distance, index_1, index_2)
+    d_ab = directed_hausdorff(true_points_norm, pred_points_norm)[0]
+    d_ba = directed_hausdorff(pred_points_norm, true_points_norm)[0]
+
+    return max(d_ab, d_ba)
+
+
+def hausdorff_distance(y_true, y_pred):
+    return hausdorff_distance_3d(y_true[np.newaxis, ...], y_pred[np.newaxis, ...])
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __init__(
+        self,
+        mode="train",
+        fraction=1.0,
+        load_cached_data=True,
+        img_size=256,
+    ):
+=======
+    def __init__(
+        self,
+        mode="train",
+        fraction=1.0,
+        load_cached_data=False,
+        img_size=256,
+    ):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # keep_default_na=False prevents empty RLE strings from becoming NaN
+        df = pd.read_csv(csv_path, keep_default_na=False)
+
+        # Subsample if fraction < 1.0
+        if self.fraction < 1.0:
+            df = df.sample(frac=self.fraction, random_state=42).reset_index(drop=True)
+
+        # 3. Save to cache
+        if load_cached_data:
+            df.to_parquet(cache_path, index=False)
+
+        return df
+=======
+        # keep_default_na=False prevents empty RLE strings from becoming NaN
+        df = pd.read_csv(csv_path, keep_default_na=False)
+
+        # Parse Case/Day/Slice for aggregation
+        # id format: caseXXX_dayYY_slice_ZZZZ
+        # We extract numeric values for sorting/grouping
+        df["case_int"] = df["case"].apply(lambda x: int(x.replace("case", "")))
+        df["day_int"] = df["day"].apply(lambda x: int(x.replace("day", "")))
+        df["slice_int"] = df["slice"].apply(lambda x: int(x))
+
+        # Subsample if fraction < 1.0
+        if self.fraction < 1.0:
+            df = df.sample(frac=self.fraction, random_state=42).reset_index(drop=True)
+
+        # 3. Save to cache
+        if load_cached_data:
+            df.to_parquet(cache_path, index=False)
+
+        return df
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        original_h = row["height"]
+        original_w = row["width"]
+
+        if self.mode in ["train", "val"]:
+            # Load Masks
+            # Classes: large_bowel, small_bowel, stomach
+            # We stack them to create (H, W, 3)
+            mask_shape = (original_h, original_w)
+
+            mask_lb = rle_decode(row["large_bowel"], mask_shape)
+            mask_sb = rle_decode(row["small_bowel"], mask_shape)
+            mask_st = rle_decode(row["stomach"], mask_shape)
+
+            # Stack: (H, W, 3)
+            mask = np.stack([mask_lb, mask_sb, mask_st], axis=-1).astype(np.float32)
+
+            # Apply Augmentations
+            transformed = self.transform(image=img, mask=mask)
+            img_aug = transformed["image"]
+            mask_aug = transformed["mask"]
+
+            # Convert to Tensor (C, H, W)
+            # Image is currently (H, W) or (H, W, 1) depending on albumentations behavior with grayscale
+            if img_aug.ndim == 2:
+                img_aug = img_aug[np.newaxis, ...]  # (1, H, W)
+            else:
+                img_aug = img_aug.transpose(2, 0, 1)  # (C, H, W)
+
+            # Mask is (H, W, 3) -> (3, H, W)
+            mask_aug = mask_aug.transpose(2, 0, 1)
+
+            return torch.from_numpy(img_aug), torch.from_numpy(mask_aug)
+
+        else:
+            # Test mode: No masks
+=======
+        original_h = row["height"]
+        original_w = row["width"]
+
+        # Metadata for aggregation
+        # (case, day, slice)
+        metadata = np.array(
+            [row["case_int"], row["day_int"], row["slice_int"]], dtype=np.int32
+        )
+
+        if self.mode in ["train", "val"]:
+            # Load Masks
+            # Classes: large_bowel, small_bowel, stomach
+            # We stack them to create (H, W, 3)
+            mask_shape = (original_h, original_w)
+
+            mask_lb = rle_decode(row["large_bowel"], mask_shape)
+            mask_sb = rle_decode(row["small_bowel"], mask_shape)
+            mask_st = rle_decode(row["stomach"], mask_shape)
+
+            # Stack: (H, W, 3)
+            mask = np.stack([mask_lb, mask_sb, mask_st], axis=-1).astype(np.float32)
+
+            # Apply Augmentations
+            transformed = self.transform(image=img, mask=mask)
+            img_aug = transformed["image"]
+            mask_aug = transformed["mask"]
+
+            # Convert to Tensor (C, H, W)
+            # Image is currently (H, W) or (H, W, 1) depending on albumentations behavior with grayscale
+            if img_aug.ndim == 2:
+                img_aug = img_aug[np.newaxis, ...]  # (1, H, W)
+            else:
+                img_aug = img_aug.transpose(2, 0, 1)  # (C, H, W)
+
+            # Mask is (H, W, 3) -> (3, H, W)
+            mask_aug = mask_aug.transpose(2, 0, 1)
+
+            # Return metadata as well
+            return (
+                torch.from_numpy(img_aug),
+                torch.from_numpy(mask_aug),
+                torch.from_numpy(metadata),
+            )
+
+        else:
+            # Test mode: No masks
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.utils import set_seed, dice_coefficient, hausdorff_distance, rle_encode
+from library.dataset import UWMadisonDataset
+=======
+from library.utils import (
+    set_seed,
+    dice_coefficient,
+    hausdorff_distance_3d,
+    rle_encode,
+)
+from library.dataset import UWMadisonDataset
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+
+    for images, masks in loader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    dice_scores = []
+    hausdorff_scores = []
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            running_loss += loss.item() * images.size(0)
+
+            # Metrics calculation per sample in batch
+            # Threshold predictions
+            preds = (outputs > 0.5).float()
+
+            for i in range(images.size(0)):
+                # Calculate metrics for each class and average
+                d_score = 0
+                h_score = 0
+                for c in range(3):
+                    d_score += dice_coefficient(masks[i, c], preds[i, c])
+                    h_score += hausdorff_distance(masks[i, c], preds[i, c])
+
+                dice_scores.append(d_score / 3.0)
+                hausdorff_scores.append(h_score / 3.0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    mean_dice = np.mean(dice_scores)
+    mean_hausdorff = np.mean(hausdorff_scores)
+
+    # Competition metric: 0.4 * Dice + 0.6 * Hausdorff (Normalized 0-1, where 1 is bad for distance?
+    # Actually HD is distance, so lower is better. But prompt says "0-1 score".
+    # Usually HD score is 1 - norm_dist or similar if higher is better.
+    # However, standard HD is a distance (lower is better).
+    # The prompt says: "The two metrics are combined...". Usually in this comp it was 0.4*Dice + 0.6*(1-HD).
+    # Given the ambiguity, I will track both raw values.
+    # To select best model, I'll maximize Dice for simplicity as it correlates well with segmentation quality.
+
+    return epoch_loss, mean_dice, mean_hausdorff
+=======
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+
+    for batch in loader:
+        # Unpack only first two, ignore metadata
+        images = batch[0].to(device)
+        masks = batch[1].to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+
+    # Storage for volume reconstruction
+    # Key: (case_int, day_int) -> list of (slice_int, pred_mask, true_mask)
+    volume_data = {}
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch[0].to(device)
+            masks = batch[1].to(device)
+            metadata = batch[2]  # (B, 3) -> case, day, slice
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            running_loss += loss.item() * images.size(0)
+
+            # Binarize predictions
+            preds = (outputs > 0.5).float().cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            meta_np = metadata.numpy()
+
+            for i in range(images.size(0)):
+                case_id = int(meta_np[i, 0])
+                day_id = int(meta_np[i, 1])
+                slice_id = int(meta_np[i, 2])
+
+                key = (case_id, day_id)
+                if key not in volume_data:
+                    volume_data[key] = []
+
+                # Store (slice_idx, pred, true)
+                # pred/true shape: (3, H, W)
+                volume_data[key].append(
+                    {"slice": slice_id, "pred": preds[i], "true": masks_np[i]}
+                )
+
+    # Compute Volumetric Metrics
+    dice_scores = []
+    hausdorff_scores = []
+
+    for key, slices in volume_data.items():
+        # Sort by slice index to form proper volume
+        slices.sort(key=lambda x: x["slice"])
+
+        # Stack to create volumes: (D, 3, H, W)
+        pred_vol = np.stack([s["pred"] for s in slices], axis=0)
+        true_vol = np.stack([s["true"] for s in slices], axis=0)
+
+        # Calculate metric per class
+        # Classes: 0=LB, 1=SB, 2=ST
+        case_dice = 0
+        case_hd = 0
+
+        for c in range(3):
+            p_c = pred_vol[:, c, :, :]  # (D, H, W)
+            t_c = true_vol[:, c, :, :]  # (D, H, W)
+
+            case_dice += dice_coefficient(t_c, p_c)
+            case_hd += hausdorff_distance_3d(t_c, p_c)
+
+        dice_scores.append(case_dice / 3.0)
+        hausdorff_scores.append(case_hd / 3.0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    mean_dice = np.mean(dice_scores) if dice_scores else 0.0
+    mean_hausdorff = np.mean(hausdorff_scores) if hausdorff_scores else 0.0
+
+    return epoch_loss, mean_dice, mean_hausdorff
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def train_model(
+    epochs=10, batch_size=32, lr=1e-4, fraction=1.0, img_size=256, patience=5
+):
+    set_seed(42)
+
+    # Datasets
+    train_dataset = UWMadisonDataset(mode="train", fraction=fraction, img_size=img_size)
+    val_dataset = UWMadisonDataset(mode="val", fraction=fraction, img_size=img_size)
+
+    train_loader = DataLoader(
+=======
+def train_model(
+    epochs=10, batch_size=32, lr=1e-4, fraction=1.0, img_size=256, patience=5
+):
+    set_seed(42)
+
+    # Datasets
+    # Force load_cached_data=False to ensure we use correct fraction and metadata
+    train_dataset = UWMadisonDataset(
+        mode="train", fraction=fraction, img_size=img_size, load_cached_data=False
+    )
+    val_dataset = UWMadisonDataset(
+        mode="val", fraction=fraction, img_size=img_size, load_cached_data=False
+    )
+
+    train_loader = DataLoader(
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Test Dataset
+    test_dataset = UWMadisonDataset(mode="test", img_size=img_size)
+    test_loader = DataLoader(
+=======
+    # Test Dataset
+    test_dataset = UWMadisonDataset(
+        mode="test", img_size=img_size, load_cached_data=False
+    )
+    test_loader = DataLoader(
+>>>>>>> REPLACE
+```

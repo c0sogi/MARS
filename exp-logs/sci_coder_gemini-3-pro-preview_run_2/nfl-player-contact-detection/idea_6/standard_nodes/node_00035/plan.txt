@@ -1,0 +1,565 @@
+To optimize the solution, I will simplify the model architecture and refine the feature engineering based on the provided lessons.
+
+**1. Architectural Simplification (Cite solution_lesson_node_00023, solution_lesson_node_00033)**
+The current `CK-ResNet` is over-engineered for this task. Lessons indicate that a simple Kinematic MLP trained on the full dataset outperforms complex architectures like ResNets or CNNs, especially given the explicit physics-based features. I will replace `CKResNet` with `KinematicMLP`, a straightforward dense network.
+
+**2. Feature Engineering Refinement (Cite solution_lesson_node_00034, solution_lesson_node_00033)**
+The current ground imputation strategy copies all player attributes (including velocity and acceleration) to the "Ground" entity. This destroys relative kinematic signals (e.g., relative speed becomes 0). I will modify `compute_instantaneous_features` to:
+-   Set Ground Position = Player Position (Distance ≈ 0).
+-   Set Ground Velocity/Acceleration = 0 (Preserving relative motion signals).
+-   Explicitly calculate and include `rel_speed` and `rel_accel` as features, as explicit kinematics trump implicit learning.
+
+**3. Configuration Updates**
+I will update the configuration to reflect the simpler model and ensure the training runs for sufficient epochs (10) to converge, as the simpler model is faster to train.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Hyperparameters (CK-ResNet)
+    # ==========================================
+    # Input dimension will be calculated dynamically based on feature count * window size
+    HIDDEN_DIM = 512
+    NUM_RES_BLOCKS = 4
+    DROPOUT_RATE = 0.1
+    FILM_DIM = 1  # Dimension of the conditioning vector (is_ground)
+=======
+    # ==========================================
+    # Model Hyperparameters (Kinematic MLP)
+    # ==========================================
+    # Input dimension will be calculated dynamically based on feature count * window size
+    HIDDEN_DIM = 512
+    DROPOUT_RATE = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM) Layer.
+    Applies an affine transformation to the input features conditioned on an external vector.
+
+    Formula: h_out = gamma(condition) * h_in + beta(condition)
+    """
+
+    def __init__(self, num_features, condition_dim=Config.FILM_DIM):
+        super(FiLMLayer, self).__init__()
+
+        # Generators for scale (gamma) and shift (beta)
+        self.scale_gen = nn.Linear(condition_dim, num_features)
+        self.shift_gen = nn.Linear(condition_dim, num_features)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize scale to Identity (1.0) and shift to Zero (0.0)
+        # This ensures the layer starts as an identity mapping, aiding convergence.
+        nn.init.constant_(self.scale_gen.weight, 0)
+        nn.init.constant_(self.scale_gen.bias, 1)
+
+        nn.init.constant_(self.shift_gen.weight, 0)
+        nn.init.constant_(self.shift_gen.bias, 0)
+
+    def forward(self, x, condition):
+        """
+        Args:
+            x (torch.Tensor): Input features (Batch, Num_Features)
+            condition (torch.Tensor): Conditioning vector (Batch, Condition_Dim)
+        """
+        gamma = self.scale_gen(condition)
+        beta = self.shift_gen(condition)
+
+        # Apply affine transformation
+        return x * gamma + beta
+
+
+class ResidualBlock(nn.Module):
+    """
+    Residual Block with FiLM conditioning.
+    Structure: Input -> [Linear->BN->ReLU->Dropout] -> [Linear->BN] -> FiLM -> Add -> ReLU
+    """
+
+    def __init__(
+        self,
+        hidden_dim,
+        condition_dim=Config.FILM_DIM,
+        dropout_rate=Config.DROPOUT_RATE,
+    ):
+        super(ResidualBlock, self).__init__()
+
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        self.film = FiLMLayer(hidden_dim, condition_dim)
+
+    def forward(self, x, condition):
+        residual = x
+
+        # First dense part
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.dropout(out)
+
+        # Second dense part
+        out = self.fc2(out)
+        out = self.bn2(out)
+
+        # Feature-wise Linear Modulation
+        out = self.film(out, condition)
+
+        # Residual Connection
+        out = out + residual
+
+        # Final Activation
+        out = self.act(out)
+
+        return out
+
+
+class CKResNet(nn.Module):
+    """
+    Conditioned Kinematic Residual Network (CK-ResNet).
+
+    A wide-input MLP backbone enhanced with residual connections and FiLM layers
+    to handle distinct physics for Player-Player vs Player-Ground interactions.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        center_dim,
+        hidden_dim=Config.HIDDEN_DIM,
+        num_blocks=Config.NUM_RES_BLOCKS,
+        condition_dim=Config.FILM_DIM,
+        dropout_rate=Config.DROPOUT_RATE,
+    ):
+        """
+        Args:
+            input_dim (int): Dimension of the flattened wide feature vector.
+            center_dim (int): Dimension of the features at t=0 (for skip connection).
+            hidden_dim (int): Internal hidden dimension.
+            num_blocks (int): Number of residual blocks.
+            condition_dim (int): Dimension of the conditioning vector (is_ground).
+            dropout_rate (float): Dropout probability.
+        """
+        super(CKResNet, self).__init__()
+
+        # Initial projection of wide input
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.BatchNorm1d(hidden_dim), nn.ReLU()
+        )
+
+        # Stack of Residual Blocks
+        self.blocks = nn.ModuleList(
+            [
+                ResidualBlock(hidden_dim, condition_dim, dropout_rate)
+                for _ in range(num_blocks)
+            ]
+        )
+
+        # Output Head
+        # Concatenates the residual output with the raw center frame features
+        self.output_head = nn.Linear(hidden_dim + center_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x_wide, x_center, condition):
+        """
+        Args:
+            x_wide (torch.Tensor): Flattened window features (Batch, Input_Dim).
+            x_center (torch.Tensor): Features at t=0 (Batch, Center_Dim).
+            condition (torch.Tensor): Conditioning vector (Batch, Condition_Dim).
+
+        Returns:
+            torch.Tensor: Logits (Batch, 1).
+        """
+        # Project wide input
+        out = self.input_proj(x_wide)
+
+        # Pass through residual blocks with conditioning
+        for block in self.blocks:
+            out = block(out, condition)
+
+        # Center-Frame Skip Connection
+        # Concatenate the processed deep features with the raw instantaneous state
+        combined = torch.cat([out, x_center], dim=1)
+
+        # Final prediction
+        logits = self.output_head(combined)
+
+        return logits
+=======
+class KinematicMLP(nn.Module):
+    """
+    Kinematic Multi-Layer Perceptron (K-MLP).
+    
+    A simple, high-capacity dense network designed to learn physics relationships
+    from explicit relative kinematic features.
+    Cite: solution_lesson_node_00023, solution_lesson_node_00033
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        center_dim,
+        hidden_dim=Config.HIDDEN_DIM,
+        dropout_rate=Config.DROPOUT_RATE,
+    ):
+        super(KinematicMLP, self).__init__()
+
+        # Combined input dimension (Wide Window + Center Frame)
+        # We concatenate them early as the MLP can learn interactions across the window
+        total_dim = input_dim + center_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(total_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.BatchNorm1d(hidden_dim // 4),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_dim // 4, 1)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x_wide, x_center, condition):
+        """
+        Args:
+            x_wide (torch.Tensor): Flattened window features.
+            x_center (torch.Tensor): Features at t=0.
+            condition (torch.Tensor): Unused in simple MLP (implicit learning).
+        """
+        # Concatenate all available features
+        x = torch.cat([x_wide, x_center], dim=1)
+        return self.net(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+def compute_instantaneous_features(df):
+    """
+    Computes interaction features for a merged dataframe (P1 and P2 columns present).
+    Handles Geometric Consistency for Ground contacts.
+    """
+    # 1. Geometric Consistency for Ground
+    # If is_ground is 1, P2 features should match P1 to represent "contact with environment at self position"
+    is_ground = df["is_ground"] == 1
+
+    for col in Config.TRACKING_COLS:
+        p1_vals = df.loc[is_ground, f"{col}_1"]
+        df.loc[is_ground, f"{col}_2"] = p1_vals
+
+    # 2. Distance Features
+    dx = df["x_position_1"] - df["x_position_2"]
+    dy = df["y_position_1"] - df["y_position_2"]
+    dist = np.sqrt(dx**2 + dy**2)
+
+    df["distance"] = dist
+    df["log_distance"] = np.log1p(dist)
+
+    # 3. Kinematic Features (Closing Speed)
+    # Convert speed/direction to velocity components
+    # Assumption: direction is in degrees, 0=N (Y+), 90=E (X+) standard NFL coords
+    dir_1_rad = np.radians(df["direction_1"].fillna(0))
+    vx_1 = df["speed_1"].fillna(0) * np.sin(dir_1_rad)
+    vy_1 = df["speed_1"].fillna(0) * np.cos(dir_1_rad)
+
+    dir_2_rad = np.radians(df["direction_2"].fillna(0))
+    vx_2 = df["speed_2"].fillna(0) * np.sin(dir_2_rad)
+    vy_2 = df["speed_2"].fillna(0) * np.cos(dir_2_rad)
+
+    dvx = vx_1 - vx_2
+    dvy = vy_1 - vy_2
+
+    # Closing speed: projection of relative velocity onto relative position vector
+    # closing_speed = -(v_rel . r_rel) / |r_rel|
+    dot_prod = dx * dvx + dy * dvy
+
+    # Clamped denominator to avoid division by zero at contact
+    denom = np.maximum(dist, 1e-6)
+
+    # Positive closing speed implies objects are moving closer
+    df["closing_speed"] = -(dot_prod / denom)
+
+    return df
+
+
+def create_wide_features(df_meta, df_tracking):
+    """
+    Constructs the wide temporal feature set (t-5 to t+5).
+    """
+    # --- Merge Tracking Data ---
+
+    # Merge Player 1
+    df = df_meta.merge(
+        df_tracking,
+        left_on=["game_play", "step", "nfl_player_id_1"],
+        right_on=["game_play", "step", "nfl_player_id"],
+        how="left",
+    )
+    df = df.rename(columns={c: f"{c}_1" for c in Config.TRACKING_COLS})
+    df = df.drop(columns=["nfl_player_id"], errors="ignore")
+
+    # Merge Player 2
+    # Handle 'G' for P2 merge by creating a temporary numeric ID column
+    df["p2_merge_id"] = pd.to_numeric(df["nfl_player_id_2"], errors="coerce")
+
+    df = df.merge(
+        df_tracking,
+        left_on=["game_play", "step", "p2_merge_id"],
+        right_on=["game_play", "step", "nfl_player_id"],
+        how="left",
+        suffixes=("", "_2"),
+    )
+    df = df.rename(columns={c: f"{c}_2" for c in Config.TRACKING_COLS})
+    df = df.drop(columns=["nfl_player_id", "p2_merge_id"], errors="ignore")
+
+    # Create conditioning feature
+    df["is_ground"] = (df["nfl_player_id_2"] == "G").astype(int)
+
+    # --- Compute Instantaneous Features ---
+    df = compute_instantaneous_features(df)
+
+    # --- Vectorized Lag Construction ---
+
+    # Define base features to shift
+    base_feats = (
+        [f"{c}_1" for c in Config.TRACKING_COLS]
+        + [f"{c}_2" for c in Config.TRACKING_COLS]
+        + ["distance", "log_distance", "closing_speed"]
+    )
+=======
+def compute_instantaneous_features(df):
+    """
+    Computes interaction features for a merged dataframe (P1 and P2 columns present).
+    Handles Geometric Consistency for Ground contacts.
+    Cite: solution_lesson_node_00034, solution_lesson_node_00033
+    """
+    # 1. Geometric Consistency for Ground
+    # Cite solution_lesson_node_00034: Strictly separate positional attributes from kinematic attributes.
+    is_ground = df["is_ground"] == 1
+
+    # Position: Match P1 (Distance = 0)
+    for col in ["x_position", "y_position"]:
+        df.loc[is_ground, f"{col}_2"] = df.loc[is_ground, f"{col}_1"]
+
+    # Kinematics: Set to 0 (Static object) to preserve relative motion signals
+    for col in ["speed", "acceleration", "sa", "direction", "orientation"]:
+        df.loc[is_ground, f"{col}_2"] = 0
+
+    # 2. Distance Features
+    dx = df["x_position_1"] - df["x_position_2"]
+    dy = df["y_position_1"] - df["y_position_2"]
+    dist = np.sqrt(dx**2 + dy**2)
+
+    df["distance"] = dist
+    df["log_distance"] = np.log1p(dist)
+
+    # 3. Explicit Relative Kinematics (Cite solution_lesson_node_00033)
+    df["rel_speed"] = df["speed_1"] - df["speed_2"]
+    df["rel_accel"] = df["acceleration_1"] - df["acceleration_2"]
+
+    # 4. Kinematic Features (Closing Speed)
+    # Convert speed/direction to velocity components
+    dir_1_rad = np.radians(df["direction_1"].fillna(0))
+    vx_1 = df["speed_1"].fillna(0) * np.sin(dir_1_rad)
+    vy_1 = df["speed_1"].fillna(0) * np.cos(dir_1_rad)
+
+    dir_2_rad = np.radians(df["direction_2"].fillna(0))
+    vx_2 = df["speed_2"].fillna(0) * np.sin(dir_2_rad)
+    vy_2 = df["speed_2"].fillna(0) * np.cos(dir_2_rad)
+
+    dvx = vx_1 - vx_2
+    dvy = vy_1 - vy_2
+
+    # Closing speed: projection of relative velocity onto relative position vector
+    dot_prod = dx * dvx + dy * dvy
+    denom = np.maximum(dist, 1e-6)
+    df["closing_speed"] = -(dot_prod / denom)
+
+    return df
+
+
+def create_wide_features(df_meta, df_tracking):
+    """
+    Constructs the wide temporal feature set (t-5 to t+5).
+    """
+    # --- Merge Tracking Data ---
+
+    # Merge Player 1
+    df = df_meta.merge(
+        df_tracking,
+        left_on=["game_play", "step", "nfl_player_id_1"],
+        right_on=["game_play", "step", "nfl_player_id"],
+        how="left",
+    )
+    df = df.rename(columns={c: f"{c}_1" for c in Config.TRACKING_COLS})
+    df = df.drop(columns=["nfl_player_id"], errors="ignore")
+
+    # Merge Player 2
+    # Handle 'G' for P2 merge by creating a temporary numeric ID column
+    df["p2_merge_id"] = pd.to_numeric(df["nfl_player_id_2"], errors="coerce")
+
+    df = df.merge(
+        df_tracking,
+        left_on=["game_play", "step", "p2_merge_id"],
+        right_on=["game_play", "step", "nfl_player_id"],
+        how="left",
+        suffixes=("", "_2"),
+    )
+    df = df.rename(columns={c: f"{c}_2" for c in Config.TRACKING_COLS})
+    df = df.drop(columns=["nfl_player_id", "p2_merge_id"], errors="ignore")
+
+    # Create conditioning feature
+    df["is_ground"] = (df["nfl_player_id_2"] == "G").astype(int)
+
+    # --- Compute Instantaneous Features ---
+    df = compute_instantaneous_features(df)
+
+    # --- Vectorized Lag Construction ---
+
+    # Define base features to shift
+    base_feats = (
+        [f"{c}_1" for c in Config.TRACKING_COLS]
+        + [f"{c}_2" for c in Config.TRACKING_COLS]
+        + ["distance", "log_distance", "closing_speed", "rel_speed", "rel_accel"]
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import CKResNet
+from library.dataset import get_dataloaders
+=======
+from library.model import KinematicMLP
+from library.dataset import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    print(f"Model Input Dim: {input_dim}, Center Dim: {center_dim}")
+
+    model = CKResNet(input_dim=input_dim, center_dim=center_dim).to(device)
+
+    # 4. Optimizer & Loss
+=======
+    print(f"Model Input Dim: {input_dim}, Center Dim: {center_dim}")
+
+    model = KinematicMLP(input_dim=input_dim, center_dim=center_dim).to(device)
+
+    # 4. Optimizer & Loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.model import CKResNet
+from library.dataset import get_dataloaders
+=======
+from library.config import Config
+from library.model import KinematicMLP
+from library.dataset import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    except StopIteration:
+        print("Error: Test loader is empty. Cannot determine model dimensions.")
+        return pd.DataFrame(columns=["contact_id", "contact"])
+
+    model = CKResNet(input_dim=input_dim, center_dim=center_dim)
+
+    # Load trained weights
+=======
+    except StopIteration:
+        print("Error: Test loader is empty. Cannot determine model dimensions.")
+        return pd.DataFrame(columns=["contact_id", "contact"])
+
+    model = KinematicMLP(input_dim=input_dim, center_dim=center_dim)
+
+    # Load trained weights
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- 1. Configuration ---
+    # Override Config for a fast but effective baseline execution
+    # We reduce epochs to 5 to meet the time constraint while using the full dataset
+    Config.EPOCHS = 5
+    Config.BATCH_SIZE = 4096
+=======
+    # --- 1. Configuration ---
+    # Override Config for a fast but effective baseline execution
+    # We increase epochs to 10 to ensure convergence with the simpler MLP
+    Config.EPOCHS = 10
+    Config.BATCH_SIZE = 4096
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        feature_names.extend(
+            ["distance" + suffix, "log_distance" + suffix, "closing_speed" + suffix]
+        )
+
+    correlations = []
+=======
+        feature_names.extend(
+            ["distance" + suffix, "log_distance" + suffix, "closing_speed" + suffix, "rel_speed" + suffix, "rel_accel" + suffix]
+        )
+
+    correlations = []
+>>>>>>> REPLACE
+```

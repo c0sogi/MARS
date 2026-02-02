@@ -1,0 +1,1478 @@
+I will optimize the solution by reverting to the **Context-Gated Residual GRU (CGR-GRU)** architecture, which historically achieved the best performance (LER ~0.0825). This involves removing the explicit velocity stream and the auxiliary boundary loss, as manual feature engineering and complex multi-task objectives proved detrimental (Cite solution_lesson_node_00053). I will also correct the audio feature extraction to use a hop length that mathematically aligns with the video frame rate (800 samples), eliminating the need for harmful interpolation (Cite solution_lesson_node_00054). Finally, I will extend the training duration to 60 epochs to ensure convergence (Cite solution_lesson_node_00040) and update the cache directory to force re-processing of the corrected features.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for specific experiment idea
+    WORKING_DIR = "./working/idea_8"
+
+    # Cache directory for processed features (npy files)
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+=======
+    # Working directory for specific experiment idea
+    WORKING_DIR = "./working/idea_opt_final"
+
+    # Cache directory for processed features (npy files)
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture (KA-MTRN)
+    # ==========================================
+    # Tri-Stream Input Dimensions
+    POSE_INPUT_DIM = SKELETON_INPUT_DIM  # 60
+    VELOCITY_INPUT_DIM = SKELETON_INPUT_DIM  # 60
+    AUDIO_INPUT_DIM = N_MFCC  # 13
+
+    # Convolutional Stem
+=======
+    # ==========================================
+    # Model Architecture (CGRNet)
+    # ==========================================
+    # Dual-Stream Input Dimensions
+    POSE_INPUT_DIM = SKELETON_INPUT_DIM  # 60
+    AUDIO_INPUT_DIM = N_MFCC  # 13
+
+    # Convolutional Stem
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 8  # Micro-batching for small dataset
+    NUM_EPOCHS = 50  # Maximum epochs
+    LEARNING_RATE = 1e-3  # Initial LR for AdamW
+    WEIGHT_DECAY = 0.05  # Aggressive regularization
+
+    # Loss Configuration
+    LABEL_SMOOTHING = 0.1
+    BACKGROUND_WEIGHT = 0.5  # Weight for class 0 in CrossEntropy
+    BOUNDARY_LOSS_WEIGHT = 0.5
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 8  # Micro-batching for small dataset
+    NUM_EPOCHS = 60  # Maximum epochs
+    LEARNING_RATE = 1e-3  # Initial LR for AdamW
+    WEIGHT_DECAY = 0.05  # Aggressive regularization
+
+    # Loss Configuration
+    LABEL_SMOOTHING = 0.1
+    BACKGROUND_WEIGHT = 0.5  # Weight for class 0 in CrossEntropy
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+        # Audio transformation
+        self.mfcc_transform = T.MFCC(
+            sample_rate=Config.AUDIO_SAMPLE_RATE,
+            n_mfcc=Config.AUDIO_INPUT_DIM,
+            melkwargs={"n_fft": 400, "hop_length": 160, "n_mels": 23, "center": False},
+        )
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        sample_id = row["sample_id"]
+
+        # Try to load from cache
+        cache_path = os.path.join(Config.CACHE_DIR, f"{sample_id}.npz")
+
+        data = None
+        if self.load_cached_data and os.path.exists(cache_path):
+            try:
+                data = np.load(cache_path)
+                pose = torch.from_numpy(data["pose"]).float()
+                velocity = torch.from_numpy(data["velocity"]).float()
+                audio = torch.from_numpy(data["audio"]).float()
+                labels = torch.from_numpy(data["labels"]).long()
+                boundaries = torch.from_numpy(data["boundaries"]).float()
+            except Exception as e:
+                # If cache is corrupted, fall back to processing
+                print(f"Error loading cache for {sample_id}: {e}")
+                data = None
+
+        if data is None:
+            # Process from raw files
+            pose, velocity, audio, labels, boundaries = self._process_raw_data(row)
+
+            # Save to cache
+            if self.load_cached_data:
+                np.savez_compressed(
+                    cache_path,
+                    pose=pose.numpy(),
+                    velocity=velocity.numpy(),
+                    audio=audio.numpy(),
+                    labels=labels.numpy(),
+                    boundaries=boundaries.numpy(),
+                )
+
+        # Apply Normalization
+        if self.stats:
+            pose = (pose - self.stats["pose_mean"]) / (self.stats["pose_std"] + 1e-6)
+            velocity = (velocity - self.stats["vel_mean"]) / (
+                self.stats["vel_std"] + 1e-6
+            )
+            audio = (audio - self.stats["audio_mean"]) / (
+                self.stats["audio_std"] + 1e-6
+            )
+
+        # Apply Augmentation (only in train mode)
+        if self.mode == "train":
+            pose, velocity, audio = self._augment_data(pose, velocity, audio)
+
+        return pose, velocity, audio, labels, boundaries
+
+    def _process_raw_data(self, row):
+        """Reads .mat and .wav files and extracts features."""
+        # 1. Load MAT file for Skeleton and Labels
+        mat_path = os.path.join(Config.INPUT_DIR, row["data_path"])
+        try:
+            mat = scipy.io.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+            video_struct = mat["Video"]
+            num_frames = video_struct.NumFrames
+
+            # --- Skeleton Processing ---
+            # Extract frames. Structure: Video.Frames[i].Skeleton.WorldPosition
+            # We assume single user (UserIndex 1) or take the first valid skeleton
+
+            # Pre-allocate
+            skeleton_data = np.zeros(
+                (num_frames, Config.NUM_JOINTS, 3), dtype=np.float32
+            )
+
+            frames = video_struct.Frames
+            # Handle case where Frames is a single object or empty
+            if not isinstance(frames, np.ndarray):
+                frames = np.array([frames]) if frames is not None else np.array([])
+
+            actual_frames = min(len(frames), num_frames)
+
+            for i in range(actual_frames):
+                frame_obj = frames[i]
+                if hasattr(frame_obj, "Skeleton"):
+                    skel = frame_obj.Skeleton
+                    # If multiple skeletons, pick the first one (usually the user)
+                    if isinstance(skel, np.ndarray) and skel.size > 0:
+                        skel = skel[0]
+
+                    if hasattr(skel, "WorldPosition"):
+                        # WorldPosition is usually 20x1 struct array or similar
+                        # We need to extract X, Y, Z for each joint
+                        # Assuming JointsType order is fixed as per prompt
+
+                        # Check if WorldPosition is an object or array
+                        wp = skel.WorldPosition
+                        if isinstance(wp, np.ndarray) and wp.size == Config.NUM_JOINTS:
+                            for j in range(Config.NUM_JOINTS):
+                                joint = wp[j]
+                                skeleton_data[i, j, 0] = joint.X
+                                skeleton_data[i, j, 1] = joint.Y
+                                skeleton_data[i, j, 2] = joint.Z
+
+            # Pose: Relative to HipCenter (Index 0)
+            hip_center = skeleton_data[:, 0:1, :]
+            pose = skeleton_data - hip_center
+            pose = pose.reshape(num_frames, -1)  # Flatten to (T, 60)
+            pose = torch.tensor(pose, dtype=torch.float32)
+
+            # Velocity: Delta Pose
+            velocity = torch.zeros_like(pose)
+            velocity[1:] = pose[1:] - pose[:-1]
+
+            # --- Label Processing ---
+            labels = torch.zeros(num_frames, dtype=torch.long)
+
+            # Extract labels from metadata or MAT
+            # The metadata CSV has a 'labels' string, but that doesn't give start/end frames.
+            # We must use the MAT file 'Labels' struct for precise frame-wise annotation.
+            if hasattr(video_struct, "Labels"):
+                lbls = video_struct.Labels
+                if not isinstance(lbls, np.ndarray):
+                    lbls = np.array([lbls]) if lbls is not None else np.array([])
+
+                if lbls.size > 0:
+                    # If single element, wrap in list
+                    if lbls.size == 1 and not isinstance(lbls, np.ndarray):
+                        lbls = [lbls]
+                    elif lbls.size == 1:
+                        lbls = [lbls.item()]
+
+                    for l in lbls:
+                        if (
+                            hasattr(l, "Name")
+                            and hasattr(l, "Begin")
+                            and hasattr(l, "End")
+                        ):
+                            name = l.Name
+                            if name in Config.LABEL_MAP:
+                                lid = Config.LABEL_MAP[name]
+                                start = max(0, int(l.Begin) - 1)  # 1-based to 0-based
+                                end = min(num_frames, int(l.End))
+                                labels[start:end] = lid
+
+            # Boundaries: 1 where label changes
+            boundaries = torch.zeros(num_frames, dtype=torch.float32)
+            # Change from t-1 to t
+            diff = labels[1:] != labels[:-1]
+            boundaries[1:] = diff.float()
+            # Also mark start of first gesture if it's not background
+            if labels[0] != 0:
+                boundaries[0] = 1.0
+
+        except Exception as e:
+            print(f"Error processing MAT {mat_path}: {e}")
+            # Return dummy data to avoid crash, will likely be filtered out or cause poor performance
+            # Ideally this shouldn't happen with valid data
+            num_frames = 100
+            pose = torch.zeros((num_frames, Config.POSE_INPUT_DIM))
+            velocity = torch.zeros((num_frames, Config.VELOCITY_INPUT_DIM))
+            labels = torch.zeros(num_frames, dtype=torch.long)
+            boundaries = torch.zeros(num_frames, dtype=torch.float32)
+
+        # 2. Process Audio
+        audio_path = (
+            os.path.join(Config.INPUT_DIR, row["audio_path"])
+            if pd.notna(row["audio_path"])
+            else None
+        )
+        audio_features = torch.zeros((num_frames, Config.AUDIO_INPUT_DIM))
+
+        if audio_path and os.path.exists(audio_path):
+            try:
+                waveform, sample_rate = torchaudio.load(audio_path)
+                # Resample if needed
+                if sample_rate != Config.AUDIO_SAMPLE_RATE:
+                    resampler = T.Resample(sample_rate, Config.AUDIO_SAMPLE_RATE)
+                    waveform = resampler(waveform)
+
+                # Convert to mono
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+                # Extract MFCC
+                mfcc = self.mfcc_transform(waveform)  # (1, n_mfcc, time)
+                mfcc = mfcc.squeeze(0).transpose(0, 1)  # (time, n_mfcc)
+
+                # Align to video frames
+                # Interpolate feature sequence to match num_frames
+                if mfcc.shape[0] > 0:
+                    mfcc = mfcc.unsqueeze(0).transpose(1, 2)  # (1, n_mfcc, time)
+                    mfcc = F.interpolate(
+                        mfcc, size=num_frames, mode="linear", align_corners=False
+                    )
+                    mfcc = mfcc.transpose(1, 2).squeeze(0)  # (num_frames, n_mfcc)
+                    audio_features = mfcc
+            except Exception as e:
+                print(f"Error processing Audio {audio_path}: {e}")
+
+        # Ensure lengths match exactly
+        min_len = min(pose.shape[0], audio_features.shape[0])
+        # If mismatch is small, truncate/pad. Here we just truncate to min for safety,
+        # but ideally we interpolate audio to pose length.
+        # Since we interpolated audio above, they should match, but let's be safe.
+        if audio_features.shape[0] != num_frames:
+            # Re-interpolate if length mismatch persists (e.g. rounding errors)
+            tmp = audio_features.unsqueeze(0).transpose(1, 2)
+            tmp = F.interpolate(
+                tmp, size=num_frames, mode="linear", align_corners=False
+            )
+            audio_features = tmp.transpose(1, 2).squeeze(0)
+
+        return pose, velocity, audio_features, labels, boundaries
+
+    def _augment_data(self, pose, velocity, audio):
+        """Applies random augmentation."""
+        T, D_pose = pose.shape
+        T_aud, D_aud = audio.shape
+
+        # 1. Gaussian Noise (Pose only)
+        if np.random.rand() < 0.5:
+            noise = torch.randn_like(pose) * 0.01
+            pose = pose + noise
+
+        # 2. Channel Masking
+        if np.random.rand() < 0.3:
+            # Mask Pose/Vel channels
+            mask_idx = np.random.choice(D_pose, size=int(D_pose * 0.1), replace=False)
+            pose[:, mask_idx] = 0
+            velocity[:, mask_idx] = 0
+
+            # Mask Audio channels
+            mask_idx_aud = np.random.choice(D_aud, size=int(D_aud * 0.1), replace=False)
+            audio[:, mask_idx_aud] = 0
+
+        # 3. Temporal Cutout
+        if np.random.rand() < 0.3:
+            # Mask a contiguous chunk
+            mask_len = np.random.randint(5, 15)
+            if T > mask_len:
+                start = np.random.randint(0, T - mask_len)
+                pose[start : start + mask_len, :] = 0
+                velocity[start : start + mask_len, :] = 0
+                audio[start : start + mask_len, :] = 0
+
+        return pose, velocity, audio
+
+
+def collate_fn(batch):
+    """
+    Pads sequences to the longest in the batch.
+    Returns:
+        pose: (B, T_max, D_p)
+        velocity: (B, T_max, D_v)
+        audio: (B, T_max, D_a)
+        labels: (B, T_max)
+        boundaries: (B, T_max)
+        lengths: (B,)
+    """
+    poses, vels, audios, labels, boundaries = zip(*batch)
+
+    lengths = torch.tensor([p.shape[0] for p in poses])
+
+    pose_padded = pad_sequence(poses, batch_first=True, padding_value=0)
+    vel_padded = pad_sequence(vels, batch_first=True, padding_value=0)
+    audio_padded = pad_sequence(audios, batch_first=True, padding_value=0)
+    labels_padded = pad_sequence(
+        labels, batch_first=True, padding_value=0
+    )  # 0 is background
+    boundaries_padded = pad_sequence(boundaries, batch_first=True, padding_value=0)
+
+    return (
+        pose_padded,
+        vel_padded,
+        audio_padded,
+        labels_padded,
+        boundaries_padded,
+        lengths,
+    )
+
+
+def compute_global_stats(metadata_df):
+    """
+    Computes global mean and std for Pose, Velocity, and Audio streams.
+    Uses the cache if stats.npz exists, otherwise computes from scratch.
+    """
+    stats_path = os.path.join(Config.WORKING_DIR, "stats.npz")
+
+    if os.path.exists(stats_path):
+        print("Loading global stats from cache...")
+        loaded = np.load(stats_path)
+        return {k: torch.tensor(v) for k, v in loaded.items()}
+
+    print("Computing global stats from training data...")
+    dataset = GestureDataset(
+        metadata_df, mode="test", stats=None, load_cached_data=True
+    )
+    loader = DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn
+    )
+
+    # Accumulators
+    pose_sum = torch.zeros(Config.POSE_INPUT_DIM)
+    pose_sq_sum = torch.zeros(Config.POSE_INPUT_DIM)
+    vel_sum = torch.zeros(Config.VELOCITY_INPUT_DIM)
+    vel_sq_sum = torch.zeros(Config.VELOCITY_INPUT_DIM)
+    audio_sum = torch.zeros(Config.AUDIO_INPUT_DIM)
+    audio_sq_sum = torch.zeros(Config.AUDIO_INPUT_DIM)
+
+    total_frames = 0
+
+    for pose, vel, audio, _, _, lengths in loader:
+        # Unpad
+        L = lengths[0]
+        p = pose[0, :L]
+        v = vel[0, :L]
+        a = audio[0, :L]
+
+        pose_sum += p.sum(dim=0)
+        pose_sq_sum += (p**2).sum(dim=0)
+
+        vel_sum += v.sum(dim=0)
+        vel_sq_sum += (v**2).sum(dim=0)
+
+        audio_sum += a.sum(dim=0)
+        audio_sq_sum += (a**2).sum(dim=0)
+
+        total_frames += L
+
+    def get_stats(s, sq, N):
+        mean = s / N
+        var = (sq / N) - (mean**2)
+        std = torch.sqrt(torch.clamp(var, min=1e-6))
+        return mean, std
+
+    pose_mean, pose_std = get_stats(pose_sum, pose_sq_sum, total_frames)
+    vel_mean, vel_std = get_stats(vel_sum, vel_sq_sum, total_frames)
+    audio_mean, audio_std = get_stats(audio_sum, audio_sq_sum, total_frames)
+
+    stats = {
+        "pose_mean": pose_mean,
+        "pose_std": pose_std,
+        "vel_mean": vel_mean,
+        "vel_std": vel_std,
+        "audio_mean": audio_mean,
+        "audio_std": audio_std,
+    }
+=======
+        # Audio transformation
+        # Cite solution_lesson_node_00054: Match hop_length to frame rate (16000Hz / 20FPS = 800)
+        self.mfcc_transform = T.MFCC(
+            sample_rate=Config.AUDIO_SAMPLE_RATE,
+            n_mfcc=Config.AUDIO_INPUT_DIM,
+            melkwargs={"n_fft": 400, "hop_length": 800, "n_mels": 23, "center": False},
+        )
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        sample_id = row["sample_id"]
+
+        # Try to load from cache
+        cache_path = os.path.join(Config.CACHE_DIR, f"{sample_id}.npz")
+
+        data = None
+        if self.load_cached_data and os.path.exists(cache_path):
+            try:
+                data = np.load(cache_path)
+                pose = torch.from_numpy(data["pose"]).float()
+                audio = torch.from_numpy(data["audio"]).float()
+                labels = torch.from_numpy(data["labels"]).long()
+            except Exception as e:
+                # If cache is corrupted, fall back to processing
+                print(f"Error loading cache for {sample_id}: {e}")
+                data = None
+
+        if data is None:
+            # Process from raw files
+            # Cite solution_lesson_node_00053: Removed velocity and boundaries
+            pose, audio, labels = self._process_raw_data(row)
+
+            # Save to cache
+            if self.load_cached_data:
+                np.savez_compressed(
+                    cache_path,
+                    pose=pose.numpy(),
+                    audio=audio.numpy(),
+                    labels=labels.numpy(),
+                )
+
+        # Apply Normalization
+        if self.stats:
+            pose = (pose - self.stats["pose_mean"]) / (self.stats["pose_std"] + 1e-6)
+            audio = (audio - self.stats["audio_mean"]) / (
+                self.stats["audio_std"] + 1e-6
+            )
+
+        # Apply Augmentation (only in train mode)
+        if self.mode == "train":
+            pose, audio = self._augment_data(pose, audio)
+
+        return pose, audio, labels
+
+    def _process_raw_data(self, row):
+        """Reads .mat and .wav files and extracts features."""
+        # 1. Load MAT file for Skeleton and Labels
+        mat_path = os.path.join(Config.INPUT_DIR, row["data_path"])
+        try:
+            mat = scipy.io.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+            video_struct = mat["Video"]
+            num_frames = video_struct.NumFrames
+
+            # --- Skeleton Processing ---
+            # Extract frames. Structure: Video.Frames[i].Skeleton.WorldPosition
+            # We assume single user (UserIndex 1) or take the first valid skeleton
+
+            # Pre-allocate
+            skeleton_data = np.zeros(
+                (num_frames, Config.NUM_JOINTS, 3), dtype=np.float32
+            )
+
+            frames = video_struct.Frames
+            # Handle case where Frames is a single object or empty
+            if not isinstance(frames, np.ndarray):
+                frames = np.array([frames]) if frames is not None else np.array([])
+
+            actual_frames = min(len(frames), num_frames)
+
+            for i in range(actual_frames):
+                frame_obj = frames[i]
+                if hasattr(frame_obj, "Skeleton"):
+                    skel = frame_obj.Skeleton
+                    # If multiple skeletons, pick the first one (usually the user)
+                    if isinstance(skel, np.ndarray) and skel.size > 0:
+                        skel = skel[0]
+
+                    if hasattr(skel, "WorldPosition"):
+                        # WorldPosition is usually 20x1 struct array or similar
+                        # We need to extract X, Y, Z for each joint
+                        # Assuming JointsType order is fixed as per prompt
+
+                        # Check if WorldPosition is an object or array
+                        wp = skel.WorldPosition
+                        if isinstance(wp, np.ndarray) and wp.size == Config.NUM_JOINTS:
+                            for j in range(Config.NUM_JOINTS):
+                                joint = wp[j]
+                                skeleton_data[i, j, 0] = joint.X
+                                skeleton_data[i, j, 1] = joint.Y
+                                skeleton_data[i, j, 2] = joint.Z
+
+            # Pose: Relative to HipCenter (Index 0)
+            hip_center = skeleton_data[:, 0:1, :]
+            pose = skeleton_data - hip_center
+            pose = pose.reshape(num_frames, -1)  # Flatten to (T, 60)
+            pose = torch.tensor(pose, dtype=torch.float32)
+
+            # Cite solution_lesson_node_00053: Removed explicit velocity calculation
+
+            # --- Label Processing ---
+            labels = torch.zeros(num_frames, dtype=torch.long)
+
+            # Extract labels from metadata or MAT
+            # The metadata CSV has a 'labels' string, but that doesn't give start/end frames.
+            # We must use the MAT file 'Labels' struct for precise frame-wise annotation.
+            if hasattr(video_struct, "Labels"):
+                lbls = video_struct.Labels
+                if not isinstance(lbls, np.ndarray):
+                    lbls = np.array([lbls]) if lbls is not None else np.array([])
+
+                if lbls.size > 0:
+                    # If single element, wrap in list
+                    if lbls.size == 1 and not isinstance(lbls, np.ndarray):
+                        lbls = [lbls]
+                    elif lbls.size == 1:
+                        lbls = [lbls.item()]
+
+                    for l in lbls:
+                        if (
+                            hasattr(l, "Name")
+                            and hasattr(l, "Begin")
+                            and hasattr(l, "End")
+                        ):
+                            name = l.Name
+                            if name in Config.LABEL_MAP:
+                                lid = Config.LABEL_MAP[name]
+                                start = max(0, int(l.Begin) - 1)  # 1-based to 0-based
+                                end = min(num_frames, int(l.End))
+                                labels[start:end] = lid
+
+        except Exception as e:
+            print(f"Error processing MAT {mat_path}: {e}")
+            # Return dummy data to avoid crash, will likely be filtered out or cause poor performance
+            # Ideally this shouldn't happen with valid data
+            num_frames = 100
+            pose = torch.zeros((num_frames, Config.POSE_INPUT_DIM))
+            labels = torch.zeros(num_frames, dtype=torch.long)
+
+        # 2. Process Audio
+        audio_path = (
+            os.path.join(Config.INPUT_DIR, row["audio_path"])
+            if pd.notna(row["audio_path"])
+            else None
+        )
+        audio_features = torch.zeros((num_frames, Config.AUDIO_INPUT_DIM))
+
+        if audio_path and os.path.exists(audio_path):
+            try:
+                waveform, sample_rate = torchaudio.load(audio_path)
+                # Resample if needed
+                if sample_rate != Config.AUDIO_SAMPLE_RATE:
+                    resampler = T.Resample(sample_rate, Config.AUDIO_SAMPLE_RATE)
+                    waveform = resampler(waveform)
+
+                # Convert to mono
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+                # Extract MFCC
+                mfcc = self.mfcc_transform(waveform)  # (1, n_mfcc, time)
+                mfcc = mfcc.squeeze(0).transpose(0, 1)  # (time, n_mfcc)
+
+                # Cite solution_lesson_node_00054: Removed interpolation, relying on hop_length alignment
+                audio_features = mfcc
+            except Exception as e:
+                print(f"Error processing Audio {audio_path}: {e}")
+
+        # Ensure lengths match exactly
+        min_len = min(pose.shape[0], audio_features.shape[0])
+        # Truncate to min length to handle rounding errors from audio extraction
+        pose = pose[:min_len]
+        labels = labels[:min_len]
+        audio_features = audio_features[:min_len]
+        
+        # If audio is shorter than video (rare with center=False/True logic but possible), pad
+        if audio_features.shape[0] < pose.shape[0]:
+             pad_len = pose.shape[0] - audio_features.shape[0]
+             padding = torch.zeros((pad_len, Config.AUDIO_INPUT_DIM))
+             audio_features = torch.cat([audio_features, padding], dim=0)
+
+        return pose, audio_features, labels
+
+    def _augment_data(self, pose, audio):
+        """Applies random augmentation."""
+        T, D_pose = pose.shape
+        T_aud, D_aud = audio.shape
+
+        # 1. Gaussian Noise (Pose only)
+        if np.random.rand() < 0.5:
+            noise = torch.randn_like(pose) * 0.01
+            pose = pose + noise
+
+        # 2. Channel Masking
+        if np.random.rand() < 0.3:
+            # Mask Pose channels
+            mask_idx = np.random.choice(D_pose, size=int(D_pose * 0.1), replace=False)
+            pose[:, mask_idx] = 0
+
+            # Mask Audio channels
+            mask_idx_aud = np.random.choice(D_aud, size=int(D_aud * 0.1), replace=False)
+            audio[:, mask_idx_aud] = 0
+
+        # 3. Temporal Cutout
+        if np.random.rand() < 0.3:
+            # Mask a contiguous chunk
+            mask_len = np.random.randint(5, 15)
+            if T > mask_len:
+                start = np.random.randint(0, T - mask_len)
+                pose[start : start + mask_len, :] = 0
+                audio[start : start + mask_len, :] = 0
+
+        return pose, audio
+
+
+def collate_fn(batch):
+    """
+    Pads sequences to the longest in the batch.
+    Returns:
+        pose: (B, T_max, D_p)
+        audio: (B, T_max, D_a)
+        labels: (B, T_max)
+        lengths: (B,)
+    """
+    poses, audios, labels = zip(*batch)
+
+    lengths = torch.tensor([p.shape[0] for p in poses])
+
+    pose_padded = pad_sequence(poses, batch_first=True, padding_value=0)
+    audio_padded = pad_sequence(audios, batch_first=True, padding_value=0)
+    labels_padded = pad_sequence(
+        labels, batch_first=True, padding_value=0
+    )  # 0 is background
+
+    return (
+        pose_padded,
+        audio_padded,
+        labels_padded,
+        lengths,
+    )
+
+
+def compute_global_stats(metadata_df):
+    """
+    Computes global mean and std for Pose and Audio streams.
+    Uses the cache if stats.npz exists, otherwise computes from scratch.
+    """
+    stats_path = os.path.join(Config.WORKING_DIR, "stats.npz")
+
+    if os.path.exists(stats_path):
+        print("Loading global stats from cache...")
+        loaded = np.load(stats_path)
+        return {k: torch.tensor(v) for k, v in loaded.items()}
+
+    print("Computing global stats from training data...")
+    dataset = GestureDataset(
+        metadata_df, mode="test", stats=None, load_cached_data=True
+    )
+    loader = DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn
+    )
+
+    # Accumulators
+    pose_sum = torch.zeros(Config.POSE_INPUT_DIM)
+    pose_sq_sum = torch.zeros(Config.POSE_INPUT_DIM)
+    audio_sum = torch.zeros(Config.AUDIO_INPUT_DIM)
+    audio_sq_sum = torch.zeros(Config.AUDIO_INPUT_DIM)
+
+    total_frames = 0
+
+    for pose, audio, _, lengths in loader:
+        # Unpad
+        L = lengths[0]
+        p = pose[0, :L]
+        a = audio[0, :L]
+
+        pose_sum += p.sum(dim=0)
+        pose_sq_sum += (p**2).sum(dim=0)
+
+        audio_sum += a.sum(dim=0)
+        audio_sq_sum += (a**2).sum(dim=0)
+
+        total_frames += L
+
+    def get_stats(s, sq, N):
+        mean = s / N
+        var = (sq / N) - (mean**2)
+        std = torch.sqrt(torch.clamp(var, min=1e-6))
+        return mean, std
+
+    pose_mean, pose_std = get_stats(pose_sum, pose_sq_sum, total_frames)
+    audio_mean, audio_std = get_stats(audio_sum, audio_sq_sum, total_frames)
+
+    stats = {
+        "pose_mean": pose_mean,
+        "pose_std": pose_std,
+        "audio_mean": audio_mean,
+        "audio_std": audio_std,
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class KAMTRN(nn.Module):
+    """
+    Kinematic-Aware Multi-Task Residual Network.
+    Tri-Stream Input -> Gated Fusion -> Residual BiGRU -> Multi-Task Heads.
+    """
+
+    def __init__(self):
+        super(KAMTRN, self).__init__()
+
+        # 1. Tri-Stream Encoders
+        # We project all streams to the same embedding dimension initially.
+        # Let's use Config.HIDDEN_DIM as the embedding size for simplicity and capacity.
+        embed_dim = Config.HIDDEN_DIM
+
+        self.pose_encoder = StreamEncoder(
+            Config.POSE_INPUT_DIM,
+            embed_dim,
+            Config.CNN_KERNEL_SIZE,
+            Config.CNN_PADDING,
+            Config.DROPOUT,
+        )
+
+        self.vel_encoder = StreamEncoder(
+            Config.VELOCITY_INPUT_DIM,
+            embed_dim,
+            Config.CNN_KERNEL_SIZE,
+            Config.CNN_PADDING,
+            Config.DROPOUT,
+        )
+
+        self.audio_encoder = StreamEncoder(
+            Config.AUDIO_INPUT_DIM,
+            embed_dim,
+            Config.CNN_KERNEL_SIZE,
+            Config.CNN_PADDING,
+            Config.DROPOUT,
+        )
+
+        # 2. Gated Fusion
+        fused_dim = embed_dim * 3
+        self.layer_norm = nn.LayerNorm(fused_dim)
+        self.context_gating = ContextGating(fused_dim)
+
+        # 3. Residual Recurrent Backbone
+        self.backbone = ResidualBiGRU(
+            input_dim=fused_dim, hidden_dim=Config.HIDDEN_DIM, dropout=Config.DROPOUT
+        )
+
+        # Backbone output dimension (Bidirectional)
+        rnn_out_dim = Config.HIDDEN_DIM * 2
+
+        # 4. Multi-Task Heads
+
+        # Classification Head
+        self.class_head = nn.Sequential(
+            nn.Linear(rnn_out_dim, rnn_out_dim),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(rnn_out_dim, Config.NUM_CLASSES),
+        )
+
+        # Boundary Head (Auxiliary)
+        self.boundary_head = nn.Sequential(
+            nn.Linear(rnn_out_dim, rnn_out_dim // 2),
+            nn.ReLU(),
+            nn.Linear(rnn_out_dim // 2, 1),
+            # Sigmoid is applied in loss function (BCEWithLogitsLoss) usually,
+            # but for inference/probability we might need it.
+            # We'll output logits here.
+        )
+
+    def forward(self, pose, velocity, audio):
+        """
+        Args:
+            pose: (B, T, D_pose)
+            velocity: (B, T, D_vel)
+            audio: (B, T, D_audio)
+        Returns:
+            class_logits: (B, T, NumClasses)
+            boundary_logits: (B, T, 1)
+        """
+        # 1. Encode Streams
+        p_emb = self.pose_encoder(pose)  # (B, T, H)
+        v_emb = self.vel_encoder(velocity)  # (B, T, H)
+        a_emb = self.audio_encoder(audio)  # (B, T, H)
+
+        # 2. Fuse
+        fused = torch.cat([p_emb, v_emb, a_emb], dim=2)  # (B, T, 3H)
+        fused = self.layer_norm(fused)
+        fused = self.context_gating(fused)
+
+        # 3. Backbone
+        features = self.backbone(fused)  # (B, T, 2H)
+
+        # 4. Heads
+        class_logits = self.class_head(features)
+        boundary_logits = self.boundary_head(features)
+
+        return class_logits, boundary_logits
+=======
+class CGRNet(nn.Module):
+    """
+    Context-Gated Residual Network (CGRNet).
+    Dual-Stream Input (Pose, Audio) -> Gated Fusion -> Residual BiGRU -> Classification Head.
+    Cite solution_lesson_node_00036
+    """
+
+    def __init__(self):
+        super(CGRNet, self).__init__()
+
+        # 1. Dual-Stream Encoders
+        # Cite solution_lesson_node_00053: Removed Velocity Stream
+        embed_dim = Config.HIDDEN_DIM
+
+        self.pose_encoder = StreamEncoder(
+            Config.POSE_INPUT_DIM,
+            embed_dim,
+            Config.CNN_KERNEL_SIZE,
+            Config.CNN_PADDING,
+            Config.DROPOUT,
+        )
+
+        self.audio_encoder = StreamEncoder(
+            Config.AUDIO_INPUT_DIM,
+            embed_dim,
+            Config.CNN_KERNEL_SIZE,
+            Config.CNN_PADDING,
+            Config.DROPOUT,
+        )
+
+        # 2. Gated Fusion
+        fused_dim = embed_dim * 2
+        self.layer_norm = nn.LayerNorm(fused_dim)
+        self.context_gating = ContextGating(fused_dim)
+
+        # 3. Residual Recurrent Backbone
+        self.backbone = ResidualBiGRU(
+            input_dim=fused_dim, hidden_dim=Config.HIDDEN_DIM, dropout=Config.DROPOUT
+        )
+
+        # Backbone output dimension (Bidirectional)
+        rnn_out_dim = Config.HIDDEN_DIM * 2
+
+        # 4. Classification Head
+        self.class_head = nn.Sequential(
+            nn.Linear(rnn_out_dim, rnn_out_dim),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(rnn_out_dim, Config.NUM_CLASSES),
+        )
+
+    def forward(self, pose, audio):
+        """
+        Args:
+            pose: (B, T, D_pose)
+            audio: (B, T, D_audio)
+        Returns:
+            class_logits: (B, T, NumClasses)
+        """
+        # 1. Encode Streams
+        p_emb = self.pose_encoder(pose)  # (B, T, H)
+        a_emb = self.audio_encoder(audio)  # (B, T, H)
+
+        # 2. Fuse
+        fused = torch.cat([p_emb, a_emb], dim=2)  # (B, T, 2H)
+        fused = self.layer_norm(fused)
+        fused = self.context_gating(fused)
+
+        # 3. Backbone
+        features = self.backbone(fused)  # (B, T, 2H)
+
+        # 4. Heads
+        class_logits = self.class_head(features)
+
+        return class_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import KAMTRN
+from library.data_loader import get_dataloaders
+
+
+class Trainer:
+    def __init__(self):
+        self.device = Config.get_device()
+        print(f"Using device: {self.device}")
+
+        # Initialize Model
+        self.model = KAMTRN().to(self.device)
+
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=Config.NUM_EPOCHS, eta_min=1e-6
+        )
+
+        # Loss Functions
+        # Class weights: Downweight background (index 0)
+        class_weights = torch.ones(Config.NUM_CLASSES).to(self.device)
+        class_weights[0] = Config.BACKGROUND_WEIGHT
+
+        self.criterion_cls = nn.CrossEntropyLoss(
+            weight=class_weights, label_smoothing=Config.LABEL_SMOOTHING
+        )
+        self.criterion_bnd = nn.BCEWithLogitsLoss()
+
+        # Early Stopping State
+        self.best_score = float("inf")
+        self.patience_counter = 0
+
+    def train_epoch(self, loader):
+        self.model.train()
+        total_loss = 0.0
+
+        for batch in loader:
+            # Unpack batch
+            pose, velocity, audio, labels, boundaries, lengths = batch
+
+            # Move to device
+            pose = pose.to(self.device)
+            velocity = velocity.to(self.device)
+            audio = audio.to(self.device)
+            labels = labels.to(self.device)
+            boundaries = boundaries.to(self.device)
+
+            # Forward Pass
+            class_logits, boundary_logits = self.model(pose, velocity, audio)
+
+            # Reshape for Loss Calculation
+            # Flatten batch and time dimensions
+            # class_logits: (B, T, C) -> (B*T, C)
+            # labels: (B, T) -> (B*T)
+            B, T, C = class_logits.shape
+            flat_class_logits = class_logits.reshape(-1, C)
+            flat_labels = labels.reshape(-1)
+
+            # boundary_logits: (B, T, 1) -> (B, T)
+            flat_boundary_logits = boundary_logits.squeeze(-1)
+
+            # Compute Losses
+            loss_cls = self.criterion_cls(flat_class_logits, flat_labels)
+            loss_bnd = self.criterion_bnd(flat_boundary_logits, boundaries)
+
+            # Multi-Task Combination
+            loss = loss_cls + Config.BOUNDARY_LOSS_WEIGHT * loss_bnd
+
+            # Optimization Step
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), Config.GRADIENT_CLIP_VAL
+            )
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / len(loader)
+
+    def validate(self, loader):
+        self.model.eval()
+        total_loss = 0.0
+
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in loader:
+                pose, velocity, audio, labels, boundaries, lengths = batch
+
+                pose = pose.to(self.device)
+                velocity = velocity.to(self.device)
+                audio = audio.to(self.device)
+                labels = labels.to(self.device)
+                boundaries = boundaries.to(self.device)
+
+                # Forward
+                class_logits, boundary_logits = self.model(pose, velocity, audio)
+
+                # Loss Calculation (for monitoring)
+                B, T, C = class_logits.shape
+                loss_cls = self.criterion_cls(
+                    class_logits.reshape(-1, C), labels.reshape(-1)
+                )
+                loss_bnd = self.criterion_bnd(boundary_logits.squeeze(-1), boundaries)
+                loss = loss_cls + Config.BOUNDARY_LOSS_WEIGHT * loss_bnd
+                total_loss += loss.item()
+
+                # Decoding for Metric
+                probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+                labels_np = labels.cpu().numpy()
+
+                # Process each sequence in the batch
+                for i in range(B):
+                    length = lengths[i]
+
+                    # Slice valid sequence (ignore padding)
+                    valid_probs = probs[i, :length, :]
+                    valid_targets = labels_np[i, :length]
+
+                    # Decode Predictions
+                    pred_seq = rle_decode(
+                        valid_probs,
+                        min_length=Config.MIN_SEGMENT_LENGTH,
+                        background_class=0,
+                    )
+                    all_preds.append(pred_seq)
+
+                    # Decode Targets (Ground Truth)
+                    # Use min_length=1 to capture all annotated GT gestures
+                    target_seq = rle_decode(
+                        valid_targets, min_length=1, background_class=0
+                    )
+                    all_targets.append(target_seq)
+
+        # Compute Levenshtein Error Rate
+        score = compute_levenshtein_ratio(all_preds, all_targets)
+
+        return score, total_loss / len(loader)
+=======
+from library.model import CGRNet
+from library.data_loader import get_dataloaders
+
+
+class Trainer:
+    def __init__(self):
+        self.device = Config.get_device()
+        print(f"Using device: {self.device}")
+
+        # Initialize Model
+        self.model = CGRNet().to(self.device)
+
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=Config.NUM_EPOCHS, eta_min=1e-6
+        )
+
+        # Loss Functions
+        # Class weights: Downweight background (index 0)
+        class_weights = torch.ones(Config.NUM_CLASSES).to(self.device)
+        class_weights[0] = Config.BACKGROUND_WEIGHT
+
+        self.criterion_cls = nn.CrossEntropyLoss(
+            weight=class_weights, label_smoothing=Config.LABEL_SMOOTHING
+        )
+
+        # Early Stopping State
+        self.best_score = float("inf")
+        self.patience_counter = 0
+
+    def train_epoch(self, loader):
+        self.model.train()
+        total_loss = 0.0
+
+        for batch in loader:
+            # Unpack batch
+            pose, audio, labels, lengths = batch
+
+            # Move to device
+            pose = pose.to(self.device)
+            audio = audio.to(self.device)
+            labels = labels.to(self.device)
+
+            # Forward Pass
+            class_logits = self.model(pose, audio)
+
+            # Reshape for Loss Calculation
+            # Flatten batch and time dimensions
+            # class_logits: (B, T, C) -> (B*T, C)
+            # labels: (B, T) -> (B*T)
+            B, T, C = class_logits.shape
+            flat_class_logits = class_logits.reshape(-1, C)
+            flat_labels = labels.reshape(-1)
+
+            # Compute Losses
+            loss = self.criterion_cls(flat_class_logits, flat_labels)
+
+            # Optimization Step
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), Config.GRADIENT_CLIP_VAL
+            )
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / len(loader)
+
+    def validate(self, loader):
+        self.model.eval()
+        total_loss = 0.0
+
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in loader:
+                pose, audio, labels, lengths = batch
+
+                pose = pose.to(self.device)
+                audio = audio.to(self.device)
+                labels = labels.to(self.device)
+
+                # Forward
+                class_logits = self.model(pose, audio)
+
+                # Loss Calculation (for monitoring)
+                B, T, C = class_logits.shape
+                loss = self.criterion_cls(
+                    class_logits.reshape(-1, C), labels.reshape(-1)
+                )
+                total_loss += loss.item()
+
+                # Decoding for Metric
+                probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+                labels_np = labels.cpu().numpy()
+
+                # Process each sequence in the batch
+                for i in range(B):
+                    length = lengths[i]
+
+                    # Slice valid sequence (ignore padding)
+                    valid_probs = probs[i, :length, :]
+                    valid_targets = labels_np[i, :length]
+
+                    # Decode Predictions
+                    pred_seq = rle_decode(
+                        valid_probs,
+                        min_length=Config.MIN_SEGMENT_LENGTH,
+                        background_class=0,
+                    )
+                    all_preds.append(pred_seq)
+
+                    # Decode Targets (Ground Truth)
+                    # Use min_length=1 to capture all annotated GT gestures
+                    target_seq = rle_decode(
+                        valid_targets, min_length=1, background_class=0
+                    )
+                    all_targets.append(target_seq)
+
+        # Compute Levenshtein Error Rate
+        score = compute_levenshtein_ratio(all_preds, all_targets)
+
+        return score, total_loss / len(loader)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def predict(self):
+        print("Generating predictions for test set...")
+        _, _, test_loader = get_dataloaders()
+
+        # Load Best Model
+        best_model_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+        if not os.path.exists(best_model_path):
+            print(
+                "No checkpoint found! Running inference with untrained model (not recommended)."
+            )
+        else:
+            self.model.load_state_dict(
+                torch.load(best_model_path, map_location=self.device)
+            )
+            print("Loaded best model checkpoint.")
+
+        self.model.eval()
+        predictions = []
+
+        # Get sample IDs from test metadata to ensure order
+        test_df = pd.read_csv(Config.TEST_CSV)
+        sample_ids = test_df["sample_id"].tolist()
+
+        idx_counter = 0
+
+        with torch.no_grad():
+            for batch in test_loader:
+                pose, velocity, audio, _, _, lengths = batch
+
+                pose = pose.to(self.device)
+                velocity = velocity.to(self.device)
+                audio = audio.to(self.device)
+
+                class_logits, _ = self.model(pose, velocity, audio)
+                probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+
+                # Batch size is 1 for test loader
+                length = lengths[0]
+                valid_probs = probs[0, :length, :]
+
+                # Decode
+                pred_seq = rle_decode(
+                    valid_probs,
+                    min_length=Config.MIN_SEGMENT_LENGTH,
+                    background_class=0,
+                )
+
+                # Format string: "Label1,Label2,..."
+                pred_str = ",".join(map(str, pred_seq))
+
+                # Store with ID
+                current_id = sample_ids[idx_counter]
+                predictions.append((current_id, pred_str))
+                idx_counter += 1
+=======
+    def predict(self):
+        print("Generating predictions for test set...")
+        _, _, test_loader = get_dataloaders()
+
+        # Load Best Model
+        best_model_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+        if not os.path.exists(best_model_path):
+            print(
+                "No checkpoint found! Running inference with untrained model (not recommended)."
+            )
+        else:
+            self.model.load_state_dict(
+                torch.load(best_model_path, map_location=self.device)
+            )
+            print("Loaded best model checkpoint.")
+
+        self.model.eval()
+        predictions = []
+
+        # Get sample IDs from test metadata to ensure order
+        test_df = pd.read_csv(Config.TEST_CSV)
+        sample_ids = test_df["sample_id"].tolist()
+
+        idx_counter = 0
+
+        with torch.no_grad():
+            for batch in test_loader:
+                pose, audio, labels, lengths = batch
+
+                pose = pose.to(self.device)
+                audio = audio.to(self.device)
+
+                class_logits = self.model(pose, audio)
+                probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+
+                # Batch size is 1 for test loader
+                length = lengths[0]
+                valid_probs = probs[0, :length, :]
+
+                # Decode
+                pred_seq = rle_decode(
+                    valid_probs,
+                    min_length=Config.MIN_SEGMENT_LENGTH,
+                    background_class=0,
+                )
+
+                # Format string: "Label1,Label2,..."
+                pred_str = ",".join(map(str, pred_seq))
+
+                # Store with ID
+                current_id = sample_ids[idx_counter]
+                predictions.append((current_id, pred_str))
+                idx_counter += 1
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration for Fast Baseline
+    # The dataset is small (~300 samples), so we use the full dataset but reduce epochs
+    # to ensure the script completes quickly while still learning.
+    Config.NUM_EPOCHS = 10
+
+    # Set random seed for reproducibility
+    set_seed(Config.SEED)
+=======
+def main():
+    # 1. Configuration
+    # Cite solution_lesson_node_00040: Increased epochs for convergence
+    Config.NUM_EPOCHS = 60
+
+    # Set random seed for reproducibility
+    set_seed(Config.SEED)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Metrics for failure analysis
+    sample_errors = []
+    sample_lengths = []
+    sample_velocities = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            pose, velocity, audio, labels, boundaries, lengths = batch
+
+            # Move to device
+            pose = pose.to(trainer.device)
+            velocity = velocity.to(trainer.device)
+            audio = audio.to(trainer.device)
+            labels = labels.to(trainer.device)
+
+            # Forward pass
+            class_logits, _ = trainer.model(pose, velocity, audio)
+
+            # Probabilities
+            probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+            labels_np = labels.cpu().numpy()
+
+            # Process batch
+            B = class_logits.shape[0]
+            for i in range(B):
+                length = lengths[i].item()
+
+                # Slice valid sequence
+                valid_probs = probs[i, :length, :]
+                valid_targets = labels_np[i, :length]
+
+                # Decode
+                pred_seq = rle_decode(
+                    valid_probs,
+                    min_length=Config.MIN_SEGMENT_LENGTH,
+                    background_class=0,
+                )
+                target_seq = rle_decode(valid_targets, min_length=1, background_class=0)
+
+                all_preds.append(pred_seq)
+                all_targets.append(target_seq)
+
+                # Failure Analysis Data Collection
+                # 1. Error Magnitude (Levenshtein Distance)
+                dist = edit_distance(pred_seq, target_seq)
+                sample_errors.append(dist)
+
+                # 2. Sequence Length
+                sample_lengths.append(length)
+
+                # 3. Motion Intensity (Mean Absolute Velocity)
+                # velocity is (B, T, D). Slice (T, D)
+                vel_seq = velocity[i, :length, :]
+                mean_vel = vel_seq.abs().mean().item()
+                sample_velocities.append(mean_vel)
+
+    # 4. Compute and Print Final Metric
+    final_metric = compute_levenshtein_ratio(all_preds, all_targets)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    if len(sample_errors) > 1:
+        # Correlation: Error vs Sequence Length
+        corr_len, p_len = scipy.stats.pearsonr(sample_errors, sample_lengths)
+        print(f"Correlation (Error vs Seq Length): {corr_len:.4f} (p={p_len:.4f})")
+
+        # Correlation: Error vs Motion Intensity
+        corr_vel, p_vel = scipy.stats.pearsonr(sample_errors, sample_velocities)
+        print(
+            f"Correlation (Error vs Motion Intensity): {corr_vel:.4f} (p={p_vel:.4f})"
+        )
+
+        # Summary Stats
+        print(f"Mean Error: {np.mean(sample_errors):.4f}")
+        print(f"Max Error: {np.max(sample_errors)}")
+    else:
+        print("Not enough samples for correlation analysis.")
+=======
+    # Metrics for failure analysis
+    sample_errors = []
+    sample_lengths = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            pose, audio, labels, lengths = batch
+
+            # Move to device
+            pose = pose.to(trainer.device)
+            audio = audio.to(trainer.device)
+            labels = labels.to(trainer.device)
+
+            # Forward pass
+            class_logits = trainer.model(pose, audio)
+
+            # Probabilities
+            probs = torch.softmax(class_logits, dim=2).cpu().numpy()
+            labels_np = labels.cpu().numpy()
+
+            # Process batch
+            B = class_logits.shape[0]
+            for i in range(B):
+                length = lengths[i].item()
+
+                # Slice valid sequence
+                valid_probs = probs[i, :length, :]
+                valid_targets = labels_np[i, :length]
+
+                # Decode
+                pred_seq = rle_decode(
+                    valid_probs,
+                    min_length=Config.MIN_SEGMENT_LENGTH,
+                    background_class=0,
+                )
+                target_seq = rle_decode(valid_targets, min_length=1, background_class=0)
+
+                all_preds.append(pred_seq)
+                all_targets.append(target_seq)
+
+                # Failure Analysis Data Collection
+                # 1. Error Magnitude (Levenshtein Distance)
+                dist = edit_distance(pred_seq, target_seq)
+                sample_errors.append(dist)
+
+                # 2. Sequence Length
+                sample_lengths.append(length)
+
+    # 4. Compute and Print Final Metric
+    final_metric = compute_levenshtein_ratio(all_preds, all_targets)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    if len(sample_errors) > 1:
+        # Correlation: Error vs Sequence Length
+        corr_len, p_len = scipy.stats.pearsonr(sample_errors, sample_lengths)
+        print(f"Correlation (Error vs Seq Length): {corr_len:.4f} (p={p_len:.4f})")
+
+        # Summary Stats
+        print(f"Mean Error: {np.mean(sample_errors):.4f}")
+        print(f"Max Error: {np.max(sample_errors)}")
+    else:
+        print("Not enough samples for correlation analysis.")
+>>>>>>> REPLACE
+```

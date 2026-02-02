@@ -1,0 +1,144 @@
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.neighbors import NeighborhoodComponentsAnalysis
+from sklearn.linear_model import LogisticRegressionCV
+from library.config import Config
+
+
+def build_global_lda():
+    """
+    Constructs the Global Generative Anchor expert.
+
+    Architecture:
+        StandardScaler -> Linear Discriminant Analysis (LDA)
+
+    Configuration:
+        - Solver: LSQR (supports shrinkage)
+        - Shrinkage: Auto (Ledoit-Wolf lemma)
+
+    Returns:
+        sklearn.pipeline.Pipeline: The initialized pipeline.
+    """
+    steps = [
+        ("scaler", StandardScaler()),
+        (
+            "lda",
+            LinearDiscriminantAnalysis(
+                solver=Config.LDA_SOLVER, shrinkage=Config.LDA_SHRINKAGE
+            ),
+        ),
+    ]
+    return Pipeline(steps)
+
+
+def build_robust_lda():
+    """
+    Constructs a Robust Generative Expert.
+    Cite solution_lesson_node_00056: Providing diverse experts for greedy selection.
+
+    Architecture:
+        RobustScaler -> Linear Discriminant Analysis (LDA)
+    """
+    steps = [
+        ("scaler", RobustScaler()),
+        (
+            "lda",
+            LinearDiscriminantAnalysis(
+                solver=Config.LDA_SOLVER, shrinkage=Config.LDA_SHRINKAGE
+            ),
+        ),
+    ]
+    return Pipeline(steps)
+
+
+def build_power_lda():
+    """
+    Constructs a Gaussianized Generative Expert.
+    Cite solution_lesson_node_00006: LDA models class densities; improving Gaussianity may help.
+
+    Architecture:
+        PowerTransformer -> Linear Discriminant Analysis (LDA)
+    """
+    steps = [
+        ("scaler", PowerTransformer()),
+        (
+            "lda",
+            LinearDiscriminantAnalysis(
+                solver=Config.LDA_SOLVER, shrinkage=Config.LDA_SHRINKAGE
+            ),
+        ),
+    ]
+    return Pipeline(steps)
+
+
+def build_eigen_lda():
+    """
+    Constructs an Eigen-Solver Generative Expert.
+
+    Architecture:
+        StandardScaler -> LDA (Eigen Solver)
+    """
+    steps = [
+        ("scaler", StandardScaler()),
+        (
+            "lda",
+            LinearDiscriminantAnalysis(solver="eigen", shrinkage=Config.LDA_SHRINKAGE),
+        ),
+    ]
+    return Pipeline(steps)
+
+
+def build_discriminative_lr():
+    """
+    Constructs the Discriminative Linear Expert.
+
+    Architecture:
+        StandardScaler -> Logistic Regression (with CV)
+
+    Configuration:
+        - Optimization: LBFGS
+        - Grid Search: Dense logarithmic grid for C (Inverse Regularization)
+        - Metric: Negative Log Loss
+
+    Returns:
+        sklearn.pipeline.Pipeline: The initialized pipeline.
+    """
+    # Note: LogisticRegressionCV automatically handles the grid search efficiently.
+    # We use 'multinomial' implicitly by the nature of the data/solver,
+    # but 'neg_log_loss' scoring ensures we optimize the competition metric.
+    steps = [
+        ("scaler", StandardScaler()),
+        (
+            "logreg",
+            LogisticRegressionCV(
+                Cs=Config.LOGREG_C_GRID,
+                cv=Config.LOGREG_CV,  # Standard 5-fold internal CV
+                solver=Config.LOGREG_SOLVER,
+                max_iter=Config.LOGREG_MAX_ITER,
+                scoring="neg_log_loss",
+                n_jobs=Config.LOGREG_JOBS,
+                random_state=Config.RANDOM_SEED,
+                refit=True,
+            ),
+        ),
+    ]
+    return Pipeline(steps)
+
+
+def get_expert_pool():
+    """
+    Factory function to instantiate the pool of experts for the ensemble.
+
+    Returns:
+        dict: A dictionary where keys are expert names and values are
+              untrained sklearn Pipelines.
+    """
+    return {
+        "Global_LDA": build_global_lda(),
+        "Robust_LDA": build_robust_lda(),
+        "Power_LDA": build_power_lda(),
+        "Eigen_LDA": build_eigen_lda(),
+        "Discriminative_LR": build_discriminative_lr(),
+    }

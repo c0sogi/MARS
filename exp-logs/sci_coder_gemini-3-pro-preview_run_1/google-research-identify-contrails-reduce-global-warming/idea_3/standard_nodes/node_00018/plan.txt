@@ -1,0 +1,434 @@
+To optimize performance, I will implement a custom, wide U-Net architecture trained from scratch, replacing the pretrained ResNet34 model. This aligns with findings that custom architectures with limited downsampling (max 16x) preserve thin contrail features better than deeper backbones (Cite solution_lesson_node_00015, solution_lesson_node_00016). I will also adjust the training configuration by increasing the batch size to 64 and prioritizing Focal Loss (weight 0.75) over Dice Loss (weight 0.25) to stabilize gradients in this highly imbalanced task (Cite solution_lesson_node_00006). Finally, I will extend training to 20 epochs to ensure sufficient convergence (Cite solution_lesson_node_00002).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Model Architecture
+    # --------------------------------------------------------------------------
+    ENCODER_NAME = "resnet34"
+    ENCODER_WEIGHTS = "imagenet"
+    IN_CHANNELS = 3
+    CLASSES = 1
+
+    # Dilated ResNet Configuration
+    # NOTE: ResNet34 (BasicBlock) does not support dilation > 1 in torchvision.
+    # We disable dilation here and handle the resolution restoration via upsampling
+    # in the model definition.
+    OUTPUT_STRIDE = 32
+    REPLACE_STRIDE_WITH_DILATION = None
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+    EPOCHS = 10
+
+    # Debugging / Development
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 500  # Number of samples to use when DEBUG is True
+
+    # Loss Function Configuration (Focal + Dice)
+    FOCAL_ALPHA = 0.5  # Balanced weighting for class imbalance
+    FOCAL_GAMMA = 2.0
+    FOCAL_WEIGHT = 0.5
+    DICE_WEIGHT = 0.5
+=======
+    # --------------------------------------------------------------------------
+    # Model Architecture
+    # --------------------------------------------------------------------------
+    IN_CHANNELS = 3
+    CLASSES = 1
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+    EPOCHS = 20
+
+    # Debugging / Development
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 500  # Number of samples to use when DEBUG is True
+
+    # Loss Function Configuration (Focal + Dice)
+    FOCAL_ALPHA = 0.5  # Balanced weighting for class imbalance
+    FOCAL_GAMMA = 2.0
+    FOCAL_WEIGHT = 0.75
+    DICE_WEIGHT = 0.25
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet34, ResNet34_Weights
+from library.config import Config
+
+
+class ConvReluBN(nn.Module):
+    """
+    Basic Convolutional Block: Conv -> BN -> ReLU
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super(ConvReluBN, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class DecoderBlock(nn.Module):
+    """
+    U-Net Decoder Block: Upsample -> Concat -> ConvBlock -> ConvBlock
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+        # After concatenation, the channel count is in_channels + skip_channels
+        self.conv1 = ConvReluBN(in_channels + skip_channels, out_channels)
+        self.conv2 = ConvReluBN(out_channels, out_channels)
+
+    def forward(self, x, skip):
+        # Bilinear upsampling
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+
+        # Concatenate with skip connection
+        if skip is not None:
+            # Ensure spatial dimensions match (robustness for odd sizes, though 256 is power of 2)
+            if x.size(2) != skip.size(2) or x.size(3) != skip.size(3):
+                x = F.interpolate(
+                    x,
+                    size=(skip.size(2), skip.size(3)),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            x = torch.cat([x, skip], dim=1)
+
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+
+class DilatedResNetUNet(nn.Module):
+    """
+    Dilated ResNet34 U-Net.
+
+    Encoder: ResNet34.
+    Decoder: Custom U-Net decoder.
+    Note: ResNet34 does not support dilation in torchvision. We simulate the
+    high-resolution feature map by upsampling layer4 output before fusion.
+    """
+
+    def __init__(self):
+        super(DilatedResNetUNet, self).__init__()
+
+        # ----------------------------------------------------------------------
+        # Encoder (ResNet34)
+        # ----------------------------------------------------------------------
+        # Use ImageNet weights
+        weights = (
+            ResNet34_Weights.IMAGENET1K_V1
+            if Config.ENCODER_WEIGHTS == "imagenet"
+            else None
+        )
+
+        # Initialize ResNet34 without dilation (BasicBlock does not support it)
+        self.encoder = resnet34(
+            weights=weights,
+            replace_stride_with_dilation=None,
+        )
+
+        # Modify input layer if necessary (ResNet default is 3 channels, which matches our Ash composite)
+        if Config.IN_CHANNELS != 3:
+            self.encoder.conv1 = nn.Conv2d(
+                Config.IN_CHANNELS, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+
+        # ----------------------------------------------------------------------
+        # Decoder
+        # ----------------------------------------------------------------------
+        # Channel counts for ResNet34:
+        # e0 (relu)   : 64
+        # e1 (layer1) : 64
+        # e2 (layer2) : 128
+        # e3 (layer3) : 256
+        # e4 (layer4) : 512
+
+        # Center Block: Fuses e4 (512) and e3 (256). Both are 16x16.
+        # No upsampling here, just concatenation and processing.
+        self.center_conv1 = ConvReluBN(512 + 256, 256)
+        self.center_conv2 = ConvReluBN(256, 256)
+
+        # Decoder Stage 3: Upsample Center (256) -> Concat e2 (128) -> Output 128
+        self.dec3 = DecoderBlock(in_channels=256, skip_channels=128, out_channels=128)
+
+        # Decoder Stage 2: Upsample Dec3 (128) -> Concat e1 (64) -> Output 64
+        self.dec2 = DecoderBlock(in_channels=128, skip_channels=64, out_channels=64)
+
+        # Decoder Stage 1: Upsample Dec2 (64) -> Concat e0 (64) -> Output 64
+        self.dec1 = DecoderBlock(in_channels=64, skip_channels=64, out_channels=64)
+
+        # ----------------------------------------------------------------------
+        # Segmentation Head
+        # ----------------------------------------------------------------------
+        # Final upsample from 128x128 (Dec1 output) to 256x256
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            ConvReluBN(64, 32),
+            nn.Conv2d(32, Config.CLASSES, kernel_size=1),
+        )
+
+    def forward(self, x):
+        # ----------------------------------------------------------------------
+        # Encoder Pass
+        # ----------------------------------------------------------------------
+        # Input: (B, 3, 256, 256)
+        x = self.encoder.conv1(x)
+        x = self.encoder.bn1(x)
+        e0 = self.encoder.relu(x)  # (B, 64, 128, 128)
+
+        x = self.encoder.maxpool(e0)
+        e1 = self.encoder.layer1(x)  # (B, 64, 64, 64)
+        e2 = self.encoder.layer2(e1)  # (B, 128, 32, 32)
+        e3 = self.encoder.layer3(e2)  # (B, 256, 16, 16)
+        e4 = self.encoder.layer4(e3)  # (B, 512, 8, 8)
+
+        # ----------------------------------------------------------------------
+        # Decoder Pass
+        # ----------------------------------------------------------------------
+        # Center: Fuse e4 and e3
+        # e4 is 8x8, e3 is 16x16. Upsample e4 to 16x16.
+        e4_up = F.interpolate(
+            e4, size=e3.shape[2:], mode="bilinear", align_corners=False
+        )
+
+        center = torch.cat([e4_up, e3], dim=1)
+        center = self.center_conv1(center)
+        center = self.center_conv2(center)  # (B, 256, 16, 16)
+
+        # Decode
+        d3 = self.dec3(center, e2)  # -> (B, 128, 32, 32)
+        d2 = self.dec2(d3, e1)  # -> (B, 64, 64, 64)
+        d1 = self.dec1(d2, e0)  # -> (B, 64, 128, 128)
+
+        # ----------------------------------------------------------------------
+        # Head
+        # ----------------------------------------------------------------------
+        logits = self.final_conv(d1)  # -> (B, 1, 256, 256)
+
+        return logits
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+
+
+class DoubleConv(nn.Module):
+    """
+    Standard U-Net Block: (Conv -> BN -> ReLU) * 2
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class ContrailUNet(nn.Module):
+    """
+    Custom U-Net Architecture.
+    Features:
+    - 4 Encoder Stages (Max downsampling 16x) to preserve thin features.
+    - Base filters 64, scaling up to 1024 at bottleneck.
+    - Trained from scratch.
+    """
+
+    def __init__(self, in_channels=Config.IN_CHANNELS, out_channels=Config.CLASSES):
+        super(ContrailUNet, self).__init__()
+
+        # Encoder
+        self.enc1 = DoubleConv(in_channels, 64)
+        self.enc2 = DoubleConv(64, 128)
+        self.enc3 = DoubleConv(128, 256)
+        self.enc4 = DoubleConv(256, 512)
+
+        # Bottleneck
+        self.bottleneck = DoubleConv(512, 1024)
+
+        # Pooling
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Decoder
+        self.up4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(1024, 512)
+
+        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(512, 256)
+
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(256, 128)
+
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(128, 64)
+
+        # Final Convolution
+        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        p1 = self.pool(e1)
+
+        e2 = self.enc2(p1)
+        p2 = self.pool(e2)
+
+        e3 = self.enc3(p2)
+        p3 = self.pool(e3)
+
+        e4 = self.enc4(p3)
+        p4 = self.pool(e4)
+
+        # Bottleneck
+        b = self.bottleneck(p4)
+
+        # Decoder
+        d4 = self.up4(b)
+        # Handle potential padding issues if dimensions are not perfect powers of 2
+        # (Though 256x256 is safe)
+        if d4.shape != e4.shape:
+            d4 = F.interpolate(d4, size=e4.shape[2:], mode="bilinear", align_corners=True)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        if d3.shape != e3.shape:
+            d3 = F.interpolate(d3, size=e3.shape[2:], mode="bilinear", align_corners=True)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        if d2.shape != e2.shape:
+            d2 = F.interpolate(d2, size=e2.shape[2:], mode="bilinear", align_corners=True)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        if d1.shape != e1.shape:
+            d1 = F.interpolate(d1, size=e1.shape[2:], mode="bilinear", align_corners=True)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        # Output
+        logits = self.final_conv(d1)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DilatedResNetUNet
+from library.loss import ContrailLoss
+=======
+from library.model import ContrailUNet
+from library.loss import ContrailLoss
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model, Loss, Optimizer
+    model = DilatedResNetUNet().to(device)
+
+    criterion = ContrailLoss().to(device)
+=======
+    # 3. Model, Loss, Optimizer
+    model = ContrailUNet().to(device)
+
+    criterion = ContrailLoss().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import train_model
+from library.model import DilatedResNetUNet
+from library.dataset import get_dataloaders
+=======
+from library.train import train_model
+from library.model import ContrailUNet
+from library.dataset import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Training
+    # --------------------------------------------------------------------------
+    # We run for a limited number of epochs (3) to create a fast baseline.
+    # The A100 GPU can handle the full dataset efficiently.
+    print("\n==== Starting Training ====")
+    best_dice_score = train_model(
+        epochs=3,
+        batch_size=Config.BATCH_SIZE,
+        debug=False,  # Use full dataset for a robust baseline
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. Load Best Model
+    # --------------------------------------------------------------------------
+    print("\n==== Loading Best Model ====")
+    model = DilatedResNetUNet().to(device)
+    checkpoint_path = os.path.join(Config.CHECKPOINTS_DIR, "best_model.pth")
+=======
+    # 2. Training
+    # --------------------------------------------------------------------------
+    # We run for a limited number of epochs (3) to create a fast baseline.
+    # The A100 GPU can handle the full dataset efficiently.
+    print("\n==== Starting Training ====")
+    best_dice_score = train_model(
+        epochs=Config.EPOCHS,
+        batch_size=Config.BATCH_SIZE,
+        debug=False,  # Use full dataset for a robust baseline
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. Load Best Model
+    # --------------------------------------------------------------------------
+    print("\n==== Loading Best Model ====")
+    model = ContrailUNet().to(device)
+    checkpoint_path = os.path.join(Config.CHECKPOINTS_DIR, "best_model.pth")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,341 @@
+My implementation strategy focuses on addressing the overfitting observed in the previous solution (RIDS-Net) by reverting to a more robust, lower-capacity architecture (DSPR-Net) as suggested by the provided lessons.
+
+1.  **Architecture Upgrade (DSPR-Net)**: I will replace the `RIDSNet` class with `DSPRNet`. This architecture features two parallel streams: a "Deep Interaction" stream (Image + Tabular) to capture complex non-linearities, and a "Linear Residual" stream (Baseline FVC + Time) to robustly model the dominant linear decay trend. This directly applies **Lesson 52** (Dual-Stream Residuals) and **Lesson 60** (Over-parameterized Linear Baselines).
+2.  **Capacity Constraint**: I will switch the backbone from `tf_efficientnet_b2_ns` to `tf_efficientnet_b0` and reduce the fusion embedding dimension from 128 to 64. This reduction is critical to prevent the high-dimensional image features from overpowering the tabular signal on this small dataset, applying **Lesson 54** (Capacity Mismatch) and **Lesson 65** (Constraining Fusion Dimensionality).
+3.  **Training Configuration**: I will increase the epoch count to 30 to ensure the projection heads have sufficient time to converge, as per **Lesson 9**.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Model Architecture
+    # -------------------------------------------------------------------------
+    MODEL_NAME = "tf_efficientnet_b2_ns"  # EfficientNet-B2 Noisy Student
+    IMAGE_SIZE = 260  # Native resolution for EfficientNet-B2
+    IN_CHANNELS = 1  # DICOM images are grayscale
+    NUM_SLICES = 3  # Anchor slice + 2 boundary slices
+    EMBED_DIM = 128  # Dimension for latent projections
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 50
+=======
+    # -------------------------------------------------------------------------
+    # Model Architecture
+    # -------------------------------------------------------------------------
+    MODEL_NAME = "tf_efficientnet_b0"  # EfficientNet-B0 (Smaller, less overfitting)
+    IMAGE_SIZE = 224  # Native resolution for EfficientNet-B0
+    IN_CHANNELS = 1  # DICOM images are grayscale
+    NUM_SLICES = 3  # Anchor slice + 2 boundary slices
+    EMBED_DIM = 64  # Constrained dimension to prevent overfitting (Cite solution_lesson_node_00065)
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 30
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class RIDSNet(nn.Module):
+    """
+    Residual-Interaction Dual-Stream Network (RIDS-Net).
+
+    Architecture:
+    1. Image Branch: EfficientNet-B2 (Fine-tuned top layers) -> Projection -> 128 dim
+    2. Clinical Stream (A): Tabular Input -> MLP -> 128 dim (H_clin)
+    3. Interaction Stream (B): Concat(Image, H_clin) -> MLP -> 128 dim (H_resid)
+    4. Fusion: H_final = H_clin + H_resid
+    5. Head: H_final -> Linear -> [mu, raw_sigma]
+    """
+
+    def __init__(self):
+        super(RIDSNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # 1. Image Backbone (EfficientNet-B2)
+        # ---------------------------------------------------------------------
+        # Load pretrained model
+        # in_chans=3 matches the 3 slices stacked in data.py
+        self.backbone = timm.create_model(
+            Config.MODEL_NAME,
+            pretrained=True,
+            in_chans=3,
+            num_classes=0,  # Remove classifier
+            global_pool="",  # We will handle pooling manually
+        )
+
+        # Determine number of features output by the backbone
+        # For EfficientNet-B2, this is typically 1408
+        num_backbone_features = self.backbone.num_features
+
+        # Global Average Pooling
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # Image Projection Layer: Project backbone features to embedding dimension
+        self.img_project = nn.Linear(num_backbone_features, Config.EMBED_DIM)
+
+        # ---------------------------------------------------------------------
+        # Freezing Logic
+        # ---------------------------------------------------------------------
+        # Freeze all parameters first
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the top layers for adaptation
+        # Unfreeze conv_head and bn2 (the final processing before classifier)
+        for param in self.backbone.conv_head.parameters():
+            param.requires_grad = True
+        for param in self.backbone.bn2.parameters():
+            param.requires_grad = True
+
+        # Unfreeze the last two blocks of the main stage
+        # EfficientNet 'blocks' is a nn.Sequential of stages.
+        # We unfreeze the last 2 stages.
+        for block in self.backbone.blocks[-2:]:
+            for param in block.parameters():
+                param.requires_grad = True
+
+        # ---------------------------------------------------------------------
+        # 2. Stream A: Clinical Anchor (Over-Parameterized Trajectory)
+        # ---------------------------------------------------------------------
+        # Input features: [Base_FVC, t_rel, Age, Sex, Smoke_0, Smoke_1, Smoke_2] -> 7 features
+        self.tabular_input_dim = 7
+
+        self.clinical_mlp = nn.Sequential(
+            nn.Linear(self.tabular_input_dim, Config.EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.EMBED_DIM, Config.EMBED_DIM),
+            # Output: H_clin
+        )
+
+        # ---------------------------------------------------------------------
+        # 3. Stream B: Visual Interaction Stream
+        # ---------------------------------------------------------------------
+        # Input: Concat(Image_Embed, H_clin) -> 128 + 128 = 256
+        self.interaction_input_dim = Config.EMBED_DIM * 2
+
+        self.visual_mlp = nn.Sequential(
+            nn.Linear(self.interaction_input_dim, Config.EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.EMBED_DIM, Config.EMBED_DIM),
+            # Output: H_resid
+        )
+
+        # ---------------------------------------------------------------------
+        # 4. Head
+        # ---------------------------------------------------------------------
+        # Projects H_final to [mu, raw_sigma]
+        self.head = nn.Linear(Config.EMBED_DIM, 2)
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images: Tensor (Batch, 3, H, W)
+            tabular: Tensor (Batch, 7)
+
+        Returns:
+            Tensor (Batch, 2) -> [mu, raw_sigma]
+        """
+        # --- Image Branch ---
+        # Extract features: (B, C, H, W)
+        features = self.backbone.forward_features(images)
+        # Pool: (B, C, 1, 1) -> (B, C)
+        features = self.global_pool(features).flatten(1)
+        # Project: (B, 128)
+        img_embed = self.img_project(features)
+
+        # --- Stream A: Clinical Anchor ---
+        # Compute H_clin: (B, 128)
+        h_clin = self.clinical_mlp(tabular)
+
+        # --- Stream B: Visual Interaction ---
+        # Concatenate Image Embedding and Clinical Latent
+        # This forces the visual stream to see the clinical context
+        combined = torch.cat([img_embed, h_clin], dim=1)
+
+        # Compute H_resid: (B, 128)
+        h_resid = self.visual_mlp(combined)
+
+        # --- Fusion ---
+        # Residual connection: The visual info acts as a correction to the clinical anchor
+        h_final = h_clin + h_resid
+
+        # --- Output Head ---
+        # Predict mu and raw_sigma
+        out = self.head(h_final)
+
+        return out
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPRNet).
+    
+    Implements the architecture described in Lesson 52 and 60.
+    Stream A (Deep): Image + Tabular -> Non-linear interaction.
+    Stream B (Linear): Baseline FVC + Time -> Linear projection (Over-parameterized).
+    Fusion: Summation in latent space.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # 1. Image Backbone (EfficientNet-B0)
+        # ---------------------------------------------------------------------
+        # Cite solution_lesson_node_00054: Limit capacity to prevent overfitting
+        self.backbone = timm.create_model(
+            Config.MODEL_NAME,
+            pretrained=True,
+            in_chans=3,
+            num_classes=0,
+            global_pool="",
+        )
+
+        num_backbone_features = self.backbone.num_features
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Project image features to latent dim (64)
+        # Cite solution_lesson_node_00008: Project high-dim features
+        self.img_project = nn.Linear(num_backbone_features, Config.EMBED_DIM)
+
+        # Freezing Logic (Differential Learning Rate support)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze top layers
+        for param in self.backbone.conv_head.parameters():
+            param.requires_grad = True
+        for param in self.backbone.bn2.parameters():
+            param.requires_grad = True
+        for block in self.backbone.blocks[-2:]:
+            for param in block.parameters():
+                param.requires_grad = True
+
+        # ---------------------------------------------------------------------
+        # 2. Stream A: Deep Interaction (Non-Linear Correction)
+        # ---------------------------------------------------------------------
+        # Input: All tabular features (7)
+        self.tabular_input_dim = 7
+        
+        # Encode tabular features
+        self.deep_tabular_mlp = nn.Sequential(
+            nn.Linear(self.tabular_input_dim, Config.EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.EMBED_DIM, Config.EMBED_DIM),
+            nn.ReLU()
+        )
+        
+        # Fuse Image + Tabular for Deep Stream
+        # Input: 64 (Image) + 64 (Tabular) = 128
+        self.deep_fusion_mlp = nn.Sequential(
+            nn.Linear(Config.EMBED_DIM * 2, Config.EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.EMBED_DIM, Config.EMBED_DIM)
+        )
+
+        # ---------------------------------------------------------------------
+        # 3. Stream B: Linear Residual (Strong Baseline Prior)
+        # ---------------------------------------------------------------------
+        # Input: Baseline FVC, Relative Time (Indices 0, 1)
+        # Cite solution_lesson_node_00052: Linear residual stream
+        # Cite solution_lesson_node_00060: Over-parameterize linear stream (Project to latent)
+        self.linear_input_dim = 2
+        self.linear_stream_proj = nn.Linear(self.linear_input_dim, Config.EMBED_DIM)
+        
+        # ---------------------------------------------------------------------
+        # 4. Head
+        # ---------------------------------------------------------------------
+        # Shared head for mu and sigma
+        # Cite solution_lesson_node_00055: Do not isolate priors from uncertainty
+        self.head = nn.Linear(Config.EMBED_DIM, 2)
+
+    def forward(self, images, tabular):
+        # --- Stream A: Deep Interaction ---
+        # Image Features
+        img_feat = self.backbone.forward_features(images)
+        img_feat = self.global_pool(img_feat).flatten(1)
+        img_embed = self.img_project(img_feat)
+        
+        # Tabular Features
+        tab_deep = self.deep_tabular_mlp(tabular)
+        
+        # Concatenate and Process
+        h_deep = self.deep_fusion_mlp(torch.cat([img_embed, tab_deep], dim=1))
+        
+        # --- Stream B: Linear Residual ---
+        # Select Baseline FVC (0) and Time (1)
+        tab_linear_in = tabular[:, 0:2]
+        h_linear = self.linear_stream_proj(tab_linear_in)
+        
+        # --- Fusion ---
+        # Summation in latent space
+        h_final = h_deep + h_linear
+        
+        # --- Output ---
+        out = self.head(h_final)
+        
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import RIDSNet
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+=======
+from library.model import DSPRNet
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Initialize Model
+    device = Config.DEVICE
+    model = RIDSNet().to(device)
+=======
+    # 2. Initialize Model
+    device = Config.DEVICE
+    model = DSPRNet().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RIDSNet
+from library.train import run_training
+
+# Override Config for fast baseline execution
+Config.EPOCHS = 20
+=======
+from library.model import DSPRNet
+from library.train import run_training
+
+# Override Config for fast baseline execution
+Config.EPOCHS = 30
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load the best model
+    device = Config.DEVICE
+    model = RIDSNet().to(device)
+=======
+    # Load the best model
+    device = Config.DEVICE
+    model = DSPRNet().to(device)
+>>>>>>> REPLACE
+```

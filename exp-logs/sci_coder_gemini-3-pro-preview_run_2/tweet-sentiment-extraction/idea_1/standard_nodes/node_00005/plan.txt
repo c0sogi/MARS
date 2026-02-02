@@ -1,0 +1,1258 @@
+To improve the model's performance, I will implement the following strategy:
+
+1.  **Architecture Upgrade**: I will replace the Bi-GRU encoder with a pre-trained **RoBERTa-base** model. The failure analysis showed high error rates on positive/negative tweets, indicating the GRU lacked the semantic understanding to identify specific sentiment-bearing phrases. A Transformer model is better suited for this extraction task (Cite solution_lesson_node_00001).
+2.  **Tokenization Refinement**: I will switch from whitespace splitting to **Byte-Pair Encoding (BPE)** using `AutoTokenizer`. I will utilize `offset_mapping` to map predicted token spans back to precise character indices in the original text, ensuring accurate string reconstruction for the Jaccard metric.
+3.  **Hyperparameter Optimization**: I will adjust the hyperparameters for fine-tuning (Batch Size: 32, Learning Rate: 3e-5, Epochs: 3) to ensure stable convergence within the runtime limits.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Max length for padding sequences.
+# EDA showed max word count is 33, so 64 provides a safe buffer.
+MAX_LEN = 64
+
+# Sentiment mapping
+SENTIMENT_MAP = {"negative": 0, "neutral": 1, "positive": 2}
+
+# Debugging options
+# Set DEBUG to True to run on a small subset of data
+DEBUG = False
+DEBUG_SIZE = 100  # Number of samples to use when DEBUG is True
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+# Dimension of word embeddings
+EMBED_DIM = 100
+
+# Dimension of sentiment embeddings (concatenated to word embeddings)
+SENTIMENT_EMBED_DIM = 16
+
+# Hidden dimension of the GRU
+HIDDEN_DIM = 128
+
+# Dropout probability
+DROPOUT = 0.3
+
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+BATCH_SIZE = 64
+NUM_EPOCHS = 15
+LEARNING_RATE = 0.001
+=======
+# Max length for padding sequences.
+MAX_LEN = 96
+
+# Model Name
+MODEL_NAME = "roberta-base"
+
+# Sentiment mapping
+SENTIMENT_MAP = {"negative": 0, "neutral": 1, "positive": 2}
+
+# Debugging options
+# Set DEBUG to True to run on a small subset of data
+DEBUG = False
+DEBUG_SIZE = 100  # Number of samples to use when DEBUG is True
+
+# ==========================================
+# Model Hyperparameters
+# ==========================================
+# Dropout probability
+DROPOUT = 0.1
+
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+BATCH_SIZE = 32
+NUM_EPOCHS = 3
+LEARNING_RATE = 3e-5
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+from library.config import (
+    EMBED_DIM,
+    SENTIMENT_EMBED_DIM,
+    HIDDEN_DIM,
+    DROPOUT,
+    SENTIMENT_MAP,
+)
+
+
+class BiGRUPointerNetwork(nn.Module):
+    """
+    A Bidirectional GRU Pointer Network for sentiment span extraction.
+
+    Architecture:
+    1. Word Embeddings & Sentiment Embeddings
+    2. Concatenation: Word Emb + Sentiment Emb (repeated for seq len)
+    3. Bi-Directional GRU
+    4. Two Linear Heads: Start Index Logits, End Index Logits
+    """
+
+    def __init__(self, vocab_size):
+        super(BiGRUPointerNetwork, self).__init__()
+
+        # 1. Embeddings
+        self.word_embedding = nn.Embedding(
+            num_embeddings=vocab_size, embedding_dim=EMBED_DIM, padding_idx=0
+        )
+
+        self.sentiment_embedding = nn.Embedding(
+            num_embeddings=len(SENTIMENT_MAP), embedding_dim=SENTIMENT_EMBED_DIM
+        )
+
+        # 2. Recurrent Layer
+        # Input size is sum of word embedding and sentiment embedding dimensions
+        input_size = EMBED_DIM + SENTIMENT_EMBED_DIM
+
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=HIDDEN_DIM,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Regularization
+        self.dropout = nn.Dropout(DROPOUT)
+
+        # 4. Output Heads
+        # The GRU is bidirectional, so the hidden size is doubled
+        gru_output_dim = HIDDEN_DIM * 2
+
+        self.start_head = nn.Linear(gru_output_dim, 1)
+        self.end_head = nn.Linear(gru_output_dim, 1)
+
+    def forward(self, input_ids, sentiment_ids, attention_mask=None):
+        """
+        Args:
+            input_ids: (batch_size, seq_len)
+            sentiment_ids: (batch_size)
+            attention_mask: (batch_size, seq_len) - Not strictly used by GRU but kept for interface consistency
+
+        Returns:
+            start_logits: (batch_size, seq_len)
+            end_logits: (batch_size, seq_len)
+        """
+        # Get Word Embeddings -> (batch_size, seq_len, embed_dim)
+        word_emb = self.word_embedding(input_ids)
+
+        # Get Sentiment Embeddings -> (batch_size, sentiment_embed_dim)
+        sent_emb = self.sentiment_embedding(sentiment_ids)
+
+        # Expand sentiment embeddings to match sequence length
+        # (batch_size, 1, sentiment_embed_dim)
+        sent_emb = sent_emb.unsqueeze(1)
+        # (batch_size, seq_len, sentiment_embed_dim)
+        sent_emb = sent_emb.expand(-1, input_ids.size(1), -1)
+
+        # Concatenate embeddings -> (batch_size, seq_len, embed_dim + sentiment_embed_dim)
+        embeddings = torch.cat([word_emb, sent_emb], dim=2)
+
+        # Apply Dropout to inputs
+        embeddings = self.dropout(embeddings)
+
+        # Pass through Bi-GRU
+        # output: (batch_size, seq_len, hidden_dim * 2)
+        # h_n: (num_layers * num_directions, batch_size, hidden_dim)
+        gru_out, _ = self.gru(embeddings)
+
+        # Apply Dropout to hidden states
+        gru_out = self.dropout(gru_out)
+
+        # Predict Start and End logits
+        # (batch_size, seq_len, 1) -> (batch_size, seq_len)
+        start_logits = self.start_head(gru_out).squeeze(-1)
+        end_logits = self.end_head(gru_out).squeeze(-1)
+
+        return start_logits, end_logits
+=======
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+from library.config import MODEL_NAME, DROPOUT
+
+
+class TransformerPointerNetwork(nn.Module):
+    """
+    A Transformer-based Pointer Network for sentiment span extraction.
+    Uses a pre-trained model (e.g., RoBERTa) as the encoder.
+    """
+
+    def __init__(self):
+        super(TransformerPointerNetwork, self).__init__()
+        
+        self.config = AutoConfig.from_pretrained(MODEL_NAME)
+        self.roberta = AutoModel.from_pretrained(MODEL_NAME, config=self.config)
+        
+        self.dropout = nn.Dropout(DROPOUT)
+        
+        # Two outputs: start logic and end logit
+        self.start_head = nn.Linear(self.config.hidden_size, 1)
+        self.end_head = nn.Linear(self.config.hidden_size, 1)
+
+        # Initialize weights for heads
+        nn.init.xavier_uniform_(self.start_head.weight)
+        nn.init.xavier_uniform_(self.end_head.weight)
+        nn.init.constant_(self.start_head.bias, 0)
+        nn.init.constant_(self.end_head.bias, 0)
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        """
+        Args:
+            input_ids: (batch_size, seq_len)
+            attention_mask: (batch_size, seq_len)
+
+        Returns:
+            start_logits: (batch_size, seq_len)
+            end_logits: (batch_size, seq_len)
+        """
+        # Transformer Output
+        outputs = self.roberta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
+        
+        # Last hidden state: (batch_size, seq_len, hidden_size)
+        sequence_output = outputs.last_hidden_state
+        sequence_output = self.dropout(sequence_output)
+        
+        # Predict Start and End logits
+        start_logits = self.start_head(sequence_output).squeeze(-1)
+        end_logits = self.end_head(sequence_output).squeeze(-1)
+
+        return start_logits, end_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+import os
+import json
+import torch
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter
+from library.config import (
+    TRAIN_PATH,
+    VAL_PATH,
+    TEST_PATH,
+    WORKING_DIR,
+    CACHE_DIR,
+    MAX_LEN,
+    SENTIMENT_MAP,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    DEBUG,
+    DEBUG_SIZE,
+)
+from library.utils import jaccard
+
+
+class Vocabulary:
+    def __init__(self):
+        self.stoi = {}
+        self.itos = {}
+        self.pad_token = "<PAD>"
+        self.unk_token = "<UNK>"
+
+    def build(self, texts):
+        # Flatten all texts and count words
+        words = []
+        for text in texts:
+            words.extend(str(text).split())
+
+        # Sort by frequency for stability
+        counter = Counter(words)
+        unique_words = sorted(counter.keys())
+
+        # 0 is reserved for padding, 1 for unknown
+        self.stoi = {self.pad_token: 0, self.unk_token: 1}
+        self.itos = {0: self.pad_token, 1: self.unk_token}
+
+        idx = 2
+        for w in unique_words:
+            self.stoi[w] = idx
+            self.itos[idx] = w
+            idx += 1
+
+    def to_json(self, path):
+        with open(path, "w") as f:
+            json.dump(self.stoi, f)
+
+    def from_json(self, path):
+        with open(path, "r") as f:
+            self.stoi = json.load(f)
+        self.itos = {v: k for k, v in self.stoi.items()}
+
+    def __len__(self):
+        return len(self.stoi)
+
+    def encode(self, text):
+        tokens = str(text).split()
+        return [self.stoi.get(token, self.stoi[self.unk_token]) for token in tokens]
+
+
+def find_best_span(text, selected_text):
+    """
+    Finds the start and end token indices in 'text' that best match 'selected_text'.
+    First tries exact subsequence match, then falls back to maximizing Jaccard score.
+    """
+    # Tokenize
+    text_tokens = str(text).split()
+
+    # If selected_text is missing or empty
+    if pd.isna(selected_text) or len(str(selected_text).strip()) == 0:
+        return 0, 0
+
+    # Optimization: If exact match exists as a sublist
+    selected_tokens = str(selected_text).split()
+    len_sel = len(selected_tokens)
+    len_text = len(text_tokens)
+
+    # Heuristic: Try to find exact sub-sequence first
+    for i in range(len_text - len_sel + 1):
+        if text_tokens[i : i + len_sel] == selected_tokens:
+            return i, i + len_sel - 1
+
+    # Fallback: Maximize Jaccard overlap
+    best_jaccard = -1.0
+    best_span = (0, 0)
+
+    # We check all valid spans
+    for i in range(len_text):
+        for j in range(i, len_text):
+            # Reconstruct substring from tokens
+            candidate = " ".join(text_tokens[i : j + 1])
+            score = jaccard(candidate, selected_text)
+            if score > best_jaccard:
+                best_jaccard = score
+                best_span = (i, j)
+
+    return best_span
+
+
+def process_data(df, vocab, max_len, sentiment_map, is_test=False):
+    """
+    Converts dataframe text to padded indices and generates labels.
+    """
+    input_ids_list = []
+    attention_masks_list = []
+    sentiment_ids_list = []
+    start_ids_list = []
+    end_ids_list = []
+
+    for _, row in df.iterrows():
+        text = row["text"]
+        sentiment = row["sentiment"]
+
+        # Encode Text
+        ids = vocab.encode(text)
+
+        # Pad/Truncate
+        curr_len = len(ids)
+        if curr_len > max_len:
+            ids = ids[:max_len]
+            mask = [1] * max_len
+        else:
+            mask = [1] * curr_len + [0] * (max_len - curr_len)
+            ids = ids + [vocab.stoi["<PAD>"]] * (max_len - curr_len)
+
+        input_ids_list.append(ids)
+        attention_masks_list.append(mask)
+        sentiment_ids_list.append(sentiment_map[sentiment])
+
+        if not is_test:
+            selected_text = row["selected_text"]
+            start, end = find_best_span(text, selected_text)
+
+            # Clamp to max_len
+            if start >= max_len:
+                start = max_len - 1
+            if end >= max_len:
+                end = max_len - 1
+
+            start_ids_list.append(start)
+            end_ids_list.append(end)
+        else:
+            # Dummy labels for test set
+            start_ids_list.append(0)
+            end_ids_list.append(0)
+
+    return {
+        "input_ids": np.array(input_ids_list, dtype=np.int64),
+        "attention_masks": np.array(attention_masks_list, dtype=np.int64),
+        "sentiment_ids": np.array(sentiment_ids_list, dtype=np.int64),
+        "start_ids": np.array(start_ids_list, dtype=np.int64),
+        "end_ids": np.array(end_ids_list, dtype=np.int64),
+    }
+
+
+class TweetDataset(Dataset):
+    def __init__(self, df, data_dict):
+        self.text_ids = df["textID"].values
+        self.texts = df["text"].values
+        self.sentiments = df["sentiment"].values
+
+        self.input_ids = torch.tensor(data_dict["input_ids"])
+        self.attention_masks = torch.tensor(data_dict["attention_masks"])
+        self.sentiment_ids = torch.tensor(data_dict["sentiment_ids"])
+        self.start_ids = torch.tensor(data_dict["start_ids"])
+        self.end_ids = torch.tensor(data_dict["end_ids"])
+
+    def __len__(self):
+        return len(self.text_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_masks[idx],
+            "sentiment_id": self.sentiment_ids[idx],
+            "start_idx": self.start_ids[idx],
+            "end_idx": self.end_ids[idx],
+            "text": str(self.texts[idx]),
+            "textID": str(self.text_ids[idx]),
+            "sentiment": str(self.sentiments[idx]),
+        }
+
+
+def get_loaders(load_cached_data=True):
+    """
+    Main entry point to get data loaders. Handles caching, vocabulary building, and batching.
+    """
+    # Ensure cache directory exists
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Load Dataframes from metadata
+    df_train = pd.read_csv(TRAIN_PATH)
+    df_val = pd.read_csv(VAL_PATH)
+    df_test = pd.read_csv(TEST_PATH)
+
+    # Handle missing values (Metadata script should have handled this, but for safety)
+    df_train.dropna(subset=["text", "sentiment", "selected_text"], inplace=True)
+    df_val.dropna(subset=["text", "sentiment", "selected_text"], inplace=True)
+    df_test.dropna(subset=["text", "sentiment"], inplace=True)
+
+    # Debug Mode: Slice data if requested
+    if DEBUG:
+        df_train = df_train.head(DEBUG_SIZE)
+        df_val = df_val.head(DEBUG_SIZE)
+        df_test = df_test.head(DEBUG_SIZE)
+
+    # Vocabulary Handling
+    vocab_path = os.path.join(CACHE_DIR, "vocab.json")
+    vocab = Vocabulary()
+
+    # Load vocab if exists and caching is enabled
+    if load_cached_data and os.path.exists(vocab_path):
+        vocab.from_json(vocab_path)
+    else:
+        # Build vocab from training text and save
+        vocab.build(df_train["text"].tolist())
+        vocab.to_json(vocab_path)
+
+    # Helper to process or load cache
+    def get_cached_or_process(df, split_name, is_test=False):
+        cache_file = os.path.join(CACHE_DIR, f"{split_name}_data.npz")
+
+        if load_cached_data and os.path.exists(cache_file):
+            try:
+                loaded = np.load(cache_file)
+                return {k: loaded[k] for k in loaded.files}
+            except Exception:
+                pass  # Fallback to processing if load fails
+
+        # Process data
+        data = process_data(df, vocab, MAX_LEN, SENTIMENT_MAP, is_test)
+
+        # Save to cache
+        np.savez(cache_file, **data)
+        return data
+
+    # Get processed data dictionaries
+    train_data = get_cached_or_process(df_train, "train", is_test=False)
+    val_data = get_cached_or_process(df_val, "val", is_test=False)
+    test_data = get_cached_or_process(df_test, "test", is_test=True)
+
+    # Create Datasets
+    train_dataset = TweetDataset(df_train, train_data)
+    val_dataset = TweetDataset(df_val, val_data)
+    test_dataset = TweetDataset(df_test, test_data)
+
+    # Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader, vocab
+=======
+import os
+import torch
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from library.config import (
+    TRAIN_PATH,
+    VAL_PATH,
+    TEST_PATH,
+    WORKING_DIR,
+    CACHE_DIR,
+    MAX_LEN,
+    SENTIMENT_MAP,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    DEBUG,
+    DEBUG_SIZE,
+    MODEL_NAME,
+)
+
+
+def process_data(df, tokenizer, max_len, is_test=False):
+    """
+    Converts dataframe text to padded indices and generates labels using Transformers tokenizer.
+    Returns offset mapping for reconstruction.
+    """
+    input_ids_list = []
+    attention_masks_list = []
+    start_ids_list = []
+    end_ids_list = []
+    offset_mapping_list = []
+
+    for _, row in df.iterrows():
+        text = str(row["text"]).strip()
+        sentiment = str(row["sentiment"])
+
+        # Tokenize: [CLS] sentiment [SEP] text [SEP] or <s> sentiment </s> </s> text </s>
+        enc = tokenizer(
+            sentiment,
+            text,
+            max_length=max_len,
+            padding="max_length",
+            truncation=True,
+            return_offsets_mapping=True,
+        )
+
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
+        offsets = enc["offset_mapping"]
+        sequence_ids = enc.sequence_ids()
+
+        input_ids_list.append(input_ids)
+        attention_masks_list.append(attention_mask)
+        offset_mapping_list.append(offsets)
+
+        if not is_test:
+            selected_text = str(row["selected_text"]).strip()
+            
+            # Find character start/end in the original text
+            start_char = text.find(selected_text)
+            if start_char == -1:
+                # Fallback: if selected_text not found, use whole text
+                start_char = 0
+                end_char = len(text)
+            else:
+                end_char = start_char + len(selected_text)
+
+            # Find corresponding token indices
+            # sequence_ids: None (special), 0 (sentiment), 1 (text)
+            
+            # Find start and end of the text segment in tokens
+            token_start_index = 0
+            while token_start_index < len(sequence_ids) and sequence_ids[token_start_index] != 1:
+                token_start_index += 1
+            
+            token_end_index = len(sequence_ids) - 1
+            while token_end_index >= 0 and sequence_ids[token_end_index] != 1:
+                token_end_index -= 1
+
+            # If text was truncated completely, handle it
+            if token_start_index > token_end_index:
+                start_ids_list.append(0)
+                end_ids_list.append(0)
+                continue
+
+            # Check if the answer is within the span
+            if offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char:
+                # Move i forward until we hit start_char
+                i = token_start_index
+                while i <= token_end_index and offsets[i][0] <= start_char:
+                    i += 1
+                start_idx = i - 1
+                
+                # Move j backward until we hit end_char
+                j = token_end_index
+                while j >= token_start_index and offsets[j][1] >= end_char:
+                    j -= 1
+                end_idx = j + 1
+                
+                start_ids_list.append(start_idx)
+                end_ids_list.append(end_idx)
+            else:
+                # If truncated, point to CLS or 0
+                start_ids_list.append(0)
+                end_ids_list.append(0)
+        else:
+            start_ids_list.append(0)
+            end_ids_list.append(0)
+
+    return {
+        "input_ids": np.array(input_ids_list, dtype=np.int64),
+        "attention_masks": np.array(attention_masks_list, dtype=np.int64),
+        "start_ids": np.array(start_ids_list, dtype=np.int64),
+        "end_ids": np.array(end_ids_list, dtype=np.int64),
+        "offset_mapping": np.array(offset_mapping_list, dtype=np.int64),
+    }
+
+
+class TweetDataset(Dataset):
+    def __init__(self, df, data_dict):
+        self.text_ids = df["textID"].values
+        self.texts = df["text"].values
+        self.sentiments = df["sentiment"].values
+
+        self.input_ids = torch.tensor(data_dict["input_ids"])
+        self.attention_masks = torch.tensor(data_dict["attention_masks"])
+        self.start_ids = torch.tensor(data_dict["start_ids"])
+        self.end_ids = torch.tensor(data_dict["end_ids"])
+        self.offset_mapping = torch.tensor(data_dict["offset_mapping"])
+
+    def __len__(self):
+        return len(self.text_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_masks[idx],
+            "start_idx": self.start_ids[idx],
+            "end_idx": self.end_ids[idx],
+            "offset_mapping": self.offset_mapping[idx],
+            "text": str(self.texts[idx]),
+            "textID": str(self.text_ids[idx]),
+            "sentiment": str(self.sentiments[idx]),
+        }
+
+
+def get_loaders(load_cached_data=True):
+    """
+    Main entry point to get data loaders.
+    """
+    # Ensure cache directory exists
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Load Dataframes from metadata
+    df_train = pd.read_csv(TRAIN_PATH)
+    df_val = pd.read_csv(VAL_PATH)
+    df_test = pd.read_csv(TEST_PATH)
+
+    # Handle missing values
+    df_train.dropna(subset=["text", "sentiment", "selected_text"], inplace=True)
+    df_val.dropna(subset=["text", "sentiment", "selected_text"], inplace=True)
+    df_test.dropna(subset=["text", "sentiment"], inplace=True)
+
+    # Debug Mode
+    if DEBUG:
+        df_train = df_train.head(DEBUG_SIZE)
+        df_val = df_val.head(DEBUG_SIZE)
+        df_test = df_test.head(DEBUG_SIZE)
+
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    # Helper to process or load cache
+    def get_cached_or_process(df, split_name, is_test=False):
+        # We don't cache for this run to avoid compatibility issues with previous vocab-based cache
+        data = process_data(df, tokenizer, MAX_LEN, is_test)
+        return data
+
+    # Get processed data dictionaries
+    train_data = get_cached_or_process(df_train, "train", is_test=False)
+    val_data = get_cached_or_process(df_val, "val", is_test=False)
+    test_data = get_cached_or_process(df_test, "test", is_test=True)
+
+    # Create Datasets
+    train_dataset = TweetDataset(df_train, train_data)
+    val_dataset = TweetDataset(df_val, val_data)
+    test_dataset = TweetDataset(df_test, test_data)
+
+    # Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader, tokenizer
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import BiGRUPointerNetwork
+from library.data_loader import get_loaders
+
+
+def loss_fn(start_logits, end_logits, start_positions, end_positions):
+    """
+    Computes the sum of CrossEntropyLoss for start and end indices.
+    """
+    loss_fct = nn.CrossEntropyLoss()
+    start_loss = loss_fct(start_logits, start_positions)
+    end_loss = loss_fct(end_logits, end_positions)
+    return start_loss + end_loss
+
+
+def decode_span(start_logits, end_logits, attention_mask):
+    """
+    Decodes the best span (start, end) for each sample in the batch.
+    Maximizes P(start) * P(end) subject to start <= end.
+    """
+    batch_size, seq_len = start_logits.size()
+    mask = attention_mask.bool()
+
+    # Mask padding tokens by setting logits to a very small number
+    start_logits = start_logits.masked_fill(~mask, -1e9)
+    end_logits = end_logits.masked_fill(~mask, -1e9)
+
+    # Convert logits to probabilities
+    start_probs = torch.softmax(start_logits, dim=1).detach().cpu().numpy()
+    end_probs = torch.softmax(end_logits, dim=1).detach().cpu().numpy()
+
+    start_preds = []
+    end_preds = []
+
+    for k in range(batch_size):
+        s_p = start_probs[k]
+        e_p = end_probs[k]
+
+        # Compute joint probability matrix: P(start=i, end=j) = P(start=i) * P(end=j)
+        score_mat = np.outer(s_p, e_p)
+
+        # Enforce start <= end by masking the lower triangle
+        score_mat = np.triu(score_mat)
+
+        # Find the indices maximizing the score
+        flat_idx = np.argmax(score_mat)
+        i = flat_idx // seq_len
+        j = flat_idx % seq_len
+
+        start_preds.append(i)
+        end_preds.append(j)
+
+    return start_preds, end_preds
+
+
+def train_fn(data_loader, model, optimizer, device):
+    """
+    Runs one epoch of training.
+    """
+    model.train()
+    total_loss = 0
+
+    for batch in data_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        sentiment_ids = batch["sentiment_id"].to(device)
+        start_positions = batch["start_idx"].to(device)
+        end_positions = batch["end_idx"].to(device)
+
+        optimizer.zero_grad()
+
+        start_logits, end_logits = model(input_ids, sentiment_ids, attention_mask)
+
+        loss = loss_fn(start_logits, end_logits, start_positions, end_positions)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(data_loader)
+
+
+def eval_fn(data_loader, model, device):
+    """
+    Evaluates the model on the validation set.
+    Computes Loss and Jaccard Score.
+    """
+    model.eval()
+    total_loss = 0
+    total_jaccard = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            sentiment_ids = batch["sentiment_id"].to(device)
+            start_positions = batch["start_idx"].to(device)
+            end_positions = batch["end_idx"].to(device)
+            texts = batch["text"]
+
+            start_logits, end_logits = model(input_ids, sentiment_ids, attention_mask)
+
+            loss = loss_fn(start_logits, end_logits, start_positions, end_positions)
+            total_loss += loss.item()
+
+            # Decode predictions
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            # Calculate Jaccard
+            for k in range(len(texts)):
+                text = texts[k]
+                tokens = text.split()
+
+                # Reconstruct Predicted Text
+                i_p, j_p = start_preds[k], end_preds[k]
+                # Safe slicing handles out of bounds
+                pred_str = " ".join(tokens[i_p : j_p + 1])
+
+                # Reconstruct Ground Truth Text from labels
+                # We use the labels because the Dataset doesn't return selected_text string directly
+                i_t, j_t = start_positions[k].item(), end_positions[k].item()
+                gt_str = " ".join(tokens[i_t : j_t + 1])
+
+                score = jaccard(pred_str, gt_str)
+                total_jaccard += score
+                total_samples += 1
+
+    return total_loss / len(data_loader), total_jaccard / total_samples
+
+
+def predict_fn(data_loader, model, device):
+    """
+    Runs inference on the test set and saves the submission file.
+    """
+    model.eval()
+    predictions = []
+
+    print("Generating predictions...")
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            sentiment_ids = batch["sentiment_id"].to(device)
+            texts = batch["text"]
+            text_ids = batch["textID"]
+
+            start_logits, end_logits = model(input_ids, sentiment_ids, attention_mask)
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            for k in range(len(texts)):
+                text = texts[k]
+                tokens = text.split()
+                i, j = start_preds[k], end_preds[k]
+                pred_str = " ".join(tokens[i : j + 1])
+                predictions.append({"textID": text_ids[k], "selected_text": pred_str})
+
+    df_sub = pd.DataFrame(predictions)
+    # Ensure correct column order
+    df_sub = df_sub[["textID", "selected_text"]]
+    df_sub.to_csv(SUBMISSION_FILE, index=False)
+    print(f"Submission saved to {SUBMISSION_FILE}")
+
+
+def run():
+    """
+    Main execution function:
+    1. Loads data
+    2. Initializes model
+    3. Trains with Early Stopping
+    4. Predicts on Test Set
+    """
+    # 1. Load Data
+    print("Loading data...")
+    train_loader, val_loader, test_loader, vocab = get_loaders(load_cached_data=True)
+
+    # 2. Initialize Model
+    print("Initializing model...")
+    model = BiGRUPointerNetwork(len(vocab)).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+=======
+from library.model import TransformerPointerNetwork
+from library.data_loader import get_loaders
+
+
+def loss_fn(start_logits, end_logits, start_positions, end_positions):
+    """
+    Computes the sum of CrossEntropyLoss for start and end indices.
+    """
+    loss_fct = nn.CrossEntropyLoss()
+    start_loss = loss_fct(start_logits, start_positions)
+    end_loss = loss_fct(end_logits, end_positions)
+    return start_loss + end_loss
+
+
+def decode_span(start_logits, end_logits, attention_mask):
+    """
+    Decodes the best span (start, end) for each sample in the batch.
+    Maximizes P(start) * P(end) subject to start <= end.
+    """
+    batch_size, seq_len = start_logits.size()
+    mask = attention_mask.bool()
+
+    # Mask padding tokens by setting logits to a very small number
+    start_logits = start_logits.masked_fill(~mask, -1e9)
+    end_logits = end_logits.masked_fill(~mask, -1e9)
+
+    # Convert logits to probabilities
+    start_probs = torch.softmax(start_logits, dim=1).detach().cpu().numpy()
+    end_probs = torch.softmax(end_logits, dim=1).detach().cpu().numpy()
+
+    start_preds = []
+    end_preds = []
+
+    for k in range(batch_size):
+        s_p = start_probs[k]
+        e_p = end_probs[k]
+
+        # Compute joint probability matrix: P(start=i, end=j) = P(start=i) * P(end=j)
+        score_mat = np.outer(s_p, e_p)
+
+        # Enforce start <= end by masking the lower triangle
+        score_mat = np.triu(score_mat)
+
+        # Find the indices maximizing the score
+        flat_idx = np.argmax(score_mat)
+        i = flat_idx // seq_len
+        j = flat_idx % seq_len
+
+        start_preds.append(i)
+        end_preds.append(j)
+
+    return start_preds, end_preds
+
+
+def get_selected_text(text, start_idx, end_idx, offsets):
+    """
+    Reconstructs the selected text from the original text using offsets.
+    """
+    selected_text = ""
+    # If predicted span is invalid or points to special tokens (0,0), return full text or empty
+    if start_idx >= len(offsets) or end_idx >= len(offsets):
+        return text
+    
+    start_char = offsets[start_idx][0]
+    end_char = offsets[end_idx][1]
+    
+    if start_char == 0 and end_char == 0:
+        return text
+        
+    selected_text = text[start_char:end_char]
+    return selected_text
+
+
+def train_fn(data_loader, model, optimizer, device):
+    """
+    Runs one epoch of training.
+    """
+    model.train()
+    total_loss = 0
+
+    for batch in data_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        start_positions = batch["start_idx"].to(device)
+        end_positions = batch["end_idx"].to(device)
+
+        optimizer.zero_grad()
+
+        start_logits, end_logits = model(input_ids, attention_mask)
+
+        loss = loss_fn(start_logits, end_logits, start_positions, end_positions)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(data_loader)
+
+
+def eval_fn(data_loader, model, device):
+    """
+    Evaluates the model on the validation set.
+    Computes Loss and Jaccard Score.
+    """
+    model.eval()
+    total_loss = 0
+    total_jaccard = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            start_positions = batch["start_idx"].to(device)
+            end_positions = batch["end_idx"].to(device)
+            texts = batch["text"]
+            offsets = batch["offset_mapping"].numpy()
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+
+            loss = loss_fn(start_logits, end_logits, start_positions, end_positions)
+            total_loss += loss.item()
+
+            # Decode predictions
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            # Calculate Jaccard
+            for k in range(len(texts)):
+                text = texts[k]
+                
+                # Reconstruct Predicted Text using offsets
+                pred_str = get_selected_text(text, start_preds[k], end_preds[k], offsets[k])
+
+                # Reconstruct Ground Truth Text using offsets
+                gt_str = get_selected_text(text, start_positions[k].item(), end_positions[k].item(), offsets[k])
+
+                score = jaccard(pred_str, gt_str)
+                total_jaccard += score
+                total_samples += 1
+
+    return total_loss / len(data_loader), total_jaccard / total_samples
+
+
+def predict_fn(data_loader, model, device):
+    """
+    Runs inference on the test set and saves the submission file.
+    """
+    model.eval()
+    predictions = []
+
+    print("Generating predictions...")
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            texts = batch["text"]
+            text_ids = batch["textID"]
+            offsets = batch["offset_mapping"].numpy()
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            for k in range(len(texts)):
+                text = texts[k]
+                pred_str = get_selected_text(text, start_preds[k], end_preds[k], offsets[k])
+                predictions.append({"textID": text_ids[k], "selected_text": pred_str})
+
+    df_sub = pd.DataFrame(predictions)
+    # Ensure correct column order
+    df_sub = df_sub[["textID", "selected_text"]]
+    df_sub.to_csv(SUBMISSION_FILE, index=False)
+    print(f"Submission saved to {SUBMISSION_FILE}")
+
+
+def run():
+    """
+    Main execution function:
+    1. Loads data
+    2. Initializes model
+    3. Trains with Early Stopping
+    4. Predicts on Test Set
+    """
+    # 1. Load Data
+    print("Loading data...")
+    train_loader, val_loader, test_loader, tokenizer = get_loaders(load_cached_data=False)
+
+    # 2. Initialize Model
+    print("Initializing model...")
+    model = TransformerPointerNetwork().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import BiGRUPointerNetwork
+from library.engine import train_fn, eval_fn, predict_fn, decode_span
+from library.utils import jaccard
+
+
+def run_pipeline():
+    # ==========================================
+    # 1. Configuration for Fast Baseline
+    # ==========================================
+    # Override config defaults for a faster run while utilizing A100 memory
+    config.NUM_EPOCHS = 5
+    config.BATCH_SIZE = 256  # Increase batch size for A100
+
+    print(
+        f"Configuration: Epochs={config.NUM_EPOCHS}, Batch Size={config.BATCH_SIZE}, Device={config.DEVICE}"
+    )
+
+    # ==========================================
+    # 2. Data Loading
+    # ==========================================
+    print("Loading data...")
+    train_loader, val_loader, test_loader, vocab = get_loaders(load_cached_data=True)
+
+    # ==========================================
+    # 3. Model Initialization
+    # ==========================================
+    print("Initializing model...")
+    model = BiGRUPointerNetwork(len(vocab)).to(config.DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+=======
+from library.model import TransformerPointerNetwork
+from library.engine import train_fn, eval_fn, predict_fn, decode_span, get_selected_text
+from library.utils import jaccard
+
+
+def run_pipeline():
+    # ==========================================
+    # 1. Configuration for Fast Baseline
+    # ==========================================
+    # Override config defaults for a faster run while utilizing A100 memory
+    # RoBERTa fine-tuning
+    config.NUM_EPOCHS = 3
+    config.BATCH_SIZE = 32
+
+    print(
+        f"Configuration: Epochs={config.NUM_EPOCHS}, Batch Size={config.BATCH_SIZE}, Device={config.DEVICE}"
+    )
+
+    # ==========================================
+    # 2. Data Loading
+    # ==========================================
+    print("Loading data...")
+    train_loader, val_loader, test_loader, tokenizer = get_loaders(load_cached_data=False)
+
+    # ==========================================
+    # 3. Model Initialization
+    # ==========================================
+    print("Initializing model...")
+    model = TransformerPointerNetwork().to(config.DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(config.DEVICE)
+            attention_mask = batch["attention_mask"].to(config.DEVICE)
+            sentiment_ids = batch["sentiment_id"].to(config.DEVICE)
+            start_positions = batch["start_idx"].to(config.DEVICE)
+            end_positions = batch["end_idx"].to(config.DEVICE)
+            texts = batch["text"]
+
+            # Forward pass
+            start_logits, end_logits = model(input_ids, sentiment_ids, attention_mask)
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            # Analyze per sample
+            for k in range(len(texts)):
+                text = texts[k]
+                tokens = text.split()
+
+                # Reconstruct Prediction
+                i_p, j_p = start_preds[k], end_preds[k]
+                pred_str = " ".join(tokens[i_p : j_p + 1])
+
+                # Reconstruct Ground Truth
+                i_t, j_t = start_positions[k].item(), end_positions[k].item()
+                gt_str = " ".join(tokens[i_t : j_t + 1])
+
+                # Calculate Jaccard
+                score = jaccard(pred_str, gt_str)
+
+                # Store data for correlation
+                errors.append(1.0 - score)  # Error is inverse of Jaccard
+                lengths.append(len(tokens))
+                sentiments.append(sentiment_ids[k].item())
+=======
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(config.DEVICE)
+            attention_mask = batch["attention_mask"].to(config.DEVICE)
+            start_positions = batch["start_idx"].to(config.DEVICE)
+            end_positions = batch["end_idx"].to(config.DEVICE)
+            texts = batch["text"]
+            offsets = batch["offset_mapping"].numpy()
+
+            # Forward pass
+            start_logits, end_logits = model(input_ids, attention_mask)
+            start_preds, end_preds = decode_span(
+                start_logits, end_logits, attention_mask
+            )
+
+            # Analyze per sample
+            for k in range(len(texts)):
+                text = texts[k]
+                
+                # Reconstruct Prediction
+                pred_str = get_selected_text(text, start_preds[k], end_preds[k], offsets[k])
+
+                # Reconstruct Ground Truth
+                gt_str = get_selected_text(text, start_positions[k].item(), end_positions[k].item(), offsets[k])
+
+                # Calculate Jaccard
+                score = jaccard(pred_str, gt_str)
+
+                # Store data for correlation
+                errors.append(1.0 - score)
+                lengths.append(len(text.split())) # Use word count for length analysis
+                
+                # Map sentiment string to code for analysis consistency
+                sent_str = batch["sentiment"][k]
+                sent_code = config.SENTIMENT_MAP[sent_str]
+                sentiments.append(sent_code)
+>>>>>>> REPLACE
+```

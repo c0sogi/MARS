@@ -1,0 +1,350 @@
+To optimize the catheter detection performance, I will implement the following changes based on the provided lessons and analysis of the previous run:
+
+1.  **Batch Size and Stability (Cite solution_lesson_node_00007)**: The previous solution used a batch size of 8, which is suboptimal for Batch Normalization stability. I will increase the `batch_size` to 16. To accommodate this larger batch size within the GPU memory limits while maintaining the 640x640 resolution, I will enable **Automatic Mixed Precision (AMP)** training.
+2.  **Model Regularization and Generalization**: I will implement **Exponential Moving Average (EMA)** of the model weights (`decay=0.9995`). EMA acts as a robust ensemble of the model's recent states, typically leading to better generalization and stability on the validation set compared to the raw weights at the final step.
+3.  **Training Duration**: The previous run showed consistent improvement up to epoch 6. I will increase `num_epochs` to 12 to allow the model (and its EMA shadow) to converge further, taking advantage of the available 4-hour runtime.
+4.  **Numerical Stability**: To ensure the **Generalized Mean (GeM)** pooling layer remains stable under mixed precision (where `pow` operations can be risky), I will force the GeM calculation to execute in `float32`.
+
+Here are the code modifications:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    num_epochs = 6
+    batch_size = 8
+    learning_rate = 1e-4  # Constant learning rate
+    weight_decay = 1e-2
+    max_grad_norm = 10.0
+
+    # Early Stopping
+    patience = 3
+    min_delta = 1e-4
+=======
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    num_epochs = 12
+    batch_size = 16
+    learning_rate = 1e-4  # Constant learning rate
+    weight_decay = 1e-2
+    max_grad_norm = 10.0
+
+    # Advanced Training
+    use_amp = True
+    use_ema = True
+    ema_decay = 0.9995
+
+    # Early Stopping
+    patience = 5
+    min_delta = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def gem(self, x, p=3, eps=1e-6):
+        # x shape: (Batch, Channels, Height, Width)
+        # Clamp to avoid numerical instability with pow
+        x = x.clamp(min=eps)
+
+        # Calculate average of x^p
+        # F.avg_pool2d with kernel size equal to input spatial dimensions acts as global average pooling
+        x_pow = x.pow(p)
+        avg_pool = F.avg_pool2d(x_pow, (x.size(-2), x.size(-1)))
+
+        # Raise to power 1/p
+        return avg_pool.pow(1.0 / p)
+=======
+    def gem(self, x, p=3, eps=1e-6):
+        # x shape: (Batch, Channels, Height, Width)
+        
+        # Force FP32 for stability with pow, especially when using AMP
+        x = x.to(torch.float32)
+        
+        # Clamp to avoid numerical instability with pow
+        x = x.clamp(min=eps)
+
+        # Calculate average of x^p
+        # F.avg_pool2d with kernel size equal to input spatial dimensions acts as global average pooling
+        x_pow = x.pow(p)
+        avg_pool = F.avg_pool2d(x_pow, (x.size(-2), x.size(-1)))
+
+        # Raise to power 1/p
+        return avg_pool.pow(1.0 / p)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+import os
+import time
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from library.config import Config
+from library.utils import seed_everything, get_score, get_pos_weights
+from library.dataset import get_dataloaders
+from library.model import CatheterModel
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    y_true_list = []
+    y_pred_list = []
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+        # Apply sigmoid to logits for scoring
+        probs = torch.sigmoid(logits)
+
+        y_true_list.append(labels.detach().cpu().numpy())
+        y_pred_list.append(probs.detach().cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+
+    y_true = np.concatenate(y_true_list, axis=0)
+    y_pred = np.concatenate(y_pred_list, axis=0)
+    epoch_auc = get_score(y_true, y_pred)
+
+    return epoch_loss, epoch_auc
+=======
+import os
+import time
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from timm.utils import ModelEmaV2
+from library.config import Config
+from library.utils import seed_everything, get_score, get_pos_weights
+from library.dataset import get_dataloaders
+from library.model import CatheterModel
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None, ema=None):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    y_true_list = []
+    y_pred_list = []
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed Precision Training
+        with torch.cuda.amp.autocast(enabled=Config.use_amp):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            
+            # Unscale before clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+            
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+            optimizer.step()
+
+        # Update EMA
+        if ema is not None:
+            ema.update(model)
+
+        running_loss += loss.item() * images.size(0)
+
+        # Apply sigmoid to logits for scoring
+        probs = torch.sigmoid(logits)
+
+        y_true_list.append(labels.detach().cpu().numpy())
+        y_pred_list.append(probs.detach().cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+
+    y_true = np.concatenate(y_true_list, axis=0)
+    y_pred = np.concatenate(y_pred_list, axis=0)
+    epoch_auc = get_score(y_true, y_pred)
+
+    return epoch_loss, epoch_auc
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Initialize Model, Loss, Optimizer
+    model = CatheterModel(
+        model_name=Config.model_name,
+        pretrained=Config.pretrained,
+        num_classes=Config.num_classes,
+        in_channels=Config.in_channels,
+    )
+    model = model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    # 5. Training Loop
+    best_auc = -1.0
+    epochs_no_improve = 0
+
+    print("\nStarting training...")
+
+    for epoch in range(num_epochs):
+        start_time = time.time()
+
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, optimizer, criterion, device
+        )
+        val_loss, val_auc = valid_one_epoch(model, val_loader, criterion, device)
+
+        elapsed = time.time() - start_time
+
+        print(f"Epoch {epoch+1}/{num_epochs} - Time: {elapsed:.2f}s")
+        print(f"  Train Loss: {train_loss} | Train AUC: {train_auc}")
+        print(f"  Valid Loss: {val_loss} | Valid AUC: {val_auc}")
+
+        # Checkpoint and Early Stopping
+        if val_auc > best_auc + Config.min_delta:
+            print(
+                f"  Validation AUC improved from {best_auc} to {val_auc}. Saving model to {model_save_path}..."
+            )
+            best_auc = val_auc
+            torch.save(model.state_dict(), model_save_path)
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            print(
+                f"  No improvement in validation AUC. Patience: {epochs_no_improve}/{patience}"
+            )
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs.")
+            break
+=======
+    # 4. Initialize Model, Loss, Optimizer, Scaler, EMA
+    model = CatheterModel(
+        model_name=Config.model_name,
+        pretrained=Config.pretrained,
+        num_classes=Config.num_classes,
+        in_channels=Config.in_channels,
+    )
+    model = model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    # AMP Scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=Config.use_amp)
+
+    # EMA
+    ema = None
+    if Config.use_ema:
+        print(f"Initializing EMA with decay {Config.ema_decay}")
+        ema = ModelEmaV2(model, decay=Config.ema_decay)
+
+    # 5. Training Loop
+    best_auc = -1.0
+    epochs_no_improve = 0
+
+    print("\nStarting training...")
+
+    for epoch in range(num_epochs):
+        start_time = time.time()
+
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, scaler, ema
+        )
+        
+        # Validate using EMA model if available, otherwise standard model
+        val_model = ema.module if ema else model
+        val_loss, val_auc = valid_one_epoch(val_model, val_loader, criterion, device)
+
+        elapsed = time.time() - start_time
+
+        print(f"Epoch {epoch+1}/{num_epochs} - Time: {elapsed:.2f}s")
+        print(f"  Train Loss: {train_loss} | Train AUC: {train_auc}")
+        print(f"  Valid Loss: {val_loss} | Valid AUC: {val_auc}")
+
+        # Checkpoint and Early Stopping
+        if val_auc > best_auc + Config.min_delta:
+            print(
+                f"  Validation AUC improved from {best_auc} to {val_auc}. Saving model to {model_save_path}..."
+            )
+            best_auc = val_auc
+            # Save the model that was used for validation (EMA or Standard)
+            save_model = ema.module if ema else model
+            torch.save(save_model.state_dict(), model_save_path)
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            print(
+                f"  No improvement in validation AUC. Patience: {epochs_no_improve}/{patience}"
+            )
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs.")
+            break
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # --- 5. Submission ---
+    print("\n[Step 4/4] Checking Submission Threshold...")
+
+    THRESHOLD = 0.9122773173141027
+    SUBMISSION_DIR = "./submission"
+
+    if final_metric > THRESHOLD:
+=======
+    # --- 5. Submission ---
+    print("\n[Step 4/4] Checking Submission Threshold...")
+
+    THRESHOLD = 0.9386695350345494
+    SUBMISSION_DIR = "./submission"
+
+    if final_metric > THRESHOLD:
+>>>>>>> REPLACE
+```

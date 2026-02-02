@@ -1,0 +1,297 @@
+import os
+import sys
+import pandas as pd
+import numpy as np
+import torch
+import shutil
+
+# Import library modules
+from library.config import Config
+from library.utils import (
+    tokenize,
+    load_glove_embeddings,
+    parse_annotation_record,
+    compute_micro_f1,
+)
+from library.data_loader import (
+    build_vocab,
+    LongAnswerDataset,
+    get_long_answer_loader,
+    process_short_answer_data,
+)
+from library.modeling import DEConvNet, WindowLogisticRegressor
+from library.training import train_ranker, train_extractor
+from library.inference import generate_predictions
+
+
+def setup_fast_config():
+    """
+    Patches the Config class to use small datasets and fast training parameters.
+    """
+    print("Setting up fast configuration...")
+
+    # Create working directory for subsets
+    subset_dir = os.path.join(Config.WORKING_DIR, "subsets")
+    os.makedirs(subset_dir, exist_ok=True)
+
+    # Paths for subset metadata
+    Config.TRAIN_META_FILE = os.path.join(subset_dir, "train_subset.parquet")
+    Config.VAL_META_FILE = os.path.join(subset_dir, "val_subset.parquet")
+    Config.TEST_META_FILE = os.path.join(subset_dir, "test_subset.parquet")
+
+    # Hyperparameters for speed
+    Config.NUM_EPOCHS = 1
+    Config.BATCH_SIZE = 4
+    Config.VOCAB_SIZE = 1000
+    Config.EMBEDDING_DIM = 50
+    Config.TRAIN_SAMPLE_SIZE = 50  # Limit processing
+    Config.PATIENCE = 1
+
+    # Cache files (ensure they don't conflict with previous runs if re-running)
+    Config.VOCAB_CACHE_FILE = os.path.join(Config.WORKING_DIR, "vocab_subset.npy")
+    Config.EMBEDDING_MATRIX_CACHE_FILE = os.path.join(
+        Config.WORKING_DIR, "emb_subset.npy"
+    )
+    Config.SHORT_ANSWER_DATA_CACHE = os.path.join(
+        Config.WORKING_DIR, "sa_data_subset.parquet"
+    )
+    Config.LONG_ANSWER_MODEL_PATH = os.path.join(
+        Config.WORKING_DIR, "la_model_subset.pth"
+    )
+    Config.SHORT_ANSWER_WEIGHTS_PATH = os.path.join(
+        Config.WORKING_DIR, "sa_weights_subset.npy"
+    )
+    Config.SUBMISSION_FILE = os.path.join(Config.WORKING_DIR, "submission_subset.csv")
+
+    # Ensure setup directories exist
+    Config.setup()
+
+
+def create_data_subsets():
+    """
+    Reads original metadata, samples a few rows, and saves to working dir.
+    """
+    print("Creating data subsets...")
+
+    # Original paths
+    orig_train_path = "./metadata/train.parquet"
+    orig_val_path = "./metadata/val.parquet"
+    orig_test_path = "./metadata/test.parquet"
+
+    # Load and sample
+    train_df = pd.read_parquet(orig_train_path).head(50)
+    val_df = pd.read_parquet(orig_val_path).head(20)
+    test_df = pd.read_parquet(orig_test_path).head(20)
+
+    # Save to new Config paths
+    train_df.to_parquet(Config.TRAIN_META_FILE, index=False)
+    val_df.to_parquet(Config.VAL_META_FILE, index=False)
+    test_df.to_parquet(Config.TEST_META_FILE, index=False)
+
+    print(
+        f"Created subsets: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}"
+    )
+
+
+def test_utils_and_vocab():
+    print("\n--- Testing Utils and Vocab ---")
+
+    # Test Tokenization
+    text = "Hello world! This is a test."
+    tokens = tokenize(text)
+    assert len(tokens) == 6, "Tokenization failed"
+    print("Tokenization verified.")
+
+    # Build Vocab
+    train_meta = pd.read_parquet(Config.TRAIN_META_FILE)
+    vocab = build_vocab(train_meta, load_cached_data=False)
+    assert len(vocab) > 0, "Vocabulary is empty"
+    assert Config.UNK_TOKEN in vocab, "UNK token missing"
+    print(f"Vocabulary built with {len(vocab)} tokens.")
+
+    # Load Embeddings (Random init expected since GloVe file missing)
+    emb_matrix = load_glove_embeddings(
+        vocab, Config.EMBEDDING_DIM, load_cached_data=False
+    )
+    assert emb_matrix.shape == (
+        len(vocab),
+        Config.EMBEDDING_DIM,
+    ), "Embedding matrix shape mismatch"
+    print("Embedding matrix initialized.")
+
+    return vocab, emb_matrix
+
+
+def test_data_loading(vocab):
+    print("\n--- Testing Data Loading ---")
+
+    train_meta = pd.read_parquet(Config.TRAIN_META_FILE)
+
+    # Test Long Answer Dataset
+    dataset = LongAnswerDataset(
+        train_meta, Config.TRAIN_DATA_FILE, vocab, split="train", load_cached_data=False
+    )
+
+    if len(dataset) > 0:
+        sample = dataset[0]
+        assert "question" in sample
+        assert "candidate" in sample
+        assert "label" in sample
+        assert sample["question"].dtype == torch.int64
+        print(f"LongAnswerDataset sample keys verified: {list(sample.keys())}")
+    else:
+        print(
+            "Warning: LongAnswerDataset is empty (possibly no positive labels in subset)."
+        )
+
+    # Test DataLoader
+    loader = get_long_answer_loader(
+        train_meta,
+        Config.TRAIN_DATA_FILE,
+        vocab,
+        split="train",
+        batch_size=Config.BATCH_SIZE,
+        load_cached_data=True,  # Use the cache generated by dataset init above
+    )
+
+    for batch in loader:
+        assert batch["question"].shape[0] <= Config.BATCH_SIZE
+        assert batch["candidate"].shape[1] == Config.MAX_SEQ_LEN
+        print("DataLoader batch shape verified.")
+        break
+
+    return loader
+
+
+def test_short_answer_processing(vocab):
+    print("\n--- Testing Short Answer Processing ---")
+    train_meta = pd.read_parquet(Config.TRAIN_META_FILE)
+
+    X, y = process_short_answer_data(
+        train_meta, Config.TRAIN_DATA_FILE, vocab, load_cached_data=False
+    )
+
+    if len(X) > 0:
+        assert X.shape[1] == 4, "Short answer features should have 4 dimensions"
+        assert len(X) == len(y), "Mismatch between features and labels"
+        print(f"Short answer data processed. Samples: {len(X)}")
+    else:
+        print("Warning: No short answer samples generated from subset.")
+        # Create dummy data for modeling test if empty
+        X = np.random.rand(10, 4).astype(np.float32)
+        y = np.random.randint(0, 2, 10).astype(np.float32)
+
+    return X, y
+
+
+def test_modeling(vocab, emb_matrix):
+    print("\n--- Testing Modeling ---")
+
+    # 1. DEConvNet
+    model_la = DEConvNet(emb_matrix)
+    batch_size = 2
+    dummy_q = torch.randint(0, len(vocab), (batch_size, Config.MAX_QUES_LEN))
+    dummy_c = torch.randint(0, len(vocab), (batch_size, Config.MAX_SEQ_LEN))
+
+    output = model_la(dummy_q, dummy_c)
+    assert output.shape == (
+        batch_size,
+    ), f"DEConvNet output shape mismatch: {output.shape}"
+    assert (
+        output.min() >= 0 and output.max() <= 1
+    ), "Output not in probability range [0, 1]"
+    print("DEConvNet forward pass successful.")
+
+    # 2. WindowLogisticRegressor
+    model_sa = WindowLogisticRegressor(input_dim=4)
+    dummy_x = torch.randn(batch_size, 4)
+    output_sa = model_sa(dummy_x)
+    assert output_sa.shape == (
+        batch_size,
+    ), f"WindowLogisticRegressor output shape mismatch: {output_sa.shape}"
+    print("WindowLogisticRegressor forward pass successful.")
+
+    return model_la, model_sa
+
+
+def test_training(model_la, train_loader, X_sa, y_sa):
+    print("\n--- Testing Training Functions ---")
+
+    # Train Long Answer Ranker
+    val_meta = pd.read_parquet(Config.VAL_META_FILE)
+    # Reuse train loader as val loader for simplicity in this test
+    trained_la = train_ranker(
+        model_la,
+        train_loader,
+        train_loader,
+        val_meta,
+        epochs=1,
+        device=torch.device("cpu"),
+    )
+    assert os.path.exists(
+        Config.LONG_ANSWER_MODEL_PATH
+    ), "Long answer model checkpoint not found"
+    print("Ranker training simulation complete.")
+
+    # Train Short Answer Extractor
+    trained_sa = train_extractor(X_sa, y_sa, epochs=1, device=torch.device("cpu"))
+    assert os.path.exists(
+        Config.SHORT_ANSWER_WEIGHTS_PATH
+    ), "Short answer weights file not found"
+    print("Extractor training simulation complete.")
+
+
+def test_inference():
+    print("\n--- Testing Inference Pipeline ---")
+
+    # Run the full inference function
+    # This uses the test_subset.parquet we created
+    generate_predictions(load_cached_data=True, batch_size=2)
+
+    assert os.path.exists(Config.SUBMISSION_FILE), "Submission file not created"
+
+    # Verify submission content
+    sub_df = pd.read_csv(Config.SUBMISSION_FILE)
+    assert "example_id" in sub_df.columns
+    assert "PredictionString" in sub_df.columns
+    # Check if we have rows (20 samples * 2 rows each = 40 rows)
+    assert len(sub_df) == 40, f"Expected 40 rows in submission, got {len(sub_df)}"
+
+    print("Inference pipeline executed successfully.")
+
+
+if __name__ == "__main__":
+    # Set seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    try:
+        # 1. Setup
+        setup_fast_config()
+        create_data_subsets()
+
+        # 2. Utils & Vocab
+        vocab, emb_matrix = test_utils_and_vocab()
+
+        # 3. Data Loading
+        train_loader = test_data_loading(vocab)
+        X_sa, y_sa = test_short_answer_processing(vocab)
+
+        # 4. Modeling
+        model_la, model_sa = test_modeling(vocab, emb_matrix)
+
+        # 5. Training
+        test_training(model_la, train_loader, X_sa, y_sa)
+
+        # 6. Inference
+        test_inference()
+
+        print("\nAll tests passed successfully!")
+
+    except Exception as e:
+        print(f"\nTest failed with error: {e}")
+        # Print traceback for debugging
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

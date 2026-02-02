@@ -1,0 +1,768 @@
+My implementation strategy focuses on replacing the ineffective Deep Learning branch with domain-specific Geometric Features and refining the linear ensemble, as supported by the provided lessons.
+
+1.  **Remove Deep Learning & Add Geometric Features**: I will completely remove the `DeepFeatureExtractor` (ResNet18) and replace it with a `GeometricFeatureExtractor`. This new extractor will compute **Aspect Ratio, Extent, Solidity, and Eccentricity** from the binary leaf images using OpenCV. This addresses Lesson 00049 (Deep features are noise for binary shapes) and Lesson 00050 (Geometric features outperform generic descriptors).
+
+2.  **Optimize Hyperparameters**: I will update the `Config` to use a **dense, broad logarithmic grid** (100 points) for the Logistic Regression regularization parameter (`C`). This directly applies Lesson 00047 (Grid density) and Lesson 00037 (Broad search space).
+
+3.  **Refine Ensemble Structure**: I will simplify the model to a **Hybrid Ensemble of Logistic Regression and Linear Discriminant Analysis (LDA)** trained on the combined feature set (Handcrafted + Geometric). This leverages Lesson 00006 (Generative-Discriminative Ensembling).
+
+4.  **Pipeline Integration**: I will modify `DataPipeline` and `runfile.py` to process a single unified feature view (Handcrafted + Geometric) instead of separate views, ensuring efficient training and valid scaling.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # IMAGE PROCESSING (VIEW 2)
+    # =========================================================================
+    # Dimensions for ResNet18 input
+    IMG_HEIGHT = 224
+    IMG_WIDTH = 224
+    IMG_SIZE = (IMG_HEIGHT, IMG_WIDTH)
+
+    # Batch size for feature extraction (inference only)
+    BATCH_SIZE = 32
+
+    # =========================================================================
+    # FEATURE ENGINEERING
+    # =========================================================================
+    # Variance ratio to retain when applying PCA to deep embeddings
+    PCA_VARIANCE = 0.95
+
+    # =========================================================================
+    # MODEL HYPERPARAMETERS
+    # =========================================================================
+    # Cross-Validation settings
+    CV_FOLDS = 3
+
+    # Logistic Regression (Estimators A & C)
+    # Dense, broad logarithmic grid for C (Inverse of regularization strength)
+    # Synthesizes the need for broad search with high density for sharp optima.
+    LR_CS = np.logspace(-4, 4, 50)
+
+    LR_SOLVER = "lbfgs"
+=======
+    # =========================================================================
+    # MODEL HYPERPARAMETERS
+    # =========================================================================
+    # Cross-Validation settings
+    CV_FOLDS = 3
+
+    # Logistic Regression
+    # Dense, broad logarithmic grid for C (Inverse of regularization strength)
+    # Cite {solution_lesson_node_00047}: Prioritize grid density over speed.
+    # Cite {solution_lesson_node_00037}: Broadening Regularization Search Spaces.
+    LR_CS = np.logspace(-4, 4, 100)
+
+    LR_SOLVER = "lbfgs"
+>>>>>>> REPLACE
+```
+
+```diff
+library/image_extractor.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from library.config import Config
+
+
+def set_seed(seed=42):
+    """Sets the random seed for reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+class ImageDataset(Dataset):
+    """
+    Custom Dataset for loading and preprocessing leaf images.
+    """
+
+    def __init__(self, image_paths, transform=None):
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        path = self.image_paths[idx]
+        # Open image and convert to RGB to ensure 3 channels (ResNet expectation)
+        # This handles binary/grayscale inputs correctly.
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"Error loading image {path}: {e}")
+            # Return a blank image in case of error to prevent crash, though unlikely with verified metadata
+            img = Image.new("RGB", (Config.IMG_WIDTH, Config.IMG_HEIGHT))
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img
+
+
+class DeepFeatureExtractor:
+    """
+    Extracts high-level semantic features from images using a pre-trained ResNet18.
+    """
+
+    def __init__(self):
+        set_seed(Config.RANDOM_SEED)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize ResNet18 with ImageNet weights
+        # We use the modern weights API
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        self.model = models.resnet18(weights=weights)
+
+        # Remove the classification head (fc layer)
+        # ResNet18 structure: ... -> avgpool -> flatten -> fc
+        # Replacing fc with Identity allows us to get the 512-dim vector after flatten
+        self.model.fc = nn.Identity()
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        # Define the preprocessing pipeline
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((Config.IMG_HEIGHT, Config.IMG_WIDTH)),
+                transforms.ToTensor(),
+                # Normalize with ImageNet mean and std
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+
+    def extract(self, image_paths, cache_name=None, load_cached_data=True):
+        """
+        Extracts features for a list of image paths.
+
+        Args:
+            image_paths (list): List of file paths to images.
+            cache_name (str, optional): Name of the cache file (without extension).
+            load_cached_data (bool): Whether to attempt loading from cache.
+
+        Returns:
+            np.ndarray: Array of shape (N, 512) containing extracted features.
+        """
+        # Ensure working directory exists
+        os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+        cache_path = None
+        if cache_name:
+            cache_path = os.path.join(Config.WORKING_DIR, f"{cache_name}.npy")
+
+        # 1. Try to load from cache
+        if load_cached_data and cache_path and os.path.exists(cache_path):
+            print(f"Loading cached deep features from {cache_path}")
+            try:
+                features = np.load(cache_path)
+                if features.shape[0] == len(image_paths):
+                    return features
+                else:
+                    print(
+                        f"Cache size mismatch ({features.shape[0]} vs {len(image_paths)}). Recomputing..."
+                    )
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Recomputing...")
+
+        # 2. Compute from scratch
+        print(
+            f"Extracting deep features for {len(image_paths)} images using {self.device}..."
+        )
+
+        dataset = ImageDataset(image_paths, transform=self.transform)
+
+        # Use num_workers for parallel data loading
+        dataloader = DataLoader(
+            dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True if self.device.type == "cuda" else False,
+        )
+
+        features_list = []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = batch.to(self.device)
+
+                # Forward pass
+                # Output shape: (Batch Size, 512)
+                outputs = self.model(batch)
+
+                # Move to CPU and convert to numpy
+                features_list.append(outputs.cpu().numpy())
+
+        if features_list:
+            features = np.vstack(features_list)
+        else:
+            # Handle empty input case
+            features = np.empty((0, 512))
+
+        # 3. Save to cache
+        if cache_path:
+            print(f"Saving deep features to {cache_path}")
+            np.save(cache_path, features)
+
+        return features
+=======
+import os
+import cv2
+import numpy as np
+
+
+class GeometricFeatureExtractor:
+    """
+    Extracts domain-specific geometric features from binary leaf images.
+    Cite {solution_lesson_node_00050}: Domain-Specific Geometric Features Outperform Generic Descriptors.
+    Cite {solution_lesson_node_00049}: Incompatibility of ImageNet Transfer Learning with Binary Shape Data.
+    """
+
+    def extract(self, image_paths):
+        """
+        Extracts geometric features: Aspect Ratio, Extent, Solidity, Eccentricity.
+        
+        Args:
+            image_paths (list): List of file paths to images.
+
+        Returns:
+            np.ndarray: Array of shape (N, 4) containing extracted features.
+        """
+        features = []
+        for path in image_paths:
+            if not os.path.exists(path):
+                features.append([0, 0, 0, 0])
+                continue
+                
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                features.append([0, 0, 0, 0])
+                continue
+
+            # Invert: Leaf (black) -> White, Background (white) -> Black
+            # The dataset description says "binary black leaves against white backgrounds"
+            _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+            
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(cnt)
+                x, y, w, h = cv2.boundingRect(cnt)
+                rect_area = w * h
+                hull = cv2.convexHull(cnt)
+                hull_area = cv2.contourArea(hull)
+                
+                # Aspect Ratio
+                aspect_ratio = float(w) / h if h > 0 else 0
+                
+                # Extent
+                extent = float(area) / rect_area if rect_area > 0 else 0
+                
+                # Solidity
+                solidity = float(area) / hull_area if hull_area > 0 else 0
+                
+                # Eccentricity
+                if len(cnt) >= 5:
+                    try:
+                        (x, y), (MA, ma), angle = cv2.fitEllipse(cnt)
+                        a = ma / 2
+                        b = MA / 2
+                        if a > 0:
+                            eccentricity = np.sqrt(1 - (min(a, b) / max(a, b)) ** 2)
+                        else:
+                            eccentricity = 0
+                    except:
+                        eccentricity = 0
+                else:
+                    eccentricity = 0
+            else:
+                aspect_ratio, extent, solidity, eccentricity = 0, 0, 0, 0
+                
+            features.append([aspect_ratio, extent, solidity, eccentricity])
+            
+        return np.array(features)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_pipeline.py
+<<<<<<< SEARCH
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.decomposition import PCA
+from library.config import Config
+from library.image_extractor import DeepFeatureExtractor
+
+
+class DataPipeline:
+    """
+    Handles data loading, merging, feature extraction, and preprocessing for the
+    Deep-Feature Augmented Multi-View Ensemble.
+    """
+
+    def __init__(self):
+        """
+        Initialize the pipeline and the deep feature extractor.
+        """
+        self.deep_extractor = DeepFeatureExtractor()
+
+    def load_and_merge_data(self):
+=======
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from library.config import Config
+from library.image_extractor import GeometricFeatureExtractor
+
+
+class DataPipeline:
+    """
+    Handles data loading, merging, feature extraction, and preprocessing.
+    Combines Handcrafted features with Geometric features.
+    """
+
+    def __init__(self):
+        """
+        Initialize the pipeline and the geometric feature extractor.
+        """
+        self.geo_extractor = GeometricFeatureExtractor()
+
+    def load_and_merge_data(self):
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_pipeline.py
+<<<<<<< SEARCH
+    def process_view1_handcrafted(self, X_train, X_test):
+        """
+        Applies StandardScaler to the handcrafted features.
+
+        Args:
+            X_train (np.ndarray): Training features.
+            X_test (np.ndarray): Test features.
+
+        Returns:
+            tuple: (X_train_scaled, X_test_scaled)
+        """
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        return X_train_scaled, X_test_scaled
+
+    def process_view2_deep(self, X_train, X_test):
+        """
+        Applies StandardScaler and PCA to the deep features.
+
+        Args:
+            X_train (np.ndarray): Training deep embeddings.
+            X_test (np.ndarray): Test deep embeddings.
+
+        Returns:
+            tuple: (X_train_pca, X_test_pca)
+        """
+        # 1. Standard Scaling
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        # 2. PCA
+        pca = PCA(n_components=Config.PCA_VARIANCE, random_state=Config.RANDOM_SEED)
+        X_train_pca = pca.fit_transform(X_train_scaled)
+        X_test_pca = pca.transform(X_test_scaled)
+
+        return X_train_pca, X_test_pca
+
+    def run(self, load_cached_data=True):
+        """
+        Executes the full data pipeline.
+
+        Args:
+            load_cached_data (bool): Whether to load extracted deep features from cache.
+
+        Returns:
+            dict: Dictionary containing processed data arrays and auxiliary info.
+        """
+        print("Pipeline: Loading and merging metadata...")
+        df_train, df_test = self.load_and_merge_data()
+
+        # --- Target Encoding ---
+        print("Pipeline: Encoding targets...")
+        le = LabelEncoder()
+        y_train = le.fit_transform(df_train["species"])
+        classes = le.classes_
+
+        # --- View 1: Handcrafted Features ---
+        print("Pipeline: Processing View 1 (Handcrafted)...")
+        X_train_hc_raw = self.get_handcrafted_features(df_train)
+        X_test_hc_raw = self.get_handcrafted_features(df_test)
+
+        X_train_view1, X_test_view1 = self.process_view1_handcrafted(
+            X_train_hc_raw, X_test_hc_raw
+        )
+
+        # --- View 2: Deep Features ---
+        print("Pipeline: Processing View 2 (Deep Embeddings)...")
+        train_paths = self.get_image_paths(df_train)
+        test_paths = self.get_image_paths(df_test)
+
+        # Extract features (uses library caching)
+        # We use distinct cache names for the merged train set and the test set
+        X_train_deep_raw = self.deep_extractor.extract(
+            train_paths,
+            cache_name="train_full_deep_features",
+            load_cached_data=load_cached_data,
+        )
+        X_test_deep_raw = self.deep_extractor.extract(
+            test_paths,
+            cache_name="test_deep_features",
+            load_cached_data=load_cached_data,
+        )
+
+        X_train_view2, X_test_view2 = self.process_view2_deep(
+            X_train_deep_raw, X_test_deep_raw
+        )
+
+        print(
+            f"Pipeline: View 2 dimensionality reduced from {X_train_deep_raw.shape[1]} to {X_train_view2.shape[1]}."
+        )
+
+        # --- Packaging ---
+        data = {
+            "X_train_view1": X_train_view1,
+            "X_train_view2": X_train_view2,
+            "y_train": y_train,
+            "X_test_view1": X_test_view1,
+            "X_test_view2": X_test_view2,
+            "test_ids": df_test["id"].values,
+            "classes": classes,
+        }
+
+        return data
+=======
+    def process_features(self, X_train, X_test):
+        """
+        Applies StandardScaler to the features.
+
+        Args:
+            X_train (np.ndarray): Training features.
+            X_test (np.ndarray): Test features.
+
+        Returns:
+            tuple: (X_train_scaled, X_test_scaled)
+        """
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        return X_train_scaled, X_test_scaled
+
+    def run(self, load_cached_data=True):
+        """
+        Executes the full data pipeline.
+        """
+        print("Pipeline: Loading and merging metadata...")
+        df_train, df_test = self.load_and_merge_data()
+
+        # --- Target Encoding ---
+        print("Pipeline: Encoding targets...")
+        le = LabelEncoder()
+        y_train = le.fit_transform(df_train["species"])
+        classes = le.classes_
+
+        # --- Handcrafted Features ---
+        print("Pipeline: Extracting Handcrafted Features...")
+        X_train_hc = self.get_handcrafted_features(df_train)
+        X_test_hc = self.get_handcrafted_features(df_test)
+
+        # --- Geometric Features ---
+        print("Pipeline: Extracting Geometric Features...")
+        train_paths = self.get_image_paths(df_train)
+        test_paths = self.get_image_paths(df_test)
+
+        X_train_geo = self.geo_extractor.extract(train_paths)
+        X_test_geo = self.geo_extractor.extract(test_paths)
+
+        # --- Merge ---
+        print("Pipeline: Merging Features...")
+        X_train_full = np.hstack([X_train_hc, X_train_geo])
+        X_test_full = np.hstack([X_test_hc, X_test_geo])
+
+        # --- Scaling ---
+        print("Pipeline: Scaling Features...")
+        X_train_scaled, X_test_scaled = self.process_features(X_train_full, X_test_full)
+
+        # --- Packaging ---
+        data = {
+            "X_train": X_train_scaled,
+            "y_train": y_train,
+            "X_test": X_test_scaled,
+            "test_ids": df_test["id"].values,
+            "classes": classes,
+        }
+
+        return data
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Process View 1: Handcrafted Features
+    print("Processing View 1 (Handcrafted) for Validation...")
+    X_train_v1_raw = pipeline.get_handcrafted_features(df_train_split)
+    X_val_v1_raw = pipeline.get_handcrafted_features(df_val_split)
+
+    # Scale (Fit on Train, Transform Val)
+    X_train_v1, X_val_v1 = pipeline.process_view1_handcrafted(
+        X_train_v1_raw, X_val_v1_raw
+    )
+
+    # 4. Process View 2: Deep Features
+    print("Processing View 2 (Deep Embeddings) for Validation...")
+    train_img_paths = pipeline.get_image_paths(df_train_split)
+    val_img_paths = pipeline.get_image_paths(df_val_split)
+
+    # Extract (using cache if available)
+    X_train_v2_raw = pipeline.deep_extractor.extract(
+        train_img_paths, cache_name="train_split_deep", load_cached_data=True
+    )
+    X_val_v2_raw = pipeline.deep_extractor.extract(
+        val_img_paths, cache_name="val_split_deep", load_cached_data=True
+    )
+
+    # Scale & PCA (Fit on Train, Transform Val)
+    X_train_v2, X_val_v2 = pipeline.process_view2_deep(X_train_v2_raw, X_val_v2_raw)
+
+    # 5. Train Models (Validation Split)
+    print("Training Validation Models...")
+
+    # Estimator A: LogReg on View 1
+    model_a_val = get_discriminative_solver()
+    probs_a_val = train_predict(
+        model_a_val,
+        X_train_v1,
+        y_train_split,
+        X_val_v1,
+        model_name="Val_Estimator_A_HC_LogReg",
+    )
+
+    # Estimator B: LDA on View 1
+    model_b_val = get_generative_solver()
+    probs_b_val = train_predict(
+        model_b_val,
+        X_train_v1,
+        y_train_split,
+        X_val_v1,
+        model_name="Val_Estimator_B_HC_LDA",
+    )
+
+    # Estimator C: LogReg on View 2
+    model_c_val = get_discriminative_solver()
+    probs_c_val = train_predict(
+        model_c_val,
+        X_train_v2,
+        y_train_split,
+        X_val_v2,
+        model_name="Val_Estimator_C_Deep_LogReg",
+    )
+
+    # 6. Ensemble and Evaluate
+    # Soft Voting
+    probs_ensemble_val = (probs_a_val + probs_b_val + probs_c_val) / 3.0
+    probs_ensemble_val = clip_probabilities(probs_ensemble_val)
+=======
+    # 3. Process Features (Handcrafted + Geometric)
+    print("Processing Features for Validation...")
+    
+    # Handcrafted
+    X_train_hc = pipeline.get_handcrafted_features(df_train_split)
+    X_val_hc = pipeline.get_handcrafted_features(df_val_split)
+
+    # Geometric
+    train_img_paths = pipeline.get_image_paths(df_train_split)
+    val_img_paths = pipeline.get_image_paths(df_val_split)
+    
+    X_train_geo = pipeline.geo_extractor.extract(train_img_paths)
+    X_val_geo = pipeline.geo_extractor.extract(val_img_paths)
+
+    # Merge
+    X_train_raw = np.hstack([X_train_hc, X_train_geo])
+    X_val_raw = np.hstack([X_val_hc, X_val_geo])
+
+    # Scale (Fit on Train, Transform Val)
+    X_train, X_val = pipeline.process_features(X_train_raw, X_val_raw)
+
+    # 5. Train Models (Validation Split)
+    print("Training Validation Models...")
+
+    # Estimator A: Logistic Regression (Discriminative)
+    model_a_val = get_discriminative_solver()
+    probs_a_val = train_predict(
+        model_a_val,
+        X_train,
+        y_train_split,
+        X_val,
+        model_name="Val_Estimator_A_LogReg",
+    )
+
+    # Estimator B: LDA (Generative)
+    model_b_val = get_generative_solver()
+    probs_b_val = train_predict(
+        model_b_val,
+        X_train,
+        y_train_split,
+        X_val,
+        model_name="Val_Estimator_B_LDA",
+    )
+
+    # 6. Ensemble and Evaluate
+    # Soft Voting
+    # Cite {solution_lesson_node_00006}: Generative-Discriminative Ensembling.
+    probs_ensemble_val = (probs_a_val + probs_b_val) / 2.0
+    probs_ensemble_val = clip_probabilities(probs_ensemble_val)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Failure Analysis
+    # Get feature names for View 1
+    feature_cols = [
+        c
+        for c in df_train_split.columns
+        if any(k in c for k in ["margin", "shape", "texture"])
+    ]
+    feature_cols.sort()
+    perform_failure_analysis(
+        X_val_v1, y_val_split, probs_ensemble_val, feature_names=feature_cols
+    )
+
+    # =========================================================================
+    # PHASE 2: FINAL SUBMISSION (Train on Full Data, Predict on Test)
+    # =========================================================================
+    THRESHOLD = 0.00870833951594525
+
+    if val_log_loss < THRESHOLD:
+        print(
+            f"\nValidation metric ({val_log_loss}) meets threshold ({THRESHOLD}). Proceeding to submission..."
+        )
+
+        # 1. Run Pipeline on Full Data (Train+Val merged, Test)
+        print("Running full data pipeline...")
+        data = pipeline.run(load_cached_data=True)
+
+        X_train_full_v1 = data["X_train_view1"]
+        X_train_full_v2 = data["X_train_view2"]
+        y_train_full = data["y_train"]
+        X_test_v1 = data["X_test_view1"]
+        X_test_v2 = data["X_test_view2"]
+        test_ids = data["test_ids"]
+        classes = data["classes"]
+
+        # 2. Train Final Models
+        print("Training Final Models on Combined Dataset...")
+
+        # Estimator A
+        model_a_final = get_discriminative_solver()
+        probs_a_test = train_predict(
+            model_a_final,
+            X_train_full_v1,
+            y_train_full,
+            X_test_v1,
+            model_name="Final_Estimator_A",
+        )
+
+        # Estimator B
+        model_b_final = get_generative_solver()
+        probs_b_test = train_predict(
+            model_b_final,
+            X_train_full_v1,
+            y_train_full,
+            X_test_v1,
+            model_name="Final_Estimator_B",
+        )
+
+        # Estimator C
+        model_c_final = get_discriminative_solver()
+        probs_c_test = train_predict(
+            model_c_final,
+            X_train_full_v2,
+            y_train_full,
+            X_test_v2,
+            model_name="Final_Estimator_C",
+        )
+
+        # 3. Ensemble Predictions
+        probs_final = (probs_a_test + probs_b_test + probs_c_test) / 3.0
+=======
+    # 7. Failure Analysis
+    # Get feature names
+    feature_cols = [
+        c
+        for c in df_train_split.columns
+        if any(k in c for k in ["margin", "shape", "texture"])
+    ]
+    feature_cols.sort()
+    # Append geometric feature names
+    feature_cols.extend(["aspect_ratio", "extent", "solidity", "eccentricity"])
+    
+    perform_failure_analysis(
+        X_val, y_val_split, probs_ensemble_val, feature_names=feature_cols
+    )
+
+    # =========================================================================
+    # PHASE 2: FINAL SUBMISSION (Train on Full Data, Predict on Test)
+    # =========================================================================
+    THRESHOLD = 0.00870833951594525
+
+    if val_log_loss < THRESHOLD:
+        print(
+            f"\nValidation metric ({val_log_loss}) meets threshold ({THRESHOLD}). Proceeding to submission..."
+        )
+
+        # 1. Run Pipeline on Full Data (Train+Val merged, Test)
+        print("Running full data pipeline...")
+        data = pipeline.run(load_cached_data=True)
+
+        X_train_full = data["X_train"]
+        y_train_full = data["y_train"]
+        X_test = data["X_test"]
+        test_ids = data["test_ids"]
+        classes = data["classes"]
+
+        # 2. Train Final Models
+        print("Training Final Models on Combined Dataset...")
+
+        # Estimator A
+        model_a_final = get_discriminative_solver()
+        probs_a_test = train_predict(
+            model_a_final,
+            X_train_full,
+            y_train_full,
+            X_test,
+            model_name="Final_Estimator_A",
+        )
+
+        # Estimator B
+        model_b_final = get_generative_solver()
+        probs_b_test = train_predict(
+            model_b_final,
+            X_train_full,
+            y_train_full,
+            X_test,
+            model_name="Final_Estimator_B",
+        )
+
+        # 3. Ensemble Predictions
+        probs_final = (probs_a_test + probs_b_test) / 2.0
+>>>>>>> REPLACE
+```

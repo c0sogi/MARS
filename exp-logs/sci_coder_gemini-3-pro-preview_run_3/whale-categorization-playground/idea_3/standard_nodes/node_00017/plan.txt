@@ -1,0 +1,322 @@
+The strategy focuses on correcting the validation methodology to align with the open-set retrieval nature of the task, as highlighted in **Lesson solution_lesson_node_00016**. The previous solution's low performance was largely due to evaluating the model as a closed-set classifier on a validation set containing 'new_whale' samples, which the classification head could not predict.
+
+**Optimization Strategy:**
+1.  **Refine Validation (`eval_fn`):** Rewrite `eval_fn` in `library/engine.py` to perform a proper retrieval evaluation. Instead of using the classification head's logits, we will:
+    *   Extract embeddings for the validation set (Query).
+    *   Extract embeddings for the training set (Gallery).
+    *   Compute distances (using k-Reciprocal Re-ranking if enabled) to find the nearest neighbors in the gallery.
+    *   Apply the `new_whale_threshold` logic to validly predict 'new_whale' for open-set samples.
+    *   Compute MAP@5 on these retrieval predictions.
+2.  **Gallery Data Loading:** In `runfile.py`, create a dedicated `gallery_loader` that loads the training data without augmentation (using validation transforms). This ensures stable gallery embeddings for the validation step.
+3.  **Training Duration:** Increase `epochs` from 12 to 15 in `runfile.py` to allow the model to converge further, now that we have a reliable metric to track progress.
+
+These changes ensure that the validation score accurately reflects the model's ability to retrieve whale identities and handle unknown whales, directly addressing the "Validation-Inference Alignment" lesson.
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def eval_fn(dataloader, model, device, id_map):
+    """
+    Performs validation by computing MAP@5 against learned class centers.
+    """
+    model.eval()
+
+    # Create inverse map: int -> str
+    idx_to_id = {v: k for k, v in id_map.items()}
+
+    predictions = []
+    ground_truths = []
+
+    # Access the head layer to get class centers
+    # Handle DataParallel wrapper if present
+    if hasattr(model, "module"):
+        head_layer = model.module.head
+    else:
+        head_layer = model.head
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+
+            # Get embeddings (model returns embeddings in eval mode)
+            embeddings = model(images)
+
+            # Compute logits using the head (Cosine Similarity)
+            # The head normalizes both input and weights internally
+            logits = head_layer(embeddings)
+
+            # Get top 5 predictions
+            _, topk_indices = torch.topk(logits, k=5, dim=1)
+            topk_indices = topk_indices.cpu().numpy()
+
+            # Process batch for metrics
+            labels_np = labels.numpy()
+            for i in range(len(labels_np)):
+                true_idx = labels_np[i]
+
+                # Decode ground truth
+                # Note: val set is guaranteed to have IDs present in training set per metadata logic
+                if true_idx in idx_to_id:
+                    true_label = idx_to_id[true_idx]
+                else:
+                    true_label = "new_whale"
+
+                ground_truths.append(true_label)
+
+                # Decode predictions
+                preds = [idx_to_id.get(idx, "new_whale") for idx in topk_indices[i]]
+                predictions.append(preds)
+
+    # Calculate MAP@5
+    score = calc_map5(ground_truths, predictions)
+    return score
+
+
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    patience=5,
+    save_path=None,
+):
+=======
+def eval_fn(val_loader, gallery_loader, model, device, id_map):
+    """
+    Performs validation by computing MAP@5 using a retrieval approach (Query vs Gallery).
+    Cite solution_lesson_node_00016: Validate using inference pipeline, not training objective.
+    """
+    model.eval()
+
+    # Create inverse map: int -> str
+    idx_to_id = {v: k for k, v in id_map.items()}
+
+    # 1. Extract Gallery Features (Train Set)
+    gallery_feats = []
+    gallery_labels = []
+    with torch.no_grad():
+        for images, labels in gallery_loader:
+            images = images.to(device)
+            feats = model(images)
+            gallery_feats.append(feats)
+            gallery_labels.extend(labels.numpy())
+    
+    gallery_feats = torch.cat(gallery_feats, dim=0)
+    # Normalize features (important for cosine distance / re-ranking)
+    gallery_feats = F.normalize(gallery_feats, p=2, dim=1)
+
+    # 2. Extract Query Features (Val Set)
+    query_feats = []
+    query_labels = []
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            feats = model(images)
+            query_feats.append(feats)
+            query_labels.extend(labels.numpy())
+            
+    query_feats = torch.cat(query_feats, dim=0)
+    query_feats = F.normalize(query_feats, p=2, dim=1)
+
+    # 3. Compute Distance Matrix
+    # Use re-ranking if enabled to match inference
+    if CFG.use_reranking:
+        dist_mat = re_ranking(
+            query_feats.cpu().numpy(),
+            gallery_feats.cpu().numpy(),
+            k1=CFG.k1,
+            k2=CFG.k2,
+            lambda_value=CFG.lambda_value
+        )
+    else:
+        # Cosine distance = 1 - cosine_similarity
+        sim_mat = torch.mm(query_feats, gallery_feats.t())
+        dist_mat = 1.0 - sim_mat.cpu().numpy()
+
+    # 4. Generate Predictions
+    predictions = []
+    ground_truths = []
+
+    # Pre-sort distances for efficiency
+    # argsort along axis 1 (gallery items)
+    sorted_indices = np.argsort(dist_mat, axis=1)
+    
+    for i in range(len(query_labels)):
+        # Ground Truth
+        true_idx = query_labels[i]
+        if true_idx in idx_to_id:
+            true_label = idx_to_id[true_idx]
+        else:
+            true_label = "new_whale"
+        ground_truths.append(true_label)
+
+        # Predictions
+        preds = []
+        
+        # Get distances for this query
+        dists = dist_mat[i]
+        indices = sorted_indices[i]
+        
+        # Check nearest neighbor distance for 'new_whale' threshold
+        min_dist = dists[indices[0]]
+        
+        if min_dist > CFG.new_whale_threshold:
+            preds.append("new_whale")
+            
+        for idx in indices:
+            train_idx = gallery_labels[idx]
+            label_str = idx_to_id.get(train_idx, "new_whale")
+            
+            if label_str not in preds:
+                preds.append(label_str)
+            
+            if len(preds) >= 5:
+                break
+        
+        # Fill with new_whale if needed
+        while len(preds) < 5:
+            preds.append("new_whale")
+            
+        predictions.append(preds[:5])
+
+    # Calculate MAP@5
+    score = calc_map5(ground_truths, predictions)
+    return score
+
+
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    gallery_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    patience=5,
+    save_path=None,
+):
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Validation Step
+        val_score = eval_fn(val_loader, model, device, id_map)
+
+        # Scheduler Step
+=======
+        # Validation Step
+        val_score = eval_fn(val_loader, gallery_loader, model, device, id_map)
+
+        # Scheduler Step
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Fast Baseline Settings: Limit epochs to ensure completion within 2 hours
+    epochs = 12
+
+    print(f"Running on device: {device}")
+=======
+    # Optimized Settings: Increase epochs for better convergence with correct validation
+    epochs = 15
+
+    print(f"Running on device: {device}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+    )
+
+    num_classes = len(train_dataset.get_id_map())
+    print(f"Training on {len(train_dataset)} images with {num_classes} classes.")
+    print(f"Validating on {len(val_dataset)} images.")
+
+    # -------------------------------------------------------------------------
+    # 3. Model Initialization
+=======
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+    )
+
+    # Gallery Loader for Validation (Train data, no augs)
+    # Cite solution_lesson_node_00016: Use gallery for retrieval-based validation
+    gallery_dataset = WhaleDataset(
+        csv_file=CFG.train_csv,
+        mode="train",
+        transform=get_transforms("val"), # No augmentation
+        id_map=train_dataset.get_id_map(),
+        exclude_new_whale=True,
+    )
+    
+    gallery_loader = DataLoader(
+        gallery_dataset,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+    )
+
+    num_classes = len(train_dataset.get_id_map())
+    print(f"Training on {len(train_dataset)} images with {num_classes} classes.")
+    print(f"Validating on {len(val_dataset)} images.")
+
+    # -------------------------------------------------------------------------
+    # 3. Model Initialization
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print("Starting training...")
+    best_score = fit(
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        device,
+        epochs=epochs,
+        patience=5,
+        save_path=CFG.model_path,
+    )
+=======
+    print("Starting training...")
+    best_score = fit(
+        model,
+        train_loader,
+        val_loader,
+        gallery_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        device,
+        epochs=epochs,
+        patience=5,
+        save_path=CFG.model_path,
+    )
+>>>>>>> REPLACE
+```

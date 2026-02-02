@@ -1,0 +1,276 @@
+I will remove the Modality Dropout mechanism and introduce a Cosine Annealing learning rate scheduler to optimize performance.
+
+1.  **Remove Modality Dropout**: I will remove the `ModalityDropout` class and its usage in the `AsymmetricEfficientNet` model. Lesson {solution_lesson_node_00046} indicates that structured dropout of entire modality groups degraded performance by ~3.3% in this specific multi-modal setting, likely because complementary signals were being suppressed.
+2.  **Add Learning Rate Scheduler**: I will add `CosineAnnealingLR` to the training loop. While Lesson {solution_lesson_node_00011} notes that weight decay is the primary regularizer (which is preserved at `1e-2`), Lesson {solution_lesson_node_00007} suggests that a scheduler helps stabilize the training loss curve, which may aid convergence on this small dataset.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+MODEL_NAME = "efficientnet_b0"
+MODALITY_DROPOUT_PROB = 0.2  # Probability to drop an entire modality group
+HEAD_DROPOUT_PROB = 0.5  # Dropout in the classification head
+NUM_CLASSES = 1
+=======
+MODEL_NAME = "efficientnet_b0"
+HEAD_DROPOUT_PROB = 0.5  # Dropout in the classification head
+NUM_CLASSES = 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import (
+    MODEL_NAME,
+    MODALITY_DROPOUT_PROB,
+    HEAD_DROPOUT_PROB,
+    NUM_CLASSES,
+    SEED,
+)
+
+# -----------------------------------------------------------------------------
+# Custom Layers
+# -----------------------------------------------------------------------------
+
+
+class ModalityDropout(nn.Module):
+    """
+    Drops an entire modality group from the feature maps.
+
+    Assumes the input x comes from a grouped convolution stem where:
+    - Input channels: 12 (4 modalities * 3 slices)
+    - Output channels: 32
+    - Groups: 4
+
+    Therefore, the 32 output channels are divided into 4 groups of 8 channels each.
+    Group 0 (0-7): Modality 1 (FLAIR)
+    Group 1 (8-15): Modality 2 (T1w)
+    Group 2 (16-23): Modality 3 (T1wCE)
+    Group 3 (24-31): Modality 4 (T2w)
+    """
+
+    def __init__(self, p=0.2, num_groups=4):
+        super().__init__()
+        self.p = p
+        self.num_groups = num_groups
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            return x
+
+        # x shape: (B, C, H, W), where C=32
+        B, C, H, W = x.shape
+        channels_per_group = C // self.num_groups
+
+        # We want to drop each group with probability p
+        # However, the prompt implies dropping *one* modality group or potentially multiple?
+        # "randomly zeroes out an entire modality group" usually implies independent Bernoulli per group
+        # or selecting one to drop. Standard dropout is Bernoulli.
+
+        # Create a mask of shape (B, num_groups)
+        # Keep probability is 1-p
+        mask_groups = torch.bernoulli(
+            torch.full((B, self.num_groups), 1 - self.p, device=x.device)
+        )
+
+        # Expand mask to channels: (B, num_groups) -> (B, num_groups, 1) -> (B, num_groups, channels_per_group)
+        mask_expanded = mask_groups.unsqueeze(-1).expand(-1, -1, channels_per_group)
+
+        # Flatten to (B, C)
+        mask_final = mask_expanded.reshape(B, C)
+
+        # Expand to spatial dims: (B, C, 1, 1)
+        mask_final = mask_final.unsqueeze(-1).unsqueeze(-1)
+
+        # Apply mask. We scale by 1/(1-p) to maintain expected value (inverted dropout)
+        # to ensure the next layers receive consistent magnitude.
+        scale = 1.0 / (1 - self.p)
+        return x * mask_final * scale
+
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+
+
+class AsymmetricEfficientNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # 1. Load Backbone
+        # Use pretrained=True to get ImageNet weights
+        self.backbone = timm.create_model(
+            MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES
+        )
+
+        # 2. Modify Stem for 12 Channels (Grouped Conv)
+        # Original stem: Conv2d(3, 32, k=3, s=2, p=1, bias=False)
+        old_stem = self.backbone.conv_stem
+
+        # New stem: Conv2d(12, 32, k=3, s=2, p=1, groups=4, bias=False)
+        # We assume 4 modalities * 3 channels = 12 input channels.
+        # Groups=4 ensures Modality 0 connects only to Output Filters 0-7, etc.
+        self.backbone.conv_stem = nn.Conv2d(
+            in_channels=12,
+            out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size,
+            stride=old_stem.stride,
+            padding=old_stem.padding,
+            groups=4,
+            bias=(old_stem.bias is not None),
+        )
+
+        # 3. Asymmetric Initialization
+        # The weight shape for Grouped Conv is (Out, In/Groups, k, k).
+        # For original: (32, 3, 3, 3).
+        # For new (groups=4): (32, 12/4, 3, 3) -> (32, 3, 3, 3).
+        # The shapes are identical. We copy the weights directly.
+        # This maps Pretrained Filters 0-7 to Modality 0, Filters 8-15 to Modality 1, etc.
+        self.backbone.conv_stem.weight.data = old_stem.weight.data.clone()
+
+        # 4. Insert Modality Dropout
+        self.modality_dropout = ModalityDropout(p=MODALITY_DROPOUT_PROB, num_groups=4)
+
+        # 5. Regularized Head
+        # Replace the final classifier with Dropout + Linear
+        in_features = self.backbone.classifier.in_features
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=HEAD_DROPOUT_PROB), nn.Linear(in_features, NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        # We need to manually run the stem to insert Modality Dropout
+        # EfficientNet B0 structure in timm:
+        # x -> conv_stem -> bn1 -> act1 -> blocks -> conv_head -> bn2 -> act2 -> global_pool -> classifier
+
+        # 1. Stem
+        x = self.backbone.conv_stem(x)
+        x = self.backbone.bn1(x)
+        x = F.silu(x, inplace=True)
+
+        # 2. Modality Dropout (Structural Innovation)
+        x = self.modality_dropout(x)
+
+        # 3. Blocks
+        x = self.backbone.blocks(x)
+=======
+from library.config import (
+    MODEL_NAME,
+    HEAD_DROPOUT_PROB,
+    NUM_CLASSES,
+    SEED,
+)
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+
+
+class AsymmetricEfficientNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # 1. Load Backbone
+        # Use pretrained=True to get ImageNet weights
+        self.backbone = timm.create_model(
+            MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES
+        )
+
+        # 2. Modify Stem for 12 Channels (Grouped Conv)
+        # Original stem: Conv2d(3, 32, k=3, s=2, p=1, bias=False)
+        old_stem = self.backbone.conv_stem
+
+        # New stem: Conv2d(12, 32, k=3, s=2, p=1, groups=4, bias=False)
+        # We assume 4 modalities * 3 channels = 12 input channels.
+        # Groups=4 ensures Modality 0 connects only to Output Filters 0-7, etc.
+        self.backbone.conv_stem = nn.Conv2d(
+            in_channels=12,
+            out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size,
+            stride=old_stem.stride,
+            padding=old_stem.padding,
+            groups=4,
+            bias=(old_stem.bias is not None),
+        )
+
+        # 3. Asymmetric Initialization
+        # The weight shape for Grouped Conv is (Out, In/Groups, k, k).
+        # For original: (32, 3, 3, 3).
+        # For new (groups=4): (32, 12/4, 3, 3) -> (32, 3, 3, 3).
+        # The shapes are identical. We copy the weights directly.
+        # This maps Pretrained Filters 0-7 to Modality 0, Filters 8-15 to Modality 1, etc.
+        self.backbone.conv_stem.weight.data = old_stem.weight.data.clone()
+
+        # 4. Regularized Head
+        # Replace the final classifier with Dropout + Linear
+        in_features = self.backbone.classifier.in_features
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=HEAD_DROPOUT_PROB), nn.Linear(in_features, NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        # We need to manually run the stem to insert Modality Dropout (REMOVED)
+        # EfficientNet B0 structure in timm:
+        # x -> conv_stem -> bn1 -> act1 -> blocks -> conv_head -> bn2 -> act2 -> global_pool -> classifier
+
+        # 1. Stem
+        x = self.backbone.conv_stem(x)
+        x = self.backbone.bn1(x)
+        x = F.silu(x, inplace=True)
+
+        # 2. Blocks
+        x = self.backbone.blocks(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Loss & Optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+
+    # 5. Training Loop
+    best_auc = 0.0
+    patience = 5
+    patience_counter = 0
+
+    print(f"Starting training for {num_epochs} epochs on {DEVICE}...")
+
+    for epoch in range(num_epochs):
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, criterion, optimizer, DEVICE
+        )
+        val_loss, val_auc = validate_one_epoch(model, val_loader, criterion, DEVICE)
+
+        print(f"Epoch {epoch+1}/{num_epochs}")
+=======
+    # 4. Loss & Optimizer
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
+
+    # 5. Training Loop
+    best_auc = 0.0
+    patience = 5
+    patience_counter = 0
+
+    print(f"Starting training for {num_epochs} epochs on {DEVICE}...")
+
+    for epoch in range(num_epochs):
+        train_loss, train_auc = train_one_epoch(
+            model, train_loader, criterion, optimizer, DEVICE
+        )
+        val_loss, val_auc = validate_one_epoch(model, val_loader, criterion, DEVICE)
+        
+        scheduler.step()
+
+        print(f"Epoch {epoch+1}/{num_epochs}")
+>>>>>>> REPLACE
+```

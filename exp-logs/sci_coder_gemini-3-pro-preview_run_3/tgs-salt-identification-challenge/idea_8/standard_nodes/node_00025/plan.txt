@@ -1,0 +1,474 @@
+To optimize the solution, I will implement a strategy focused on **convergence depth over ensemble width**, supported by the provided lessons.
+
+1.  **Single Model Training (Cite Lesson 00024)**: I will abandon the 5-fold ensemble (which ran for only 40 epochs per fold) in favor of training a single model on Fold 0 for **80 epochs**. This ensures the model has sufficient time to converge, particularly for the Lovasz-Hinge loss fine-tuning phase (Cite Lesson 00020).
+2.  **Dynamic Threshold Optimization (Cite Lesson 00011)**: I will modify the validation routine to perform a threshold sweep (0.3 to 0.75) at the end of each epoch. The model checkpointing and scheduler will track this **optimized mAP** rather than the mAP at a fixed 0.5 threshold. This ensures we save the model with the best discriminative power, decoupling performance from calibration.
+3.  **Configuration Updates**: I will update `EPOCHS` to 80 in `config.py` and remove the override in `runfile.py`.
+
+The estimated runtime for 80 epochs on a single fold is approximately 11-15 minutes, well within the 4-hour limit.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BATCH_SIZE = 64
+    EPOCHS = 80
+    LEARNING_RATE = 1e-4
+=======
+    BATCH_SIZE = 64
+    EPOCHS = 80
+    LEARNING_RATE = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            # Model returns single tensor in eval mode
+            output = model(images)
+
+            # Calculate loss for monitoring
+            # Note: If in warm-up (BCE), output is logits. If Lovasz, output is logits.
+            # Criterion handles logits.
+            loss = criterion(output, masks)
+            running_loss += loss.item()
+
+            # Apply sigmoid for metric calculation
+            preds = torch.sigmoid(output)
+
+            # Store for batch-wise mAP calculation or calculate per batch and average
+            # calc_map handles batch logic. We can accumulate or average.
+            # Given memory constraints, let's accumulate mAP per batch and average.
+            # However, calc_map logic is per image.
+
+            # Move to CPU to save GPU memory for accumulation if needed,
+            # but simpler to compute map on batch and average.
+            batch_map = calc_map(preds, masks)
+            all_preds.append(batch_map)
+
+    avg_loss = running_loss / len(loader)
+    avg_map = np.mean(all_preds)
+
+    return avg_loss, avg_map
+=======
+    # Accumulate predictions for threshold optimization (Cite Lesson 00011)
+    all_preds_np = []
+    all_masks_np = []
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            # Model returns single tensor in eval mode
+            output = model(images)
+
+            # Calculate loss for monitoring
+            loss = criterion(output, masks)
+            running_loss += loss.item()
+
+            # Apply sigmoid and move to CPU
+            preds = torch.sigmoid(output).cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            
+            all_preds_np.append(preds)
+            all_masks_np.append(masks_np)
+
+    avg_loss = running_loss / len(loader)
+    
+    # Concatenate all batches
+    all_preds_np = np.concatenate(all_preds_np, axis=0)
+    all_masks_np = np.concatenate(all_masks_np, axis=0)
+
+    # Dynamic Threshold Sweep (Cite Lesson 00011)
+    # Optimize metric to decouple discrimination from calibration
+    best_map = 0.0
+    thresholds = np.arange(0.3, 0.76, 0.05)
+    
+    for t in thresholds:
+        score = calc_map(all_preds_np, all_masks_np, pixel_threshold=t)
+        if score > best_map:
+            best_map = score
+
+    return avg_loss, best_map
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration Override for Fast Baseline
+    # Reducing epochs to ensure completion within 2 hours while maintaining convergence
+    Config.EPOCHS = 40
+    Config.setup()
+    seed_everything(Config.SEED)
+
+    print("Starting Stratified 5-Fold Ensemble Pipeline...")
+
+    # 2. Train Folds
+    for fold_idx in range(Config.N_FOLDS):
+        run_fold(fold_idx)
+
+    # 3. OOF Inference & Aggregation
+    print("\nGenerating OOF Predictions...")
+    df_train = pd.read_csv(Config.TRAIN_METADATA_PATH)
+    ids, images, masks, depths = load_data(df_train, "train", load_cached_data=True)
+
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    all_oof_preds = []
+    all_oof_targets = []
+    all_oof_ids = []
+
+    device = Config.DEVICE
+
+    # Calculate crop indices to revert padding (128 -> 101)
+    pad_h = Config.IMG_SIZE - Config.ORIG_SIZE
+    pad_w = Config.IMG_SIZE - Config.ORIG_SIZE
+    h_start = pad_h // 2
+    w_start = pad_w // 2
+
+    for fold_idx, (_, val_idx) in enumerate(skf.split(ids, df_train["coverage_class"])):
+        print(f"Processing Fold {fold_idx} Validation...")
+
+        # Load Model
+        model = SaltModel(
+            encoder_name=Config.ENCODER, pretrained=False, in_channels=Config.CHANNELS
+        )
+        ckpt_path = os.path.join(Config.CHECKPOINT_DIR, f"fold_{fold_idx}_best.pth")
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        # Data
+        val_dataset = SaltDataset(
+            images[val_idx],
+            depths[val_idx],
+            masks[val_idx],
+            transform=get_transforms("valid"),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        fold_preds = []
+        fold_targets = []
+
+        with torch.no_grad():
+            for imgs, msks in val_loader:
+                imgs = imgs.to(device)
+
+                # TTA: Original
+                out1 = torch.sigmoid(model(imgs))
+
+                # TTA: Horizontal Flip
+                imgs_flip = torch.flip(imgs, dims=[3])
+                out2 = torch.sigmoid(model(imgs_flip))
+                out2 = torch.flip(out2, dims=[3])
+
+                # Average
+                avg_pred = (out1 + out2) / 2.0
+
+                # Crop back to 101x101
+                avg_pred = avg_pred[
+                    :,
+                    :,
+                    h_start : h_start + Config.ORIG_SIZE,
+                    w_start : w_start + Config.ORIG_SIZE,
+                ]
+
+                fold_preds.append(avg_pred.cpu().numpy())
+                fold_targets.append(msks.numpy())
+
+        fold_preds = np.concatenate(fold_preds, axis=0)  # (N, 1, 101, 101)
+        fold_targets = np.concatenate(fold_targets, axis=0)  # (N, H, W) or (N, 1, H, W)
+
+        # Crop targets (dataset padding)
+        if fold_targets.ndim == 4:
+            fold_targets = fold_targets[
+                :,
+                :,
+                h_start : h_start + Config.ORIG_SIZE,
+                w_start : w_start + Config.ORIG_SIZE,
+            ]
+            fold_targets = fold_targets.squeeze(1)
+        elif fold_targets.ndim == 3:
+            fold_targets = fold_targets[
+                :,
+                h_start : h_start + Config.ORIG_SIZE,
+                w_start : w_start + Config.ORIG_SIZE,
+            ]
+
+        fold_preds = fold_preds.squeeze(1)
+
+        all_oof_preds.append(fold_preds)
+        all_oof_targets.append(fold_targets)
+        all_oof_ids.extend(ids[val_idx])
+
+        del model
+        torch.cuda.empty_cache()
+
+    all_oof_preds = np.concatenate(all_oof_preds, axis=0)
+    all_oof_targets = np.concatenate(all_oof_targets, axis=0)
+
+    # 4. Threshold Optimization
+    print("Optimizing Threshold...")
+    best_score, best_threshold = optimize_threshold(all_oof_preds, all_oof_targets)
+
+    print(f"Final Validation Metric: {best_score:.10f}")
+    print(f"Optimal Threshold: {best_threshold:.2f}")
+
+    # 5. Failure Analysis
+    analyze_failures(all_oof_preds, all_oof_targets, all_oof_ids, best_threshold)
+
+    # 6. Submission
+    if best_score > 0.827:
+        print("Generating Submission...")
+
+        # Load Test Data
+        df_test = pd.read_csv(Config.TEST_METADATA_PATH)
+        test_ids, test_images, _, test_depths = load_data(
+            df_test, "test", load_cached_data=True
+        )
+
+        test_dataset = SaltDataset(
+            test_images, test_depths, masks=None, transform=get_transforms("valid")
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        # Load all models
+        models = []
+        for fold_idx in range(Config.N_FOLDS):
+            m = SaltModel(
+                encoder_name=Config.ENCODER,
+                pretrained=False,
+                in_channels=Config.CHANNELS,
+            )
+            m.load_state_dict(
+                torch.load(
+                    os.path.join(Config.CHECKPOINT_DIR, f"fold_{fold_idx}_best.pth"),
+                    map_location=device,
+                )
+            )
+            m.to(device)
+            m.eval()
+            models.append(m)
+
+        final_rles = []
+
+        with torch.no_grad():
+            for imgs, _ in test_loader:
+                imgs = imgs.to(device)
+
+                # Ensemble TTA
+                batch_preds = 0.0
+
+                for m in models:
+                    # Original
+                    out = torch.sigmoid(m(imgs))
+                    # Flip
+                    imgs_flip = torch.flip(imgs, dims=[3])
+                    out_flip = torch.sigmoid(m(imgs_flip))
+                    out_flip = torch.flip(out_flip, dims=[3])
+
+                    batch_preds += (out + out_flip) / 2.0
+
+                batch_preds /= len(models)
+=======
+def main():
+    # 1. Configuration Setup
+    # Removed epoch override to allow full 80 epoch training (Cite Lesson 00024)
+    Config.setup()
+    seed_everything(Config.SEED)
+
+    print("Starting Single Model Training Pipeline (Fold 0)...")
+
+    # 2. Train Single Fold (Cite Lesson 00024: Depth over Width)
+    run_fold(0)
+
+    # 3. Validation Inference (Fold 0 only)
+    print("\nGenerating Validation Predictions...")
+    df_train = pd.read_csv(Config.TRAIN_METADATA_PATH)
+    ids, images, masks, depths = load_data(df_train, "train", load_cached_data=True)
+
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    all_oof_preds = []
+    all_oof_targets = []
+    all_oof_ids = []
+
+    device = Config.DEVICE
+
+    # Calculate crop indices to revert padding (128 -> 101)
+    pad_h = Config.IMG_SIZE - Config.ORIG_SIZE
+    pad_w = Config.IMG_SIZE - Config.ORIG_SIZE
+    h_start = pad_h // 2
+    w_start = pad_w // 2
+
+    # Only process Fold 0
+    for fold_idx, (_, val_idx) in enumerate(skf.split(ids, df_train["coverage_class"])):
+        if fold_idx > 0:
+            break
+            
+        print(f"Processing Fold {fold_idx} Validation...")
+
+        # Load Model
+        model = SaltModel(
+            encoder_name=Config.ENCODER, pretrained=False, in_channels=Config.CHANNELS
+        )
+        ckpt_path = os.path.join(Config.CHECKPOINT_DIR, f"fold_{fold_idx}_best.pth")
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        # Data
+        val_dataset = SaltDataset(
+            images[val_idx],
+            depths[val_idx],
+            masks[val_idx],
+            transform=get_transforms("valid"),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        fold_preds = []
+        fold_targets = []
+
+        with torch.no_grad():
+            for imgs, msks in val_loader:
+                imgs = imgs.to(device)
+
+                # TTA: Original
+                out1 = torch.sigmoid(model(imgs))
+
+                # TTA: Horizontal Flip (Cite Lesson 00002)
+                imgs_flip = torch.flip(imgs, dims=[3])
+                out2 = torch.sigmoid(model(imgs_flip))
+                out2 = torch.flip(out2, dims=[3])
+
+                # Average
+                avg_pred = (out1 + out2) / 2.0
+
+                # Crop back to 101x101
+                avg_pred = avg_pred[
+                    :,
+                    :,
+                    h_start : h_start + Config.ORIG_SIZE,
+                    w_start : w_start + Config.ORIG_SIZE,
+                ]
+
+                fold_preds.append(avg_pred.cpu().numpy())
+                fold_targets.append(msks.numpy())
+
+        fold_preds = np.concatenate(fold_preds, axis=0)  # (N, 1, 101, 101)
+        fold_targets = np.concatenate(fold_targets, axis=0)  # (N, H, W) or (N, 1, H, W)
+
+        # Crop targets (dataset padding)
+        if fold_targets.ndim == 4:
+            fold_targets = fold_targets[
+                :,
+                :,
+                h_start : h_start + Config.ORIG_SIZE,
+                w_start : w_start + Config.ORIG_SIZE,
+            ]
+            fold_targets = fold_targets.squeeze(1)
+        elif fold_targets.ndim == 3:
+            fold_targets = fold_targets[
+                :,
+                h_start : h_start + Config.ORIG_SIZE,
+                w_start : w_start + Config.ORIG_SIZE,
+            ]
+
+        fold_preds = fold_preds.squeeze(1)
+
+        all_oof_preds.append(fold_preds)
+        all_oof_targets.append(fold_targets)
+        all_oof_ids.extend(ids[val_idx])
+
+        del model
+        torch.cuda.empty_cache()
+
+    all_oof_preds = np.concatenate(all_oof_preds, axis=0)
+    all_oof_targets = np.concatenate(all_oof_targets, axis=0)
+
+    # 4. Threshold Optimization
+    print("Optimizing Threshold...")
+    best_score, best_threshold = optimize_threshold(all_oof_preds, all_oof_targets)
+
+    print(f"Final Validation Metric: {best_score:.10f}")
+    print(f"Optimal Threshold: {best_threshold:.2f}")
+
+    # 5. Failure Analysis
+    analyze_failures(all_oof_preds, all_oof_targets, all_oof_ids, best_threshold)
+
+    # 6. Submission
+    if best_score > 0.827:
+        print("Generating Submission...")
+
+        # Load Test Data
+        df_test = pd.read_csv(Config.TEST_METADATA_PATH)
+        test_ids, test_images, _, test_depths = load_data(
+            df_test, "test", load_cached_data=True
+        )
+
+        test_dataset = SaltDataset(
+            test_images, test_depths, masks=None, transform=get_transforms("valid")
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        # Load Single Model (Fold 0)
+        model = SaltModel(
+            encoder_name=Config.ENCODER,
+            pretrained=False,
+            in_channels=Config.CHANNELS,
+        )
+        model.load_state_dict(
+            torch.load(
+                os.path.join(Config.CHECKPOINT_DIR, "fold_0_best.pth"),
+                map_location=device,
+            )
+        )
+        model.to(device)
+        model.eval()
+
+        final_rles = []
+
+        with torch.no_grad():
+            for imgs, _ in test_loader:
+                imgs = imgs.to(device)
+
+                # TTA: Original
+                out = torch.sigmoid(model(imgs))
+                # TTA: Flip
+                imgs_flip = torch.flip(imgs, dims=[3])
+                out_flip = torch.sigmoid(model(imgs_flip))
+                out_flip = torch.flip(out_flip, dims=[3])
+
+                batch_preds = (out + out_flip) / 2.0
+>>>>>>> REPLACE
+```

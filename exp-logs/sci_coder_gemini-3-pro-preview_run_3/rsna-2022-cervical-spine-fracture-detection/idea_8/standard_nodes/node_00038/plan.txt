@@ -1,0 +1,700 @@
+To improve the model's performance, I will revert the "Box-Guided" supervision strategy which caused a significant regression (from ~0.12 to ~0.93). According to **Lesson solution_lesson_node_00033**, enforcing rigid instance-level constraints (like bounding boxes) on subsampled volumetric data often degrades performance due to misalignment and label noise. I will return to a pure Multiple Instance Learning (MIL) approach where the model learns to localize fractures based solely on study-level labels.
+
+Additionally, I will increase the training duration from 5 to 10 epochs. **Lesson solution_lesson_node_00007** suggests that decoupling the scheduler and allowing for a longer training horizon (even if early stopping triggers) is beneficial for convergence, especially when removing the auxiliary loss signal.
+
+Here are the specific changes:
+1.  **`library/config.py`**: Update `CACHE_DIR` to `idea_9`, remove `ALPHA_BOX_LOSS`, and set `EPOCHS` to 10.
+2.  **`library/loss.py`**: Remove the bounding box BCE loss component and rename the class to `HierarchicalMILLoss`.
+3.  **`library/data.py`**: Remove all bounding box loading, processing, and return values from the dataset.
+4.  **`library/engine.py`**: Update training and validation loops to handle the simplified data signature (removing box targets).
+5.  **`runfile.py`**: Update the training call to use `Config.EPOCHS` and import the modified loss class.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Output Paths
+    # Using 'idea_8' as specified in the prompt requirements for caching
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_8")
+    MODEL_PATH = os.path.join(WORKING_DIR, "best_model.pth")
+=======
+    # Output Paths
+    # Using 'idea_9' for the pure MIL ablation (removing box guidance)
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_9")
+    MODEL_PATH = os.path.join(WORKING_DIR, "best_model.pth")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    SEED = 42
+    BATCH_SIZE = 8  # Small batch size acts as regularizer
+    NUM_WORKERS = 4  # 12 vCPUs available
+    EPOCHS = 10
+
+    # Optimizer
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 1e-2
+
+    # Scheduler
+    # T_max set to 1.5 * EPOCHS for decoupled cosine annealing
+    T_MAX_MULT = 1.5
+    MIN_LR = 1e-6
+
+    # Loss Weights
+    # Alpha for the Box-Guided Loss component
+    ALPHA_BOX_LOSS = 1.0
+
+    # Device
+=======
+    # Training Hyperparameters
+    SEED = 42
+    BATCH_SIZE = 8  # Small batch size acts as regularizer
+    NUM_WORKERS = 4  # 12 vCPUs available
+    EPOCHS = 10
+
+    # Optimizer
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 1e-2
+
+    # Scheduler
+    # T_max set to 1.5 * EPOCHS for decoupled cosine annealing
+    T_MAX_MULT = 1.5
+    MIN_LR = 1e-6
+
+    # Device
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class HybridHierarchicalLoss(nn.Module):
+    """
+    Implements the Hybrid Hierarchical Loss for Cervical Spine Fracture Detection.
+
+    Components:
+    1. L_MIL: Weighted Multi-label Logarithmic Loss on global max-pooled predictions.
+       Weights: 1.0 for C1-C7, 7.0 for patient_overall.
+    2. L_Box: Slice-Level Binary Cross Entropy on instance logits, supervised by
+       bounding box masks. Applied only to samples with valid box annotations.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.alpha = Config.ALPHA_BOX_LOSS
+
+        # Competition metric weights: C1-C7 = 1.0, Patient_Overall = 7.0
+        # Registered as buffer to handle device movement automatically
+        weights = torch.tensor([1.0] * 7 + [7.0])
+        self.register_buffer("mil_weights", weights)
+
+        # Base Loss Functions
+        # MIL Loss: Weighted BCE. Reduction is mean to average over batch.
+        # Note: We pass pos_weight=None, but use the 'weight' argument for class balancing
+        # in the forward pass if needed, or initialize here if static.
+        # PyTorch BCEWithLogitsLoss 'weight' arg is for rescaling weight given to the loss of each batch element
+        # OR class if broadcastable.
+        self.bce_mil = nn.BCEWithLogitsLoss(weight=self.mil_weights)
+
+        # Box Loss: Standard BCE. Reduction is none to allow masking.
+        self.bce_box = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, instance_logits, targets, box_targets=None, box_mask=None):
+        """
+        Args:
+            instance_logits (torch.Tensor): Shape (B, Seq_Len, 7). Raw logits for C1-C7 per slice.
+            targets (torch.Tensor): Shape (B, 8). Global ground truth [C1...C7, patient_overall].
+            box_targets (torch.Tensor, optional): Shape (B, Seq_Len, 7). Sparse binary masks for fractures.
+            box_mask (torch.Tensor, optional): Shape (B,). Binary mask indicating which samples have
+                                               valid bounding box annotations (1.0 = has boxes, 0.0 = no boxes).
+
+        Returns:
+            tuple: (total_loss, metrics_dict)
+        """
+        # --- 1. MIL Component (Global Level) ---
+
+        # Global Max Pooling: Aggregate slice logits to study logits
+        # Shape: (B, 7)
+        pooled_logits, _ = torch.max(instance_logits, dim=1)
+
+        # Derive patient_overall logit
+        # Logic: If any vertebra is fractured, patient is fractured.
+        # In probability space: p_overall = max(p_c1, ... p_c7)
+        # In logit space: logit_overall = max(logit_c1, ... logit_c7)
+        # Shape: (B, 1)
+        patient_logit, _ = torch.max(pooled_logits, dim=1, keepdim=True)
+
+        # Concatenate to form full prediction vector: [C1...C7, patient_overall]
+        # Shape: (B, 8)
+        global_logits = torch.cat([pooled_logits, patient_logit], dim=1)
+
+        # Calculate Weighted MIL Loss
+        loss_mil = self.bce_mil(global_logits, targets.float())
+
+        # --- 2. Box Component (Slice Level) ---
+
+        loss_box = torch.tensor(0.0, device=instance_logits.device)
+
+        # Only compute box loss if targets and mask are provided
+        if box_targets is not None and box_mask is not None:
+            # Flatten sequence dims for BCE if needed, or keep as is.
+            # instance_logits: (B, S, 7), box_targets: (B, S, 7)
+
+            # Compute raw BCE loss per element
+            # Shape: (B, S, 7)
+            raw_box_loss = self.bce_box(instance_logits, box_targets.float())
+
+            # Aggregate loss per sample (average over sequence and classes)
+            # Shape: (B,)
+            per_sample_box_loss = raw_box_loss.mean(dim=(1, 2))
+
+            # Apply mask: Zero out loss for samples without box annotations
+            # box_mask shape: (B,)
+            masked_loss = per_sample_box_loss * box_mask
+
+            # Normalize by the number of valid samples to avoid gradient dilution
+            num_valid_samples = box_mask.sum()
+
+            if num_valid_samples > 0:
+                loss_box = masked_loss.sum() / num_valid_samples
+            else:
+                loss_box = torch.tensor(0.0, device=instance_logits.device)
+
+        # --- 3. Total Loss ---
+        total_loss = loss_mil + self.alpha * loss_box
+
+        metrics = {
+            "loss": total_loss.item(),
+            "loss_mil": loss_mil.item(),
+            "loss_box": loss_box.item(),
+        }
+
+        return total_loss, metrics
+=======
+class HierarchicalMILLoss(nn.Module):
+    """
+    Implements the Hierarchical Loss for Cervical Spine Fracture Detection.
+    Cite solution_lesson_node_00033: Removing box-guided supervision as it degraded performance.
+
+    Components:
+    1. L_MIL: Weighted Multi-label Logarithmic Loss on global max-pooled predictions.
+       Weights: 1.0 for C1-C7, 7.0 for patient_overall.
+    """
+
+    def __init__(self):
+        super().__init__()
+        
+        # Competition metric weights: C1-C7 = 1.0, Patient_Overall = 7.0
+        # Registered as buffer to handle device movement automatically
+        weights = torch.tensor([1.0] * 7 + [7.0])
+        self.register_buffer("mil_weights", weights)
+
+        # Base Loss Functions
+        # MIL Loss: Weighted BCE. Reduction is mean to average over batch.
+        self.bce_mil = nn.BCEWithLogitsLoss(weight=self.mil_weights)
+
+    def forward(self, instance_logits, targets):
+        """
+        Args:
+            instance_logits (torch.Tensor): Shape (B, Seq_Len, 7). Raw logits for C1-C7 per slice.
+            targets (torch.Tensor): Shape (B, 8). Global ground truth [C1...C7, patient_overall].
+
+        Returns:
+            tuple: (total_loss, metrics_dict)
+        """
+        # --- 1. MIL Component (Global Level) ---
+
+        # Global Max Pooling: Aggregate slice logits to study logits
+        # Shape: (B, 7)
+        pooled_logits, _ = torch.max(instance_logits, dim=1)
+
+        # Derive patient_overall logit
+        # Logic: If any vertebra is fractured, patient is fractured.
+        # In probability space: p_overall = max(p_c1, ... p_c7)
+        # In logit space: logit_overall = max(logit_c1, ... logit_c7)
+        # Shape: (B, 1)
+        patient_logit, _ = torch.max(pooled_logits, dim=1, keepdim=True)
+
+        # Concatenate to form full prediction vector: [C1...C7, patient_overall]
+        # Shape: (B, 8)
+        global_logits = torch.cat([pooled_logits, patient_logit], dim=1)
+
+        # Calculate Weighted MIL Loss
+        loss_mil = self.bce_mil(global_logits, targets.float())
+
+        metrics = {
+            "loss": loss_mil.item(),
+        }
+
+        return loss_mil, metrics
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        # Load Bounding Boxes (only for train/val)
+        self.box_df = None
+        if mode in ["train", "val"] and os.path.exists(Config.BOUNDING_BOXES_PATH):
+            self.box_df = pd.read_csv(Config.BOUNDING_BOXES_PATH)
+
+        # Pre-group boxes by StudyInstanceUID for O(1) access
+        self.boxes_by_study = {}
+        if self.box_df is not None:
+            # Filter to only relevant columns
+            # Assuming columns: StudyInstanceUID, x, y, width, height, slice_number
+            # We map fracture types based on the slice?
+            # The competition boxes usually don't label the vertebra directly in the box row
+            # but the task implies we need to know which vertebra is fractured.
+            # However, the prompt says: "Map the provided fracture bounding boxes... If a bounding box for 'C1' exists..."
+            # The provided box csv usually just has geometry.
+            # We will infer the vertebra from the segmentation or just use the box presence as a generic fracture signal
+            # OR we use the global labels to infer.
+            # Strict reading: "If a bounding box for 'C1' exists".
+            # Since the box file often doesn't have the class, we will use the global labels to gate the box targets
+            # or assume the box indicates a fracture on that slice.
+            # For this implementation, we treat any box on a slice as a positive target for the fractured vertebrae
+            # present in that study, or simply as a binary "fracture present on slice" signal.
+            # Given the output is (64, 7), we'll assign the box to all positive global classes for that study
+            # (Weakly supervised localization refinement).
+            for study_id, group in self.box_df.groupby("StudyInstanceUID"):
+                self.boxes_by_study[study_id] = group
+
+    def __len__(self):
+=======
+    def __len__(self):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # E. Generate Box Targets (Sparse Mask)
+        # Shape: (Seq, 7)
+        box_targets = np.zeros((seq_len, 7), dtype=np.float32)
+        has_box = 0.0
+
+        if self.mode in ["train", "val"] and study_id in self.boxes_by_study:
+            study_boxes = self.boxes_by_study[study_id]
+
+            # Identify which of the sampled indices correspond to a box
+            # We iterate through boxes, find their volume index, and check if that index
+            # is close to one of our sampled indices.
+
+            # Invert slice_map for lookup: Index -> InstanceNumber (not needed directly)
+            # We need: Box(InstanceNumber) -> VolumeIndex
+
+            for _, row in study_boxes.iterrows():
+                slice_num = int(row["slice_number"])
+                if slice_num in slice_map:
+                    vol_idx = slice_map[slice_num]
+
+                    # Find if this vol_idx is in our sampled 'indices'
+                    # Since we sample, we might miss the exact slice.
+                    # We assign the box to the nearest sampled slice.
+                    dist = np.abs(indices - vol_idx)
+                    min_dist_idx = np.argmin(dist)
+
+                    # Threshold: only assign if reasonably close (e.g. within sampling stride)
+                    stride = depth / seq_len
+                    if dist[min_dist_idx] < max(2.0, stride):
+                        # This sampled slice contains a fracture
+                        # Which subtype? The boxes don't say.
+                        # We use the global labels to turn on relevant columns.
+                        # If global C1 is 1, and we have a box, we assume it *might* be C1.
+                        # This is a heuristic for "Hybrid Supervised".
+                        # If labels are provided:
+                        if labels is not None:
+                            for c_idx, col in enumerate(
+                                ["C1", "C2", "C3", "C4", "C5", "C6", "C7"]
+                            ):
+                                if labels[col] == 1:
+                                    box_targets[min_dist_idx, c_idx] = 1.0
+                        else:
+                            # Fallback if no labels (shouldn't happen in train): set all to 1?
+                            # Or just ignore.
+                            pass
+
+                        has_box = 1.0
+
+        # Convert stacks to uint8 for storage
+        stacks_uint8 = (stacks * 255).astype(np.uint8)
+
+        data = {"images": stacks_uint8, "box_targets": box_targets, "has_box": has_box}
+
+        # Save to cache
+        if self.load_cached_data:
+            np.save(cache_path, data)
+
+        return data
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        study_id = row["StudyInstanceUID"]
+
+        # Get Global Labels
+        # [C1...C7, patient_overall]
+        targets = np.zeros(8, dtype=np.float32)
+        labels_dict = None
+
+        if self.mode != "test":
+            cols = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "patient_overall"]
+            targets = row[cols].values.astype(np.float32)
+            labels_dict = row[cols].to_dict()
+
+        # Load Data (Images + Box Targets)
+        data = self._process_and_cache(study_id, row["image_path"], labels_dict)
+
+        # Unpack
+        images = data["images"].astype(np.float32) / 255.0  # (Seq, 3, H, W)
+        box_targets = data["box_targets"]  # (Seq, 7)
+        has_box = np.float32(data["has_box"])
+
+        # Augmentation
+        # We need to apply the same transform to all slices in the sequence
+        if self.transform:
+            seq, c, h, w = images.shape
+            # Reshape to (H, W, Seq*C) to apply 2D transform consistently
+            images_reshaped = images.transpose(2, 3, 0, 1).reshape(h, w, seq * c)
+
+            augmented = self.transform(image=images_reshaped)["image"]
+
+            # Reshape back to (Seq, C, H, W)
+            # Albumentations returns tensor if ToTensorV2 is used, or numpy
+            if isinstance(augmented, torch.Tensor):
+                # (C_total, H, W) -> (Seq, C, H, W)
+                images = augmented.view(seq, c, h, w)
+            else:
+                images = augmented.reshape(h, w, seq, c).transpose(2, 3, 0, 1)
+                images = torch.from_numpy(images)
+        else:
+            images = torch.from_numpy(images)
+
+        # Convert targets to tensors
+        targets = torch.tensor(targets, dtype=torch.float32)
+        box_targets = torch.tensor(box_targets, dtype=torch.float32)
+        has_box = torch.tensor(has_box, dtype=torch.float32)
+
+        return images, targets, box_targets, has_box, study_id
+=======
+        # Convert stacks to uint8 for storage
+        stacks_uint8 = (stacks * 255).astype(np.uint8)
+
+        data = {"images": stacks_uint8}
+
+        # Save to cache
+        if self.load_cached_data:
+            np.save(cache_path, data)
+
+        return data
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        study_id = row["StudyInstanceUID"]
+
+        # Get Global Labels
+        # [C1...C7, patient_overall]
+        targets = np.zeros(8, dtype=np.float32)
+        labels_dict = None
+
+        if self.mode != "test":
+            cols = ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "patient_overall"]
+            targets = row[cols].values.astype(np.float32)
+            labels_dict = row[cols].to_dict()
+
+        # Load Data
+        data = self._process_and_cache(study_id, row["image_path"], labels_dict)
+
+        # Unpack
+        images = data["images"].astype(np.float32) / 255.0  # (Seq, 3, H, W)
+
+        # Augmentation
+        # We need to apply the same transform to all slices in the sequence
+        if self.transform:
+            seq, c, h, w = images.shape
+            # Reshape to (H, W, Seq*C) to apply 2D transform consistently
+            images_reshaped = images.transpose(2, 3, 0, 1).reshape(h, w, seq * c)
+
+            augmented = self.transform(image=images_reshaped)["image"]
+
+            # Reshape back to (Seq, C, H, W)
+            # Albumentations returns tensor if ToTensorV2 is used, or numpy
+            if isinstance(augmented, torch.Tensor):
+                # (C_total, H, W) -> (Seq, C, H, W)
+                images = augmented.view(seq, c, h, w)
+            else:
+                images = augmented.reshape(h, w, seq, c).transpose(2, 3, 0, 1)
+                images = torch.from_numpy(images)
+        else:
+            images = torch.from_numpy(images)
+
+        # Convert targets to tensors
+        targets = torch.tensor(targets, dtype=torch.float32)
+
+        return images, targets, study_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.loss import HybridHierarchicalLoss
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+
+    total_loss_sum = 0.0
+    mil_loss_sum = 0.0
+    box_loss_sum = 0.0
+    num_batches = 0
+
+    for batch_idx, (images, targets, box_targets, has_box, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+        box_targets = box_targets.to(device)
+        has_box = has_box.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass: (B, Seq, 7)
+        instance_logits = model(images)
+
+        # Calculate Loss
+        loss, metrics = criterion(instance_logits, targets, box_targets, has_box)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate metrics
+        total_loss_sum += metrics["loss"]
+        mil_loss_sum += metrics["loss_mil"]
+        box_loss_sum += metrics["loss_box"]
+        num_batches += 1
+
+    avg_loss = total_loss_sum / num_batches
+    avg_mil = mil_loss_sum / num_batches
+    avg_box = box_loss_sum / num_batches
+
+    return avg_loss, avg_mil, avg_box
+
+
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss and the competition metric score.
+    """
+    model.eval()
+
+    total_loss_sum = 0.0
+    num_batches = 0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, targets, box_targets, has_box, _ in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            box_targets = box_targets.to(device)
+            has_box = has_box.to(device)
+
+            # Forward pass
+            instance_logits = model(images)
+
+            # Calculate validation loss (for tracking)
+            loss, _ = criterion(instance_logits, targets, box_targets, has_box)
+            total_loss_sum += loss.item()
+            num_batches += 1
+
+            # Aggregate predictions for metric calculation
+=======
+from library.loss import HierarchicalMILLoss
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+
+    total_loss_sum = 0.0
+    num_batches = 0
+
+    for batch_idx, (images, targets, _) in enumerate(loader):
+        images = images.to(device)
+        targets = targets.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass: (B, Seq, 7)
+        instance_logits = model(images)
+
+        # Calculate Loss
+        loss, metrics = criterion(instance_logits, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate metrics
+        total_loss_sum += metrics["loss"]
+        num_batches += 1
+
+    avg_loss = total_loss_sum / num_batches
+
+    return avg_loss
+
+
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Returns average loss and the competition metric score.
+    """
+    model.eval()
+
+    total_loss_sum = 0.0
+    num_batches = 0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, targets, _ in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # Forward pass
+            instance_logits = model(images)
+
+            # Calculate validation loss (for tracking)
+            loss, _ = criterion(instance_logits, targets)
+            total_loss_sum += loss.item()
+            num_batches += 1
+
+            # Aggregate predictions for metric calculation
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    for epoch in range(1, epochs + 1):
+        # Train
+        t_loss, t_mil, t_box = train_one_epoch(
+            model, train_loader, optimizer, criterion, device
+        )
+
+        # Validate
+        v_loss, v_score = validate(model, val_loader, criterion, device)
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Print Metrics (Full Precision)
+        print(f"Epoch {epoch}/{epochs} | LR: {current_lr:.8f}")
+        print(f"Train Loss: {t_loss:.8f} (MIL: {t_mil:.8f}, Box: {t_box:.8f})")
+        print(f"Val Loss:   {v_loss:.8f} | Val Score: {v_score:.8f}")
+
+        # Early Stopping
+=======
+    criterion = HierarchicalMILLoss().to(device)
+
+    # Scheduler: Decoupled Cosine Annealing
+    # T_max set relative to epochs as per config
+    t_max = int(epochs * Config.T_MAX_MULT)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=t_max, eta_min=Config.MIN_LR
+    )
+
+    best_score = float("inf")
+    patience_counter = 0
+
+    print(f"Starting training on device: {device}")
+
+    for epoch in range(1, epochs + 1):
+        # Train
+        t_loss = train_one_epoch(
+            model, train_loader, optimizer, criterion, device
+        )
+
+        # Validate
+        v_loss, v_score = validate(model, val_loader, criterion, device)
+
+        # Step Scheduler
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Print Metrics (Full Precision)
+        print(f"Epoch {epoch}/{epochs} | LR: {current_lr:.8f}")
+        print(f"Train Loss: {t_loss:.8f}")
+        print(f"Val Loss:   {v_loss:.8f} | Val Score: {v_score:.8f}")
+
+        # Early Stopping
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, _, _, _, study_ids in test_loader:
+            images = images.to(device)
+
+            # Forward pass
+=======
+    with torch.no_grad():
+        for images, _, study_ids in test_loader:
+            images = images.to(device)
+
+            # Forward pass
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.loss import HybridHierarchicalLoss
+=======
+from library.loss import HierarchicalMILLoss
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- 5. Training ---
+    # Run for 5 epochs to ensure a fast baseline execution within the time limit.
+    # The fit function handles the training loop, validation monitoring, and saving the best model.
+    print("Starting training...")
+    fit(model, train_loader, val_loader, optimizer, device, epochs=5)
+
+    # --- 6. Final Evaluation ---
+    # Load the best model weights saved during training
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+
+    model.eval()
+
+    all_preds = []
+    all_targets = []
+    study_ids = []
+
+    # Perform inference on validation set to compute the final metric
+    with torch.no_grad():
+        for images, targets, _, _, s_ids in val_loader:
+            images = images.to(device)
+
+            # Forward pass
+=======
+    # --- 5. Training ---
+    # Cite solution_lesson_node_00007: Increasing epochs to allow full convergence with decoupled scheduler.
+    print("Starting training...")
+    fit(model, train_loader, val_loader, optimizer, device, epochs=Config.EPOCHS)
+
+    # --- 6. Final Evaluation ---
+    # Load the best model weights saved during training
+    if os.path.exists(Config.MODEL_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_PATH, map_location=device))
+
+    model.eval()
+
+    all_preds = []
+    all_targets = []
+    study_ids = []
+
+    # Perform inference on validation set to compute the final metric
+    with torch.no_grad():
+        for images, targets, s_ids in val_loader:
+            images = images.to(device)
+
+            # Forward pass
+>>>>>>> REPLACE
+```

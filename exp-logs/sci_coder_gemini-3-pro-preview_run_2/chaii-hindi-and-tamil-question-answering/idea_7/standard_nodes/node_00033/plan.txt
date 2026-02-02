@@ -1,0 +1,198 @@
+To improve the model's performance, I will implement **Gradient Accumulation** and **Differential Learning Rates**. Gradient accumulation will increase the effective batch size from 4 to 16, providing more stable gradient estimates for the `xlm-roberta-large` model (addressing stability issues noted in Lesson 8). Differential learning rates will assign a higher learning rate to the randomly initialized classification heads compared to the pre-trained backbone, facilitating faster convergence of the task-specific layers while preserving the multilingual representations. I will also increase the training duration to 4 epochs to ensure convergence with the new optimization strategy.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    N_FOLDS = 3
+    EPOCHS = 3
+
+    # Batch size adjusted for XLM-R Large on A100 (40GB)
+    # Using a smaller batch size with gradient accumulation is often necessary for Large models
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 8
+
+    LEARNING_RATE = 1e-5
+    WEIGHT_DECAY = 0.01
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    N_FOLDS = 3
+    EPOCHS = 4
+
+    # Batch size adjusted for XLM-R Large on A100 (40GB)
+    # Using a smaller batch size with gradient accumulation is often necessary for Large models
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 8
+    GRADIENT_ACCUMULATION_STEPS = 4
+
+    LEARNING_RATE = 1e-5
+    WEIGHT_DECAY = 0.01
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    for step, batch in enumerate(data_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        start_positions = batch["start_positions"].to(device)
+        end_positions = batch["end_positions"].to(device)
+        answerable_labels = batch["answerable_label"].to(device)
+
+        # Forward pass with mixed precision
+        with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+            start_logits, end_logits, answerability_logits = model(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
+
+            loss = loss_fn(
+                start_logits,
+                end_logits,
+                answerability_logits,
+                start_positions,
+                end_positions,
+                answerable_labels,
+            )
+
+        # Backward pass
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        batch_size = input_ids.size(0)
+        losses.update(loss.item(), batch_size)
+=======
+    for step, batch in enumerate(data_loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        start_positions = batch["start_positions"].to(device)
+        end_positions = batch["end_positions"].to(device)
+        answerable_labels = batch["answerable_label"].to(device)
+
+        # Forward pass with mixed precision
+        with torch.amp.autocast("cuda", enabled=Config.USE_FP16):
+            start_logits, end_logits, answerability_logits = model(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
+
+            loss = loss_fn(
+                start_logits,
+                end_logits,
+                answerability_logits,
+                start_positions,
+                end_positions,
+                answerable_labels,
+            )
+
+        # Normalize loss for gradient accumulation
+        loss = loss / Config.GRADIENT_ACCUMULATION_STEPS
+
+        # Backward pass
+        scaler.scale(loss).backward()
+
+        if (step + 1) % Config.GRADIENT_ACCUMULATION_STEPS == 0:
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            if scheduler is not None:
+                scheduler.step()
+
+        batch_size = input_ids.size(0)
+        # Update losses with the actual loss value (un-normalized)
+        losses.update(loss.item() * Config.GRADIENT_ACCUMULATION_STEPS, batch_size)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Setup
+    print(f"Initializing model: {Config.MODEL_NAME}")
+    model = XLMRobertaForMultiTaskQA()
+    model.to(device)
+
+    # Optimizer and Scheduler
+    optimizer = AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    total_steps = len(train_loader) * Config.EPOCHS
+    warmup_steps = int(total_steps * Config.WARMUP_RATIO)
+=======
+    # 3. Model Setup
+    print(f"Initializing model: {Config.MODEL_NAME}")
+    model = XLMRobertaForMultiTaskQA()
+    model.to(device)
+
+    # Optimizer and Scheduler
+    # Differential Learning Rates: Higher LR for heads, lower for backbone
+    param_optimizer = list(model.named_parameters())
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    
+    optimizer_grouped_parameters = [
+        # Backbone parameters (lower LR)
+        {
+            "params": [p for n, p in model.named_parameters() if "roberta" in n and not any(nd in n for nd in no_decay)],
+            "weight_decay": Config.WEIGHT_DECAY,
+            "lr": Config.LEARNING_RATE,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "roberta" in n and any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": Config.LEARNING_RATE,
+        },
+        # Head parameters (higher LR - 3x)
+        {
+            "params": [p for n, p in model.named_parameters() if "roberta" not in n and not any(nd in n for nd in no_decay)],
+            "weight_decay": Config.WEIGHT_DECAY,
+            "lr": Config.LEARNING_RATE * 3,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "roberta" not in n and any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": Config.LEARNING_RATE * 3,
+        },
+    ]
+
+    optimizer = AdamW(optimizer_grouped_parameters)
+
+    # Adjust total steps for gradient accumulation
+    num_update_steps_per_epoch = len(train_loader) // Config.GRADIENT_ACCUMULATION_STEPS
+    total_steps = num_update_steps_per_epoch * Config.EPOCHS
+    warmup_steps = int(total_steps * Config.WARMUP_RATIO)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Submission
+    THRESHOLD = 0.29861679496973614
+
+    if final_metric > THRESHOLD:
+=======
+    # 7. Submission
+    THRESHOLD = 0.5318392857142856
+
+    if final_metric > THRESHOLD:
+>>>>>>> REPLACE
+```

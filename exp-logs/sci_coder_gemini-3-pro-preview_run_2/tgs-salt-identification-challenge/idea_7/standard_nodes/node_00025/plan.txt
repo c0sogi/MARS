@@ -1,0 +1,559 @@
+Implementation Strategy:
+1.  **Refine Model Architecture (`library/model.py`)**: Transition from a Multi-Task Learning approach (auxiliary depth regression) to a **Feature Injection** approach (Cite Lesson 00024). This involves removing the auxiliary regression head and instead projecting the scalar depth into a low-dimensional embedding (32 channels) which is concatenated with the encoder's bottleneck features (Cite Lesson 00009). This explicitly conditions the decoder on the depth context.
+2.  **Update Loss Function (`library/losses.py`)**: Remove the Mean Squared Error (MSE) component related to depth regression, simplifying the objective to a combination of Binary Cross Entropy and Lovasz-Hinge Loss (Cite Lesson 00021).
+3.  **Update Data Handling (`library/dataset.py`)**: Ensure the test set data loader returns depth tensors, enabling the model to use depth information during inference.
+4.  **Update Training and Inference Loops (`library/model.py`, `library/predict.py`)**: Adjust the forward passes in training, validation, and prediction routines to accept and utilize the depth tensor input.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        if self.mode == "test":
+            if self.transform:
+                augmented = self.transform(image=img)
+                img = augmented["image"]
+
+            # Convert to tensor and normalize to [0, 1]
+            # Albumentations PadIfNeeded returns numpy array.
+            # We assume transform pipeline does not include ToTensorV2 to allow manual float conversion here.
+            img_tensor = torch.from_numpy(img).float().unsqueeze(0) / 255.0
+
+            return img_tensor, self.ids[idx]
+
+        mask = self.masks[idx]
+=======
+        if self.mode == "test":
+            if self.transform:
+                augmented = self.transform(image=img)
+                img = augmented["image"]
+
+            # Convert to tensor and normalize to [0, 1]
+            # Albumentations PadIfNeeded returns numpy array.
+            # We assume transform pipeline does not include ToTensorV2 to allow manual float conversion here.
+            img_tensor = torch.from_numpy(img).float().unsqueeze(0) / 255.0
+
+            return img_tensor, depth_tensor, self.ids[idx]
+
+        mask = self.masks[idx]
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+class SaltNetLoss(nn.Module):
+    """
+    Composite Multi-Task Loss for Salt Segmentation.
+
+    L_total = (L_bce + L_lovasz) + lambda * L_mse
+    """
+
+    def __init__(self):
+        super(SaltNetLoss, self).__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+        self.mse = nn.MSELoss()
+        self.depth_weight = config.DEPTH_LOSS_WEIGHT
+
+    def forward(self, seg_logits, depth_preds, seg_targets, depth_targets):
+        """
+        Args:
+            seg_logits: (Tensor) Segmentation logits [B, 1, H, W]
+            depth_preds: (Tensor) Depth predictions [B, 1]
+            seg_targets: (Tensor) Ground truth masks [B, 1, H, W] or [B, H, W]
+            depth_targets: (Tensor) Ground truth depths [B, 1] or [B]
+
+        Returns:
+            loss: (Tensor) Scalar loss value
+            metrics: (Dict) Dictionary containing individual loss components for logging
+        """
+        # --- Segmentation Loss ---
+        # Ensure targets are float for BCE
+        if seg_targets.dtype != torch.float32:
+            seg_targets = seg_targets.float()
+
+        # Ensure shape alignment for BCE
+        if seg_targets.ndim == 3:
+            seg_targets = seg_targets.unsqueeze(1)
+
+        loss_bce = self.bce(seg_logits, seg_targets)
+        loss_lovasz = self.lovasz(seg_logits, seg_targets)
+
+        total_seg_loss = loss_bce + loss_lovasz
+
+        # --- Regression Loss ---
+        # Ensure shape alignment for MSE
+        if depth_targets.ndim == 1:
+            depth_targets = depth_targets.unsqueeze(1)
+
+        # Ensure types match
+        if depth_targets.dtype != depth_preds.dtype:
+            depth_targets = depth_targets.to(depth_preds.dtype)
+
+        loss_depth = self.mse(depth_preds, depth_targets)
+
+        # --- Total Loss ---
+        total_loss = total_seg_loss + (self.depth_weight * loss_depth)
+
+        metrics = {
+            "loss_bce": loss_bce.item(),
+            "loss_lovasz": loss_lovasz.item(),
+            "loss_seg_total": total_seg_loss.item(),
+            "loss_depth": loss_depth.item(),
+            "loss_total": total_loss.item(),
+        }
+
+        return total_loss, metrics
+=======
+class SaltNetLoss(nn.Module):
+    """
+    Composite Loss for Salt Segmentation.
+
+    L_total = L_bce + L_lovasz
+    """
+
+    def __init__(self):
+        super(SaltNetLoss, self).__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+
+    def forward(self, seg_logits, seg_targets):
+        """
+        Args:
+            seg_logits: (Tensor) Segmentation logits [B, 1, H, W]
+            seg_targets: (Tensor) Ground truth masks [B, 1, H, W] or [B, H, W]
+
+        Returns:
+            loss: (Tensor) Scalar loss value
+            metrics: (Dict) Dictionary containing individual loss components for logging
+        """
+        # --- Segmentation Loss ---
+        # Ensure targets are float for BCE
+        if seg_targets.dtype != torch.float32:
+            seg_targets = seg_targets.float()
+
+        # Ensure shape alignment for BCE
+        if seg_targets.ndim == 3:
+            seg_targets = seg_targets.unsqueeze(1)
+
+        loss_bce = self.bce(seg_logits, seg_targets)
+        loss_lovasz = self.lovasz(seg_logits, seg_targets)
+
+        total_loss = loss_bce + loss_lovasz
+
+        metrics = {
+            "loss_bce": loss_bce.item(),
+            "loss_lovasz": loss_lovasz.item(),
+            "loss_total": total_loss.item(),
+        }
+
+        return total_loss, metrics
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class WideLinkNet34(nn.Module):
+    """
+    Multi-Task Wide-LinkNet34 with Auxiliary Depth Regression.
+    """
+
+    def __init__(self):
+        super(WideLinkNet34, self).__init__()
+
+        # Load Pretrained ResNet34
+        self.base = resnet34(weights=ResNet34_Weights.DEFAULT)
+
+        # Modify first layer for Grayscale (1 channel)
+        # Sum weights across the channel dimension to preserve intensity patterns
+        w = self.base.conv1.weight
+        self.base.conv1 = nn.Conv2d(
+            1, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.base.conv1.weight = nn.Parameter(w.sum(dim=1, keepdim=True))
+
+        # Encoder Blocks
+        self.encoder0 = nn.Sequential(
+            self.base.conv1, self.base.bn1, self.base.relu
+        )  # 64, H/2
+        self.encoder1 = nn.Sequential(self.base.maxpool, self.base.layer1)  # 64, H/4
+        self.encoder2 = self.base.layer2  # 128, H/8
+        self.encoder3 = self.base.layer3  # 256, H/16
+        self.encoder4 = self.base.layer4  # 512, H/32
+
+        # Auxiliary Depth Head (attached to bottleneck)
+        self.aux_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(512, 1)
+        )
+
+        # Decoder Blocks
+        # Dec4: 512 -> 256 (Skip e3: 256)
+        self.decoder4 = DecoderBlock(512, 256)
+        # Dec3: 256 -> 128 (Skip e2: 128)
+        self.decoder3 = DecoderBlock(256, 128)
+        # Dec2: 128 -> 64 (Skip e1: 64)
+        self.decoder2 = DecoderBlock(128, 64)
+        # Dec1: 64 -> 64 (Skip e0: 64)
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # Final Upsampling to Original Resolution (64 -> 128)
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, x):
+        # Encoder
+        e0 = self.encoder0(x)  # 64, 64x64
+        e1 = self.encoder1(e0)  # 64, 32x32
+        e2 = self.encoder2(e1)  # 128, 16x16
+        e3 = self.encoder3(e2)  # 256, 8x8
+        e4 = self.encoder4(e3)  # 512, 4x4
+
+        # Auxiliary Task
+        depth_pred = self.aux_head(e4)
+
+        # Decoder
+        d4 = self.decoder4(e4, e3)  # 256, 8x8
+        d3 = self.decoder3(d4, e2)  # 128, 16x16
+        d2 = self.decoder2(d3, e1)  # 64, 32x32
+        d1 = self.decoder1(d2, e0)  # 64, 64x64
+
+        # Final Segmentation
+        seg_logits = self.final_up(d1)  # 1, 128x128
+
+        return seg_logits, depth_pred
+=======
+class WideLinkNet34(nn.Module):
+    """
+    Wide-LinkNet34 with Depth Injection at Bottleneck.
+    """
+
+    def __init__(self):
+        super(WideLinkNet34, self).__init__()
+
+        # Load Pretrained ResNet34
+        self.base = resnet34(weights=ResNet34_Weights.DEFAULT)
+
+        # Modify first layer for Grayscale (1 channel)
+        # Sum weights across the channel dimension to preserve intensity patterns
+        w = self.base.conv1.weight
+        self.base.conv1 = nn.Conv2d(
+            1, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.base.conv1.weight = nn.Parameter(w.sum(dim=1, keepdim=True))
+
+        # Encoder Blocks
+        self.encoder0 = nn.Sequential(
+            self.base.conv1, self.base.bn1, self.base.relu
+        )  # 64, H/2
+        self.encoder1 = nn.Sequential(self.base.maxpool, self.base.layer1)  # 64, H/4
+        self.encoder2 = self.base.layer2  # 128, H/8
+        self.encoder3 = self.base.layer3  # 256, H/16
+        self.encoder4 = self.base.layer4  # 512, H/32
+
+        # Depth Projector (Scalar -> Embedding)
+        self.depth_projector = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True)
+        )
+
+        # Decoder Blocks
+        # Dec4: (512 + 32) -> 256 (Skip e3: 256)
+        self.decoder4 = DecoderBlock(544, 256)
+        # Dec3: 256 -> 128 (Skip e2: 128)
+        self.decoder3 = DecoderBlock(256, 128)
+        # Dec2: 128 -> 64 (Skip e1: 64)
+        self.decoder2 = DecoderBlock(128, 64)
+        # Dec1: 64 -> 64 (Skip e0: 64)
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # Final Upsampling to Original Resolution (64 -> 128)
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, x, depth):
+        # Encoder
+        e0 = self.encoder0(x)  # 64, 64x64
+        e1 = self.encoder1(e0)  # 64, 32x32
+        e2 = self.encoder2(e1)  # 128, 16x16
+        e3 = self.encoder3(e2)  # 256, 8x8
+        e4 = self.encoder4(e3)  # 512, 4x4
+
+        # Depth Injection
+        # Project depth: (B, 1) -> (B, 32)
+        d = self.depth_projector(depth)
+        # Reshape to (B, 32, 1, 1)
+        d = d.unsqueeze(2).unsqueeze(3)
+        # Expand to match feature map spatial dims: (B, 32, 4, 4)
+        d = d.expand(-1, -1, e4.size(2), e4.size(3))
+        # Concatenate: (B, 512+32, 4, 4)
+        e4_cat = torch.cat([e4, d], dim=1)
+
+        # Decoder
+        d4 = self.decoder4(e4_cat, e3)  # 256, 8x8
+        d3 = self.decoder3(d4, e2)  # 128, 16x16
+        d2 = self.decoder2(d3, e1)  # 64, 32x32
+        d1 = self.decoder1(d2, e0)  # 64, 64x64
+
+        # Final Segmentation
+        seg_logits = self.final_up(d1)  # 1, 128x128
+
+        return seg_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+
+    for images, masks, depths in loader:
+        images = images.to(device)
+        masks = masks.to(device)
+        depths = depths.to(device)
+
+        optimizer.zero_grad()
+
+        seg_logits, depth_preds = model(images)
+
+        loss, _ = criterion(seg_logits, depth_preds, masks, depths)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_masks = []
+
+    with torch.no_grad():
+        for images, masks, depths in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+
+            seg_logits, depth_preds = model(images)
+            loss, _ = criterion(seg_logits, depth_preds, masks, depths)
+
+            running_loss += loss.item() * images.size(0)
+
+            # Store for metric calculation
+            # Center crop to original size (101x101) before metric
+            # Current size 128x128.
+            # Center is at 64. 101/2 = 50.5. Start: 64-50=14. End: 14+101=115.
+            # Or simpler: albumentations PadIfNeeded does center padding.
+            # So we center crop.
+
+            preds_prob = torch.sigmoid(seg_logits)
+
+            # Crop to 101x101
+            h, w = preds_prob.shape[2], preds_prob.shape[3]
+            start_h = (h - config.IMG_ORIG_SIZE) // 2
+            start_w = (w - config.IMG_ORIG_SIZE) // 2
+            end_h = start_h + config.IMG_ORIG_SIZE
+            end_w = start_w + config.IMG_ORIG_SIZE
+
+            preds_crop = preds_prob[:, :, start_h:end_h, start_w:end_w]
+            masks_crop = masks[:, :, start_h:end_h, start_w:end_w]
+
+            all_preds.append(preds_crop.cpu())
+            all_masks.append(masks_crop.cpu())
+=======
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+
+    for images, masks, depths in loader:
+        images = images.to(device)
+        masks = masks.to(device)
+        depths = depths.to(device)
+
+        optimizer.zero_grad()
+
+        seg_logits = model(images, depths)
+
+        loss, _ = criterion(seg_logits, masks)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_masks = []
+
+    with torch.no_grad():
+        for images, masks, depths in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+
+            seg_logits = model(images, depths)
+            loss, _ = criterion(seg_logits, masks)
+
+            running_loss += loss.item() * images.size(0)
+
+            # Store for metric calculation
+            # Center crop to original size (101x101) before metric
+            # Current size 128x128.
+            # Center is at 64. 101/2 = 50.5. Start: 64-50=14. End: 14+101=115.
+            # Or simpler: albumentations PadIfNeeded does center padding.
+            # So we center crop.
+
+            preds_prob = torch.sigmoid(seg_logits)
+
+            # Crop to 101x101
+            h, w = preds_prob.shape[2], preds_prob.shape[3]
+            start_h = (h - config.IMG_ORIG_SIZE) // 2
+            start_w = (w - config.IMG_ORIG_SIZE) // 2
+            end_h = start_h + config.IMG_ORIG_SIZE
+            end_w = start_w + config.IMG_ORIG_SIZE
+
+            preds_crop = preds_prob[:, :, start_h:end_h, start_w:end_w]
+            masks_crop = masks[:, :, start_h:end_h, start_w:end_w]
+
+            all_preds.append(preds_crop.cpu())
+            all_masks.append(masks_crop.cpu())
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Test Inference
+    test_loader = dataset.get_test_loader(depth_mean, depth_std, load_cached_data=True)
+
+    submission_data = []
+
+    print("Generating predictions on test set...")
+    with torch.no_grad():
+        for images, ids in test_loader:
+            images = images.to(device)
+
+            # TTA: Original
+            logits, _ = model(images)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Flip
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip, _ = model(images_flip)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+=======
+    # Test Inference
+    test_loader = dataset.get_test_loader(depth_mean, depth_std, load_cached_data=True)
+
+    submission_data = []
+
+    print("Generating predictions on test set...")
+    with torch.no_grad():
+        for images, depths, ids in test_loader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # TTA: Original
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Flip
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip = model(images_flip, depths)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, ids in test_loader:
+            images = images.to(device)
+
+            # TTA: Forward Pass (Original)
+            logits, _ = net(images)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Horizontal Flip Pass
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip, _ = net(images_flip)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+=======
+    with torch.no_grad():
+        for images, depths, ids in test_loader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # TTA: Forward Pass (Original)
+            logits = net(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Horizontal Flip Pass
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip = net(images_flip, depths)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    print("Predicting on test set...")
+    with torch.no_grad():
+        for images, ids in test_loader:
+            images = images.to(device)
+
+            # TTA: Forward Pass
+            logits, _ = net(images)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Horizontal Flip Pass
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip, _ = net(images_flip)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+=======
+    print("Predicting on test set...")
+    with torch.no_grad():
+        for images, depths, ids in test_loader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # TTA: Forward Pass
+            logits = net(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # TTA: Horizontal Flip Pass
+            images_flip = torch.flip(images, dims=[3])
+            logits_flip = net(images_flip, depths)
+            probs_flip = torch.sigmoid(logits_flip)
+            probs_flip = torch.flip(probs_flip, dims=[3])
+>>>>>>> REPLACE
+```

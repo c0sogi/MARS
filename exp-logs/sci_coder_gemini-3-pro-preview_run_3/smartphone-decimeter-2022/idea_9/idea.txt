@@ -1,0 +1,47 @@
+Based on the lessons learned, specifically the failure of standard smoothing due to heavy-tailed outliers (Cite solution_lesson_node_00014) and the failure of gating due to unmodeled vehicle dynamics (Cite solution_lesson_node_00018), I propose the **Doppler-Aided Residual Boosting with Kinematic Gating** strategy.
+
+This strategy introduces a **Physics-Based Velocity Estimator** stage. Instead of inferring dynamics from noisy position sequences, we will explicitly calculate the device's velocity using the Doppler shift measurements (Pseudorange Rate) provided in the raw GNSS logs. This velocity vector will serve as a robust control input for the smoothing filter, allowing it to distinguish between valid high-speed maneuvers and multipath position jumps.
+
+### 1. Model
+The predictive core remains a **LightGBM Regressor** (Gradient Boosting Decision Trees), leveraging its proven superiority for instantaneous sensor correction (Cite solution_lesson_node_00010).
+
+*   **Architecture:** Two independent LightGBM models.
+    *   **East Model:** Predicts the Easting error ($\Delta E$).
+    *   **North Model:** Predicts the Northing error ($\Delta N$).
+*   **Target:** The model predicts the **ENU (East-North-Up) Residuals** in meters:
+    $$ \text{Target} = P_{GT} - P_{WLS} $$
+    This retains the residual learning paradigm, which effectively normalizes the target distribution (Cite solution_lesson_node_00007).
+
+### 2. Data
+The preprocessing pipeline combines point-wise feature engineering (Cite solution_lesson_node_00011) with a new physics-based derivation step.
+
+*   **Step A: Doppler Velocity Estimation (Innovation)**
+    For every timestamp, solve a Weighted Least Squares (WLS) problem using the **Doppler effect**:
+    $$ \rho' = (\vec{v}_{sat} - \vec{v}_{user}) \cdot \vec{u} + \dot{t} $$
+    Where $\rho'$ is `PseudorangeRateMetersPerSecond`, $\vec{v}_{sat}$ is `SvVelocity`, and $\vec{u}$ is the unit vector from user to satellite (derived from `WlsPosition`). Solving for $\vec{v}_{user}$ yields a robust, instantaneous velocity vector $(v_E, v_N)$ independent of position errors.
+
+*   **Step B: Feature Engineering**
+    Construct a flat feature vector for each timestamp (no windowing):
+    *   **Doppler Features:** The calculated $v_E$, $v_N$, and total speed $|v|$.
+    *   **Signal Quality:** Mean/Max/Std of `Cn0DbHz`; Satellite Count; Mean Elevation.
+    *   **IMU Dynamics:** Mean/Std of accelerometer magnitude.
+    *   **Baseline Kinematics:** Speed implied by the WLS position sequence.
+
+### 3. Training
+*   **Loss Function:** **Mean Absolute Error (MAE)**. This L1 loss ensures the model focuses on the median error and remains robust to the massive outliers common in the dataset (Cite solution_lesson_node_00007).
+*   **Validation:** **GroupKFold** cross-validation grouped by `drive_id`. This strictly enforces evaluation on unseen drives to prevent trajectory memorization (Cite solution_lesson_node_00011).
+
+### 4. Evaluation
+The inference pipeline uses the Doppler velocity to "guide" the smoothing filter, solving the gating problem identified in Lesson 00018.
+
+1.  **Prediction:** Generate predicted residuals ($\hat{\Delta E}, \hat{\Delta N}$) using LightGBM and add them to the WLS baseline to get the corrected position $\hat{P}_{corr}$.
+2.  **Doppler-Control Kalman Smoothing (Innovation):**
+    Apply a Kalman Smoother with **Control Input**:
+    *   **State:** Position $X_t = [E_t, N_t]$.
+    *   **Control Input:** Doppler Velocity $U_t = [v_{E,t}, v_{N,t}]$.
+    *   **Prediction Model:** $X_t = X_{t-1} + U_{t-1} \cdot \Delta t$.
+        *   *Why this works:* The prediction now accounts for the vehicle's physical motion. Even if the car accelerates to 30 m/s, the prediction will move 30m, keeping the innovation (error) low.
+    *   **Measurement:** The ML-corrected position $\hat{P}_{corr}$.
+    *   **Innovation Gate:** Calculate the distance between the *Doppler-predicted* position and the *ML-measured* position.
+        *   If Distance > Threshold (e.g., 15m), **reject the measurement**.
+        *   *Result:* The filter ignores the position jump (multipath) and "coasts" on the accurate Doppler velocity vector until the position signal stabilizes. This prevents the "smearing" of outliers (Cite solution_lesson_node_00014) while preserving valid high-speed motion (Cite solution_lesson_node_00018).

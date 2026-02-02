@@ -1,0 +1,362 @@
+Based on the lessons learned, specifically **Lesson 24** (Prioritize Late Fusion with Attention over FiLM) and **Lesson 18** (Preserving Strong Scalar Priors via Skip Connections), I will optimize the solution by replacing the `DualAxisFiLMNet` with an `AttentionFusedDualAxisNet`. The previous FiLM-based approach underperformed (-6.96) because it likely allowed noisy visual features to corrupt the strong tabular signal early in the network. The new architecture will use independent EfficientNet-B0 backbones for Axial and Coronal views, fused with tabular data via Multi-Head Self-Attention, and crucially, will include a skip connection for tabular features directly to the prediction head to preserve their signal. I will also ensure `Softplus` is used for variance constraints (Cite **Lesson 21**) and Global Average Pooling is applied before fusion (Cite **Lesson 20**).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # FiLM (Feature-wise Linear Modulation) settings
+    FILM_HIDDEN_DIM = 256
+
+    # ==========================================
+    # 5. Training Hyperparameters
+=======
+    # Attention Fusion settings
+    FUSION_HEADS = 4
+    SKIP_DIM = 128
+
+    # ==========================================
+    # 5. Training Hyperparameters
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FiLMLayer(nn.Module):
+    """
+    Applies Feature-wise Linear Modulation (FiLM) to the input feature map.
+    Formula: output = gamma * input + beta
+    """
+
+    def forward(self, x, gamma, beta):
+        """
+        Args:
+            x: Input feature map of shape (Batch, Channels, Height, Width)
+            gamma: Scale parameter of shape (Batch, Channels)
+            beta: Shift parameter of shape (Batch, Channels)
+        """
+        # Unsqueeze gamma and beta to match spatial dimensions (B, C, 1, 1)
+        gamma = gamma.unsqueeze(2).unsqueeze(3)
+        beta = beta.unsqueeze(2).unsqueeze(3)
+
+        return gamma * x + beta
+
+
+class TabularModulator(nn.Module):
+    """
+    MLP that processes clinical metadata to generate FiLM parameters (gamma, beta)
+    for the visual backbones.
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(TabularModulator, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DualAxisFiLMNet(nn.Module):
+    """
+    FiLM-Conditioned Dual-Axis Network.
+
+    Architecture:
+    1. Independent Axial and Coronal EfficientNet-B0 backbones (feature extractors).
+    2. Tabular Modulator generates scale/shift params from clinical data.
+    3. FiLM layers modulate the visual feature maps based on clinical context.
+    4. Global Average Pooling.
+    5. Skip-connection fusion (Modulated Visual + Raw Tabular).
+    6. Parametric Head predicting Alpha (Slope), Sigma_Base, and Sigma_Growth.
+    """
+
+    def __init__(self):
+        super(DualAxisFiLMNet, self).__init__()
+
+        # ==========================================
+        # 1. Independent Visual Backbones
+        # ==========================================
+        # We use EfficientNet-B0 initialized with ImageNet weights.
+        # global_pool='' ensures we get the spatial feature map (B, 1280, 7, 7)
+        self.axial_backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool=""
+        )
+
+        self.coronal_backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool=""
+        )
+
+        self.num_channels = Config.BACKBONE_OUT_CHANNELS  # 1280 for EfficientNet-B0
+
+        # ==========================================
+        # 2. Tabular Modulator
+        # ==========================================
+        # We need unique Gamma and Beta for EACH channel of EACH backbone.
+        # Total outputs = (Channels * 2 params) * 2 backbones
+        modulator_output_dim = 4 * self.num_channels
+
+        self.modulator = TabularModulator(
+            input_dim=Config.TABULAR_INPUT_DIM,
+            hidden_dim=Config.FILM_HIDDEN_DIM,
+            output_dim=modulator_output_dim,
+        )
+
+        # ==========================================
+        # 3. FiLM & Pooling
+        # ==========================================
+        self.film = FiLMLayer()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # ==========================================
+        # 4. Prediction Head
+        # ==========================================
+        # Input to head: Axial_Vector + Coronal_Vector + Raw_Tabular_Skip
+        head_input_dim = (self.num_channels * 2) + Config.TABULAR_INPUT_DIM
+
+        self.head = nn.Sequential(
+            nn.Linear(head_input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 3),  # Outputs: Alpha, Sigma_Base, Sigma_Growth
+        )
+
+    def forward(self, axial, coronal, tabular):
+        """
+        Args:
+            axial: Tensor (B, 3, 224, 224)
+            coronal: Tensor (B, 3, 224, 224)
+            tabular: Tensor (B, Tabular_Input_Dim)
+
+        Returns:
+            alpha: Predicted slope
+            sigma_base: Predicted base confidence
+            sigma_growth: Predicted confidence growth rate
+        """
+        # 1. Extract Visual Features
+        # Shape: (B, 1280, 7, 7)
+        f_axial = self.axial_backbone(axial)
+        f_coronal = self.coronal_backbone(coronal)
+
+        # 2. Generate Modulation Parameters
+        # Shape: (B, 5120)
+        mod_params = self.modulator(tabular)
+
+        # Split parameters: Gamma/Beta for Axial, Gamma/Beta for Coronal
+        C = self.num_channels
+        gamma_ax = mod_params[:, 0:C]
+        beta_ax = mod_params[:, C : 2 * C]
+        gamma_co = mod_params[:, 2 * C : 3 * C]
+        beta_co = mod_params[:, 3 * C : 4 * C]
+
+        # 3. Apply FiLM (Deep Feature Modulation)
+        f_axial_mod = self.film(f_axial, gamma_ax, beta_ax)
+        f_coronal_mod = self.film(f_coronal, gamma_co, beta_co)
+
+        # 4. Global Pooling
+        # Shape: (B, 1280)
+        v_axial = self.pool(f_axial_mod).flatten(1)
+        v_coronal = self.pool(f_coronal_mod).flatten(1)
+
+        # 5. Fusion with Skip Connection
+        # Concatenate modulated visual vectors with the raw tabular input
+        combined = torch.cat([v_axial, v_coronal, tabular], dim=1)
+
+        # 6. Prediction
+        out = self.head(combined)
+
+        # Split outputs
+        alpha = out[:, 0]
+
+        # Apply Softplus to sigmas to enforce positivity
+        sigma_base = F.softplus(out[:, 1])
+        sigma_growth = F.softplus(out[:, 2])
+
+        return alpha, sigma_base, sigma_growth
+=======
+class AttentionFusion(nn.Module):
+    """
+    Multi-Head Self-Attention module for fusing heterogeneous modalities.
+    """
+
+    def __init__(self, embed_dim, num_heads=4):
+        super(AttentionFusion, self).__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # x: (B, Seq_Len, Embed_Dim)
+        attn_out, _ = self.attn(x, x, x)
+        return self.norm(x + attn_out)
+
+
+class AttentionFusedDualAxisNet(nn.Module):
+    """
+    Attention-Fused Dual-Axis Network with Skip Connections.
+    Cite solution_lesson_node_00024: Prioritize Late Fusion with Attention.
+    Cite solution_lesson_node_00018: Preserving Strong Scalar Priors via Skip Connections.
+
+    Architecture:
+    1. Independent Axial and Coronal EfficientNet-B0 backbones (Global Average Pooled).
+    2. Tabular Projection to match visual embedding dimension.
+    3. Multi-Head Self-Attention Fusion of [Axial, Coronal, Tabular].
+    4. Skip Connection of Tabular Embedding to the final head.
+    5. Parametric Head predicting Alpha, Sigma_Base, Sigma_Growth.
+    """
+
+    def __init__(self):
+        super(AttentionFusedDualAxisNet, self).__init__()
+
+        # ==========================================
+        # 1. Independent Visual Backbones
+        # ==========================================
+        # Cite solution_lesson_node_00020: Use Global Average Pooling
+        self.axial_backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool="avg"
+        )
+
+        self.coronal_backbone = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, global_pool="avg"
+        )
+
+        self.embed_dim = Config.BACKBONE_OUT_CHANNELS  # 1280
+
+        # ==========================================
+        # 2. Tabular Projections
+        # ==========================================
+        # Project tabular to high-dim for attention participation
+        self.tab_proj = nn.Sequential(
+            nn.Linear(Config.TABULAR_INPUT_DIM, 512),
+            nn.ReLU(),
+            nn.Linear(512, self.embed_dim),
+        )
+
+        # Project tabular to low-dim for skip connection (Strong Prior)
+        self.tab_skip_proj = nn.Sequential(
+            nn.Linear(Config.TABULAR_INPUT_DIM, 64),
+            nn.ReLU(),
+            nn.Linear(64, Config.SKIP_DIM),
+        )
+
+        # ==========================================
+        # 3. Fusion Mechanism
+        # ==========================================
+        self.fusion = AttentionFusion(self.embed_dim, num_heads=Config.FUSION_HEADS)
+
+        # ==========================================
+        # 4. Prediction Head
+        # ==========================================
+        # Input: Flattened Attention Output (3 tokens * 1280) + Skip Connection (128)
+        head_input_dim = (3 * self.embed_dim) + Config.SKIP_DIM
+
+        self.dropout = nn.Dropout(0.2)
+        self.head = nn.Sequential(
+            nn.Linear(head_input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 3),  # Outputs: Alpha, Sigma_Base, Sigma_Growth
+        )
+
+    def forward(self, axial, coronal, tabular):
+        # 1. Extract Visual Features (B, 1280)
+        f_axial = self.axial_backbone(axial)
+        f_coronal = self.coronal_backbone(coronal)
+
+        # 2. Process Tabular Features
+        f_tab = self.tab_proj(tabular)  # (B, 1280)
+        f_skip = self.tab_skip_proj(tabular)  # (B, 128)
+
+        # 3. Attention Fusion
+        # Stack as sequence: [Axial, Coronal, Tabular] -> (B, 3, 1280)
+        seq = torch.stack([f_axial, f_coronal, f_tab], dim=1)
+        fused_seq = self.fusion(seq)
+
+        # Flatten fusion output -> (B, 3840)
+        fused_flat = fused_seq.flatten(1)
+
+        # 4. Concatenate Skip Connection
+        # Cite solution_lesson_node_00018: Add skip connection
+        combined = torch.cat([fused_flat, f_skip], dim=1)
+
+        # 5. Prediction
+        out = self.head(self.dropout(combined))
+
+        alpha = out[:, 0]
+        # Cite solution_lesson_node_00021: Enforce positivity via Softplus
+        sigma_base = F.softplus(out[:, 1])
+        sigma_growth = F.softplus(out[:, 2])
+
+        return alpha, sigma_base, sigma_growth
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DualAxisFiLMNet
+=======
+from library.model import AttentionFusedDualAxisNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def run_training(debug=False):
+    # 1. Reproducibility
+    seed_everything(Config.SEED)
+
+    # 2. Data
+    train_loader, val_loader, test_loader = get_dataloaders(debug=debug)
+
+    # 3. Model
+    device = torch.device(Config.DEVICE)
+    model = DualAxisFiLMNet().to(device)
+
+    # 4. Train
+    trainer = Trainer(model, train_loader, val_loader, device)
+=======
+def run_training(debug=False):
+    # 1. Reproducibility
+    seed_everything(Config.SEED)
+
+    # 2. Data
+    train_loader, val_loader, test_loader = get_dataloaders(debug=debug)
+
+    # 3. Model
+    device = torch.device(Config.DEVICE)
+    model = AttentionFusedDualAxisNet().to(device)
+
+    # 4. Train
+    trainer = Trainer(model, train_loader, val_loader, device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DualAxisFiLMNet
+from library.train import Trainer, generate_submission
+=======
+from library.model import AttentionFusedDualAxisNet
+from library.train import Trainer, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = DualAxisFiLMNet().to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = AttentionFusedDualAxisNet().to(device)
+>>>>>>> REPLACE
+```

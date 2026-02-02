@@ -1,0 +1,434 @@
+I will optimize the solution by addressing two critical issues identified in the lessons: the instability of BiRNNs when training with masked loss on unmeasured regions (Lesson 00136) and the optimization difficulties of DenseNet backbones in low-data regimes (Lesson 00143).
+
+My strategy is as follows:
+1.  **Loss Function Anchoring**: I will modify `MaskedMCRMSE` to accept a `mask_sequence` parameter. During training, I will set this to `False`, forcing the model to predict the zero-padded targets in the unmeasured tail (positions 68-107). This provides a stable "boundary anchor" for the Bidirectional GRU, preventing gradient drift in the backward pass (Cite Lesson 00136).
+2.  **Backbone Simplification**: I will replace the `DenseBackbone` with a `ResidualBackbone` composed of `DilatedResidualBlock`s. This reduces the feature dimensionality explosion associated with DenseNets, which is detrimental in small-data regimes (Cite Lesson 00143). The blocks will strictly decouple spatial aggregation (dilated conv) from channel mixing (pointwise conv) (Cite Lesson 00111).
+3.  **Hyperparameter Adjustment**: I will increase the `LATENT_DIM` to 128 to ensure the fixed-width residual backbone has sufficient capacity, replacing the growth-rate mechanism.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Dimensions
+    LATENT_DIM = 64  # 'Z' dimension (Main Backbone Output)
+    FEEDBACK_DIM = 32  # 'E_fb' dimension (Feedback Module Output)
+    RNN_HIDDEN_DIM = 64  # Compact Hidden Size for Final Aggregation
+
+    # Backbone Capacity
+    MAIN_GROWTH_RATE = 64  # High capacity for static features
+    FB_GROWTH_RATE = 16  # Lightweight for feedback loop
+
+    # Architecture Details
+    KERNEL_SIZE = 3
+=======
+    # Dimensions
+    LATENT_DIM = 128  # Increased for Residual Backbone (Cite Lesson 00143)
+    FEEDBACK_DIM = 32  # 'E_fb' dimension (Feedback Module Output)
+    RNN_HIDDEN_DIM = 64  # Compact Hidden Size for Final Aggregation
+
+    # Backbone Capacity
+    # Replaced Growth Rate with Fixed Width for Residual Backbone
+    
+    # Architecture Details
+    KERNEL_SIZE = 3
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+    def __init__(self):
+        super(MaskedMCRMSE, self).__init__()
+        self.scored_seq_len = Config.SCORED_SEQ_LEN
+        self.scored_target_indices = Config.SCORED_TARGET_INDICES
+
+    def forward(self, pred, target):
+        """
+        Compute the masked MCRMSE loss.
+
+        Args:
+            pred (torch.Tensor): Predicted values. Shape (Batch, Seq_Len, 5).
+            target (torch.Tensor): Ground truth values. Shape (Batch, Seq_Len, 5).
+
+        Returns:
+            torch.Tensor: Scalar loss value.
+        """
+        # 1. Sequence Masking
+        # We slice the sequence dimension to include only the valid scored positions.
+        # Typically this is the first 68 bases.
+        # We use min() to handle potential edge cases where input might be shorter (though unlikely).
+        current_seq_len = pred.shape[1]
+        valid_len = min(current_seq_len, self.scored_seq_len)
+
+        pred_valid = pred[:, :valid_len, :]
+        target_valid = target[:, :valid_len, :]
+
+        # 2. Column Masking
+=======
+    def __init__(self, mask_sequence=False):
+        super(MaskedMCRMSE, self).__init__()
+        self.scored_seq_len = Config.SCORED_SEQ_LEN
+        self.scored_target_indices = Config.SCORED_TARGET_INDICES
+        self.mask_sequence = mask_sequence
+
+    def forward(self, pred, target):
+        """
+        Compute the masked MCRMSE loss.
+
+        Args:
+            pred (torch.Tensor): Predicted values. Shape (Batch, Seq_Len, 5).
+            target (torch.Tensor): Ground truth values. Shape (Batch, Seq_Len, 5).
+
+        Returns:
+            torch.Tensor: Scalar loss value.
+        """
+        # 1. Sequence Masking (Optional)
+        # Cite Lesson 00136: Do not mask loss in unmeasured regions for BiRNNs; anchor with zeros.
+        if self.mask_sequence:
+            current_seq_len = pred.shape[1]
+            valid_len = min(current_seq_len, self.scored_seq_len)
+            pred_valid = pred[:, :valid_len, :]
+            target_valid = target[:, :valid_len, :]
+        else:
+            pred_valid = pred
+            target_valid = target
+
+        # 2. Column Masking
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DenseDilatedBlock(nn.Module):
+    """
+    Single-Layer Dilated Block with Dense Connections.
+    Structure: Conv(k=3) -> LN -> SiLU -> Conv(k=1) -> LN -> SiLU -> Dropout
+    """
+
+    def __init__(self, in_channels, growth_rate, dilation, dropout=0.1):
+        super(DenseDilatedBlock, self).__init__()
+        self.net = nn.Sequential(
+            # Spatial Aggregation
+            nn.Conv1d(
+                in_channels,
+                growth_rate,
+                kernel_size=3,
+                padding=dilation,
+                dilation=dilation,
+            ),
+            # Permute for LN handled in forward
+            nn.LayerNorm(growth_rate),
+            nn.SiLU(),
+            # Channel Mixing
+            nn.Conv1d(growth_rate, growth_rate, kernel_size=1),
+            nn.LayerNorm(growth_rate),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: (Batch, In_Channels, Seq)
+        out = self.net[0](x)
+
+        # LN 1
+        out = out.permute(0, 2, 1)
+        out = self.net[1](out)
+        out = out.permute(0, 2, 1)
+
+        # SiLU 1
+        out = self.net[2](out)
+
+        # Conv 1x1
+        out = self.net[3](out)
+
+        # LN 2
+        out = out.permute(0, 2, 1)
+        out = self.net[4](out)
+        out = out.permute(0, 2, 1)
+
+        # SiLU 2 + Dropout
+        out = self.net[5](out)
+        out = self.net[6](out)
+
+        return out
+
+
+class DenseBackbone(nn.Module):
+    """
+    Stack of DenseDilatedBlocks.
+    Maintains dense connections by concatenating all prior outputs.
+    """
+
+    def __init__(self, in_channels, growth_rate, dilations, latent_dim):
+        super(DenseBackbone, self).__init__()
+        self.blocks = nn.ModuleList()
+        current_dim = in_channels
+
+        for d in dilations:
+            block = DenseDilatedBlock(
+                current_dim, growth_rate, dilation=d, dropout=Config.DROPOUT
+            )
+            self.blocks.append(block)
+            current_dim += growth_rate
+
+        # Final projection to Latent Dim Z
+        self.projector = nn.Conv1d(current_dim, latent_dim, kernel_size=1)
+
+    def forward(self, x):
+        # x: (Batch, In_Channels, Seq)
+        features = [x]
+
+        for block in self.blocks:
+            # Concatenate all previous features
+            dense_input = torch.cat(features, dim=1)
+            out = block(dense_input)
+            features.append(out)
+
+        # Final concatenation
+        total_concat = torch.cat(features, dim=1)
+        z = self.projector(total_concat)
+        return z
+=======
+class DilatedResidualBlock(nn.Module):
+    """
+    Constant-width Residual Block with Decoupled Spatial/Channel mixing.
+    Cite Lesson 00111: Decouple spatial aggregation and channel mixing.
+    """
+
+    def __init__(self, channels, dilation, dropout=0.1):
+        super(DilatedResidualBlock, self).__init__()
+        self.net = nn.Sequential(
+            # Spatial Aggregation
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=dilation,
+                dilation=dilation,
+            ),
+            # LN 1
+            nn.LayerNorm(channels),
+            nn.SiLU(),
+            # Channel Mixing
+            nn.Conv1d(channels, channels, kernel_size=1),
+            # LN 2
+            nn.LayerNorm(channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: (Batch, Channels, Seq)
+        
+        # Spatial
+        out = self.net[0](x)
+        
+        # LN 1
+        out = out.permute(0, 2, 1)
+        out = self.net[1](out)
+        out = out.permute(0, 2, 1)
+        
+        # SiLU 1
+        out = self.net[2](out)
+        
+        # Channel
+        out = self.net[3](out)
+        
+        # LN 2
+        out = out.permute(0, 2, 1)
+        out = self.net[4](out)
+        out = out.permute(0, 2, 1)
+        
+        # SiLU 2 + Dropout
+        out = self.net[5](out)
+        out = self.net[6](out)
+        
+        return x + out
+
+
+class ResidualBackbone(nn.Module):
+    """
+    Stack of DilatedResidualBlocks.
+    Cite Lesson 00143: Prioritize fixed-width Residual architectures in low-data regimes.
+    """
+
+    def __init__(self, in_channels, hidden_dim, dilations):
+        super(ResidualBackbone, self).__init__()
+        
+        # Initial projection to hidden_dim
+        self.projector = nn.Conv1d(in_channels, hidden_dim, kernel_size=1)
+        
+        self.blocks = nn.ModuleList()
+        for d in dilations:
+            self.blocks.append(
+                DilatedResidualBlock(hidden_dim, dilation=d, dropout=Config.DROPOUT)
+            )
+
+    def forward(self, x):
+        # x: (Batch, In_Channels, Seq)
+        z = self.projector(x)
+        for block in self.blocks:
+            z = block(z)
+        return z
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FeedbackModule(nn.Module):
+    """
+    Global-Context Pure-Feedback Module.
+    Processes recycled predictions with strict channel masking but full sequence context.
+    """
+
+    def __init__(self, in_channels=5, out_channels=32, growth_rate=16):
+        super(FeedbackModule, self).__init__()
+
+        # Channel Masking Indices
+        # We want to keep indices [0, 1, 3] and zero out [2, 4]
+        self.register_buffer(
+            "channel_mask",
+            torch.tensor([1, 1, 0, 1, 0], dtype=torch.float32).view(1, 5, 1),
+        )
+
+        # Spatial Stem
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, growth_rate, kernel_size=3, padding=1),
+            nn.LayerNorm(growth_rate),
+            nn.SiLU(),
+        )
+
+        # Lightweight Backbone
+        # Using same dilations but smaller growth rate
+        self.backbone = DenseBackbone(
+            in_channels=growth_rate,
+            growth_rate=growth_rate,
+            dilations=Config.DILATIONS,
+            latent_dim=out_channels,
+        )
+
+    def forward(self, prev_pred):
+        # prev_pred: (Batch, Seq, 5) -> needs transpose for Conv1d
+        x = prev_pred.permute(0, 2, 1)  # (B, 5, L)
+
+        # Apply Channel Mask
+        x = x * self.channel_mask
+
+        # Stem
+        out = self.stem[0](x)
+        out = out.permute(0, 2, 1)
+        out = self.stem[1](out)
+        out = self.stem[2](out)
+        out = out.permute(0, 2, 1)  # (B, Stem_Dim, L)
+
+        # Backbone
+        e_fb = self.backbone(out)  # (B, Out_Dim, L)
+
+        return e_fb
+=======
+class FeedbackModule(nn.Module):
+    """
+    Global-Context Pure-Feedback Module.
+    Processes recycled predictions with strict channel masking but full sequence context.
+    """
+
+    def __init__(self, in_channels=5, out_channels=32):
+        super(FeedbackModule, self).__init__()
+
+        # Channel Masking Indices
+        # We want to keep indices [0, 1, 3] and zero out [2, 4]
+        self.register_buffer(
+            "channel_mask",
+            torch.tensor([1, 1, 0, 1, 0], dtype=torch.float32).view(1, 5, 1),
+        )
+
+        # Use Residual Backbone for Feedback as well
+        self.backbone = ResidualBackbone(
+            in_channels=in_channels,
+            hidden_dim=out_channels,
+            dilations=Config.DILATIONS,
+        )
+
+    def forward(self, prev_pred):
+        # prev_pred: (Batch, Seq, 5) -> needs transpose for Conv1d
+        x = prev_pred.permute(0, 2, 1)  # (B, 5, L)
+
+        # Apply Channel Mask
+        x = x * self.channel_mask
+
+        # Backbone
+        e_fb = self.backbone(x)  # (B, Out_Dim, L)
+
+        return e_fb
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def __init__(self):
+        super(HC_HIGFN, self).__init__()
+
+        # 1. Hybrid Input Stem
+        # Input channels: 4(Seq) + 3(Struct) + 7(Loop) + 4(Partner) = 18
+        self.input_stem = HybridInputStem(in_channels=18, context_channels=32)
+
+        # 2. Main Backbone (High Capacity)
+        # Input to backbone is output of stem
+        self.main_backbone = DenseBackbone(
+            in_channels=self.input_stem.out_channels,
+            growth_rate=Config.MAIN_GROWTH_RATE,
+            dilations=Config.DILATIONS,
+            latent_dim=Config.LATENT_DIM,
+        )
+
+        # 3. Feedback Module
+        self.feedback_module = FeedbackModule(
+            in_channels=5,
+            out_channels=Config.FEEDBACK_DIM,
+            growth_rate=Config.FB_GROWTH_RATE,
+        )
+
+        # 4. Interaction & Head
+=======
+    def __init__(self):
+        super(HC_HIGFN, self).__init__()
+
+        # 1. Hybrid Input Stem
+        # Input channels: 4(Seq) + 3(Struct) + 7(Loop) + 4(Partner) = 18
+        self.input_stem = HybridInputStem(in_channels=18, context_channels=32)
+
+        # 2. Main Backbone (Residual)
+        # Input to backbone is output of stem
+        self.main_backbone = ResidualBackbone(
+            in_channels=self.input_stem.out_channels,
+            hidden_dim=Config.LATENT_DIM,
+            dilations=Config.DILATIONS,
+        )
+
+        # 3. Feedback Module
+        self.feedback_module = FeedbackModule(
+            in_channels=5,
+            out_channels=Config.FEEDBACK_DIM,
+        )
+
+        # 4. Interaction & Head
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    criterion = MaskedMCRMSE()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+=======
+    # Cite Lesson 00136: Do not mask sequence in training loss to anchor BiGRU on zero-padded tail
+    criterion = MaskedMCRMSE(mask_sequence=False)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+>>>>>>> REPLACE
+```

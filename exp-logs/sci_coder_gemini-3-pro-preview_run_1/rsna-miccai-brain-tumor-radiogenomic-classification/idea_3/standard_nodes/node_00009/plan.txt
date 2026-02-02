@@ -1,0 +1,317 @@
+I will optimize the solution by transitioning from a complex Volumetric Sequence Transformer to a **2.5D Stacked CNN** (Cite Lesson 00008). This approach treats multiple slices as input channels rather than a time sequence, significantly reducing memory overhead and allowing for a larger batch size (32 vs 4), which is critical for stabilizing Batch Normalization and training convergence. I will employ **Geometric Slice Sampling** (Cite Lesson 00006) to select 3 slices per modality (at 30%, 50%, and 70% depth) instead of a single middle slice, creating a 9-channel input that captures volumetric context without relying on unsupervised heuristics that often select noise.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Input Dimensions
+    IMG_SIZE = 224
+    NUM_SLICES = 24  # Sequence length (N) for the transformer
+
+    # Modalities to use (forming the 3 channels of the input)
+    # As per idea: FLAIR, T1wCE, T2w
+    SELECTED_MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+    NUM_CHANNELS = len(SELECTED_MODALITIES)
+
+    # Geometric Sampling
+    # Percentage of top/bottom slices to discard before sampling
+    SLICE_DISCARD_PCT = 0.15
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b0"
+    PRETRAINED_BACKBONE = True
+
+    # Transformer Encoder settings
+    HIDDEN_DIM = 256  # Projection dimension after backbone
+    TRANSFORMER_LAYERS = 2
+    TRANSFORMER_HEADS = 4
+    DROPOUT_RATE = 0.3  # Heavy dropout as per idea
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 16  # Adjusted for A100 40GB (Sequence data is memory intensive)
+=======
+    # Input Dimensions
+    IMG_SIZE = 224
+    NUM_SLICES = 3  # Reduced to 3 for 2.5D stacking (Cite Lesson 00008)
+
+    # Modalities to use (forming the 3 channels of the input)
+    # As per idea: FLAIR, T1wCE, T2w
+    SELECTED_MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+    NUM_CHANNELS = len(SELECTED_MODALITIES)
+
+    # Geometric Sampling
+    # Percentage of top/bottom slices to discard before sampling
+    # Cite Lesson 00006: Geometric priors (30%-70% range)
+    SLICE_DISCARD_PCT = 0.30
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b0"
+    PRETRAINED_BACKBONE = True
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 32  # Increased for stability (Cite Lesson 00008)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Reshape back to (Sequence, Channels, Height, Width) for PyTorch
+        # Current shape: (H, W, S*C)
+        # Transpose to (S*C, H, W)
+        combined_vol = np.transpose(combined_vol, (2, 0, 1))
+
+        # Reshape to (S, C, H, W)
+        # Since we concatenated [Slice1_C123, Slice2_C123...], the first dim is ordered by sequence then channel
+        final_tensor = combined_vol.reshape(
+            Config.NUM_SLICES, Config.NUM_CHANNELS, Config.IMG_SIZE, Config.IMG_SIZE
+        )
+
+        # Convert to torch tensor
+        final_tensor = torch.from_numpy(final_tensor).float()
+=======
+        # Reshape back to (Channels, Height, Width) for PyTorch
+        # Current shape: (H, W, S*C)
+        # Transpose to (S*C, H, W) where S*C is the total channel depth
+        combined_vol = np.transpose(combined_vol, (2, 0, 1))
+
+        # Convert to torch tensor: (Total_Channels, H, W)
+        final_tensor = torch.from_numpy(combined_vol).float()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class VolumetricTransformer(nn.Module):
+    """
+    2.5D Volumetric Sequence Transformer.
+
+    Architecture:
+    1. Time-Distributed CNN (EfficientNet-B0) to extract features from each slice.
+    2. Linear Projection to reduce feature dimension.
+    3. Positional Encoding + CLS Token injection.
+    4. Transformer Encoder to aggregate information across the Z-axis (slices).
+    5. Classification Head on the CLS token output.
+    """
+
+    def __init__(self):
+        super(VolumetricTransformer, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0
+        # num_classes=0 removes the classifier, returning the pooled features
+        # in_chans=3 matches our input (FLAIR, T1wCE, T2w)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED_BACKBONE,
+            num_classes=0,
+            in_chans=Config.NUM_CHANNELS,
+        )
+
+        # Get the feature dimension of the backbone (1280 for EfficientNet-B0)
+        self.backbone_dim = self.backbone.num_features
+
+        # 2. Projection Layer
+        self.projector = nn.Sequential(
+            nn.Linear(self.backbone_dim, Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.ReLU(),
+        )
+
+        # 3. Sequence Components
+        # Learnable CLS token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, Config.HIDDEN_DIM))
+
+        # Learnable Positional Embeddings
+        # Sequence length + 1 for the CLS token
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, Config.NUM_SLICES + 1, Config.HIDDEN_DIM)
+        )
+
+        # 4. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=Config.HIDDEN_DIM,
+            nhead=Config.TRANSFORMER_HEADS,
+            dim_feedforward=Config.HIDDEN_DIM * 4,
+            dropout=Config.DROPOUT_RATE,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # Pre-Norm usually stabilizes training
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=Config.TRANSFORMER_LAYERS
+        )
+
+        # 5. Classification Head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(Config.HIDDEN_DIM), nn.Linear(Config.HIDDEN_DIM, 1)
+        )
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize CLS token and Positional Embeddings
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+        # Initialize Linear layers in projector and classifier
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Sequence, Channels, Height, Width)
+        Returns:
+            logits: Output tensor of shape (Batch, 1)
+        """
+        b, s, c, h, w = x.shape
+
+        # --- 1. Time-Distributed Backbone ---
+        # Reshape to (Batch * Sequence, C, H, W) to process all slices at once
+        x = x.view(b * s, c, h, w)
+
+        # Extract features: (B*S, Backbone_Dim)
+        features = self.backbone(x)
+
+        # --- 2. Projection & Reshaping ---
+        # Reshape back to (Batch, Sequence, Backbone_Dim)
+        features = features.view(b, s, self.backbone_dim)
+
+        # Project to hidden dim: (Batch, Sequence, Hidden_Dim)
+        features = self.projector(features)
+
+        # --- 3. Sequence Preparation ---
+        # Expand CLS token to match batch size: (Batch, 1, Hidden_Dim)
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+
+        # Concatenate CLS token to the front: (Batch, Sequence + 1, Hidden_Dim)
+        x = torch.cat((cls_tokens, features), dim=1)
+
+        # Add Positional Embeddings
+        x = x + self.pos_embedding
+
+        # --- 4. Transformer ---
+        # Pass through Transformer Encoder
+        x = self.transformer(x)
+
+        # --- 5. Classification ---
+        # Extract the output of the CLS token (index 0)
+        cls_output = x[:, 0, :]
+
+        # Predict logits
+        logits = self.classifier(cls_output)
+
+        return logits
+=======
+class Glioblastoma25D(nn.Module):
+    """
+    2.5D Stacked CNN.
+    
+    Treats multiple slices as channels in a single 2D image.
+    Cite Lesson 00008: Simplification from Volumetric Sequence to 2D Stacking.
+    """
+
+    def __init__(self):
+        super(Glioblastoma25D, self).__init__()
+
+        # Input channels = Modalities * Slices
+        in_chans = Config.NUM_CHANNELS * Config.NUM_SLICES
+        
+        # Backbone: EfficientNet-B0
+        # num_classes=1 for direct binary classification
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED_BACKBONE,
+            num_classes=1,
+            in_chans=in_chans,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Total_Channels, Height, Width)
+        Returns:
+            logits: Output tensor of shape (Batch, 1)
+        """
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import VolumetricTransformer
+=======
+from library.model import Glioblastoma25D
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Initialize Model, Optimizer, Loss
+    model = VolumetricTransformer().to(Config.DEVICE)
+=======
+    # 3. Initialize Model, Optimizer, Loss
+    model = Glioblastoma25D().to(Config.DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Load Model
+    model = VolumetricTransformer().to(Config.DEVICE)
+=======
+    # 3. Load Model
+    model = Glioblastoma25D().to(Config.DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import VolumetricTransformer
+=======
+from library.model import Glioblastoma25D
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline Execution
+    Config.NUM_EPOCHS = 5
+    Config.BATCH_SIZE = 4  # Reduced from 8 to 4 to prevent OOM
+=======
+    # Override Config for Fast Baseline Execution
+    Config.NUM_EPOCHS = 5
+    Config.BATCH_SIZE = 32  # Increased for stability (Cite Lesson 00008)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # We reload the best model to perform specific analysis and get the exact metric
+    device = Config.DEVICE
+    model = VolumetricTransformer().to(device)
+=======
+    # We reload the best model to perform specific analysis and get the exact metric
+    device = Config.DEVICE
+    model = Glioblastoma25D().to(device)
+>>>>>>> REPLACE
+```

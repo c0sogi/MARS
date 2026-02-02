@@ -1,0 +1,298 @@
+To improve the model's performance, I will revert the architecture to a **Robust Dual-Path Wide-Body Network (RDP-WBN)**, addressing specific failures identified in the previous solution and leveraging the provided lessons.
+
+**Strategy:**
+1.  **Remove Top-K Pooling (Cite Lesson 00188):** The previous solution used Top-K pooling on 4x4 feature maps, which Lesson 00188 identifies as a source of high variance and noise on coarse grids. I will remove this path entirely.
+2.  **Simplify Readout to Dual-Path (Cite Lesson 00123):** I will implement the "Robust Dual-Path Readout" consisting of a Spatial Context path (Conv3x3 + Flatten) and a Global Average Pooling path. This balances spatial structure preservation with global invariance.
+3.  **Remove Branch-Specific Batch Normalization (Cite Lesson 00162):** I will remove the Batch Normalization layers applied to the individual feature branches (Spatial and GAP) immediately before concatenation. Lesson 00162 suggests that normalizing these branches independently destroys the relative signal magnitude information critical for this task, leading to worse ensemble performance.
+4.  **Maintain Metadata Fusion:** I will keep the MLP-based metadata embedding (Cite Lesson 00158) but fuse it with the un-normalized visual features.
+
+The resulting architecture will be cleaner, more robust to noise, and aligned with the "Current Best" practices identified in the lessons.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Wide-Body Backbone: Sustained width strategy
+NUM_FILTERS = 128
+# Top-K Pooling: Number of top pixels to average in the readout stream
+TOP_K = 4
+# Regularization
+DROPOUT_RATE = 0.5
+=======
+# Wide-Body Backbone: Sustained width strategy
+NUM_FILTERS = 128
+# Regularization
+DROPOUT_RATE = 0.5
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TopKAvgPooling(nn.Module):
+    """
+    Sorts pixels in spatial dimensions and computes the average of the top K pixels.
+    Acts as a robust 'Soft Max Pooling'.
+    """
+
+    def __init__(self, k=4):
+        super(TopKAvgPooling, self).__init__()
+        self.k = k
+
+    def forward(self, x):
+        # x: (N, C, H, W)
+        n, c, h, w = x.size()
+        # Flatten spatial dims: (N, C, H*W)
+        x_flat = x.view(n, c, -1)
+
+        # Handle case where H*W < k (safety check)
+        k_actual = min(self.k, x_flat.size(2))
+
+        # Get top k values along the spatial dimension
+        top_k_vals, _ = torch.topk(x_flat, k_actual, dim=2)
+
+        # Compute mean of these top K pixels
+        out = torch.mean(top_k_vals, dim=2)  # (N, C)
+        return out
+
+
+# ==========================================
+# BUILDING BLOCKS
+# ==========================================
+=======
+# ==========================================
+# BUILDING BLOCKS
+# ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+# ==========================================
+# MAIN MODEL
+# ==========================================
+class TKA_WBN(nn.Module):
+    """
+    Top-K Augmented Wide-Body Network.
+    """
+
+    def __init__(self):
+        super(TKA_WBN, self).__init__()
+
+        # --- Visual Branch (Wide-Body Delayed-Integration Backbone) ---
+        # Block 1: Input 3 -> Conv 64 -> DualPool -> 128
+        # Output Size: 75 -> 37
+        self.block1 = WideBodyBlock(in_channels=config.NUM_CHANNELS, out_channels=64)
+
+        # Block 2: Input 128 -> Conv 128 -> DualPool -> 256
+        # Output Size: 37 -> 18
+        self.block2 = WideBodyBlock(in_channels=128, out_channels=config.NUM_FILTERS)
+
+        # Block 3: Input 256 -> Conv 128 -> DualPool -> 256
+        # Output Size: 18 -> 9
+        self.block3 = WideBodyBlock(in_channels=256, out_channels=config.NUM_FILTERS)
+
+        # Block 4: Input 256 -> Conv 128 -> DualPool -> 256
+        # Output Size: 9 -> 4
+        self.block4 = WideBodyBlock(in_channels=256, out_channels=config.NUM_FILTERS)
+
+        # Final Feature Map Size: (N, 256, 4, 4)
+
+        # --- Tri-Path Readout ---
+
+        # Path A: Spatial Context
+        # Conv 256 -> 64 (3x3, pad=1) to preserve spatial grid, then flatten
+        self.path_a_conv = nn.Conv2d(256, 64, kernel_size=3, padding=1)
+        # Flatten size: 64 * 4 * 4 = 1024
+        self.path_a_bn = nn.BatchNorm1d(1024)
+
+        # Path B: Background/Global Intensity (Global Average Pooling)
+        self.path_b_pool = nn.AdaptiveAvgPool2d(1)
+        self.path_b_bn = nn.BatchNorm1d(256)
+
+        # Path C: Robust Target Intensity (Top-K Average Pooling)
+        self.path_c_pool = TopKAvgPooling(k=config.TOP_K)
+        self.path_c_bn = nn.BatchNorm1d(256)
+
+        # --- Metadata Branch ---
+        self.meta_branch = MetadataBranch(output_dim=32)
+
+        # --- Fusion Head ---
+        # Input dims: Path A (1024) + Path B (256) + Path C (256) + Meta (32) = 1568
+        fusion_dim = 1024 + 256 + 256 + 32
+
+        self.fusion_head = nn.Sequential(
+            nn.Linear(fusion_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(512, 1),
+        )
+
+    def forward(self, x_img, x_inc):
+        # Visual Backbone
+        x = self.block1(x_img)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        # x shape: (N, 256, 4, 4)
+
+        # Path A: Spatial Context
+        out_a = self.path_a_conv(x)  # (N, 64, 4, 4)
+        out_a = out_a.view(out_a.size(0), -1)  # Flatten -> (N, 1024)
+        out_a = self.path_a_bn(out_a)
+
+        # Path B: Global Average
+        out_b = self.path_b_pool(x)  # (N, 256, 1, 1)
+        out_b = out_b.view(out_b.size(0), -1)  # (N, 256)
+        out_b = self.path_b_bn(out_b)
+
+        # Path C: Top-K Average
+        out_c = self.path_c_pool(x)  # (N, 256)
+        out_c = self.path_c_bn(out_c)
+
+        # Metadata
+        out_meta = self.meta_branch(x_inc)  # (N, 32)
+
+        # Fusion
+        fused = torch.cat([out_a, out_b, out_c, out_meta], dim=1)
+
+        logits = self.fusion_head(fused)
+        return torch.sigmoid(logits)
+=======
+# ==========================================
+# MAIN MODEL
+# ==========================================
+class RDP_WBN(nn.Module):
+    """
+    Robust Dual-Path Wide-Body Network.
+    """
+
+    def __init__(self):
+        super(RDP_WBN, self).__init__()
+
+        # --- Visual Branch (Wide-Body Delayed-Integration Backbone) ---
+        # Block 1: Input 3 -> Conv 64 -> DualPool -> 128
+        # Output Size: 75 -> 37
+        self.block1 = WideBodyBlock(in_channels=config.NUM_CHANNELS, out_channels=64)
+
+        # Block 2: Input 128 -> Conv 128 -> DualPool -> 256
+        # Output Size: 37 -> 18
+        self.block2 = WideBodyBlock(in_channels=128, out_channels=config.NUM_FILTERS)
+
+        # Block 3: Input 256 -> Conv 128 -> DualPool -> 256
+        # Output Size: 18 -> 9
+        self.block3 = WideBodyBlock(in_channels=256, out_channels=config.NUM_FILTERS)
+
+        # Block 4: Input 256 -> Conv 128 -> DualPool -> 256
+        # Output Size: 9 -> 4
+        self.block4 = WideBodyBlock(in_channels=256, out_channels=config.NUM_FILTERS)
+
+        # Final Feature Map Size: (N, 256, 4, 4)
+
+        # --- Dual-Path Readout (Cite Lesson 00123) ---
+
+        # Path A: Spatial Context
+        # Conv 256 -> 64 (3x3, pad=1) to preserve spatial grid, then flatten
+        self.path_a_conv = nn.Conv2d(256, 64, kernel_size=3, padding=1)
+        # Flatten size: 64 * 4 * 4 = 1024
+        # Removed BN before concatenation (Cite Lesson 00162)
+
+        # Path B: Background/Global Intensity (Global Average Pooling)
+        self.path_b_pool = nn.AdaptiveAvgPool2d(1)
+        # Removed BN before concatenation (Cite Lesson 00162)
+
+        # --- Metadata Branch ---
+        self.meta_branch = MetadataBranch(output_dim=32)
+
+        # --- Fusion Head ---
+        # Input dims: Path A (1024) + Path B (256) + Meta (32) = 1312
+        fusion_dim = 1024 + 256 + 32
+
+        self.fusion_head = nn.Sequential(
+            nn.Linear(fusion_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(512, 1),
+        )
+
+    def forward(self, x_img, x_inc):
+        # Visual Backbone
+        x = self.block1(x_img)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        # x shape: (N, 256, 4, 4)
+
+        # Path A: Spatial Context
+        out_a = self.path_a_conv(x)  # (N, 64, 4, 4)
+        out_a = out_a.view(out_a.size(0), -1)  # Flatten -> (N, 1024)
+
+        # Path B: Global Average
+        out_b = self.path_b_pool(x)  # (N, 256, 1, 1)
+        out_b = out_b.view(out_b.size(0), -1)  # (N, 256)
+
+        # Metadata
+        out_meta = self.meta_branch(x_inc)  # (N, 32)
+
+        # Fusion
+        fused = torch.cat([out_a, out_b, out_meta], dim=1)
+
+        logits = self.fusion_head(fused)
+        return torch.sigmoid(logits)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Initialize Model
+    # TKA_WBN is defined in library.model
+    net = model.TKA_WBN()
+    net.to(config.DEVICE)
+=======
+    # 2. Initialize Model
+    # RDP_WBN is defined in library.model
+    net = model.RDP_WBN()
+    net.to(config.DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # --- OOF Inference ---
+        # Initialize a fresh model
+        net = model.TKA_WBN().to(config.DEVICE)
+        net.load_state_dict(best_weights)
+        net.eval()
+=======
+        # --- OOF Inference ---
+        # Initialize a fresh model
+        net = model.RDP_WBN().to(config.DEVICE)
+        net.load_state_dict(best_weights)
+        net.eval()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            print(f"Inference with model fold {fold_idx}...")
+
+            # Load Model
+            net = model.TKA_WBN().to(config.DEVICE)
+            weight_path = os.path.join(config.WORKING_DIR, f"model_fold_{fold_idx}.pth")
+            net.load_state_dict(torch.load(weight_path, map_location=config.DEVICE))
+            net.eval()
+=======
+            print(f"Inference with model fold {fold_idx}...")
+
+            # Load Model
+            net = model.RDP_WBN().to(config.DEVICE)
+            weight_path = os.path.join(config.WORKING_DIR, f"model_fold_{fold_idx}.pth")
+            net.load_state_dict(torch.load(weight_path, map_location=config.DEVICE))
+            net.eval()
+>>>>>>> REPLACE
+```

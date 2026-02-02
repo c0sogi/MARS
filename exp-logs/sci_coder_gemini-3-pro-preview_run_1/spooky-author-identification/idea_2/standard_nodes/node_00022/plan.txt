@@ -1,0 +1,794 @@
+To optimize the solution, I will implement a **Stacking Ensemble** strategy with **DeBERTa-v3** as the transformer backbone, leveraging the lessons provided.
+
+1.  **Backbone Upgrade**: I will replace `roberta-base` with `microsoft/deberta-v3-base` in `config.py`. DeBERTa-v3's disentangled attention mechanism provides superior performance for stylometric tasks (Cite `solution_lesson_node_00014`).
+2.  **OOF Stacking**: I will modify both `linear_branch.py` and `transformer_branch.py` to perform **5-Fold Cross-Validation** on the training set. This generates Out-of-Fold (OOF) predictions for the entire training dataset, maximizing the data available for the meta-learner (Cite `solution_lesson_node_00019`).
+3.  **Meta-Learner with Meta-Features**: I will replace the simple weighted blending in `ensemble.py` with an **XGBoost** meta-learner. I will also extract basic meta-features (text length, word count) to feed into the meta-learner alongside the base model probabilities, allowing it to conditionally weight models based on input characteristics (Cite `solution_lesson_node_00008`).
+4.  **Optimization**: I will configure the pipeline to run 5 folds with 3 epochs each for the transformer, ensuring it fits within the runtime constraints while maximizing performance.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # Contextual Branch (Transformer) Hyperparameters
+    # -------------------------------------------------------------------------
+    MODEL_NAME = "roberta-base"
+
+    # Tokenizer settings
+    MAX_LENGTH = 128  # Sufficient for sentence-level tasks
+
+    # Training settings
+    TRAIN_BATCH_SIZE = 16
+    VAL_BATCH_SIZE = 32
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    EPOCHS = 5
+
+    # Optimization
+    EARLY_STOPPING_PATIENCE = 2
+
+    # -------------------------------------------------------------------------
+    # Ensemble Settings
+    # -------------------------------------------------------------------------
+    # Default weights for soft voting (Transformer, Linear)
+    # These can be tuned on the validation set
+    ENSEMBLE_WEIGHTS = {"transformer": 0.6, "linear": 0.4}
+=======
+    # -------------------------------------------------------------------------
+    # Contextual Branch (Transformer) Hyperparameters
+    # -------------------------------------------------------------------------
+    # Cite solution_lesson_node_00014: DeBERTa-v3 Superiority
+    MODEL_NAME = "microsoft/deberta-v3-base"
+
+    # Tokenizer settings
+    MAX_LENGTH = 128  # Sufficient for sentence-level tasks
+
+    # Training settings
+    TRAIN_BATCH_SIZE = 16
+    VAL_BATCH_SIZE = 32
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    # Cite solution_lesson_node_00019: OOF Stacking requires K-Fold
+    N_FOLDS = 5
+    EPOCHS = 3 # Reduced epochs per fold to fit runtime
+
+    # Optimization
+    EARLY_STOPPING_PATIENCE = 2
+
+    # -------------------------------------------------------------------------
+    # Ensemble Settings
+    # -------------------------------------------------------------------------
+    # Cite solution_lesson_node_00008: XGBoost Meta-Learner
+    XGB_PARAMS = {
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "eval_metric": "mlogloss",
+        "learning_rate": 0.05,
+        "max_depth": 3,
+        "n_estimators": 1000,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "verbosity": 0,
+        "n_jobs": -1,
+        "random_state": SEED,
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/linear_branch.py
+<<<<<<< SEARCH
+def run_linear_branch(load_cached_data=True):
+    """
+    Orchestrates the linear branch pipeline: loading data, feature extraction,
+    training (or loading) the model, and generating predictions.
+
+    Args:
+        load_cached_data (bool): Whether to use cached features and model.
+
+    Returns:
+        tuple: (val_probs, test_probs, y_val)
+            - val_probs: Predictions for validation set.
+            - test_probs: Predictions for test set.
+            - y_val: Ground truth labels for validation set (integers).
+    """
+    print("--- Starting Linear Branch Pipeline ---")
+
+    # 1. Load Raw Data
+    print("Loading raw metadata...")
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+
+    # 2. Feature Extraction (TF-IDF)
+    print("Generating/Loading TF-IDF features...")
+    # Pass Series objects to the vectorizer helper
+    X_train, X_val, X_test = get_tfidf_features(
+        df_train["text"],
+        df_val["text"],
+        df_test["text"],
+        load_cached_data=load_cached_data,
+    )
+
+    # 3. Prepare Labels
+    print("Encoding labels...")
+    # Map string labels to IDs using Config
+    y_train = df_train["author"].map(Config.LABEL2ID).values
+    y_val = df_val["author"].map(Config.LABEL2ID).values
+
+    # 4. Train or Load Model
+    model = None
+    if load_cached_data and os.path.exists(Config.LINEAR_MODEL_PATH):
+        print(f"Loading existing linear model from {Config.LINEAR_MODEL_PATH}...")
+        try:
+            loaded_model = joblib.load(Config.LINEAR_MODEL_PATH)
+            # Check if model feature count matches data feature count
+            if (
+                hasattr(loaded_model, "n_features_in_")
+                and loaded_model.n_features_in_ != X_train.shape[1]
+            ):
+                print(
+                    f"Model expects {loaded_model.n_features_in_} features but data has {X_train.shape[1]}. Retraining..."
+                )
+                model = None
+            else:
+                model = loaded_model
+        except Exception as e:
+            print(f"Failed to load model: {e}. Proceeding to retrain.")
+
+    if model is None:
+        model = train_linear_model(X_train, y_train, X_val, y_val)
+
+    # 5. Generate Predictions
+    print("Generating predictions...")
+    val_probs = predict_linear(model, X_val)
+    test_probs = predict_linear(model, X_test)
+
+    print("--- Linear Branch Pipeline Complete ---")
+    return val_probs, test_probs, y_val
+=======
+from sklearn.model_selection import StratifiedKFold
+
+def run_linear_branch(load_cached_data=True):
+    """
+    Orchestrates the linear branch pipeline using K-Fold Cross Validation
+    to generate OOF predictions for Stacking.
+
+    Returns:
+        tuple: (train_oof, val_pred, test_pred)
+    """
+    print("--- Starting Linear Branch Pipeline (OOF Stacking) ---")
+
+    # 1. Load Raw Data
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+
+    # 2. Feature Extraction (TF-IDF)
+    # Note: We use the global vectorizer here for efficiency. 
+    # Strict OOF would require re-vectorizing inside folds, but the leakage is minimal for TF-IDF.
+    X_train, X_val, X_test = get_tfidf_features(
+        df_train["text"],
+        df_val["text"],
+        df_test["text"],
+        load_cached_data=load_cached_data,
+    )
+
+    y_train = df_train["author"].map(Config.LABEL2ID).values
+    
+    # 3. K-Fold OOF Loop
+    # Cite solution_lesson_node_00019: OOF Stacking
+    skf = StratifiedKFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
+    
+    oof_preds = np.zeros((X_train.shape[0], 3))
+    val_preds_accum = np.zeros((X_val.shape[0], 3))
+    test_preds_accum = np.zeros((X_test.shape[0], 3))
+    
+    print(f"Running {Config.N_FOLDS}-Fold CV for Linear Model...")
+    
+    for fold, (train_idx, valid_idx) in enumerate(skf.split(X_train, y_train)):
+        X_tr_fold, y_tr_fold = X_train[train_idx], y_train[train_idx]
+        X_va_fold = X_train[valid_idx]
+        
+        # Train
+        model = LogisticRegression(**Config.LOGREG_PARAMS)
+        model.fit(X_tr_fold, y_tr_fold)
+        
+        # Predict OOF
+        oof_preds[valid_idx] = model.predict_proba(X_va_fold)
+        
+        # Predict on Hold-out Val and Test
+        val_preds_accum += model.predict_proba(X_val)
+        test_preds_accum += model.predict_proba(X_test)
+        
+    # Average predictions
+    val_preds = val_preds_accum / Config.N_FOLDS
+    test_preds = test_preds_accum / Config.N_FOLDS
+    
+    print("--- Linear Branch Pipeline Complete ---")
+    return oof_preds, val_preds, test_preds
+>>>>>>> REPLACE
+```
+
+```diff
+library/transformer_branch.py
+<<<<<<< SEARCH
+def run_transformer_branch(load_cached_data=True):
+    """
+    Orchestrates the transformer branch: data loading, training/loading, and prediction.
+
+    Args:
+        load_cached_data (bool): If True, attempts to load a pre-trained model from disk.
+
+    Returns:
+        tuple: (val_probs, test_probs, y_val)
+    """
+    print("--- Starting Transformer Branch Pipeline ---")
+    set_seed(Config.SEED)
+    device = Config.get_device()
+
+    # Ensure directory exists
+    os.makedirs(Config.TRANSFORMER_MODEL_DIR, exist_ok=True)
+    model_path = os.path.join(Config.TRANSFORMER_MODEL_DIR, "best_model.pt")
+
+    # 1. Load Data
+    print("Loading raw metadata...")
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+
+    # 2. Initialize Tokenizer
+    print(f"Initializing Tokenizer ({Config.MODEL_NAME})...")
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # 3. Create Datasets
+    print("Creating Datasets...")
+    train_dataset = AuthorDataset(
+        df_train["text"], df_train["author"], tokenizer, Config.MAX_LENGTH
+    )
+    val_dataset = AuthorDataset(
+        df_val["text"], df_val["author"], tokenizer, Config.MAX_LENGTH
+    )
+    test_dataset = AuthorDataset(
+        df_test["text"], labels=None, tokenizer=tokenizer, max_length=Config.MAX_LENGTH
+    )
+
+    # 4. Create DataLoaders
+    # Pin memory for faster transfer to GPU
+    use_pin_memory = device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.TRAIN_BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=use_pin_memory,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.VAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=use_pin_memory,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.VAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=use_pin_memory,
+    )
+
+    # 5. Train or Load Model
+    model = None
+    if load_cached_data and os.path.exists(model_path):
+        print(f"Loading cached model from {model_path}...")
+        try:
+            model = TransformerModel(Config.MODEL_NAME, num_classes=3)
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.to(device)
+        except Exception as e:
+            print(f"Failed to load cached model: {e}. Proceeding to retrain.")
+            model = None
+
+    if model is None:
+        model = train_transformer(
+            train_loader, val_loader, device, Config.TRANSFORMER_MODEL_DIR
+        )
+
+    # 6. Generate Predictions
+    print("Generating predictions...")
+    val_probs = predict_transformer(model, val_loader, device)
+    test_probs = predict_transformer(model, test_loader, device)
+
+    # Get ground truth for validation
+    y_val = df_val["author"].map(Config.LABEL2ID).values
+
+    print("--- Transformer Branch Pipeline Complete ---")
+    return val_probs, test_probs, y_val
+=======
+from sklearn.model_selection import StratifiedKFold
+
+def run_transformer_branch(load_cached_data=True):
+    """
+    Orchestrates the transformer branch using K-Fold Cross Validation
+    to generate OOF predictions for Stacking.
+    
+    Returns:
+        tuple: (train_oof, val_pred, test_pred)
+    """
+    print("--- Starting Transformer Branch Pipeline (OOF Stacking) ---")
+    set_seed(Config.SEED)
+    device = Config.get_device()
+    os.makedirs(Config.TRANSFORMER_MODEL_DIR, exist_ok=True)
+    
+    # 1. Load Data
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+    
+    y_train = df_train["author"].map(Config.LABEL2ID).values
+    
+    # 2. Initialize Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+    
+    # 3. Datasets for Hold-out Val and Test (Fixed)
+    val_dataset = AuthorDataset(df_val["text"], df_val["author"], tokenizer, Config.MAX_LENGTH)
+    test_dataset = AuthorDataset(df_test["text"], labels=None, tokenizer=tokenizer, max_length=Config.MAX_LENGTH)
+    
+    val_loader = DataLoader(val_dataset, batch_size=Config.VAL_BATCH_SIZE, shuffle=False, 
+                          num_workers=Config.NUM_WORKERS, pin_memory=(device.type == "cuda"))
+    test_loader = DataLoader(test_dataset, batch_size=Config.VAL_BATCH_SIZE, shuffle=False, 
+                           num_workers=Config.NUM_WORKERS, pin_memory=(device.type == "cuda"))
+    
+    # 4. K-Fold OOF Loop
+    skf = StratifiedKFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
+    
+    oof_preds = np.zeros((len(df_train), 3))
+    val_preds_accum = np.zeros((len(df_val), 3))
+    test_preds_accum = np.zeros((len(df_test), 3))
+    
+    # Check if OOFs are already cached to save time
+    oof_cache_path = os.path.join(Config.CACHE_DIR, "transformer_oof.npy")
+    val_cache_path = os.path.join(Config.CACHE_DIR, "transformer_val.npy")
+    test_cache_path = os.path.join(Config.CACHE_DIR, "transformer_test.npy")
+    
+    if load_cached_data and os.path.exists(oof_cache_path):
+        print("Loading cached Transformer OOF predictions...")
+        return np.load(oof_cache_path), np.load(val_cache_path), np.load(test_cache_path)
+
+    print(f"Running {Config.N_FOLDS}-Fold CV for Transformer...")
+    
+    for fold, (train_idx, valid_idx) in enumerate(skf.split(df_train, y_train)):
+        print(f"\n--- Fold {fold+1}/{Config.N_FOLDS} ---")
+        
+        # Prepare Fold Data
+        fold_train_texts = df_train.iloc[train_idx]["text"]
+        fold_train_labels = df_train.iloc[train_idx]["author"]
+        fold_val_texts = df_train.iloc[valid_idx]["text"]
+        fold_val_labels = df_train.iloc[valid_idx]["author"]
+        
+        train_ds = AuthorDataset(fold_train_texts, fold_train_labels, tokenizer, Config.MAX_LENGTH)
+        valid_ds = AuthorDataset(fold_val_texts, fold_val_labels, tokenizer, Config.MAX_LENGTH)
+        
+        train_dl = DataLoader(train_ds, batch_size=Config.TRAIN_BATCH_SIZE, shuffle=True, 
+                            num_workers=Config.NUM_WORKERS, pin_memory=(device.type == "cuda"))
+        valid_dl = DataLoader(valid_ds, batch_size=Config.VAL_BATCH_SIZE, shuffle=False, 
+                            num_workers=Config.NUM_WORKERS, pin_memory=(device.type == "cuda"))
+        
+        # Train (Save best model for this fold)
+        fold_save_dir = os.path.join(Config.TRANSFORMER_MODEL_DIR, f"fold_{fold}")
+        os.makedirs(fold_save_dir, exist_ok=True)
+        
+        model = train_transformer(train_dl, valid_dl, device, fold_save_dir)
+        
+        # Predict OOF
+        oof_preds[valid_idx] = predict_transformer(model, valid_dl, device)
+        
+        # Predict on Hold-out Val and Test
+        val_preds_accum += predict_transformer(model, val_loader, device)
+        test_preds_accum += predict_transformer(model, test_loader, device)
+        
+        # Cleanup
+        del model
+        torch.cuda.empty_cache()
+
+    # Average predictions
+    val_preds = val_preds_accum / Config.N_FOLDS
+    test_preds = test_preds_accum / Config.N_FOLDS
+    
+    # Cache results
+    np.save(oof_cache_path, oof_preds)
+    np.save(val_cache_path, val_preds)
+    np.save(test_cache_path, test_preds)
+
+    print("--- Transformer Branch Pipeline Complete ---")
+    return oof_preds, val_preds, test_preds
+>>>>>>> REPLACE
+```
+
+```diff
+library/ensemble.py
+<<<<<<< SEARCH
+import numpy as np
+from scipy.optimize import minimize_scalar
+from library.utils import compute_log_loss
+from library.config import Config
+
+
+def blend_predictions(probs_linear, probs_transformer, weight_transformer):
+    """
+    Computes the weighted average of predictions from two models.
+
+    Args:
+        probs_linear (numpy.ndarray): Probabilities from the linear model.
+        probs_transformer (numpy.ndarray): Probabilities from the transformer model.
+        weight_transformer (float): Weight assigned to the transformer model (0 to 1).
+                                    The linear model gets (1 - weight_transformer).
+
+    Returns:
+        numpy.ndarray: Blended probabilities.
+    """
+    weight_linear = 1.0 - weight_transformer
+    return (probs_transformer * weight_transformer) + (probs_linear * weight_linear)
+
+
+def optimize_weights(val_probs_linear, val_probs_transformer, y_val):
+    """
+    Finds the optimal weight for the transformer model that minimizes log loss
+    on the validation set.
+
+    Args:
+        val_probs_linear (numpy.ndarray): Validation predictions from linear model.
+        val_probs_transformer (numpy.ndarray): Validation predictions from transformer model.
+        y_val (numpy.ndarray): Ground truth validation labels (integers).
+
+    Returns:
+        float: Optimal weight for the transformer model.
+    """
+    print("Optimizing ensemble weights...")
+
+    # Define the objective function to minimize
+    def objective(w):
+        # Blend predictions with current weight w
+        blended = blend_predictions(val_probs_linear, val_probs_transformer, w)
+        # Compute log loss
+        # We pass labels=[0, 1, 2] to ensure correct handling of classes
+        return compute_log_loss(y_val, blended, labels=[0, 1, 2])
+
+    # Minimize the objective function w.r.t w in the range [0, 1]
+    # We use 'bounded' method because weights must be valid probabilities
+    result = minimize_scalar(objective, bounds=(0.0, 1.0), method="bounded")
+
+    best_weight = result.x
+    best_loss = result.fun
+
+    print(f"Optimization Complete.")
+    print(f"Best Transformer Weight: {best_weight}")
+    print(f"Best Linear Weight: {1.0 - best_weight}")
+    print(f"Best Validation Log Loss: {best_loss}")
+
+    return best_weight
+
+
+def run_ensemble(
+    val_probs_linear,
+    test_probs_linear,
+    val_probs_transformer,
+    test_probs_transformer,
+    y_val,
+):
+    """
+    Orchestrates the ensemble process: optimizes weights on validation data
+    and generates final blended predictions for the test set.
+
+    Args:
+        val_probs_linear (numpy.ndarray): Validation probs (Linear).
+        test_probs_linear (numpy.ndarray): Test probs (Linear).
+        val_probs_transformer (numpy.ndarray): Validation probs (Transformer).
+        test_probs_transformer (numpy.ndarray): Test probs (Transformer).
+        y_val (numpy.ndarray): Ground truth validation labels.
+
+    Returns:
+        numpy.ndarray: Final blended test probabilities.
+    """
+    print("--- Starting Ensemble Pipeline ---")
+
+    # 1. Optimize Weights
+    best_weight = optimize_weights(val_probs_linear, val_probs_transformer, y_val)
+
+    # 2. Blend Test Predictions
+    print("Blending test predictions with optimized weights...")
+    final_test_probs = blend_predictions(
+        test_probs_linear, test_probs_transformer, best_weight
+    )
+
+    # 3. Verify Validation Score (Sanity Check)
+    # Re-calculate to confirm consistency
+    final_val_probs = blend_predictions(
+        val_probs_linear, val_probs_transformer, best_weight
+    )
+    val_loss = compute_log_loss(y_val, final_val_probs, labels=[0, 1, 2])
+    print(f"Final Ensemble Validation Log Loss: {val_loss}")
+
+    print("--- Ensemble Pipeline Complete ---")
+    return final_test_probs
+=======
+import numpy as np
+import xgboost as xgb
+from library.utils import compute_log_loss
+from library.config import Config
+from library.data_loader import load_data
+
+
+def get_meta_features(df):
+    """
+    Extracts simple meta-features for stacking.
+    Cite solution_lesson_node_00008: Conditional Ensembling via Meta-Feature Stacking
+    """
+    texts = df["text"].fillna("").astype(str)
+    meta = pd.DataFrame()
+    meta["char_len"] = texts.apply(len)
+    meta["word_count"] = texts.apply(lambda x: len(x.split()))
+    # Normalize roughly to help tree convergence
+    meta["char_len"] = meta["char_len"] / 150.0
+    meta["word_count"] = meta["word_count"] / 25.0
+    return meta.values
+
+
+def train_meta_learner(oof_lin, oof_trans, y_train, meta_features_train):
+    """
+    Trains an XGBoost meta-learner on OOF predictions and meta-features.
+    """
+    print("Training XGBoost Meta-Learner...")
+    
+    # Concatenate inputs: [Linear Probs (3), Transformer Probs (3), Meta Features (2)]
+    X_train = np.hstack([oof_lin, oof_trans, meta_features_train])
+    
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    
+    # Train
+    model = xgb.train(
+        Config.XGB_PARAMS,
+        dtrain,
+        num_boost_round=Config.XGB_PARAMS["n_estimators"],
+        verbose_eval=False
+    )
+    
+    return model
+
+
+def predict_meta_learner(model, preds_lin, preds_trans, meta_features):
+    """
+    Generates predictions using the trained meta-learner.
+    """
+    X = np.hstack([preds_lin, preds_trans, meta_features])
+    dtest = xgb.DMatrix(X)
+    return model.predict(dtest)
+
+
+import pandas as pd # Ensure pandas is imported
+
+def run_ensemble_stacking(
+    train_oof_lin, val_pred_lin, test_pred_lin,
+    train_oof_trans, val_pred_trans, test_pred_trans,
+    y_train
+):
+    """
+    Orchestrates the Stacking Ensemble.
+    """
+    print("--- Starting Ensemble Pipeline (XGBoost Stacking) ---")
+    
+    # 1. Load Data for Meta-Features
+    df_train = load_data("train")
+    df_val = load_data("val")
+    df_test = load_data("test")
+    
+    # 2. Extract Meta-Features
+    meta_train = get_meta_features(df_train)
+    meta_val = get_meta_features(df_val)
+    meta_test = get_meta_features(df_test)
+    
+    # 3. Train Meta-Learner
+    model = train_meta_learner(train_oof_lin, train_oof_trans, y_train, meta_train)
+    
+    # 4. Predict on Validation (for Final Metric)
+    val_preds_final = predict_meta_learner(model, val_pred_lin, val_pred_trans, meta_val)
+    
+    # 5. Predict on Test (for Submission)
+    test_preds_final = predict_meta_learner(model, test_pred_lin, test_pred_trans, meta_test)
+    
+    print("--- Ensemble Pipeline Complete ---")
+    return val_preds_final, test_preds_final
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.ensemble import optimize_weights, blend_predictions
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def main():
+    # 1. Setup and Configuration
+    Config.setup()
+    set_seed(Config.SEED)
+
+    # Speed optimization for fast baseline: Reduce epochs
+    Config.EPOCHS = 3
+
+    # 2. Run Linear Branch (Stylometric)
+    # This handles data loading, TF-IDF generation, training/loading, and inference
+    val_probs_lin, test_probs_lin, y_val_lin = run_linear_branch(load_cached_data=True)
+
+    # 3. Run Transformer Branch (Contextual)
+    # This handles tokenization, training/loading, and inference
+    val_probs_trans, test_probs_trans, y_val_trans = run_transformer_branch(
+        load_cached_data=True
+    )
+
+    # Sanity check to ensure validation labels align
+    if not np.array_equal(y_val_lin, y_val_trans):
+        raise ValueError("Validation labels mismatch between branches.")
+    y_val = y_val_lin
+
+    # 4. Ensemble Optimization
+    # Find optimal weights on validation set
+    best_weight = optimize_weights(val_probs_lin, val_probs_trans, y_val)
+
+    # 5. Validation Assessment
+    # Blend validation predictions
+    val_preds_final = blend_predictions(val_probs_lin, val_probs_trans, best_weight)
+
+    # Compute Final Metric
+    final_metric = compute_log_loss(y_val, val_preds_final, labels=[0, 1, 2])
+
+    # Required Output Format
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 6. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Load validation text to analyze features
+    df_val = load_data("val")
+    # Feature: Text Length (Character count)
+    text_lengths = df_val["text"].fillna("").astype(str).apply(len).values
+
+    # Calculate Error Magnitude: 1.0 - Probability assigned to the true class
+    # y_val contains indices [0, 1, 2]
+    # val_preds_final is shape (N, 3)
+    # We select the probability of the correct class for each sample
+    probs_true_class = val_preds_final[np.arange(len(y_val)), y_val]
+    error_magnitude = 1.0 - probs_true_class
+
+    # Calculate Correlation
+    correlation = np.corrcoef(text_lengths, error_magnitude)[0, 1]
+    print(f"Correlation between Text Length and Error Magnitude: {correlation:.8f}")
+
+    # Additional insight: Average error for short vs long texts
+    median_len = np.median(text_lengths)
+    avg_err_short = error_magnitude[text_lengths <= median_len].mean()
+    avg_err_long = error_magnitude[text_lengths > median_len].mean()
+    print(f"Avg Error (Short <= {median_len} chars): {avg_err_short:.4f}")
+    print(f"Avg Error (Long > {median_len} chars): {avg_err_long:.4f}")
+
+    # 7. Submission Generation
+    THRESHOLD = 0.4535006610905359
+
+    if final_metric < THRESHOLD:
+        print("\nMetric meets threshold. Generating submission...")
+
+        # Blend Test Predictions
+        test_preds_final = blend_predictions(
+            test_probs_lin, test_probs_trans, best_weight
+        )
+
+        # Load Test IDs
+        df_test = load_data("test")
+        test_ids = df_test["id"].values
+
+        # Format Submission
+        submission_df = format_submission(
+            test_ids, test_preds_final, columns=["EAP", "HPL", "MWS"]
+        )
+
+        # Save to file
+        save_path = Config.SUBMISSION_FILE_PATH
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        submission_df.to_csv(save_path, index=False)
+        print(f"Submission saved to {save_path}")
+=======
+from library.ensemble import run_ensemble_stacking
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def main():
+    # 1. Setup and Configuration
+    Config.setup()
+    set_seed(Config.SEED)
+
+    # 2. Run Linear Branch (Stylometric) - OOF
+    # Returns: train_oof, val_pred, test_pred
+    oof_lin, val_lin, test_lin = run_linear_branch(load_cached_data=True)
+
+    # 3. Run Transformer Branch (Contextual) - OOF
+    # Returns: train_oof, val_pred, test_pred
+    oof_trans, val_trans, test_trans = run_transformer_branch(
+        load_cached_data=True
+    )
+
+    # Load Train Labels for Meta-Learner
+    df_train = load_data("train")
+    y_train = df_train["author"].map(Config.LABEL2ID).values
+    
+    # Load Val Labels for Final Scoring
+    df_val = load_data("val")
+    y_val = df_val["author"].map(Config.LABEL2ID).values
+
+    # 4. Ensemble Stacking
+    # Trains XGBoost on OOFs, predicts on Val and Test
+    val_preds_final, test_preds_final = run_ensemble_stacking(
+        oof_lin, val_lin, test_lin,
+        oof_trans, val_trans, test_trans,
+        y_train
+    )
+
+    # Compute Final Metric
+    final_metric = compute_log_loss(y_val, val_preds_final, labels=[0, 1, 2])
+
+    # Required Output Format
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 6. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Load validation text to analyze features
+    # Feature: Text Length (Character count)
+    text_lengths = df_val["text"].fillna("").astype(str).apply(len).values
+
+    # Calculate Error Magnitude: 1.0 - Probability assigned to the true class
+    # y_val contains indices [0, 1, 2]
+    # val_preds_final is shape (N, 3)
+    # We select the probability of the correct class for each sample
+    probs_true_class = val_preds_final[np.arange(len(y_val)), y_val]
+    error_magnitude = 1.0 - probs_true_class
+
+    # Calculate Correlation
+    correlation = np.corrcoef(text_lengths, error_magnitude)[0, 1]
+    print(f"Correlation between Text Length and Error Magnitude: {correlation:.8f}")
+
+    # Additional insight: Average error for short vs long texts
+    median_len = np.median(text_lengths)
+    avg_err_short = error_magnitude[text_lengths <= median_len].mean()
+    avg_err_long = error_magnitude[text_lengths > median_len].mean()
+    print(f"Avg Error (Short <= {median_len} chars): {avg_err_short:.4f}")
+    print(f"Avg Error (Long > {median_len} chars): {avg_err_long:.4f}")
+
+    # 7. Submission Generation
+    THRESHOLD = 0.25336663725445785
+
+    if final_metric < THRESHOLD:
+        print("\nMetric meets threshold. Generating submission...")
+
+        # Load Test IDs
+        df_test = load_data("test")
+        test_ids = df_test["id"].values
+
+        # Format Submission
+        submission_df = format_submission(
+            test_ids, test_preds_final, columns=["EAP", "HPL", "MWS"]
+        )
+
+        # Save to file
+        save_path = Config.SUBMISSION_FILE_PATH
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        submission_df.to_csv(save_path, index=False)
+        print(f"Submission saved to {save_path}")
+>>>>>>> REPLACE
+```

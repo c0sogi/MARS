@@ -1,0 +1,318 @@
+My implementation strategy focuses on reverting the instability introduced by the `SoftJaccardLoss` and the aggressive logit masking, while restoring the architectural parameters that yielded the best previous performance.
+
+1.  **Loss Function Optimization**: I will replace the unstable `SoftJaccardLoss` and the logit-masking logic (which caused loss explosion) with a standard `KLDivLoss`. I will implement explicit masking on the *loss output* rather than the input logits to safely handle padding without numerical instability (Cite `solution_lesson_node_00043`, `solution_lesson_node_00044`).
+2.  **Model Architecture**: I will reduce the CNN head's channel dimension from 1024 (Hidden Size) back to 256. Previous experiments showed that maintaining the full hidden size in the head degrades performance and increases computational cost (Cite `solution_lesson_node_00044`).
+3.  **Configuration**: I will set the training schedule to 3 epochs with 5 folds, as this configuration previously achieved the highest validation score (Cite `solution_lesson_node_00037`). I will also clean up the configuration file to remove unused parameters like `LOSS_ALPHA`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working Directory for Caching and Models
+    # Specifically using idea_13 as the iteration identifier
+    WORKING_DIR = "./working/idea_13/"
+    OUTPUT_DIR = "./working/idea_13/"
+    SUBMISSION_DIR = "./submission/"
+    SUBMISSION_FILE = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # Model Architecture
+    MODEL_PATH = "microsoft/deberta-v3-large"
+    # Max length 128 covers the max char length (141) + special tokens comfortably
+    MAX_LEN = 128
+
+    # Training Hyperparameters
+    EPOCHS = 5
+    TRAIN_BATCH_SIZE = 8  # Adjusted for A100 40GB + Large model
+    VALID_BATCH_SIZE = 16
+    ACCUMULATION_STEPS = 1
+
+    # Optimization
+    LEARNING_RATE = 2e-5  # Base learning rate
+    LLRD_DECAY = 0.9  # Layer-wise Learning Rate Decay factor
+    WEIGHT_DECAY = 0.01
+    EPS = 1e-6
+    SCHEDULER_TYPE = "cosine"
+    WARMUP_RATIO = 0.1
+    CLIP_GRAD_NORM = 1.0
+
+    # Model Specifics
+    HIDDEN_SIZE = 1024  # DeBERTa-v3-large hidden size
+    DROP_RATE = 0.1  # Standard dropout for the head
+    USE_CNN_HEAD = True  # Toggle for Shared CNN Head
+    CNN_KERNEL_SIZE = 3
+
+    # Loss Function Hyperparameters
+    # Total Loss = (1 - ALPHA) * KL_Loss + ALPHA * Soft_Jaccard_Loss
+    LOSS_ALPHA = 0.5
+    LABEL_SMOOTHING_SIGMA = 1.0  # Sigma for Gaussian smoothing of targets
+=======
+    # Working Directory for Caching and Models
+    # Specifically using idea_14 as the iteration identifier
+    WORKING_DIR = "./working/idea_14/"
+    OUTPUT_DIR = "./working/idea_14/"
+    SUBMISSION_DIR = "./submission/"
+    SUBMISSION_FILE = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # Model Architecture
+    MODEL_PATH = "microsoft/deberta-v3-large"
+    # Max length 128 covers the max char length (141) + special tokens comfortably
+    MAX_LEN = 128
+
+    # Training Hyperparameters
+    EPOCHS = 3
+    TRAIN_BATCH_SIZE = 8  # Adjusted for A100 40GB + Large model
+    VALID_BATCH_SIZE = 16
+    ACCUMULATION_STEPS = 1
+
+    # Optimization
+    LEARNING_RATE = 2e-5  # Base learning rate
+    LLRD_DECAY = 0.9  # Layer-wise Learning Rate Decay factor
+    WEIGHT_DECAY = 0.01
+    EPS = 1e-6
+    SCHEDULER_TYPE = "cosine"
+    WARMUP_RATIO = 0.1
+    CLIP_GRAD_NORM = 1.0
+
+    # Model Specifics
+    HIDDEN_SIZE = 1024  # DeBERTa-v3-large hidden size
+    CNN_FILTERS = 256   # Reduced filters for the head
+    DROP_RATE = 0.1  # Standard dropout for the head
+    USE_CNN_HEAD = True  # Toggle for Shared CNN Head
+    CNN_KERNEL_SIZE = 3
+
+    # Loss Function Hyperparameters
+    LABEL_SMOOTHING_SIGMA = 1.0  # Sigma for Gaussian smoothing of targets
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Shared CNN Head
+        # Input to Conv1d: (Batch, Channels/Hidden, Seq_Len)
+        self.cnn = nn.Conv1d(
+            in_channels=Config.HIDDEN_SIZE,
+            out_channels=Config.HIDDEN_SIZE,
+            kernel_size=Config.CNN_KERNEL_SIZE,
+            padding=(Config.CNN_KERNEL_SIZE - 1) // 2,
+        )
+
+        self.dropout = nn.Dropout(Config.DROP_RATE)
+
+        # Final projection to Start/End logits
+        self.fc = nn.Linear(Config.HIDDEN_SIZE, 2)
+=======
+        # Shared CNN Head
+        # Input to Conv1d: (Batch, Channels/Hidden, Seq_Len)
+        self.cnn = nn.Conv1d(
+            in_channels=Config.HIDDEN_SIZE,
+            out_channels=Config.CNN_FILTERS,
+            kernel_size=Config.CNN_KERNEL_SIZE,
+            padding=(Config.CNN_KERNEL_SIZE - 1) // 2,
+        )
+
+        self.dropout = nn.Dropout(Config.DROP_RATE)
+
+        # Final projection to Start/End logits
+        self.fc = nn.Linear(Config.CNN_FILTERS, 2)
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+
+
+class SoftJaccardLoss(nn.Module):
+    """
+    Differentiable Soft Jaccard Loss.
+    Optimizes the Jaccard index directly by approximating the span mask
+    using cumulative sums of the start and end probabilities.
+    """
+
+    def __init__(self, epsilon=1e-7):
+        super(SoftJaccardLoss, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(
+        self, start_logits, end_logits, start_targets, end_targets, attention_mask=None
+    ):
+        """
+        Args:
+            start_logits: (batch_size, seq_len)
+            end_logits: (batch_size, seq_len)
+            start_targets: (batch_size, seq_len) - smoothed probabilities
+            end_targets: (batch_size, seq_len) - smoothed probabilities
+            attention_mask: (batch_size, seq_len)
+        """
+        # 1. Convert logits to probabilities
+        start_probs = F.softmax(start_logits, dim=-1)
+        end_probs = F.softmax(end_logits, dim=-1)
+
+        # 2. Compute cumulative probabilities to approximate span membership
+        # P(token_i in span) = P(start <= i) * P(end >= i)
+
+        # P(start <= i)
+        start_cumsum = torch.cumsum(start_probs, dim=-1)
+
+        # P(end >= i) = 1 - P(end < i)
+        # Calculated via reverse cumsum: flip -> cumsum -> flip
+        end_cumsum = torch.flip(
+            torch.cumsum(torch.flip(end_probs, dims=[-1]), dim=-1), dims=[-1]
+        )
+
+        # Predicted Span Mask (Soft)
+        m_pred = start_cumsum * end_cumsum
+
+        # 3. Compute Target Span Mask (Soft) from smoothed targets
+        # We treat the smoothed targets as the ground truth distribution
+        target_start_cumsum = torch.cumsum(start_targets, dim=-1)
+        target_end_cumsum = torch.flip(
+            torch.cumsum(torch.flip(end_targets, dims=[-1]), dim=-1), dims=[-1]
+        )
+        m_target = target_start_cumsum * target_end_cumsum
+
+        # 4. Apply Attention Mask
+        if attention_mask is not None:
+            mask = attention_mask.type_as(m_pred)
+            m_pred = m_pred * mask
+            m_target = m_target * mask
+
+        # 5. Compute Jaccard Score
+        # Intersection: sum(m_pred * m_target)
+        intersection = torch.sum(m_pred * m_target, dim=-1)
+
+        # Union: sum(m_pred) + sum(m_target) - intersection
+        union = torch.sum(m_pred, dim=-1) + torch.sum(m_target, dim=-1) - intersection
+
+        jaccard = intersection / (union + self.epsilon)
+
+        # 6. Loss is 1 - Jaccard
+        loss = 1.0 - jaccard
+
+        return loss.mean()
+
+
+def compute_loss(
+    start_logits, end_logits, start_targets, end_targets, attention_mask=None
+):
+    """
+    Computes the total loss combining KL Divergence and Soft Jaccard Loss.
+
+    Args:
+        start_logits: (batch_size, seq_len)
+        end_logits: (batch_size, seq_len)
+        start_targets: (batch_size, seq_len) - smoothed probabilities
+        end_targets: (batch_size, seq_len) - smoothed probabilities
+        attention_mask: (batch_size, seq_len)
+
+    Returns:
+        total_loss: scalar tensor
+    """
+
+    # --- 1. Mask Logits for Valid Probabilities ---
+    if attention_mask is not None:
+        # Set logits corresponding to padding to a very small number
+        # so they don't affect softmax/log_softmax
+        # attention_mask is 1 for keep, 0 for remove
+        pad_mask = (1.0 - attention_mask.type_as(start_logits)) * -1e9
+        start_logits = start_logits + pad_mask
+        end_logits = end_logits + pad_mask
+
+    # --- 2. KL Divergence Loss ---
+    # KLDivLoss expects log-probabilities as input and probabilities as target
+    start_log_probs = F.log_softmax(start_logits, dim=-1)
+    end_log_probs = F.log_softmax(end_logits, dim=-1)
+
+    # reduction='batchmean' divides by batch size, which is standard
+    kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+
+    kl_loss_start = kl_loss_fn(start_log_probs, start_targets)
+    kl_loss_end = kl_loss_fn(end_log_probs, end_targets)
+
+    kl_loss = (kl_loss_start + kl_loss_end) / 2.0
+
+    # --- 3. Soft Jaccard Loss ---
+    # We pass the masked logits to SoftJaccardLoss
+    jaccard_loss_fn = SoftJaccardLoss()
+    jaccard_loss = jaccard_loss_fn(
+        start_logits, end_logits, start_targets, end_targets, attention_mask
+    )
+
+    # --- 4. Combine Losses ---
+    alpha = Config.LOSS_ALPHA
+    total_loss = (1 - alpha) * kl_loss + alpha * jaccard_loss
+
+    return total_loss
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from library.config import Config
+
+
+def compute_loss(
+    start_logits, end_logits, start_targets, end_targets, attention_mask=None
+):
+    """
+    Computes the KL Divergence loss with proper masking.
+    
+    Args:
+        start_logits: (batch_size, seq_len)
+        end_logits: (batch_size, seq_len)
+        start_targets: (batch_size, seq_len) - smoothed probabilities
+        end_targets: (batch_size, seq_len) - smoothed probabilities
+        attention_mask: (batch_size, seq_len)
+
+    Returns:
+        total_loss: scalar tensor
+    """
+    # Use KLDivLoss with reduction='none' to handle masking manually
+    criterion = nn.KLDivLoss(reduction='none')
+    
+    start_log_probs = F.log_softmax(start_logits, dim=-1)
+    end_log_probs = F.log_softmax(end_logits, dim=-1)
+    
+    # Compute element-wise KL divergence
+    # shape: (batch_size, seq_len)
+    loss_start = criterion(start_log_probs, start_targets)
+    loss_end = criterion(end_log_probs, end_targets)
+    
+    if attention_mask is not None:
+        mask = attention_mask.type_as(loss_start)
+        loss_start = loss_start * mask
+        loss_end = loss_end * mask
+    
+    # Sum over sequence length (to get KL for each sample), then mean over batch
+    loss_start = loss_start.sum(dim=-1).mean()
+    loss_end = loss_end.sum(dim=-1).mean()
+    
+    return (loss_start + loss_end) / 2.0
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_training():
+    seed_everything(Config.SEED)
+
+    # Adjust epochs for fast baseline execution within 2 hours
+    # 3 epochs is sufficient for DeBERTa-Large to converge well on this task
+    Config.EPOCHS = 3
+
+    print(
+        f"Starting training with {Config.N_FOLDS} folds, {Config.EPOCHS} epochs each."
+    )
+=======
+def run_training():
+    seed_everything(Config.SEED)
+
+    print(
+        f"Starting training with {Config.N_FOLDS} folds, {Config.EPOCHS} epochs each."
+    )
+>>>>>>> REPLACE
+```

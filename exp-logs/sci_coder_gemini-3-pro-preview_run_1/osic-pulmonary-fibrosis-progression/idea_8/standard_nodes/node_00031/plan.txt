@@ -1,0 +1,433 @@
+Based on the lessons learned, specifically `solution_lesson_node_00028` (prefer symmetric self-attention over asymmetric cross-attention), `solution_lesson_node_00018` (use skip connections for strong scalar priors), and `solution_lesson_node_00030` (avoid SWA and large batch sizes on small datasets), I will optimize the solution by:
+
+1.  **Refining the Architecture**: Replacing the `ResidualCrossAttentionNet` with an `AttentionFusedDualAxisNet`. This model will project visual and tabular features to a common dimension, fuse them using symmetric Multi-Head Self-Attention, and crucially, concatenate the original tabular embedding to the fused output via a skip connection before the regression head.
+2.  **Optimizing Hyperparameters**: Reducing the batch size from 32 to 16 to introduce beneficial stochastic noise and disabling Stochastic Weight Averaging (SWA) in favor of aggressive early stopping, as SWA proved detrimental in the previous iteration.
+3.  **Simplifying Training**: Removing the SWA logic from the training loop to save time and resources, focusing on finding the single best checkpoint.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    TABULAR_INPUT_DIM = 7
+    TABULAR_HIDDEN_DIM = 128
+    ATTENTION_DIM = 64
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 32
+    EPOCHS = 30
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+    NUM_WORKERS = 4
+
+    # SWA (Stochastic Weight Averaging) Settings
+    USE_SWA = True
+    SWA_START_EPOCH = 20
+    SWA_LR = 1e-4
+=======
+    TABULAR_INPUT_DIM = 7
+    TABULAR_HIDDEN_DIM = 128
+    ATTENTION_DIM = 128  # Increased to match hidden dim for uniform attention
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    BATCH_SIZE = 16  # Reduced for better generalization (Cite solution_lesson_node_00030)
+    EPOCHS = 20
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+    NUM_WORKERS = 4
+
+    # SWA (Stochastic Weight Averaging) Settings
+    USE_SWA = False  # Disabled (Cite solution_lesson_node_00030)
+    SWA_START_EPOCH = 20
+    SWA_LR = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TabularAnchor(nn.Module):
+    """
+    Processes clinical metadata to produce:
+    1. Baseline trajectory parameters (alpha, sigma_base, sigma_growth).
+    2. A query vector for the visual attention mechanism.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(Config.TABULAR_INPUT_DIM, Config.TABULAR_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.TABULAR_HIDDEN_DIM, Config.TABULAR_HIDDEN_DIM),
+            nn.ReLU(),
+        )
+
+        # Output 1: Baseline parameters [alpha, sigma_base, sigma_growth]
+        self.head_params = nn.Linear(Config.TABULAR_HIDDEN_DIM, 3)
+
+        # Output 2: Query vector for attention
+        self.head_query = nn.Linear(Config.TABULAR_HIDDEN_DIM, Config.ATTENTION_DIM)
+
+    def forward(self, x):
+        feat = self.mlp(x)
+        params = self.head_params(feat)
+        query = self.head_query(feat)
+        return params, query
+
+
+class DualVisualBackbone(nn.Module):
+    """
+    Two independent EfficientNet-B0 backbones for Axial and Coronal views.
+    Extracts global features and projects them to the attention dimension.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Load pretrained EfficientNet-B0
+        # num_classes=0 with global_pool='' (default in timm for num_classes=0 usually means pool)
+        # We want the global feature vector.
+        self.backbone_ax = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+        )
+        self.backbone_cor = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            in_chans=Config.IN_CHANNELS,
+        )
+
+        # Determine feature dimension (1280 for EfficientNet-B0)
+        self.feat_dim = self.backbone_ax.num_features
+
+        # Projection layer to match Attention Dimension
+        self.proj = nn.Linear(self.feat_dim, Config.ATTENTION_DIM)
+
+    def forward(self, img_ax, img_cor):
+        # Extract features (Batch, Feat_Dim)
+        f_ax = self.backbone_ax(img_ax)
+        f_cor = self.backbone_cor(img_cor)
+
+        # Project to Attention Dimension (Batch, Attn_Dim)
+        k_ax = self.proj(f_ax)
+        k_cor = self.proj(f_cor)
+
+        return k_ax, k_cor
+
+
+class CrossAttentionModule(nn.Module):
+    """
+    Cross-Attention mechanism where Tabular Query attends to Visual Keys.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.scale = Config.ATTENTION_DIM**-0.5
+
+    def forward(self, query, key_ax, key_cor):
+        """
+        Args:
+            query: (B, Dim) - From Tabular
+            key_ax: (B, Dim) - From Axial View
+            key_cor: (B, Dim) - From Coronal View
+        Returns:
+            context: (B, Dim) - Weighted combination of visual features
+        """
+        # Prepare Query: (B, 1, Dim)
+        Q = query.unsqueeze(1)
+
+        # Prepare Keys/Values: Stack visual features -> (B, 2, Dim)
+        K = torch.stack([key_ax, key_cor], dim=1)
+        V = K  # We use the same features for Keys and Values
+
+        # Calculate Attention Scores
+        # (B, 1, Dim) @ (B, Dim, 2) -> (B, 1, 2)
+        scores = torch.bmm(Q, K.transpose(1, 2)) * self.scale
+        weights = F.softmax(scores, dim=-1)
+
+        # Compute Context
+        # (B, 1, 2) @ (B, 2, Dim) -> (B, 1, Dim)
+        context = torch.bmm(weights, V).squeeze(1)
+
+        return context
+
+
+class ResidualCrossAttentionNet(nn.Module):
+    """
+    Main Architecture:
+    1. Tabular Anchor -> Baseline Params + Query
+    2. Visual Backbones -> Visual Features
+    3. Cross Attention -> Visual Context
+    4. Correction Head -> Param Deltas
+    5. Final Prediction -> FVC, Confidence
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.tabular_anchor = TabularAnchor()
+        self.visual_backbone = DualVisualBackbone()
+        self.attention = CrossAttentionModule()
+
+        # Correction Head: Predicts residuals for [alpha, sigma_base, sigma_growth]
+        self.correction_head = nn.Sequential(
+            nn.Linear(Config.ATTENTION_DIM, Config.TABULAR_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.TABULAR_HIDDEN_DIM, 3),
+        )
+
+    def forward(self, tabular, img_ax, img_cor, relative_week, baseline_fvc):
+        """
+        Args:
+            tabular: (B, 7)
+            img_ax: (B, 3, 224, 224)
+            img_cor: (B, 3, 224, 224)
+            relative_week: (B,) or (B, 1)
+            baseline_fvc: (B,) or (B, 1)
+        """
+        # 1. Tabular Pathway
+        params_base, query = self.tabular_anchor(tabular)
+
+        # 2. Visual Pathway
+        k_ax, k_cor = self.visual_backbone(img_ax, img_cor)
+
+        # 3. Cross Attention
+        context = self.attention(query, k_ax, k_cor)
+
+        # 4. Residual Correction
+        delta_params = self.correction_head(context)
+
+        # 5. Combine Parameters
+        # params: [alpha, sigma_base, sigma_growth]
+        params_final = params_base + delta_params
+
+        alpha = params_final[:, 0]
+        sigma_base = params_final[:, 1]
+        sigma_growth = params_final[:, 2]
+
+        # 6. Apply Constraints
+        # Alpha (slope) is unconstrained (can be negative for decline)
+        # Sigmas must be positive -> Softplus
+        sigma_base = F.softplus(sigma_base)
+        sigma_growth = F.softplus(sigma_growth)
+
+        # 7. Parametric Inference
+        # Ensure inputs are correct shape
+        if relative_week.dim() == 1:
+            relative_week = relative_week.view(-1)
+        if baseline_fvc.dim() == 1:
+            baseline_fvc = baseline_fvc.view(-1)
+
+        # FVC = Baseline + alpha * week
+        fvc_pred = baseline_fvc + alpha * relative_week
+
+        # Confidence = sigma_base + sigma_growth * |week|
+        confidence_pred = sigma_base + sigma_growth * torch.abs(relative_week)
+
+        return fvc_pred, confidence_pred
+=======
+class AttentionFusedDualAxisNet(nn.Module):
+    """
+    Architecture utilizing Symmetric Self-Attention and Skip Connections.
+    Cite solution_lesson_node_00028 (Symmetric vs Asymmetric)
+    Cite solution_lesson_node_00018 (Skip Connections)
+    """
+
+    def __init__(self):
+        super().__init__()
+        
+        # 1. Tabular Encoder
+        self.tab_mlp = nn.Sequential(
+            nn.Linear(Config.TABULAR_INPUT_DIM, Config.TABULAR_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.TABULAR_HIDDEN_DIM, Config.TABULAR_HIDDEN_DIM),
+            nn.LayerNorm(Config.TABULAR_HIDDEN_DIM)
+        )
+
+        # 2. Visual Backbones (Independent)
+        # Cite solution_lesson_node_00014 (Avoid Weight Sharing)
+        self.backbone_ax = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, in_chans=Config.IN_CHANNELS
+        )
+        self.backbone_cor = timm.create_model(
+            Config.BACKBONE_NAME, pretrained=True, num_classes=0, in_chans=Config.IN_CHANNELS
+        )
+        
+        # Projection to match tabular dimension
+        self.vis_proj = nn.Linear(self.backbone_ax.num_features, Config.TABULAR_HIDDEN_DIM)
+
+        # 3. Symmetric Self-Attention Fusion
+        # Cite solution_lesson_node_00017 (Dynamic Fusion)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=Config.TABULAR_HIDDEN_DIM, 
+            num_heads=4, 
+            batch_first=True
+        )
+
+        # 4. Regression Head with Skip Connection
+        # Input = Fused Context (128) + Tabular Skip (128) = 256
+        self.head = nn.Sequential(
+            nn.Linear(Config.TABULAR_HIDDEN_DIM * 2, Config.TABULAR_HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.TABULAR_HIDDEN_DIM, 3) # alpha, sigma_base, sigma_growth
+        )
+
+    def forward(self, tabular, img_ax, img_cor, relative_week, baseline_fvc):
+        # 1. Encode Features
+        tab_emb = self.tab_mlp(tabular) # (B, 128)
+        
+        f_ax = self.backbone_ax(img_ax) # (B, 1280)
+        f_cor = self.backbone_cor(img_cor) # (B, 1280)
+        
+        p_ax = self.vis_proj(f_ax) # (B, 128)
+        p_cor = self.vis_proj(f_cor) # (B, 128)
+        
+        # 2. Sequence Construction [Axial, Coronal, Tabular]
+        # (B, 3, 128)
+        seq = torch.stack([p_ax, p_cor, tab_emb], dim=1)
+        
+        # 3. Self-Attention
+        attn_out, _ = self.attn(seq, seq, seq)
+        
+        # 4. Global Context (Average Pooling)
+        context = torch.mean(attn_out, dim=1) # (B, 128)
+        
+        # 5. Skip Connection
+        # Cite solution_lesson_node_00018
+        combined = torch.cat([context, tab_emb], dim=1) # (B, 256)
+        
+        # 6. Prediction
+        params = self.head(combined)
+        
+        alpha = params[:, 0]
+        # Cite solution_lesson_node_00021 (Architectural Constraints)
+        sigma_base = F.softplus(params[:, 1])
+        sigma_growth = F.softplus(params[:, 2])
+        
+        # 7. Parametric Inference
+        if relative_week.dim() == 1: relative_week = relative_week.view(-1)
+        if baseline_fvc.dim() == 1: baseline_fvc = baseline_fvc.view(-1)
+        
+        fvc_pred = baseline_fvc + alpha * relative_week
+        confidence_pred = sigma_base + sigma_growth * torch.abs(relative_week)
+        
+        return fvc_pred, confidence_pred
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import ResidualCrossAttentionNet
+from library.utils import seed_everything, laplace_log_likelihood, average_weights
+=======
+from library.model import AttentionFusedDualAxisNet
+from library.utils import seed_everything, laplace_log_likelihood, average_weights
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Model
+    model = ResidualCrossAttentionNet().to(device)
+
+    # Optimizer & Scheduler
+=======
+    # Model
+    model = AttentionFusedDualAxisNet().to(device)
+
+    # Optimizer & Scheduler
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # --- SWA / Model Averaging ---
+    print("\nPerforming SWA on top checkpoints:")
+    best_paths = [x[2] for x in top_k_checkpoints]
+    for p in best_paths:
+        print(f" - {p}")
+
+    # Load and average weights
+    model = average_weights(model, best_paths)
+
+    # Save Final Best Model
+    final_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Best averaged model saved to {final_model_path}")
+=======
+    # --- SWA / Model Averaging ---
+    if Config.USE_SWA:
+        print("\nPerforming SWA on top checkpoints:")
+        best_paths = [x[2] for x in top_k_checkpoints]
+        for p in best_paths:
+            print(f" - {p}")
+
+        # Load and average weights
+        model = average_weights(model, best_paths)
+    else:
+        # If not using SWA, ensure we load the single best model found
+        # The 'model' variable currently holds the state at the last epoch.
+        # We want the best score model.
+        # top_k_checkpoints is sorted descending by score.
+        best_ckpt = top_k_checkpoints[0][2]
+        print(f"\nLoading best checkpoint from: {best_ckpt}")
+        model.load_state_dict(torch.load(best_ckpt, map_location=device))
+
+    # Save Final Best Model
+    final_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Best model saved to {final_model_path}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+from library.model import ResidualCrossAttentionNet
+=======
+from library.model import AttentionFusedDualAxisNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/predict.py
+<<<<<<< SEARCH
+    # 3. Load Model
+    model = ResidualCrossAttentionNet()
+
+    if os.path.exists(weights_path):
+=======
+    # 3. Load Model
+    model = AttentionFusedDualAxisNet()
+
+    if os.path.exists(weights_path):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import ResidualCrossAttentionNet
+=======
+from library.model import AttentionFusedDualAxisNet
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load Best Model
+    model = ResidualCrossAttentionNet().to(device)
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+=======
+    # Load Best Model
+    model = AttentionFusedDualAxisNet().to(device)
+    best_model_path = os.path.join(Config.WORKING_DIR, "best_model.pth")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,235 @@
+To optimize the solution, I will implement **Layer-wise Learning Rate Decay (LLRD)** and expand the capacity of the classification head.
+
+**Strategy:**
+1.  **Layer-wise Learning Rate Decay (LLRD)**: I will modify the optimizer setup to apply a multiplicative decay (0.9) to the learning rate as we go from the top layer (11) down to the embeddings. This allows the model to fine-tune high-level semantic features aggressively while preserving the robust low-level features learned during pre-training, which is crucial for small datasets (Cite solution_lesson_node_00006).
+2.  **Expanded Head Capacity**: I will increase the hidden dimension of the `MultiSampleDropout` head from `hidden_size` (768) to `hidden_size * 2` (1536). The Co-Attention layer produces a very high-dimensional concatenated feature vector (~6000 dimensions). Expanding the MLP's hidden layer reduces the information bottleneck, allowing for better non-linear disentanglement of these interaction features before the final projection (Cite solution_lesson_node_00022).
+3.  **Extended Training & Tuning**: I will increase the number of epochs from 6 to 8 to accommodate the slower training dynamics of the lower layers under LLRD (Cite solution_lesson_node_00015) and slightly increase the base backbone learning rate to compensate for the decay.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory specific to Idea 8
+    working_dir = "./working/idea_8"
+    output_dir = "./working/idea_8"  # Where model checkpoints are saved
+=======
+    # Working directory specific to Idea 9
+    working_dir = "./working/idea_9"
+    output_dir = "./working/idea_9"  # Where model checkpoints are saved
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # ==========================
+    epochs = 6
+    train_batch_size = 4  # Adjusted for A100 memory with dual 512 context + CoAttention
+    valid_batch_size = 16
+    accumulation_steps = 2
+
+    # Optimizer (AdamW)
+    lr_backbone = 1e-5
+    lr_head = 1e-4
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+=======
+    # Training Hyperparameters
+    # ==========================
+    epochs = 8
+    train_batch_size = 4  # Adjusted for A100 memory with dual 512 context + CoAttention
+    valid_batch_size = 16
+    accumulation_steps = 2
+
+    # Optimizer (AdamW)
+    lr_backbone = 1.5e-5  # Slightly higher base to account for decay
+    lr_head = 1e-4
+    weight_decay = 0.01
+    max_grad_norm = 1.0
+    llrd_decay = 0.9
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        head_input_dim = (8 * self.hidden_size) + 16 + 32
+
+        self.head = MultiSampleDropout(
+            input_dim=head_input_dim,
+            hidden_dim=self.hidden_size,
+            output_dim=self.num_targets,
+            num_samples=5,
+            dropout_rate=Config.dropout,
+        )
+=======
+        head_input_dim = (8 * self.hidden_size) + 16 + 32
+
+        # Expand hidden dimension to avoid bottlenecking the rich Co-Attention features
+        # Cite solution_lesson_node_00022 (Non-Linear Projection Heads)
+        self.head = MultiSampleDropout(
+            input_dim=head_input_dim,
+            hidden_dim=self.hidden_size * 2,
+            output_dim=self.num_targets,
+            num_samples=5,
+            dropout_rate=Config.dropout,
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def get_optimizer_params(model):
+    """
+    Sets up differential learning rates and weight decay groups.
+    Backbone gets lr_backbone, Head/CoAttn gets lr_head.
+    """
+    backbone_params = list(model.backbone.named_parameters())
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+
+    # Backbone parameter groups
+    backbone_decay = [
+        p for n, p in backbone_params if not any(nd in n for nd in no_decay)
+    ]
+    backbone_no_decay = [
+        p for n, p in backbone_params if any(nd in n for nd in no_decay)
+    ]
+
+    # Identify backbone parameter IDs to separate them from the rest
+    backbone_ids = {id(p) for p in model.backbone.parameters()}
+
+    # Head/Interaction parameter groups
+    head_decay = []
+    head_no_decay = []
+
+    for n, p in model.named_parameters():
+        if id(p) not in backbone_ids:
+            if any(nd in n for nd in no_decay):
+                head_no_decay.append(p)
+            else:
+                head_decay.append(p)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": backbone_decay,
+            "lr": Config.lr_backbone,
+            "weight_decay": Config.weight_decay,
+        },
+        {"params": backbone_no_decay, "lr": Config.lr_backbone, "weight_decay": 0.0},
+        {
+            "params": head_decay,
+            "lr": Config.lr_head,
+            "weight_decay": Config.weight_decay,
+        },
+        {"params": head_no_decay, "lr": Config.lr_head, "weight_decay": 0.0},
+    ]
+    return optimizer_grouped_parameters
+=======
+def get_optimizer_params(model):
+    """
+    Sets up Layer-wise Learning Rate Decay (LLRD) and differential learning rates.
+    Cite solution_lesson_node_00006 (Transfer Learning Dominance) - preserving lower layers.
+    """
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = []
+    
+    # Base LR for backbone
+    lr = Config.lr_backbone
+    decay = Config.llrd_decay
+    
+    # 1. Backbone Layers (DeBERTa-v3-base has 12 layers: 0-11)
+    # We assign LRs: layer 11 -> lr, layer 10 -> lr*decay, ..., embeddings -> lr*decay^12
+    
+    # Group parameters by layer
+    # DeBERTa structure: backbone.embeddings..., backbone.encoder.layer.X...
+    
+    layer_params = {i: {"decay": [], "no_decay": []} for i in range(-1, 12)}
+    head_params = {"decay": [], "no_decay": []}
+    
+    for n, p in model.named_parameters():
+        if "backbone" in n:
+            # Determine layer index
+            if "encoder.layer" in n:
+                # Format: backbone.encoder.layer.5.output...
+                try:
+                    # Split by dot, find index after 'layer'
+                    parts = n.split(".")
+                    layer_idx = int(parts[parts.index("layer") + 1])
+                except:
+                    # Fallback
+                    layer_idx = 0 
+            elif "embeddings" in n:
+                layer_idx = -1
+            else:
+                # Other backbone params (e.g. final layernorm if exists, or pooler inside backbone)
+                # Treat as top layer
+                layer_idx = 11
+            
+            if any(nd in n for nd in no_decay):
+                layer_params[layer_idx]["no_decay"].append(p)
+            else:
+                layer_params[layer_idx]["decay"].append(p)
+        else:
+            # Head / CoAttention / Custom Pooler
+            if any(nd in n for nd in no_decay):
+                head_params["no_decay"].append(p)
+            else:
+                head_params["decay"].append(p)
+
+    # Create optimizer groups with calculated LRs
+    num_layers = 12
+    
+    for layer_idx in range(-1, 12):
+        # Calculate decay power
+        # layer 11: power 0 -> lr
+        # layer 0: power 11 -> lr * decay^11
+        # embeddings: power 12 -> lr * decay^12
+        
+        if layer_idx == -1:
+            power = num_layers
+        else:
+            power = (num_layers - 1) - layer_idx
+            
+        cur_lr = lr * (decay ** power)
+        
+        # Add groups
+        if layer_params[layer_idx]["decay"]:
+            optimizer_grouped_parameters.append({
+                "params": layer_params[layer_idx]["decay"],
+                "lr": cur_lr,
+                "weight_decay": Config.weight_decay
+            })
+        if layer_params[layer_idx]["no_decay"]:
+            optimizer_grouped_parameters.append({
+                "params": layer_params[layer_idx]["no_decay"],
+                "lr": cur_lr,
+                "weight_decay": 0.0
+            })
+            
+    # Head Parameters
+    optimizer_grouped_parameters.append({
+        "params": head_params["decay"],
+        "lr": Config.lr_head,
+        "weight_decay": Config.weight_decay
+    })
+    optimizer_grouped_parameters.append({
+        "params": head_params["no_decay"],
+        "lr": Config.lr_head,
+        "weight_decay": 0.0
+    })
+
+    return optimizer_grouped_parameters
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Submission
+    THRESHOLD = 0.41496954548214454
+
+    if final_metric > THRESHOLD:
+=======
+    # 5. Submission
+    THRESHOLD = 0.41661963777166594
+
+    if final_metric > THRESHOLD:
+>>>>>>> REPLACE
+```

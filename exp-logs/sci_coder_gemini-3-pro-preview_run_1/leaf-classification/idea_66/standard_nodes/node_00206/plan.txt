@@ -1,0 +1,311 @@
+Implementation Strategy:
+1.  **Configuration Update**: Modify `library/config.py` to point `CACHE_DIR` to `idea_67`. This ensures a clean slate for the new experiment and forces re-computation of features (which is necessary due to the change in contour approximation).
+2.  **Feature Extraction Refinement**: In `library/feature_extraction.py`, change the contour retrieval mode from `cv2.CHAIN_APPROX_SIMPLE` to `cv2.CHAIN_APPROX_NONE`. This aligns with Lesson 00149, ensuring maximum fidelity for geometric descriptors (like Eccentricity) by avoiding vertex compression.
+3.  **Model Architecture Overhaul**: In `library/model.py`, replace the `FactorizedOASLDA` class with `GlobalOASLDA`.
+    -   **Rationale**: As per Lesson 00204, factorizing features into independent groups destroys valuable cross-feature correlations. A global shrinkage estimator (OAS) on the full, concatenated feature set (197 dimensions) is empirically superior for this high-precision task.
+    -   **Implementation**: The new class will concatenate the feature dictionary into a single matrix and fit a single OAS estimator. It will manually compute the linear discriminant weights ($W = \Sigma^{-1}\mu$) in `float64` precision (Lesson 00190).
+4.  **Execution Update**: Update `runfile.py` and the internal `run_model` function to instantiate and use `GlobalOASLDA`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Cache directory for idea_66 (Sanitized Factorized High-Precision OAS Ensemble)
+CACHE_DIR = os.path.join(WORKING_DIR, "idea_66")
+=======
+# Cache directory for idea_67 (Global High-Precision OAS-LDA)
+CACHE_DIR = os.path.join(WORKING_DIR, "idea_67")
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_extraction.py
+<<<<<<< SEARCH
+        # Find contours
+        contours, _ = cv2.findContours(
+            img_inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+=======
+        # Find contours
+        # Cite solution_lesson_node_00149: Use CHAIN_APPROX_NONE to avoid contour compression
+        # and maximize precision of geometric feature extraction.
+        contours, _ = cv2.findContours(
+            img_inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FactorizedOASLDA:
+    """
+    A Factorized Linear Discriminant Analysis model using OAS covariance estimation.
+
+    This model trains independent LDA experts on different feature groups and
+    aggregates them via Bayesian logit summation. It uses Oracle Approximating
+    Shrinkage (OAS) to estimate covariance matrices, which is robust for
+    high-dimensional, small-sample datasets.
+    """
+
+    def __init__(self):
+        self.groups = None
+        self.group_models = {}  # Stores (Weights, Biases) for each group
+        self.priors = None
+        self.classes_ = None
+        self.dtype = FLOAT_PRECISION
+
+    def _fit_group(self, X, y):
+        """
+        Fits an OAS-LDA expert on a single feature group.
+
+        Args:
+            X (np.ndarray): Feature matrix for the group (n_samples, n_features).
+            y (np.ndarray): Target labels (n_samples,).
+
+        Returns:
+            tuple: (W, b) where W is the weight matrix and b is the bias vector.
+        """
+        n_samples, n_features = X.shape
+        n_classes = len(self.classes_)
+
+        # Initialize containers
+        means = np.zeros((n_classes, n_features), dtype=self.dtype)
+        residuals = np.zeros_like(X, dtype=self.dtype)
+
+        # 1. Compute Class Means and Residuals
+        # Residuals = X - class_mean, used for pooled covariance estimation
+        for k in range(n_classes):
+            mask = y == k
+            X_k = X[mask]
+            if len(X_k) > 0:
+                mu_k = np.mean(X_k, axis=0, dtype=self.dtype)
+                means[k] = mu_k
+                residuals[mask] = X_k - mu_k
+            else:
+                # Fallback for empty classes (unlikely in stratified splits)
+                pass
+
+        # 2. Estimate Covariance/Precision using OAS
+        # assume_centered=True because we manually centered using class means
+        oas = OAS(assume_centered=True)
+        oas.fit(residuals)
+
+        # Extract precision matrix (inverse covariance)
+        precision = oas.precision_.astype(self.dtype)
+
+        # 3. Compute Linear Discriminant Parameters
+        # LDA Discriminant: d_k(x) = x.T @ (P @ mu_k) - 0.5 * (mu_k.T @ P @ mu_k) + log(pi_k)
+        # We calculate W = P @ mu.T so that x @ W gives the first term.
+
+        # W shape: (n_features, n_classes)
+        W = np.dot(precision, means.T)
+
+        # Quadratic term: -0.5 * diag(means @ W)
+        # We compute only the diagonal efficiently
+        quad_term = -0.5 * np.sum(means * W.T, axis=1)  # Shape (n_classes,)
+
+        # Add log priors to the bias
+        # Note: This means each expert includes the prior. We will correct this during aggregation.
+        log_priors = np.log(self.priors)
+        b = quad_term + log_priors
+
+        return W, b
+
+    def fit(self, X_dict, y):
+        """
+        Fits the ensemble on the dictionary of feature groups.
+
+        Args:
+            X_dict (dict): Dictionary mapping group names to feature arrays.
+            y (np.ndarray): Target labels.
+        """
+        self.groups = list(X_dict.keys())
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+
+        # Compute Global Priors
+        class_counts = np.bincount(y, minlength=n_classes)
+        # Add epsilon to avoid log(0) if a class is missing (though unlikely)
+        self.priors = (class_counts.astype(self.dtype) + 1e-15) / class_counts.sum()
+
+        print(f"Training FactorizedOASLDA on {len(self.groups)} groups: {self.groups}")
+
+        for group, X in X_dict.items():
+            # Ensure double precision
+            X_group = X.astype(self.dtype)
+            W, b = self._fit_group(X_group, y)
+            self.group_models[group] = (W, b)
+
+        return self
+
+    def predict_proba(self, X_dict):
+        """
+        Predicts class probabilities by aggregating expert logits.
+
+        Args:
+            X_dict (dict): Dictionary mapping group names to feature arrays.
+
+        Returns:
+            np.ndarray: Probability matrix (n_samples, n_classes).
+        """
+        # Determine shapes
+        first_group = self.groups[0]
+        n_samples = X_dict[first_group].shape[0]
+        n_classes = len(self.classes_)
+
+        # Initialize total logits
+        total_logits = np.zeros((n_samples, n_classes), dtype=self.dtype)
+
+        # Sum logits from all experts
+        for group in self.groups:
+            X = X_dict[group].astype(self.dtype)
+            W, b = self.group_models[group]
+
+            # Linear Logit: Z = X @ W + b
+            logits = np.dot(X, W) + b
+            total_logits += logits
+
+        # Bayesian Aggregation Correction
+        # Since each of the G experts adds log(prior), the sum contains G * log(prior).
+        # We need the final posterior to contain exactly 1 * log(prior).
+        # Therefore, we subtract (G - 1) * log(prior).
+        if MODEL_PARAMS.get("logit_aggregation_correction", True):
+            G = len(self.groups)
+            log_priors = np.log(self.priors)
+            correction = (G - 1) * log_priors
+            total_logits -= correction
+
+        # Apply Softmax to get probabilities
+        return softmax(total_logits, axis=1)
+=======
+class GlobalOASLDA:
+    """
+    A Global Linear Discriminant Analysis model using OAS covariance estimation.
+    
+    Cite solution_lesson_node_00204: Global Shrinkage Surpasses Hard Factorization.
+    This model concatenates all feature groups into a single high-dimensional vector
+    and estimates a global covariance matrix using Oracle Approximating Shrinkage (OAS).
+    This preserves cross-feature correlations that are lost in factorized approaches.
+    """
+
+    def __init__(self):
+        self.groups = None
+        self.W = None
+        self.b = None
+        self.priors = None
+        self.classes_ = None
+        self.dtype = FLOAT_PRECISION
+
+    def fit(self, X_dict, y):
+        """
+        Fits the global OAS-LDA model on the concatenated features.
+
+        Args:
+            X_dict (dict): Dictionary mapping group names to feature arrays.
+            y (np.ndarray): Target labels.
+        """
+        # Sort groups to ensure deterministic feature order
+        self.groups = sorted(X_dict.keys())
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+
+        # Concatenate features
+        X_list = [X_dict[g].astype(self.dtype) for g in self.groups]
+        X_full = np.hstack(X_list)
+        
+        n_samples, n_features = X_full.shape
+        print(f"Training GlobalOASLDA on {n_features} features (Groups: {self.groups})")
+
+        # Compute Priors
+        class_counts = np.bincount(y, minlength=n_classes)
+        self.priors = (class_counts.astype(self.dtype) + 1e-15) / class_counts.sum()
+
+        # Initialize containers
+        means = np.zeros((n_classes, n_features), dtype=self.dtype)
+        residuals = np.zeros_like(X_full, dtype=self.dtype)
+
+        # 1. Compute Class Means and Residuals
+        for k in range(n_classes):
+            mask = y == k
+            X_k = X_full[mask]
+            if len(X_k) > 0:
+                mu_k = np.mean(X_k, axis=0, dtype=self.dtype)
+                means[k] = mu_k
+                residuals[mask] = X_k - mu_k
+
+        # 2. Estimate Covariance/Precision using OAS
+        # Cite solution_lesson_node_00190: Explicitly estimate precision matrix using OAS
+        oas = OAS(assume_centered=True)
+        oas.fit(residuals)
+        precision = oas.precision_.astype(self.dtype)
+
+        # 3. Compute Linear Discriminant Parameters
+        # W = P @ mu.T
+        self.W = np.dot(precision, means.T)
+
+        # Quadratic term: -0.5 * diag(means @ W)
+        quad_term = -0.5 * np.sum(means * self.W.T, axis=1)
+        
+        # Bias = quad_term + log(priors)
+        self.b = quad_term + np.log(self.priors)
+
+        return self
+
+    def predict_proba(self, X_dict):
+        """
+        Predicts class probabilities using the global model.
+        """
+        # Concatenate features in the same order
+        X_list = [X_dict[g].astype(self.dtype) for g in self.groups]
+        X_full = np.hstack(X_list)
+
+        # Linear Logit: Z = X @ W + b
+        logits = np.dot(X_full, self.W) + self.b
+
+        # Apply Softmax
+        return softmax(logits, axis=1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Initialize and Train Model
+    model = FactorizedOASLDA()
+    model.fit(X_train, y_train)
+=======
+    # Initialize and Train Model
+    model = GlobalOASLDA()
+    model.fit(X_train, y_train)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import FactorizedOASLDA
+=======
+from library.model import GlobalOASLDA
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Training
+    print("\nInitializing Factorized OAS-LDA Model...")
+    model = FactorizedOASLDA()
+
+    print("Fitting model on training data...")
+    model.fit(X_train, y_train)
+    print("Model fitting complete.")
+=======
+    # 3. Model Training
+    print("\nInitializing Global OAS-LDA Model...")
+    model = GlobalOASLDA()
+
+    print("Fitting model on training data...")
+    model.fit(X_train, y_train)
+    print("Model fitting complete.")
+>>>>>>> REPLACE
+```

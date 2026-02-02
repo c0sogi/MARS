@@ -1,0 +1,691 @@
+My implementation strategy involves optimizing the training duration and the validation metric calculation to improve the model's performance and ensure it passes the submission threshold.
+
+1.  **Adaptive Thresholding (Cite solution_lesson_node_00033):** I will modify the validation logic to dynamically search for the optimal binarization threshold (between 0.3 and 0.7) that maximizes the Mean Average Precision (mAP) instead of using a fixed 0.5 threshold. This ensures we evaluate the model's maximum potential and checkpoint the best performing state.
+2.  **Extended Training Duration (Cite solution_lesson_node_00035):** I will increase the number of training epochs from 30 to 50. The previous run showed steady convergence and completed very quickly (2 minutes), indicating that 30 epochs was insufficient to reach the global minimum. Extending to 50 epochs allows the Cosine Annealing scheduler to decay properly and refine the weights.
+3.  **Optimization Integration:** I will update the `evaluate`, `train_and_evaluate`, and `run_failure_analysis` functions to implement the threshold search and pass the optimal threshold to the submission generation step.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def calc_map(preds, targets, thresholds=None):
+    """
+    Calculates the Mean Average Precision (mAP) at various IoU thresholds.
+    Metric:
+        - IoU is calculated for each image.
+        - Precision is calculated at thresholds [0.5, 0.55, ..., 0.95].
+        - At a specific threshold t, precision is 1 if IoU > t, else 0.
+        - The score for an image is the mean precision across all thresholds.
+        - The final mAP is the mean score across the batch.
+
+    Args:
+        preds (np.ndarray or torch.Tensor): Predictions of shape (N, H, W). Assumed binary or probabilities.
+        targets (np.ndarray or torch.Tensor): Ground truth of shape (N, H, W).
+        thresholds (list, optional): List of IoU thresholds. Defaults to 0.5-0.95.
+
+    Returns:
+        float: The mean average precision score.
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.5, 0.96, 0.05)
+
+    # Convert tensors to numpy
+    if torch.is_tensor(preds):
+        preds = preds.detach().cpu().numpy()
+    if torch.is_tensor(targets):
+        targets = targets.detach().cpu().numpy()
+
+    # Binarize predictions and targets
+    preds = (preds > 0.5).astype(np.uint8)
+    targets = (targets > 0.5).astype(np.uint8)
+=======
+def calc_map(preds, targets, thresholds=None, binarization_threshold=0.5):
+    """
+    Calculates the Mean Average Precision (mAP) at various IoU thresholds.
+    Metric:
+        - IoU is calculated for each image.
+        - Precision is calculated at thresholds [0.5, 0.55, ..., 0.95].
+        - At a specific threshold t, precision is 1 if IoU > t, else 0.
+        - The score for an image is the mean precision across all thresholds.
+        - The final mAP is the mean score across the batch.
+
+    Args:
+        preds (np.ndarray or torch.Tensor): Predictions of shape (N, H, W). Assumed binary or probabilities.
+        targets (np.ndarray or torch.Tensor): Ground truth of shape (N, H, W).
+        thresholds (list, optional): List of IoU thresholds. Defaults to 0.5-0.95.
+        binarization_threshold (float, optional): Threshold to binarize predictions. Defaults to 0.5.
+
+    Returns:
+        float: The mean average precision score.
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.5, 0.96, 0.05)
+
+    # Convert tensors to numpy
+    if torch.is_tensor(preds):
+        preds = preds.detach().cpu().numpy()
+    if torch.is_tensor(targets):
+        targets = targets.detach().cpu().numpy()
+
+    # Binarize predictions and targets
+    preds = (preds > binarization_threshold).astype(np.uint8)
+    targets = (targets > 0.5).astype(np.uint8)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def evaluate(model, dataloader, device):
+    """
+    Evaluates the model on the validation set.
+    Unpads predictions and targets to 101x101 before calculating mAP.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # Forward pass
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # Move to CPU for processing
+            probs_np = probs.detach().cpu().numpy()  # (B, 1, 128, 128)
+            masks_np = masks.detach().cpu().numpy()  # (B, 1, 128, 128)
+
+            # Unpad each image in the batch back to 101x101
+            # Squeeze channel dim: (B, 128, 128)
+            probs_np = probs_np.squeeze(1)
+            masks_np = masks_np.squeeze(1)
+
+            batch_preds = []
+            batch_targets = []
+
+            for i in range(probs_np.shape[0]):
+                p_unpadded = unpad_image(probs_np[i], original_size=101)
+                m_unpadded = unpad_image(masks_np[i], original_size=101)
+                batch_preds.append(p_unpadded)
+                batch_targets.append(m_unpadded)
+
+            all_preds.append(np.array(batch_preds))
+            all_targets.append(np.array(batch_targets))
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate mAP
+    score = calc_map(all_preds, all_targets)
+    return score
+
+
+def predict_marginalized(model, dataloader, device, num_scans=10):
+    """
+    Performs Marginalized Depth-Scan Inference on the test set.
+    Scans a range of depth values and averages the predictions.
+    """
+    model.eval()
+    results = []
+    ids_list = []
+
+    # Define scan range: -2.0 to 2.0 standard deviations
+    scan_values = np.linspace(-2.0, 2.0, num_scans)
+
+    with torch.no_grad():
+        for images, _, _, ids in dataloader:
+            images = images.to(device)
+            batch_size = images.size(0)
+
+            # Accumulator for marginalized probabilities
+            # Shape: (B, 1, 128, 128)
+            accum_probs = torch.zeros((batch_size, 1, 128, 128), device=device)
+
+            # Marginalization Loop
+            for z_val in scan_values:
+                # Create constant depth tensor for this scan step
+                z_tensor = torch.full(
+                    (batch_size,), z_val, device=device, dtype=torch.float32
+                )
+
+                logits = model(images, z_tensor)
+                probs = torch.sigmoid(logits)
+                accum_probs += probs
+
+            # Average over scan steps
+            avg_probs = accum_probs / num_scans
+
+            # Process batch
+            avg_probs_np = avg_probs.detach().cpu().numpy().squeeze(1)
+
+            for i in range(batch_size):
+                # Unpad to 101x101
+                pred_101 = unpad_image(avg_probs_np[i], original_size=101)
+
+                # Binarize (Threshold 0.5)
+                mask_bin = (pred_101 > 0.5).astype(np.uint8)
+
+                # RLE Encode
+                rle = rle_encode(mask_bin)
+
+                results.append(rle)
+                ids_list.append(ids[i])
+
+    return ids_list, results
+
+
+def train_and_evaluate(
+    num_epochs=50, batch_size=32, learning_rate=1e-4, weight_decay=1e-2, patience=10
+):
+    """
+    Main training loop with Early Stopping and Checkpointing.
+    """
+    seed_everything(42)
+
+    # Create directories
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Data Loading
+    print("Initializing dataloaders...")
+    train_loader, val_loader, depth_stats = get_dataloaders(batch_size=batch_size)
+
+    # Model Initialization
+    print("Initializing model...")
+    model = ResNet34WideLinkNet(pretrained=True)
+    model = model.to(device)
+
+    # Loss, Optimizer, Scheduler
+    criterion = SaltLoss(bce_weight=1.0, lovasz_weight=1.0)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    # Training Loop
+    best_map = 0.0
+    epochs_no_improve = 0
+    best_model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+    print("Starting training...")
+    for epoch in range(num_epochs):
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+        val_map = evaluate(model, val_loader, device)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.6f} | Val mAP: {val_map:.10f}"
+        )
+
+        # Checkpointing and Early Stopping
+        if val_map > best_map:
+            best_map = val_map
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best mAP! Model saved to {best_model_path}")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= patience:
+            print(
+                f"Early stopping triggered after {epochs_no_improve} epochs without improvement."
+            )
+            break
+
+    print(f"Training complete. Best Val mAP: {best_map:.10f}")
+    return best_model_path, depth_stats
+
+
+def generate_submission(model_path, depth_stats, batch_size=32):
+    """
+    Loads the best model and generates the submission file using Marginalized Inference.
+    """
+    print("Generating submission...")
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load Model
+    model = ResNet34WideLinkNet(pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+
+    # Get Test Loader
+    test_loader = get_test_loader(batch_size=batch_size, depth_stats=depth_stats)
+
+    # Predict using Marginalization
+    ids, rles = predict_marginalized(model, test_loader, device, num_scans=10)
+=======
+def evaluate(model, dataloader, device):
+    """
+    Evaluates the model on the validation set.
+    Unpads predictions and targets to 101x101 before calculating mAP.
+    Optimizes the binarization threshold.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            # Forward pass
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            # Move to CPU for processing
+            probs_np = probs.detach().cpu().numpy()  # (B, 1, 128, 128)
+            masks_np = masks.detach().cpu().numpy()  # (B, 1, 128, 128)
+
+            # Unpad each image in the batch back to 101x101
+            # Squeeze channel dim: (B, 128, 128)
+            probs_np = probs_np.squeeze(1)
+            masks_np = masks_np.squeeze(1)
+
+            batch_preds = []
+            batch_targets = []
+
+            for i in range(probs_np.shape[0]):
+                p_unpadded = unpad_image(probs_np[i], original_size=101)
+                m_unpadded = unpad_image(masks_np[i], original_size=101)
+                batch_preds.append(p_unpadded)
+                batch_targets.append(m_unpadded)
+
+            all_preds.append(np.array(batch_preds))
+            all_targets.append(np.array(batch_targets))
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate mAP with threshold optimization
+    best_score = -1.0
+    best_thresh = 0.5
+    
+    # Search range: 0.3 to 0.7
+    search_space = np.linspace(0.3, 0.7, 9)
+    
+    for t in search_space:
+        score = calc_map(all_preds, all_targets, binarization_threshold=t)
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+
+    return best_score, best_thresh
+
+
+def predict_marginalized(model, dataloader, device, num_scans=10, threshold=0.5):
+    """
+    Performs Marginalized Depth-Scan Inference on the test set.
+    Scans a range of depth values and averages the predictions.
+    """
+    model.eval()
+    results = []
+    ids_list = []
+
+    # Define scan range: -2.0 to 2.0 standard deviations
+    scan_values = np.linspace(-2.0, 2.0, num_scans)
+
+    with torch.no_grad():
+        for images, _, _, ids in dataloader:
+            images = images.to(device)
+            batch_size = images.size(0)
+
+            # Accumulator for marginalized probabilities
+            # Shape: (B, 1, 128, 128)
+            accum_probs = torch.zeros((batch_size, 1, 128, 128), device=device)
+
+            # Marginalization Loop
+            for z_val in scan_values:
+                # Create constant depth tensor for this scan step
+                z_tensor = torch.full(
+                    (batch_size,), z_val, device=device, dtype=torch.float32
+                )
+
+                logits = model(images, z_tensor)
+                probs = torch.sigmoid(logits)
+                accum_probs += probs
+
+            # Average over scan steps
+            avg_probs = accum_probs / num_scans
+
+            # Process batch
+            avg_probs_np = avg_probs.detach().cpu().numpy().squeeze(1)
+
+            for i in range(batch_size):
+                # Unpad to 101x101
+                pred_101 = unpad_image(avg_probs_np[i], original_size=101)
+
+                # Binarize with optimized threshold
+                mask_bin = (pred_101 > threshold).astype(np.uint8)
+
+                # RLE Encode
+                rle = rle_encode(mask_bin)
+
+                results.append(rle)
+                ids_list.append(ids[i])
+
+    return ids_list, results
+
+
+def train_and_evaluate(
+    num_epochs=50, batch_size=32, learning_rate=1e-4, weight_decay=1e-2, patience=10
+):
+    """
+    Main training loop with Early Stopping and Checkpointing.
+    """
+    seed_everything(42)
+
+    # Create directories
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Data Loading
+    print("Initializing dataloaders...")
+    train_loader, val_loader, depth_stats = get_dataloaders(batch_size=batch_size)
+
+    # Model Initialization
+    print("Initializing model...")
+    model = ResNet34WideLinkNet(pretrained=True)
+    model = model.to(device)
+
+    # Loss, Optimizer, Scheduler
+    criterion = SaltLoss(bce_weight=1.0, lovasz_weight=1.0)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    # Training Loop
+    best_map = 0.0
+    best_threshold = 0.5
+    epochs_no_improve = 0
+    best_model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+    print("Starting training...")
+    for epoch in range(num_epochs):
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+        val_map, val_thresh = evaluate(model, val_loader, device)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.6f} | Val mAP: {val_map:.10f} | Thresh: {val_thresh:.2f}"
+        )
+
+        # Checkpointing and Early Stopping
+        if val_map > best_map:
+            best_map = val_map
+            best_threshold = val_thresh
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best mAP! Model saved to {best_model_path}")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= patience:
+            print(
+                f"Early stopping triggered after {epochs_no_improve} epochs without improvement."
+            )
+            break
+
+    print(f"Training complete. Best Val mAP: {best_map:.10f} at Threshold: {best_threshold:.2f}")
+    return best_model_path, depth_stats, best_threshold
+
+
+def generate_submission(model_path, depth_stats, batch_size=32, threshold=0.5):
+    """
+    Loads the best model and generates the submission file using Marginalized Inference.
+    """
+    print(f"Generating submission with threshold {threshold:.2f}...")
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load Model
+    model = ResNet34WideLinkNet(pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+
+    # Get Test Loader
+    test_loader = get_test_loader(batch_size=batch_size, depth_stats=depth_stats)
+
+    # Predict using Marginalization
+    ids, rles = predict_marginalized(model, test_loader, device, num_scans=10, threshold=threshold)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_failure_analysis(model, dataloader, device, val_metadata_path):
+    """
+    Runs inference on validation set, calculates metrics, and performs failure analysis.
+    """
+    print("Running Failure Analysis...")
+    model.eval()
+
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            probs_np = probs.detach().cpu().numpy().squeeze(1)
+            masks_np = masks.detach().cpu().numpy().squeeze(1)
+
+            # Unpad to original size
+            for i in range(probs_np.shape[0]):
+                p = unpad_image(probs_np[i], original_size=101)
+                m = unpad_image(masks_np[i], original_size=101)
+                all_preds.append(p)
+                all_targets.append(m)
+                all_ids.append(ids[i])
+
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    all_ids = np.array(all_ids)
+
+    # 1. Calculate and Print Final Validation Metric (mAP)
+    final_map = calc_map(all_preds, all_targets)
+    print(f"Final Validation Metric: {final_map}")
+
+    # 2. Failure Analysis
+    # Calculate IoU per image
+    ious = calculate_iou_per_image(all_preds, all_targets, threshold=0.5)
+    errors = 1.0 - ious
+
+    # Create DataFrame for analysis
+    df_analysis = pd.DataFrame({"id": all_ids, "iou": ious, "error": errors})
+
+    # Load metadata to get features (depth, coverage)
+    df_meta = pd.read_csv(val_metadata_path)
+
+    # Merge
+    df_merged = pd.merge(df_analysis, df_meta, on="id", how="left")
+
+    # Calculate Correlations
+    # Correlation between Error and Depth (z)
+    corr_depth = df_merged["error"].corr(df_merged["z"])
+
+    # Correlation between Error and Salt Coverage
+    corr_coverage = df_merged["error"].corr(df_merged["salt_coverage"])
+
+    print("\nFailure Analysis Report:")
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_coverage:.4f}")
+
+    return final_map
+
+
+def main():
+    # 1. Setup
+    seed_everything(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Train Model
+    # Using 30 epochs for a fast but effective baseline
+    print("Starting training pipeline...")
+    best_model_path, depth_stats = train_and_evaluate(
+        num_epochs=30, batch_size=32, learning_rate=1e-4, weight_decay=1e-2, patience=8
+    )
+
+    # 3. Validation & Failure Analysis
+    # Reload best model
+    model = ResNet34WideLinkNet(pretrained=False)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model = model.to(device)
+
+    # Get Validation Loader
+    _, val_loader, _ = get_dataloaders(batch_size=32, load_cached_data=True)
+
+    # Run Analysis
+    val_map = run_failure_analysis(model, val_loader, device, "./metadata/val.csv")
+
+    # 4. Submission
+    # Threshold check
+    TARGET_THRESHOLD = 0.7985
+
+    if val_map > TARGET_THRESHOLD:
+        print(f"\nValidation metric {val_map} exceeds threshold {TARGET_THRESHOLD}.")
+        # Generate submission using Marginalized Depth-Scan
+        generate_submission(best_model_path, depth_stats, batch_size=32)
+    else:
+        print(
+            f"\nValidation metric {val_map} does not meet threshold {TARGET_THRESHOLD}. Skipping submission."
+        )
+=======
+def run_failure_analysis(model, dataloader, device, val_metadata_path):
+    """
+    Runs inference on validation set, calculates metrics, and performs failure analysis.
+    """
+    print("Running Failure Analysis...")
+    model.eval()
+
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device)
+            depths = depths.to(device)
+
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            probs_np = probs.detach().cpu().numpy().squeeze(1)
+            masks_np = masks.detach().cpu().numpy().squeeze(1)
+
+            # Unpad to original size
+            for i in range(probs_np.shape[0]):
+                p = unpad_image(probs_np[i], original_size=101)
+                m = unpad_image(masks_np[i], original_size=101)
+                all_preds.append(p)
+                all_targets.append(m)
+                all_ids.append(ids[i])
+
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    all_ids = np.array(all_ids)
+
+    # 1. Calculate and Print Final Validation Metric (mAP) with Optimization
+    best_map = -1.0
+    best_thresh = 0.5
+    search_space = np.linspace(0.3, 0.7, 9)
+    
+    for t in search_space:
+        score = calc_map(all_preds, all_targets, binarization_threshold=t)
+        if score > best_map:
+            best_map = score
+            best_thresh = t
+
+    print(f"Final Validation Metric: {best_map} (Threshold: {best_thresh:.2f})")
+
+    # 2. Failure Analysis
+    # Calculate IoU per image using the optimized threshold
+    ious = calculate_iou_per_image(all_preds, all_targets, threshold=best_thresh)
+    errors = 1.0 - ious
+
+    # Create DataFrame for analysis
+    df_analysis = pd.DataFrame({"id": all_ids, "iou": ious, "error": errors})
+
+    # Load metadata to get features (depth, coverage)
+    df_meta = pd.read_csv(val_metadata_path)
+
+    # Merge
+    df_merged = pd.merge(df_analysis, df_meta, on="id", how="left")
+
+    # Calculate Correlations
+    # Correlation between Error and Depth (z)
+    corr_depth = df_merged["error"].corr(df_merged["z"])
+
+    # Correlation between Error and Salt Coverage
+    corr_coverage = df_merged["error"].corr(df_merged["salt_coverage"])
+
+    print("\nFailure Analysis Report:")
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_coverage:.4f}")
+
+    return best_map, best_thresh
+
+
+def main():
+    # 1. Setup
+    seed_everything(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 2. Train Model
+    # Increase epochs to 50 for full convergence (Cite solution_lesson_node_00035)
+    print("Starting training pipeline...")
+    best_model_path, depth_stats, best_threshold = train_and_evaluate(
+        num_epochs=50, batch_size=32, learning_rate=1e-4, weight_decay=1e-2, patience=15
+    )
+
+    # 3. Validation & Failure Analysis
+    # Reload best model
+    model = ResNet34WideLinkNet(pretrained=False)
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model = model.to(device)
+
+    # Get Validation Loader
+    _, val_loader, _ = get_dataloaders(batch_size=32, load_cached_data=True)
+
+    # Run Analysis (re-optimizes threshold on validation set)
+    val_map, val_thresh = run_failure_analysis(model, val_loader, device, "./metadata/val.csv")
+
+    # 4. Submission
+    # Threshold check
+    TARGET_THRESHOLD = 0.7985
+
+    if val_map > TARGET_THRESHOLD:
+        print(f"\nValidation metric {val_map} exceeds threshold {TARGET_THRESHOLD}.")
+        # Generate submission using Marginalized Depth-Scan with optimized threshold
+        # We use the threshold found during failure analysis (which is the same as training if data is same)
+        generate_submission(best_model_path, depth_stats, batch_size=32, threshold=val_thresh)
+    else:
+        print(
+            f"\nValidation metric {val_map} does not meet threshold {TARGET_THRESHOLD}. Skipping submission."
+        )
+>>>>>>> REPLACE
+```

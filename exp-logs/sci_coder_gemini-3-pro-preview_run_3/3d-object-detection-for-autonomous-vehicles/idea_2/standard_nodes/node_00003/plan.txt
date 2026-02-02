@@ -1,0 +1,262 @@
+The error analysis reveals a **Coordinate System Mismatch**. The Lidar points are loaded in the **Sensor Coordinate Frame**, but the Ground Truth bounding boxes are provided in the **World Coordinate Frame**. Consequently, the geometric proposals (generated in Sensor Frame) never overlap with the Ground Truth, resulting in 0.0 IoU, no positive training samples, and a failed model.
+
+To fix this, I will implement a transformation stack to convert Lidar points from Sensor Frame to World Frame before proposal generation.
+
+**Plan:**
+1.  **Update `library/utils.py`**: Add helper functions `quaternion_to_matrix`, `get_transform_matrix`, and `transform_points` to handle 3D transformations.
+2.  **Update `library/cluster_proposal.py`**: Modify `GeometricProposalGenerator.process_lidar_file` to accept an optional `transform_matrix` and apply it to the point cloud immediately after loading.
+3.  **Update `library/feature_engineering.py`**:
+    *   In `create_dataset`, load the `sample_data.json`, `calibrated_sensor.json`, and `ego_pose.json` files (inferring the correct `train_data` or `test_data` directory).
+    *   For each sample, compute the full transformation matrix ($T_{world} = T_{ego \to world} \times T_{sensor \to ego}$) using the calibration tokens.
+    *   Pass this matrix to the `process_sample_wrapper` via the `row` dictionary, ensuring proposals are generated in the World Frame.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def load_lidar(path):
+    """
+    Loads binary lidar data from the given path.
+=======
+def quaternion_to_matrix(q):
+    """
+    Converts a quaternion [w, x, y, z] to a 3x3 rotation matrix.
+    """
+    w, x, y, z = q
+    return np.array([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+        [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+        [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+    ])
+
+
+def get_transform_matrix(translation, rotation):
+    """
+    Constructs a 4x4 homogeneous transformation matrix.
+    Args:
+        translation: [x, y, z]
+        rotation: [w, x, y, z] quaternion
+    """
+    R = quaternion_to_matrix(rotation)
+    T = np.array(translation).reshape(3, 1)
+    M = np.eye(4)
+    M[:3, :3] = R
+    M[:3, 3] = T.flatten()
+    return M
+
+
+def transform_points(points, matrix):
+    """
+    Applies a 4x4 transformation matrix to points.
+    Args:
+        points: (N, 4) array [x, y, z, intensity]
+        matrix: (4, 4) transformation matrix
+    Returns:
+        Transformed points (N, 4)
+    """
+    if len(points) == 0:
+        return points
+
+    # Extract XYZ
+    xyz = points[:, :3]
+
+    # Homogeneous coordinates
+    ones = np.ones((xyz.shape[0], 1))
+    xyz_h = np.hstack([xyz, ones])
+
+    # Transform: (M @ P.T).T = P @ M.T
+    xyz_transformed = (matrix @ xyz_h.T).T
+
+    # Update points (preserve intensity)
+    points_new = points.copy()
+    points_new[:, :3] = xyz_transformed[:, :3]
+
+    return points_new
+
+
+def load_lidar(path):
+    """
+    Loads binary lidar data from the given path.
+>>>>>>> REPLACE
+```
+
+```diff
+library/cluster_proposal.py
+<<<<<<< SEARCH
+    def process_lidar_file(self, lidar_path):
+        """
+        Runs the proposal generation pipeline on a single LIDAR file.
+
+        Args:
+            lidar_path (str): Relative path to the .bin file.
+
+        Returns:
+            list: List of dictionaries {'box': np.array, 'points': np.array}
+        """
+        # 1. Load Data
+        points = load_lidar(lidar_path)
+        if len(points) == 0:
+            return []
+
+        # 2. Remove Ground
+        non_ground_points = self.remove_ground_plane(points)
+=======
+    def process_lidar_file(self, lidar_path, transform_matrix=None):
+        """
+        Runs the proposal generation pipeline on a single LIDAR file.
+
+        Args:
+            lidar_path (str): Relative path to the .bin file.
+            transform_matrix (np.ndarray, optional): 4x4 matrix to transform points to World Frame.
+
+        Returns:
+            list: List of dictionaries {'box': np.array, 'points': np.array}
+        """
+        # 1. Load Data
+        points = load_lidar(lidar_path)
+        if len(points) == 0:
+            return []
+
+        # 1b. Apply Transformation (Sensor -> World)
+        if transform_matrix is not None:
+            from library.utils import transform_points
+            points = transform_points(points, transform_matrix)
+
+        # 2. Remove Ground
+        non_ground_points = self.remove_ground_plane(points)
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import warnings
+
+from library.config import Config
+from library.utils import calc_iou_3d
+from library.cluster_proposal import GeometricProposalGenerator
+=======
+import os
+import json
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import warnings
+
+from library.config import Config
+from library.utils import calc_iou_3d, get_transform_matrix
+from library.cluster_proposal import GeometricProposalGenerator
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+def process_sample_wrapper(row, is_test=False):
+    """
+    Worker function to process a single sample.
+    Designed to be pickle-able for joblib.
+    """
+    sample_token = row["sample_token"]
+    lidar_path = row["lidar_path"]
+
+    # Initialize generator locally
+    generator = GeometricProposalGenerator()
+
+    # Generate Proposals
+    proposals = generator.process_lidar_file(lidar_path)
+
+    if not proposals:
+        return []
+=======
+def process_sample_wrapper(row, is_test=False):
+    """
+    Worker function to process a single sample.
+    Designed to be pickle-able for joblib.
+    """
+    sample_token = row["sample_token"]
+    lidar_path = row["lidar_path"]
+    transform_matrix = row.get("transform_matrix")
+
+    # Initialize generator locally
+    generator = GeometricProposalGenerator()
+
+    # Generate Proposals (with transformation to World Frame)
+    proposals = generator.process_lidar_file(lidar_path, transform_matrix=transform_matrix)
+
+    if not proposals:
+        return []
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_engineering.py
+<<<<<<< SEARCH
+        df_meta = pd.read_csv(metadata_path)
+
+        # Convert to list of dicts for parallel processing
+        rows = df_meta.to_dict("records")
+
+        # 3. Parallel Processing
+=======
+        df_meta = pd.read_csv(metadata_path)
+
+        # 2a. Load Calibration Data & Precompute Transforms
+        # Determine data directory based on metadata filename
+        if "test" in os.path.basename(metadata_path):
+            data_dir = os.path.join(Config.INPUT_DIR, "test_data")
+        else:
+            data_dir = os.path.join(Config.INPUT_DIR, "train_data")
+
+        print(f"Loading calibration data from {data_dir}...")
+        with open(os.path.join(data_dir, "sample_data.json")) as f:
+            sample_data = json.load(f)
+        with open(os.path.join(data_dir, "calibrated_sensor.json")) as f:
+            calibrated_sensor = json.load(f)
+        with open(os.path.join(data_dir, "ego_pose.json")) as f:
+            ego_pose = json.load(f)
+
+        # Build Lookups
+        # Map filename (basename) -> sample_data_entry
+        sd_map = {
+            os.path.basename(sd["filename"]): sd
+            for sd in sample_data
+            if sd["filename"].endswith(".bin")
+        }
+        calib_map = {item["token"]: item for item in calibrated_sensor}
+        ego_map = {item["token"]: item for item in ego_pose}
+
+        # Convert to list of dicts and enrich with transformation matrices
+        rows = df_meta.to_dict("records")
+        valid_rows = []
+
+        for row in rows:
+            lidar_file = os.path.basename(row["lidar_path"])
+            if lidar_file in sd_map:
+                sd = sd_map[lidar_file]
+                calib = calib_map[sd["calibrated_sensor_token"]]
+                ego = ego_map[sd["ego_pose_token"]]
+
+                # M_sensor_to_ego
+                M_se = get_transform_matrix(calib["translation"], calib["rotation"])
+                # M_ego_to_world
+                M_ew = get_transform_matrix(ego["translation"], ego["rotation"])
+                # M_total = M_ew * M_se
+                M_total = M_ew @ M_se
+
+                row["transform_matrix"] = M_total
+                valid_rows.append(row)
+            else:
+                # Fallback if mapping fails (should not happen with valid metadata)
+                valid_rows.append(row)
+
+        rows = valid_rows
+
+        # 3. Parallel Processing
+>>>>>>> REPLACE
+```

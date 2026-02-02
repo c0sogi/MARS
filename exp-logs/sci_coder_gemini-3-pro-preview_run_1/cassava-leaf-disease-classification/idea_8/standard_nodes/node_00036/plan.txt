@@ -1,0 +1,183 @@
+The error `RuntimeError: shape '[-1, 16, 3, 256, 256]' is invalid` occurs because the Swin Transformer model was initialized with its default resolution (256x256), creating fixed-size attention masks and window configurations (16 windows). However, the training loop provided 384x384 images (Phase 1), which require a different window configuration (36 windows). This mismatch causes the attention mechanism to fail (Cite debug_lesson_5).
+
+To fix this, I will:
+1.  Update `CassavaClassifier` in `library/modeling.py` to accept an `image_size` argument and pass it to `timm.create_model`. This ensures the model initializes its internal buffers (masks) for the correct resolution.
+2.  Update `runfile.py` to pass the correct `image_size` during Phase 1 (384) and Phase 2 (512) initialization.
+3.  In `runfile.py` (Phase 2), explicitly re-initialize the model with the new resolution (512) and filter out the incompatible `attn_mask` buffers when loading the weights from Phase 1. This allows the model to regenerate the correct masks for the new resolution while retaining learned weights.
+4.  Update `library/inference.py` to initialize the model with the inference resolution (512).
+
+```diff
+library/modeling.py
+<<<<<<< SEARCH
+    def __init__(self, model_name, pretrained=True):
+        super(CassavaClassifier, self).__init__()
+        self.model_name = model_name
+
+        # Create Backbone
+        # global_pool='' ensures we get the spatial feature map (B, C, H, W) or (B, H, W, C)
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            drop_path_rate=Config.drop_path_rate,
+        )
+
+        # Disable strict image size check to allow Progressive Resizing (e.g., 384 -> 512)
+        if hasattr(self.backbone, "patch_embed") and hasattr(
+            self.backbone.patch_embed, "strict_img_size"
+        ):
+            self.backbone.patch_embed.strict_img_size = False
+
+        # Determine input features and handle shape differences
+        with torch.no_grad():
+            # Dummy forward pass to inspect output shape
+            # Use model's default input size to avoid assertion errors during init
+            input_size = self.backbone.default_cfg.get("input_size", (3, 224, 224))
+            dummy = torch.randn(1, *input_size)
+            features = self.backbone(dummy)
+=======
+    def __init__(self, model_name, pretrained=True, image_size=None):
+        super(CassavaClassifier, self).__init__()
+        self.model_name = model_name
+
+        # Create Backbone
+        # global_pool='' ensures we get the spatial feature map (B, C, H, W) or (B, H, W, C)
+        # We explicitly pass img_size to ensure Swin Transformers initialize
+        # their windowing and masks correctly for the target resolution.
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            drop_path_rate=Config.drop_path_rate,
+            img_size=image_size,
+        )
+
+        # Disable strict image size check to allow Progressive Resizing (e.g., 384 -> 512)
+        if hasattr(self.backbone, "patch_embed") and hasattr(
+            self.backbone.patch_embed, "strict_img_size"
+        ):
+            self.backbone.patch_embed.strict_img_size = False
+
+        # Determine input features and handle shape differences
+        with torch.no_grad():
+            # Dummy forward pass to inspect output shape
+            # Use the specified image_size if provided, else default
+            if image_size is not None:
+                dummy_size = (3, image_size, image_size)
+            else:
+                dummy_size = self.backbone.default_cfg.get("input_size", (3, 224, 224))
+            
+            dummy = torch.randn(1, *dummy_size)
+            features = self.backbone(dummy)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            model = CassavaClassifier(model_name, pretrained=True)
+            model.to(device)
+=======
+            # Pass image_size to ensure Swin initializes correctly
+            model = CassavaClassifier(
+                model_name, pretrained=True, image_size=Config.p1_image_size
+            )
+            model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Load best weights from Stage 1
+            best_stage1_path = os.path.join(Config.output_dir, "model_best.pth")
+            if os.path.exists(best_stage1_path):
+                model.load_state_dict(torch.load(best_stage1_path))
+
+            # ------------------------------------------------------------------
+            # Phase 2: High-Resolution Fine-Tuning (512x512)
+            # ------------------------------------------------------------------
+            logger.info(
+                f"--- Phase 2: Fine-Tuning ({Config.p2_image_size}x{Config.p2_image_size}) ---"
+            )
+
+            train_loader, val_loader = get_loaders(
+                fold, image_size=Config.p2_image_size, batch_size=Config.p2_batch_size
+            )
+=======
+            # Load best weights from Stage 1
+            best_stage1_path = os.path.join(Config.output_dir, "model_best.pth")
+            
+            # ------------------------------------------------------------------
+            # Phase 2: High-Resolution Fine-Tuning (512x512)
+            # ------------------------------------------------------------------
+            logger.info(
+                f"--- Phase 2: Fine-Tuning ({Config.p2_image_size}x{Config.p2_image_size}) ---"
+            )
+
+            # Re-initialize model with new resolution
+            # This regenerates Swin masks/windows for 512x512
+            del model
+            torch.cuda.empty_cache()
+            
+            model = CassavaClassifier(
+                model_name, pretrained=True, image_size=Config.p2_image_size
+            )
+            model.to(device)
+
+            if os.path.exists(best_stage1_path):
+                logger.info("Loading Stage 1 weights for Fine-Tuning...")
+                state_dict = torch.load(best_stage1_path)
+                
+                # Filter out attention masks (buffers) to avoid shape mismatch
+                # Swin V2 masks depend on resolution and are fixed buffers
+                state_dict = {k: v for k, v in state_dict.items() if "attn_mask" not in k}
+                
+                # Load with strict=False to ignore missing mask buffers (they are already re-init)
+                model.load_state_dict(state_dict, strict=False)
+            else:
+                logger.warning("Stage 1 checkpoint not found! Starting FT from scratch.")
+
+            train_loader, val_loader = get_loaders(
+                fold, image_size=Config.p2_image_size, batch_size=Config.p2_batch_size
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        logger.info(f"Evaluating {model_name}...")
+        model = CassavaClassifier(model_name, pretrained=False)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+=======
+        logger.info(f"Evaluating {model_name}...")
+        # Use p2_image_size for inference model creation
+        model = CassavaClassifier(
+            model_name, pretrained=False, image_size=Config.p2_image_size
+        )
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+            # Initialize Model
+            # pretrained=False because we are loading custom weights
+            model = CassavaClassifier(model_name=model_name, pretrained=False)
+            model.to(device)
+=======
+            # Initialize Model
+            # pretrained=False because we are loading custom weights
+            # Pass image_size to ensure correct windowing for Swin models
+            model = CassavaClassifier(
+                model_name=model_name,
+                pretrained=False,
+                image_size=Config.p2_image_size,
+            )
+            model.to(device)
+>>>>>>> REPLACE
+```

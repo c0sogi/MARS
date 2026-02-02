@@ -1,0 +1,264 @@
+The `AssertionError` in `runfile.py` is caused by duplicate image entries in the merged dataframe (due to multiple annotations per image). When `train_test_split` is applied, these duplicates can be split across training and validation sets, resulting in data leakage where the same image appears in both. I will fix this by dropping duplicate rows based on `image_id` before the split, ensuring each image is unique. I will also create `train.py` with the provided deep learning workflow (using PyTorch and `timm`) to train a ResNet50 model and generate the submission.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Rename id to image_id for consistency and drop redundant columns
+    train_merged = train_merged.rename(columns={"id": "image_id"})
+    train_merged = train_merged[["image_id", "file_path", "category_id", "region_id"]]
+
+    # --- Process Test Data ---
+=======
+    # Rename id to image_id for consistency and drop redundant columns
+    train_merged = train_merged.rename(columns={"id": "image_id"})
+    train_merged = train_merged[["image_id", "file_path", "category_id", "region_id"]]
+
+    # FIX: Drop duplicates based on image_id
+    # Some images have multiple annotations. We keep the first one to ensure
+    # each image appears only once in the dataset, preventing overlap after split.
+    print("Checking for duplicate image_ids...")
+    initial_len = len(train_merged)
+    train_merged = train_merged.drop_duplicates(subset="image_id", keep="first")
+    final_len = len(train_merged)
+    if initial_len != final_len:
+        print(f"Dropped {initial_len - final_len} duplicate annotations. Kept {final_len} unique images.")
+
+    # --- Process Test Data ---
+>>>>>>> REPLACE
+```
+
+```diff
+train.py
+<<<<<<< SEARCH
+=======
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+import timm
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.metrics import f1_score
+from tqdm import tqdm
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_CSV = os.path.join(METADATA_DIR, "train.csv")
+VAL_CSV = os.path.join(METADATA_DIR, "val.csv")
+TEST_CSV = os.path.join(METADATA_DIR, "test.csv")
+SUBMISSION_PATH = "submission.csv"
+
+BATCH_SIZE = 128
+IMAGE_SIZE = 224
+NUM_WORKERS = 12
+EPOCHS = 8
+LEARNING_RATE = 1e-3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def get_transforms(data='train'):
+    if data == 'train':
+        return A.Compose([
+            A.Resize(256, 256),
+            A.RandomCrop(IMAGE_SIZE, IMAGE_SIZE),
+            A.HorizontalFlip(p=0.5),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+            ToTensorV2(),
+        ])
+    elif data == 'valid' or data == 'test':
+        return A.Compose([
+            A.Resize(256, 256),
+            A.CenterCrop(IMAGE_SIZE, IMAGE_SIZE),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+            ToTensorV2(),
+        ])
+
+class HerbariumDataset(Dataset):
+    def __init__(self, df, transform=None, mode='train', cat_to_idx=None):
+        self.df = df
+        self.transform = transform
+        self.mode = mode
+        self.cat_to_idx = cat_to_idx
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        file_path = os.path.join(INPUT_DIR, row['file_path'])
+        
+        image = cv2.imread(file_path)
+        if image is None:
+            image = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented['image']
+
+        if self.mode in ['train', 'valid']:
+            cat_id = row['category_id']
+            label = self.cat_to_idx[cat_id]
+            return image, torch.tensor(label, dtype=torch.long)
+        else:
+            image_id = row['image_id']
+            return image, image_id
+
+def train_one_epoch(model, loader, criterion, optimizer, scaler, scheduler):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(loader, desc="Training")
+    for images, labels in pbar:
+        images = images.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        with autocast():
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        if scheduler:
+            scheduler.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+        pbar.set_postfix({'loss': running_loss / total, 'acc': correct / total})
+
+    return running_loss / total, correct / total
+
+def validate(model, loader, criterion):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in tqdm(loader, desc="Validation"):
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(loader.dataset)
+    macro_f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    return epoch_loss, macro_f1
+
+def predict(model, loader, idx_to_cat):
+    model.eval()
+    predictions = []
+    image_ids = []
+    
+    with torch.no_grad():
+        for images, ids in tqdm(loader, desc="Inference"):
+            images = images.to(DEVICE)
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+            
+            preds = predicted.cpu().numpy()
+            mapped_preds = [idx_to_cat[p] for p in preds]
+            
+            predictions.extend(mapped_preds)
+            image_ids.extend(ids.numpy())
+            
+    return image_ids, predictions
+
+def main():
+    torch.backends.cudnn.benchmark = True
+    
+    print("Loading metadata...")
+    train_df = pd.read_csv(TRAIN_CSV)
+    val_df = pd.read_csv(VAL_CSV)
+    test_df = pd.read_csv(TEST_CSV)
+
+    print("Creating category mapping...")
+    unique_cats = sorted(train_df['category_id'].unique())
+    cat_to_idx = {cat: i for i, cat in enumerate(unique_cats)}
+    idx_to_cat = {i: cat for cat, i in cat_to_idx.items()}
+    num_classes = len(unique_cats)
+    print(f"Number of classes: {num_classes}")
+
+    train_dataset = HerbariumDataset(train_df, transform=get_transforms('train'), mode='train', cat_to_idx=cat_to_idx)
+    val_dataset = HerbariumDataset(val_df, transform=get_transforms('valid'), mode='valid', cat_to_idx=cat_to_idx)
+    test_dataset = HerbariumDataset(test_df, transform=get_transforms('test'), mode='test')
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+    print("Creating model...")
+    model = timm.create_model('resnet50', pretrained=True, num_classes=num_classes)
+    model = model.to(DEVICE)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    
+    steps_per_epoch = len(train_loader)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        epochs=EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.3,
+    )
+    
+    scaler = GradScaler()
+
+    best_f1 = 0.0
+    
+    for epoch in range(EPOCHS):
+        print(f"Epoch {epoch+1}/{EPOCHS}")
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, scaler, scheduler)
+        val_loss, val_f1 = validate(model, val_loader, criterion)
+        
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f} | Val Macro F1: {val_f1:.4f}")
+        
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            torch.save(model.state_dict(), "best_model.pth")
+            print("Saved best model.")
+
+    print("Loading best model for inference...")
+    model.load_state_dict(torch.load("best_model.pth"))
+    
+    ids, preds = predict(model, test_loader, idx_to_cat)
+    
+    submission = pd.DataFrame({'Id': ids, 'Predicted': preds})
+    submission.to_csv(SUBMISSION_PATH, index=False)
+    print(f"Submission saved to {SUBMISSION_PATH}")
+
+if __name__ == "__main__":
+    main()
+>>>>>>> REPLACE
+```

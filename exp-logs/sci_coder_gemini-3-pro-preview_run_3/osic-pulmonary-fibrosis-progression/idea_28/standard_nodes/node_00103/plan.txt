@@ -1,0 +1,373 @@
+My implementation strategy focuses on reverting to the **Dual-Stream Point-Wise Residual (DSPR)** architecture, which was identified as the superior approach in the lessons learned (Cite `solution_lesson_node_00052`). The previous solution (MACAN) over-complicated the signal flow with a cascaded structure that failed to robustly capture the strong linear baseline signal, leading to overfitting.
+
+Key changes include:
+1.  **Architecture Update (DSPRNet):** I will replace the `MACAN` model with `DSPRNet`. This architecture features two parallel streams:
+    -   **Deep Interaction Stream:** Processes Image embeddings and all Tabular features (including Time) via an MLP to capture complex non-linear residuals.
+    -   **Linear Residual Stream:** Processes only the dominant autoregressive features (`Baseline FVC` and `Time`) via a linear projection. Crucially, this projection is over-parameterized to a 64-dimensional latent space (Cite `solution_lesson_node_00060`) to prevent optimization bottlenecks.
+    -   **Fusion:** The outputs of these streams are summed in the latent space before passing to the final head, ensuring the uncertainty estimation has direct access to strong domain priors (Cite `solution_lesson_node_00055`).
+2.  **Hyperparameter Optimization:** I will increase the training duration to 25 epochs (Cite `solution_lesson_node_00100`) and ensure the Learning Rate Scheduler's horizon (`T_max`) is strictly synchronized with this duration to guarantee proper convergence.
+3.  **Config Updates:** I will update the `EPOCHS` and `T_MAX` settings in `config.py` and ensure `runfile.py` utilizes these values instead of hardcoded defaults.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 32
+    EPOCHS = 50
+
+    # Optimization
+    # Differential Learning Rates
+    LR_BACKBONE = 1e-4  # Lower LR for fine-tuning pre-trained weights
+    LR_HEAD = 1e-3  # Higher LR for the MLP streams and head
+    WEIGHT_DECAY = 1e-2  # Standard AdamW weight decay
+
+    # Scheduler (Cosine Annealing)
+    T_MAX = 50  # Should match EPOCHS for full cycle
+    ETA_MIN = 1e-6
+=======
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 32
+    EPOCHS = 25
+
+    # Optimization
+    # Differential Learning Rates
+    LR_BACKBONE = 1e-4  # Lower LR for fine-tuning pre-trained weights
+    LR_HEAD = 1e-3  # Higher LR for the MLP streams and head
+    WEIGHT_DECAY = 1e-2  # Standard AdamW weight decay
+
+    # Scheduler (Cosine Annealing)
+    T_MAX = 25  # Should match EPOCHS for full cycle
+    ETA_MIN = 1e-6
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MACAN(nn.Module):
+    """
+    Metric-Aligned Cascaded Anchor Network.
+    Combines a clinical anchor MLP with a cascaded visual modifier.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # --- Image Branch ---
+        self.img_encoder = ImageEncoder()
+
+        # --- Stream A: Clinical Anchor ---
+        # Input features: Scaled_Base_FVC, Scaled_Rel_Weeks, Scaled_Age,
+        #                 Sex_Male, Sex_Female, Smoke_Ex, Smoke_Never, Smoke_Current
+        # Total input dim = 8
+        input_dim_tabular = 8
+
+        self.stream_a = nn.Sequential(
+            nn.Linear(input_dim_tabular, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.LATENT_DIM),
+        )
+
+        # --- Stream B: Cascaded Visual Interaction ---
+        # Input: Concatenation of Image Projection (64) + Stream A Output (64)
+        cascade_input_dim = Config.PROJECTION_DIM + Config.LATENT_DIM
+
+        self.stream_b = nn.Sequential(
+            nn.Linear(cascade_input_dim, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.LATENT_DIM),
+        )
+
+        # --- Shared Head ---
+        # Projects the fused latent vector to mu and raw_sigma
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+    def forward(self, image, tabular):
+        """
+        Args:
+            image: Tensor of shape (B, 3, H, W)
+            tabular: Tensor of shape (B, 8)
+        Returns:
+            mu: Predicted FVC (Z-scored scale)
+            sigma: Predicted Confidence (Z-scored scale, positive)
+        """
+        # 1. Image Encoding
+        img_emb = self.img_encoder(image)  # (B, 64)
+
+        # 2. Stream A (Clinical Anchor)
+        clin_emb = self.stream_a(tabular)  # (B, 64)
+
+        # 3. Stream B (Cascade)
+        # Concatenate image features with the clinical anchor
+        combined = torch.cat([img_emb, clin_emb], dim=1)  # (B, 128)
+        vis_correction = self.stream_b(combined)  # (B, 64)
+
+        # 4. Residual Fusion
+        # The visual stream acts as a residual correction to the clinical anchor
+        final_emb = clin_emb + vis_correction  # (B, 64)
+
+        # 5. Prediction Head
+        out = self.head(final_emb)  # (B, 2)
+
+        mu = out[:, 0]
+        raw_sigma = out[:, 1]
+
+        # 6. Uncertainty Constraint
+        # Apply softplus to ensure positivity
+        sigma = F.softplus(raw_sigma) + 1e-6
+
+        return mu, sigma
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network.
+    Cite solution_lesson_node_00052: Dual-Stream Residuals.
+    Cite solution_lesson_node_00060: Over-Parameterization of Linear Baselines.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # --- Image Branch ---
+        self.img_encoder = ImageEncoder()
+
+        # --- Stream A: Deep Interaction Stream ---
+        # Inputs: Image (64) + Tabular (8)
+        # Tabular: [Base_FVC, Rel_Weeks, Age, Sex_M, Sex_F, Smoke_Ex, Smoke_N, Smoke_C]
+        self.tab_encoder = nn.Sequential(
+            nn.Linear(8, Config.HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.PROJECTION_DIM),  # 64
+        )
+
+        # Fusion of Image + Deep Tabular
+        self.deep_fusion = nn.Sequential(
+            nn.Linear(Config.PROJECTION_DIM * 2, Config.HIDDEN_DIM),  # 128 -> 128
+            nn.ReLU(),
+            nn.Linear(Config.HIDDEN_DIM, Config.LATENT_DIM),  # 128 -> 64
+        )
+
+        # --- Stream B: Linear Residual Stream ---
+        # Cite solution_lesson_node_00060: Project linear baseline to latent dim.
+        # Inputs: Scaled_Base_FVC (idx 0), Scaled_Rel_Weeks (idx 1)
+        self.linear_stream = nn.Linear(2, Config.LATENT_DIM)
+
+        # --- Shared Head ---
+        # Cite solution_lesson_node_00055: Uncertainty from shared representation.
+        self.head = nn.Linear(Config.LATENT_DIM, 2)
+
+    def forward(self, image, tabular):
+        """
+        Args:
+            image: Tensor of shape (B, 3, H, W)
+            tabular: Tensor of shape (B, 8)
+        Returns:
+            mu: Predicted FVC (Z-scored scale)
+            sigma: Predicted Confidence (Z-scored scale, positive)
+        """
+        # 1. Deep Stream
+        img_emb = self.img_encoder(image)  # (B, 64)
+        tab_emb = self.tab_encoder(tabular)  # (B, 64)
+
+        deep_in = torch.cat([img_emb, tab_emb], dim=1)  # (B, 128)
+        deep_emb = self.deep_fusion(deep_in)  # (B, 64)
+
+        # 2. Linear Stream (Residual)
+        # Extract Base_FVC and Rel_Weeks
+        linear_in = tabular[:, :2]
+        linear_emb = self.linear_stream(linear_in)  # (B, 64)
+
+        # 3. Summation in Latent Space
+        # Cite solution_lesson_node_00052
+        final_emb = deep_emb + linear_emb  # (B, 64)
+
+        # 4. Prediction
+        out = self.head(final_emb)
+        mu = out[:, 0]
+        sigma = F.softplus(out[:, 1]) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import MACAN
+=======
+from library.model import DSPRNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Model
+    model = MACAN().to(device)
+
+    # 3. Optimization
+    # Differential Learning Rates
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        if "img_encoder.backbone" in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+=======
+    # 2. Model
+    model = DSPRNet().to(device)
+
+    # 3. Optimization
+    # Differential Learning Rates
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        if "img_encoder.backbone" in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def inference():
+    """
+    Generates predictions for the test set and saves submission.csv.
+    """
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 1. Load Model
+    model = MACAN().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+    else:
+        print("Warning: Best model not found. Using random weights.")
+    model.eval()
+=======
+def inference():
+    """
+    Generates predictions for the test set and saves submission.csv.
+    """
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 1. Load Model
+    model = DSPRNet().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+    else:
+        print("Warning: Best model not found. Using random weights.")
+    model.eval()
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import MACAN
+=======
+from library.model import DSPRNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 2. Load Model
+    model = MACAN().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        print(f"Loading model weights from {Config.BEST_MODEL_PATH}")
+        state_dict = torch.load(Config.BEST_MODEL_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        print("Warning: Best model weights not found. Using random initialization.")
+=======
+    # 2. Load Model
+    model = DSPRNet().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        print(f"Loading model weights from {Config.BEST_MODEL_PATH}")
+        state_dict = torch.load(Config.BEST_MODEL_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        print("Warning: Best model weights not found. Using random initialization.")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MACAN
+from library.train import train_model
+from library.inference import predict_test
+
+
+def run():
+    # 1. Initialization
+    Config.setup()
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 2. Training
+    # We override epochs to 15 for a fast baseline that is sufficient for this dataset size.
+    print("--- Starting Training ---")
+    train_model(epochs=15, batch_size=Config.BATCH_SIZE)
+
+    # 3. Validation & Failure Analysis
+    print("\n--- Starting Validation & Failure Analysis ---")
+
+    # Load validation data
+    # We only need the val_loader here
+    _, val_loader, _ = get_dataloaders(
+        batch_size=Config.BATCH_SIZE, num_workers=Config.NUM_WORKERS
+    )
+
+    # Load the best model saved during training
+    model = MACAN().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+        print("Loaded best model checkpoint.")
+    else:
+        print("Warning: Best model checkpoint not found. Using random weights.")
+=======
+from library.model import DSPRNet
+from library.train import train_model
+from library.inference import predict_test
+
+
+def run():
+    # 1. Initialization
+    Config.setup()
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 2. Training
+    # Cite solution_lesson_node_00100: Sync scheduler with epochs.
+    print("--- Starting Training ---")
+    train_model(epochs=Config.EPOCHS, batch_size=Config.BATCH_SIZE)
+
+    # 3. Validation & Failure Analysis
+    print("\n--- Starting Validation & Failure Analysis ---")
+
+    # Load validation data
+    # We only need the val_loader here
+    _, val_loader, _ = get_dataloaders(
+        batch_size=Config.BATCH_SIZE, num_workers=Config.NUM_WORKERS
+    )
+
+    # Load the best model saved during training
+    model = DSPRNet().to(device)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
+        print("Loaded best model checkpoint.")
+    else:
+        print("Warning: Best model checkpoint not found. Using random weights.")
+>>>>>>> REPLACE
+```

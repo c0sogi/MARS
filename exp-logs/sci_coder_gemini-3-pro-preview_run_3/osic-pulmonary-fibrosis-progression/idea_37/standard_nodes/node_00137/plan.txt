@@ -1,0 +1,460 @@
+Based on the analysis of the lessons learned, specifically **Lesson 00052** (Dual-Stream Residuals), **Lesson 00060** (Over-Parameterization of Linear Baselines), and **Lesson 00126** (Preserving Weak Residual Signals), I will transition the model architecture from the "Cascaded Output-Space Residual" approach to the superior **Dual-Stream Point-Wise Residual Network (DSPRNet)**.
+
+The strategy involves:
+1.  **Refactoring the Model**: Implementing `DSPRNet` with two parallel streams fused in latent space:
+    *   **Linear Stream**: Projects `[Baseline FVC, Time]` into a 64-dimensional latent space (Cite Lesson 00060).
+    *   **Deep Stream**: Processes `[Image, Metadata]` through EfficientNet-B2 and an MLP, projecting to the same 64-dimensional space.
+    *   **Fusion**: Summing the latent vectors before the final head (Cite Lesson 00052).
+2.  **Removing Regularization**: Setting `DROPOUT_RATE` to 0.0 in the deep stream to avoid suppressing the weak residual signal provided by the images (Cite Lesson 00126).
+3.  **Standard Initialization**: Removing zero-initialization for the deep stream (Cite Lesson 00118).
+4.  **Optimization**: Increasing `EPOCHS` to 25 to allow sufficient convergence time for the dual-stream architecture, which typically peaks around epoch 14-20 (Cite Lesson 00094).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Visual Stream (Stream B)
+    DROPOUT_RATE = 0.2
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+=======
+    # Visual Stream (Stream B)
+    DROPOUT_RATE = 0.0  # Cite Lesson 00126: Avoid dropout on weak residual branch
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalAnchor(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor.
+    Learns the baseline disease trajectory from structured clinical data.
+    """
+
+    def __init__(self):
+        super(ClinicalAnchor, self).__init__()
+
+        # Inputs: Base_FVC, Relative_Time, Age, Sex, Smoke
+        input_dim = Config.CLINICAL_INPUT_DIM
+        hidden_dim = Config.CLINICAL_HIDDEN_DIM
+        latent_dim = Config.CLINICAL_LATENT_DIM
+
+        # Feature Extractor MLP
+        # Linear(Input -> 128) -> ReLU -> Linear(128 -> 64)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),  # Activation before latent usage usually helps, though prompt didn't strictly specify, standard practice for embedding.
+            # Prompt says: Linear(128->64). It implies the output of this is H_clin.
+        )
+
+        # Base Prediction Head
+        # Linear(64 -> 2) -> [mu_base, sigma_base_raw]
+        self.head = nn.Linear(latent_dim, 2)
+
+    def forward(self, x):
+        # x shape: (Batch, 5)
+        h_clin = self.net(x)
+        preds = self.head(h_clin)
+        return h_clin, preds
+
+
+class VisualResidual(nn.Module):
+    """
+    Stream B: Regularized Cascaded Visual Residual.
+    Learns a correction (residual) to the clinical baseline using CT scans.
+    """
+
+    def __init__(self):
+        super(VisualResidual, self).__init__()
+
+        # Backbone: EfficientNet-B2
+        # num_classes=0 removes the classifier, returning pooled features if global_pool is set (default in timm)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Feature dimension of EfficientNet-B2 (usually 1408)
+        self.img_feature_dim = self.backbone.num_features
+
+        # Freeze lower layers, unfreeze top layers
+        # Freezing all first
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the Conv Head and BN
+        for param in self.backbone.conv_head.parameters():
+            param.requires_grad = True
+        for param in self.backbone.bn2.parameters():
+            param.requires_grad = True
+
+        # Unfreeze the last 2 blocks (EfficientNet usually has 7 blocks)
+        # We access the blocks via .blocks
+        num_blocks = len(self.backbone.blocks)
+        for i in range(num_blocks - 2, num_blocks):
+            for param in self.backbone.blocks[i].parameters():
+                param.requires_grad = True
+
+        # Fusion Dimension: Image Features + Clinical Latent
+        fusion_dim = self.img_feature_dim + Config.CLINICAL_LATENT_DIM
+
+        # Residual MLP
+        # Linear(Fused -> 128) -> ReLU -> Dropout -> Linear(128 -> 64) -> Dropout -> Linear(64 -> 2)
+        self.residual_net = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(p=Config.DROPOUT_RATE),
+            nn.Linear(128, 64),
+            nn.ReLU(),  # Added ReLU to match standard MLP structure between layers
+            nn.Dropout(p=Config.DROPOUT_RATE),
+            nn.Linear(64, 2),
+        )
+
+        # Zero Initialization of the final layer
+        # This ensures the residual starts at 0, so the model starts as the Clinical Anchor
+        self._init_zero_output()
+
+    def _init_zero_output(self):
+        final_layer = self.residual_net[-1]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.zeros_(final_layer.bias)
+
+    def forward(self, img, h_clin):
+        # img shape: (Batch, 3, 260, 260)
+        # h_clin shape: (Batch, 64)
+
+        # Extract image features
+        img_emb = self.backbone(img)  # (Batch, 1408)
+
+        # Concatenate with clinical latent
+        fused = torch.cat([img_emb, h_clin], dim=1)  # (Batch, 1472)
+
+        # Predict residuals
+        residuals = self.residual_net(fused)  # (Batch, 2)
+
+        return residuals
+
+
+class RCOSRNet(nn.Module):
+    """
+    Regularized Cascaded Output-Space Residual Network.
+    Combines Clinical Anchor and Visual Residual via probabilistic output fusion.
+    """
+
+    def __init__(self):
+        super(RCOSRNet, self).__init__()
+        self.clinical_anchor = ClinicalAnchor()
+        self.visual_residual = VisualResidual()
+
+    def forward(self, image, clinical):
+        """
+        Args:
+            image (torch.Tensor): CT slices (B, 3, H, W)
+            clinical (torch.Tensor): Clinical features (B, 5)
+        Returns:
+            mu (torch.Tensor): Predicted FVC mean (B, 1)
+            sigma (torch.Tensor): Predicted confidence (B, 1)
+        """
+        # 1. Stream A: Clinical Anchor
+        # h_clin: (B, 64), base_preds: (B, 2)
+        h_clin, base_preds = self.clinical_anchor(clinical)
+
+        # 2. Stream B: Visual Residual
+        # residuals: (B, 2)
+        residuals = self.visual_residual(image, h_clin)
+
+        # 3. Output Fusion
+        # Split predictions into Mean and Sigma components
+        # Index 0: Mean, Index 1: Raw Sigma (Logit)
+
+        base_mu = base_preds[:, 0:1]
+        base_sigma_raw = base_preds[:, 1:2]
+
+        res_mu = residuals[:, 0:1]
+        res_sigma_raw = residuals[:, 1:2]
+
+        # Additive Residual for Mean
+        mu_final = base_mu + res_mu
+
+        # Additive Residual for Sigma (in logit space), then Softplus
+        # This allows the image to increase or decrease uncertainty
+        sigma_final = F.softplus(base_sigma_raw + res_sigma_raw) + 1e-6
+
+        return mu_final, sigma_final
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPRNet).
+    Fuses a strong linear stream (Baseline+Time) with a deep interaction stream (Image+Meta)
+    in the latent space. (Cite Lesson 00052)
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # ---------------------------------------------------------------------
+        # Deep Stream (Stream A) Components
+        # ---------------------------------------------------------------------
+        # Backbone: EfficientNet-B2
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Freeze lower layers, unfreeze top layers
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze Head and last 2 blocks
+        for param in self.backbone.conv_head.parameters():
+            param.requires_grad = True
+        for param in self.backbone.bn2.parameters():
+            param.requires_grad = True
+        
+        num_blocks = len(self.backbone.blocks)
+        for i in range(num_blocks - 2, num_blocks):
+            for param in self.backbone.blocks[i].parameters():
+                param.requires_grad = True
+
+        img_dim = self.backbone.num_features
+        clin_dim = Config.CLINICAL_INPUT_DIM
+        latent_dim = Config.CLINICAL_LATENT_DIM # 64
+
+        # Deep Interaction MLP
+        # Fuses Image Embeddings + All Clinical Features
+        # No Dropout (Cite Lesson 00126)
+        self.deep_mlp = nn.Sequential(
+            nn.Linear(img_dim + clin_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim)
+        )
+
+        # ---------------------------------------------------------------------
+        # Linear Stream (Stream B) Components
+        # ---------------------------------------------------------------------
+        # Projects [Base_FVC, Time] to Latent Space
+        # Over-parameterization (Cite Lesson 00060)
+        self.linear_proj = nn.Linear(2, latent_dim)
+
+        # ---------------------------------------------------------------------
+        # Shared Head
+        # ---------------------------------------------------------------------
+        self.head = nn.Linear(latent_dim, 2)
+
+    def forward(self, image, clinical):
+        """
+        Args:
+            image (torch.Tensor): CT slices (B, 3, H, W)
+            clinical (torch.Tensor): Clinical features (B, 5)
+                                     [Base_FVC, Time, Age, Sex, Smoke]
+        """
+        # 1. Linear Stream (Stream B)
+        # Extract Base_FVC and Time (Indices 0 and 1)
+        linear_input = clinical[:, :2]
+        z_linear = self.linear_proj(linear_input)
+
+        # 2. Deep Stream (Stream A)
+        img_emb = self.backbone(image)
+        deep_input = torch.cat([img_emb, clinical], dim=1)
+        z_deep = self.deep_mlp(deep_input)
+
+        # 3. Latent Fusion (Summation) (Cite Lesson 00052)
+        z_fused = z_linear + z_deep
+
+        # 4. Projection
+        preds = self.head(z_fused)
+
+        mu = preds[:, 0:1]
+        sigma_raw = preds[:, 1:2]
+        sigma = F.softplus(sigma_raw) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import RCOSRNet
+
+
+class LaplaceLogLikelihoodLoss(nn.Module):
+=======
+from library.model import DSPRNet
+
+
+class LaplaceLogLikelihoodLoss(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Differential Learning Rates
+        # Group parameters: Backbone vs Heads (Clinical + Residual MLP)
+        backbone_params = []
+        head_params = []
+
+        # Get IDs of parameters in the backbone
+        # Note: VisualResidual unfreezes specific parts of the backbone,
+        # so we filter by requires_grad as well.
+        backbone_ptr = model.visual_residual.backbone
+        backbone_ids = set(map(id, backbone_ptr.parameters()))
+
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+
+            if id(param) in backbone_ids:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+=======
+        # Differential Learning Rates
+        # Group parameters: Backbone vs Heads
+        backbone_params = []
+        head_params = []
+
+        # Get IDs of parameters in the backbone
+        backbone_ptr = model.backbone
+        backbone_ids = set(map(id, backbone_ptr.parameters()))
+
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+
+            if id(param) in backbone_ids:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Model
+    model = RCOSRNet().to(device)
+
+    # Training
+=======
+    # Model
+    model = DSPRNet().to(device)
+
+    # Training
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import RCOSRNet
+
+
+def predict_test_set(model=None, device=None):
+    """
+    Generates submission.csv by predicting FVC for all Patient_Week combinations
+    in sample_submission.csv.
+
+    Args:
+        model (nn.Module, optional): Trained RCOSRNet model. If None, loads from Config.CHECKPOINT_DIR.
+        device (torch.device, optional): Torch device. If None, uses Config.DEVICE.
+=======
+from library.model import DSPRNet
+
+
+def predict_test_set(model=None, device=None):
+    """
+    Generates submission.csv by predicting FVC for all Patient_Week combinations
+    in sample_submission.csv.
+
+    Args:
+        model (nn.Module, optional): Trained DSPRNet model. If None, loads from Config.CHECKPOINT_DIR.
+        device (torch.device, optional): Torch device. If None, uses Config.DEVICE.
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Load model if not provided
+    if model is None:
+        model = RCOSRNet().to(device)
+        checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+=======
+    # Load model if not provided
+    if model is None:
+        model = DSPRNet().to(device)
+        checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RCOSRNet
+from library.train import Trainer
+from library.inference import predict_test_set
+
+
+def main():
+    # 1. Setup and Configuration
+    # Initialize environment and seeds
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    # Fast Baseline Overrides
+    # Reducing epochs to ensure the script completes quickly (within ~2 hours limit)
+    # while still allowing enough convergence for the small dataset.
+    Config.EPOCHS = 15
+
+    device = Config.DEVICE
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    print("Loading datasets...")
+    # load_cached_data=True is default in the library function, utilizing ./working cache
+    train_loader, val_loader = get_dataloaders(debug=False)
+
+    # 3. Model Initialization
+    print("Initializing RCOSR-Net model...")
+    model = RCOSRNet().to(device)
+=======
+from library.model import DSPRNet
+from library.train import Trainer
+from library.inference import predict_test_set
+
+
+def main():
+    # 1. Setup and Configuration
+    # Initialize environment and seeds
+    seed_everything(Config.SEED)
+    Config.setup()
+
+    # Fast Baseline Overrides
+    # Increasing epochs to 25 to match DSPRNet convergence profile (Cite Lesson 00094/00100)
+    Config.EPOCHS = 25
+
+    device = Config.DEVICE
+    print(f"Running on device: {device}")
+
+    # 2. Data Loading
+    print("Loading datasets...")
+    # load_cached_data=True is default in the library function, utilizing ./working cache
+    train_loader, val_loader = get_dataloaders(debug=False)
+
+    # 3. Model Initialization
+    print("Initializing DSPRNet model...")
+    model = DSPRNet().to(device)
+>>>>>>> REPLACE
+```

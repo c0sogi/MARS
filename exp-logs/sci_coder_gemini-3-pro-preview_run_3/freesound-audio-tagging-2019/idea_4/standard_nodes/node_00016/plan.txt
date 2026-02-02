@@ -1,0 +1,309 @@
+I will optimize the solution by reverting the architecture to the single-channel, attention-pooling configuration that previously achieved the best results, as identified in the provided lessons.
+
+Key changes include:
+1.  **Data Pipeline**: Simplify the input from a 3-channel composite (Mel, Delta, Delta-Delta) to a single-channel Log-Mel Spectrogram. This addresses the finding that synthetic channels degrade transfer learning performance from ImageNet models (Cite solution_lesson_node_00015).
+2.  **Model Architecture**:
+    *   Modify the `EfficientNet-B0` backbone to accept single-channel input by summing the pretrained RGB weights, ensuring better feature transfer (Cite solution_lesson_node_00015).
+    *   Replace the "Hybrid" pooling (Attention + Max) with pure **Attention Pooling**. The hybrid approach was associated with the regression in performance, while Attention Pooling effectively aggregates features in weakly labeled data (Cite solution_lesson_node_00007).
+3.  **Regularization**: Introduce **Mixup Augmentation** ($\alpha=0.2$) in the training loop. The absence of Mixup was identified as a critical factor in the previous solution's overfitting and poor generalization (Cite solution_lesson_node_00015).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Input Channels: 3
+    # Channel 1: Log-Mel Spectrogram
+    # Channel 2: Delta Features
+    # Channel 3: Delta-Delta Features
+    IN_CHANNELS = 3
+
+    # ==========================================
+    # Training Hyperparameters
+=======
+    # Input Channels: 1 (Log-Mel only) Cite solution_lesson_node_00015
+    IN_CHANNELS = 1
+
+    # ==========================================
+    # Training Hyperparameters
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Optimizer (AdamW)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.01
+=======
+    # Mixup Augmentation Cite solution_lesson_node_00015
+    MIXUP_ALPHA = 0.2
+
+    # Optimizer (AdamW)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.01
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.sr,
+            n_fft=Config.N_FFT,
+            hop_length=Config.HOP_LENGTH,
+            n_mels=Config.N_MELS,
+            f_min=Config.F_MIN,
+            f_max=Config.F_MAX,
+        )
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB()
+        self.compute_deltas = torchaudio.transforms.ComputeDeltas()
+
+        # 4. Augmentations (Train only)
+=======
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.sr,
+            n_fft=Config.N_FFT,
+            hop_length=Config.HOP_LENGTH,
+            n_mels=Config.N_MELS,
+            f_min=Config.F_MIN,
+            f_max=Config.F_MAX,
+        )
+        self.amp_to_db = torchaudio.transforms.AmplitudeToDB()
+        # compute_deltas removed Cite solution_lesson_node_00015
+
+        # 4. Augmentations (Train only)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Channel 1: Log-Mel Spectrogram
+        mel = self.mel_spec(wav)
+        log_mel = self.amp_to_db(mel)  # Shape: (1, n_mels, time)
+
+        # Apply SpecAugment (only on Log-Mel, before Deltas)
+        if self.split == "train":
+            log_mel = self.freq_mask(log_mel)
+            log_mel = self.time_mask(log_mel)
+
+        # Channel 2: Delta
+        delta = self.compute_deltas(log_mel)
+
+        # Channel 3: Delta-Delta
+        delta_delta = self.compute_deltas(delta)
+
+        # Stack Channels
+        image = torch.cat([log_mel, delta, delta_delta], dim=0)  # (3, n_mels, time)
+
+        # 6. Normalization (Instance-wise Standardization)
+=======
+        # Channel 1: Log-Mel Spectrogram
+        mel = self.mel_spec(wav)
+        log_mel = self.amp_to_db(mel)  # Shape: (1, n_mels, time)
+
+        # Apply SpecAugment
+        if self.split == "train":
+            log_mel = self.freq_mask(log_mel)
+            log_mel = self.time_mask(log_mel)
+
+        # Use single channel Cite solution_lesson_node_00015
+        image = log_mel
+
+        # 6. Normalization (Instance-wise Standardization)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class HybridEfficientNet(nn.Module):
+    """
+    Hybrid Architecture combining EfficientNet-B0 backbone with a
+    dual-branch pooling head (Attention + Global Max) to capture
+    both polyphonic and sparse sound events.
+    """
+
+    def __init__(self):
+        super(HybridEfficientNet, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0 (Pretrained)
+        # We use the features extractor part of the model
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+        self.backbone = efficientnet_b0(weights=weights)
+        self.features = self.backbone.features
+
+        # EfficientNet-B0 outputs 1280 channels at the final layer
+        self.feature_dim = 1280
+
+        # 2. Hybrid Pooling Heads
+
+        # Branch A: Attention Pooling (for polyphonic/continuous events)
+        # First, pool frequency dimension to 1, keeping time
+        self.avg_pool_freq = nn.AdaptiveAvgPool2d((1, None))
+        self.att_pooling = AttentionPooling(self.feature_dim)
+
+        # Branch B: Global Max Pooling (for sparse/transient events)
+        # Max pool over entire spatial map (Freq, Time)
+        self.global_max_pool = nn.AdaptiveMaxPool2d((1, 1))
+
+        # 3. Classifier
+        # Input dimension is 2 * feature_dim (concatenation of both branches)
+        self.classifier = nn.Linear(self.feature_dim * 2, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, 3, Freq, Time)
+        Returns:
+            logits: Output logits of shape (Batch, Num_Classes)
+        """
+        # Extract features: (Batch, 1280, F', T')
+        x = self.features(x)
+
+        # --- Branch A: Attention Pooling ---
+        # Collapse Frequency: (Batch, 1280, 1, T')
+        x_seq = self.avg_pool_freq(x)
+        # Squeeze to (Batch, 1280, T')
+        x_seq = x_seq.squeeze(2)
+        # Permute to (Batch, T', 1280) for Linear layers
+        x_seq = x_seq.permute(0, 2, 1)
+        # Apply Attention
+        out_att = self.att_pooling(x_seq)  # (Batch, 1280)
+
+        # --- Branch B: Global Max Pooling ---
+        # Max over F' and T': (Batch, 1280, 1, 1)
+        out_max = self.global_max_pool(x)
+        # Flatten: (Batch, 1280)
+        out_max = out_max.flatten(1)
+
+        # --- Fusion ---
+        # Concatenate embeddings: (Batch, 2560)
+        out_cat = torch.cat([out_att, out_max], dim=1)
+
+        # --- Classification ---
+        logits = self.classifier(out_cat)
+
+        return logits
+=======
+class AudioClassifier(nn.Module):
+    """
+    EfficientNet-B0 backbone with Attention Pooling.
+    Modified for single-channel input and optimized for multi-label audio tagging.
+    """
+
+    def __init__(self):
+        super(AudioClassifier, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0 (Pretrained)
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+        self.backbone = efficientnet_b0(weights=weights)
+        
+        # Modify first convolutional layer for 1-channel input Cite solution_lesson_node_00015
+        # Sum weights across the 3 input channels to preserve pretrained features
+        first_conv = self.backbone.features[0][0]
+        w_sum = first_conv.weight.sum(dim=1, keepdim=True)
+        first_conv.weight = nn.Parameter(w_sum)
+        first_conv.in_channels = 1
+        
+        self.features = self.backbone.features
+
+        # EfficientNet-B0 outputs 1280 channels at the final layer
+        self.feature_dim = 1280
+
+        # 2. Pooling Head: Attention Pooling Cite solution_lesson_node_00007
+        # First, pool frequency dimension to 1, keeping time
+        self.avg_pool_freq = nn.AdaptiveAvgPool2d((1, None))
+        self.att_pooling = AttentionPooling(self.feature_dim)
+
+        # 3. Classifier
+        self.classifier = nn.Linear(self.feature_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, 1, Freq, Time)
+        Returns:
+            logits: Output logits of shape (Batch, Num_Classes)
+        """
+        # Extract features: (Batch, 1280, F', T')
+        x = self.features(x)
+
+        # Collapse Frequency: (Batch, 1280, 1, T')
+        x_seq = self.avg_pool_freq(x)
+        # Squeeze to (Batch, 1280, T')
+        x_seq = x_seq.squeeze(2)
+        # Permute to (Batch, T', 1280) for Linear layers
+        x_seq = x_seq.permute(0, 2, 1)
+        
+        # Apply Attention Pooling
+        out = self.att_pooling(x_seq)  # (Batch, 1280)
+
+        # Classification
+        logits = self.classifier(out)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        batch_size = inputs.size(0)
+
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+=======
+        batch_size = inputs.size(0)
+
+        # Apply Mixup Augmentation Cite solution_lesson_node_00015
+        if Config.MIXUP_ALPHA > 0:
+            lam = np.random.beta(Config.MIXUP_ALPHA, Config.MIXUP_ALPHA)
+            index = torch.randperm(batch_size).to(device)
+            inputs = lam * inputs + (1 - lam) * inputs[index]
+            # Linearly mix targets for BCE loss
+            targets = lam * targets + (1 - lam) * targets[index]
+
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        loss.backward()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import HybridEfficientNet
+from library.engine import fit_model
+
+# Suppress warnings for cleaner output
+=======
+from library.model import AudioClassifier
+from library.engine import fit_model
+
+# Suppress warnings for cleaner output
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing HybridEfficientNet...")
+    model = HybridEfficientNet()
+
+    # 4. Training Loop
+=======
+    # 3. Model Initialization
+    print("Initializing AudioClassifier...")
+    model = AudioClassifier()
+
+    # 4. Training Loop
+>>>>>>> REPLACE
+```

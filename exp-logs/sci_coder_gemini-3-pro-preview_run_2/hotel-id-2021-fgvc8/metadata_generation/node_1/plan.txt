@@ -1,0 +1,359 @@
+The error in `runfile.py` is caused by duplicate image IDs in `train.csv`, which leads to the same image being assigned to both training and validation sets during the split, triggering the data leakage assertion. To fix this, I will remove duplicate entries from the training dataframe based on the `image` column before processing. Additionally, I will create `train.py` to train a ResNet50 model using the generated metadata and `predict.py` to generate the submission file, implementing the full solution pipeline.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Read CSVs
+    train_df = pd.read_csv(train_csv_path)
+    test_df = pd.read_csv(sample_sub_path)
+
+    # Construct relative file paths
+=======
+    # Read CSVs
+    train_df = pd.read_csv(train_csv_path)
+    test_df = pd.read_csv(sample_sub_path)
+
+    # Remove duplicates based on image ID to prevent leakage
+    if train_df['image'].duplicated().any():
+        n_dupes = train_df['image'].duplicated().sum()
+        print(f"  Found {n_dupes} duplicate image IDs in train.csv. Removing duplicates...")
+        train_df = train_df.drop_duplicates(subset=['image'], keep='first').reset_index(drop=True)
+
+    # Construct relative file paths
+>>>>>>> REPLACE
+```
+
+```diff
+train.py
+<<<<<<< SEARCH
+=======
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import timm
+from PIL import Image
+from tqdm import tqdm
+import json
+import random
+
+# Configuration
+CONFIG = {
+    "seed": 42,
+    "img_size": 224,
+    "batch_size": 64,
+    "epochs": 10,
+    "lr": 1e-3,
+    "num_workers": 4,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "model_name": "resnet50",
+    "input_dir": "./input",
+    "metadata_dir": "./metadata",
+    "output_dir": "./output"
+}
+
+def seed_everything(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+seed_everything(CONFIG['seed'])
+os.makedirs(CONFIG['output_dir'], exist_ok=True)
+
+# --- Dataset ---
+class HotelDataset(Dataset):
+    def __init__(self, df, transform=None, label_encoder=None, input_dir="./input"):
+        self.df = df
+        self.transform = transform
+        self.input_dir = input_dir
+        self.label_encoder = label_encoder
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.input_dir, row['file_path'])
+        
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            # Return a black image in case of error
+            image = Image.new('RGB', (224, 224), (0, 0, 0))
+            
+        if self.transform:
+            image = self.transform(image)
+            
+        if self.label_encoder:
+            label = self.label_encoder[row['hotel_id']]
+            return image, torch.tensor(label, dtype=torch.long)
+        else:
+            return image
+
+# --- Training Utils ---
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(loader, desc="Training")
+    for images, labels in pbar:
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+        pbar.set_postfix({"loss": running_loss/total, "acc": correct/total})
+        
+    return running_loss / len(loader), correct / total
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    # For MAP@5, we need to store predictions
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Validation")
+        for images, labels in pbar:
+            images, labels = images.to(device), labels.to(device)
+            
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            # Store top 5 preds for MAP@5 calculation
+            _, top5_preds = torch.topk(outputs, 5, dim=1)
+            all_preds.append(top5_preds.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            
+            pbar.set_postfix({"loss": running_loss/total, "acc": correct/total})
+            
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
+    
+    # Calculate MAP@5
+    # Since there is only 1 ground truth per image, AP@5 is 1/rank if correct in top 5, else 0.
+    # MAP is mean of APs.
+    apk_sum = 0
+    for i in range(len(all_labels)):
+        if all_labels[i] in all_preds[i]:
+            # Find rank (0-indexed in numpy, so +1)
+            rank = np.where(all_preds[i] == all_labels[i])[0][0] + 1
+            apk_sum += 1.0 / rank
+    
+    map5 = apk_sum / len(all_labels)
+    
+    return running_loss / len(loader), correct / total, map5
+
+# --- Main ---
+def main():
+    # Load Metadata
+    train_df = pd.read_csv(os.path.join(CONFIG['metadata_dir'], "train_metadata.csv"))
+    val_df = pd.read_csv(os.path.join(CONFIG['metadata_dir'], "val_metadata.csv"))
+    
+    # Encode Labels
+    # We need a consistent mapping. 
+    # Combine train and val hotel_ids to ensure we cover everything (though val should be subset of train)
+    unique_hotels = sorted(list(set(train_df['hotel_id'].unique()) | set(val_df['hotel_id'].unique())))
+    label_encoder = {hotel_id: idx for idx, hotel_id in enumerate(unique_hotels)}
+    
+    # Save label encoder
+    with open(os.path.join(CONFIG['output_dir'], "label_encoder.json"), "w") as f:
+        # Convert keys to str for json
+        json.dump({str(k): v for k, v in label_encoder.items()}, f)
+        
+    print(f"Number of classes: {len(unique_hotels)}")
+    
+    # Transforms
+    train_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Datasets & Loaders
+    train_dataset = HotelDataset(train_df, transform=train_transform, label_encoder=label_encoder)
+    val_dataset = HotelDataset(val_df, transform=val_transform, label_encoder=label_encoder)
+    
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, 
+                              num_workers=CONFIG['num_workers'], pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, 
+                            num_workers=CONFIG['num_workers'], pin_memory=True)
+    
+    # Model
+    model = timm.create_model(CONFIG['model_name'], pretrained=True, num_classes=len(unique_hotels))
+    model = model.to(CONFIG['device'])
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'])
+    
+    best_map5 = 0.0
+    
+    for epoch in range(CONFIG['epochs']):
+        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}")
+        
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, CONFIG['device'])
+        val_loss, val_acc, val_map5 = validate(model, val_loader, criterion, CONFIG['device'])
+        
+        scheduler.step()
+        
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val MAP@5: {val_map5:.4f}")
+        
+        if val_map5 > best_map5:
+            best_map5 = val_map5
+            print(f"New best MAP@5! Saving model...")
+            torch.save(model.state_dict(), os.path.join(CONFIG['output_dir'], "best_model.pth"))
+            
+    print("Training complete.")
+
+if __name__ == "__main__":
+    main()
+>>>>>>> REPLACE
+```
+
+```diff
+predict.py
+<<<<<<< SEARCH
+=======
+import os
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import timm
+from PIL import Image
+from tqdm import tqdm
+import json
+
+# Configuration
+CONFIG = {
+    "img_size": 224,
+    "batch_size": 128,
+    "num_workers": 4,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "model_name": "resnet50",
+    "input_dir": "./input",
+    "metadata_dir": "./metadata",
+    "output_dir": "./output",
+    "submission_file": "submission.csv"
+}
+
+class TestDataset(Dataset):
+    def __init__(self, df, transform=None, input_dir="./input"):
+        self.df = df
+        self.transform = transform
+        self.input_dir = input_dir
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.input_dir, row['file_path'])
+        
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception:
+            image = Image.new('RGB', (224, 224), (0, 0, 0))
+            
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, row['image']
+
+def main():
+    # Load Metadata
+    test_df = pd.read_csv(os.path.join(CONFIG['metadata_dir'], "test_metadata.csv"))
+    
+    # Load Label Encoder
+    with open(os.path.join(CONFIG['output_dir'], "label_encoder.json"), "r") as f:
+        label_map = json.load(f)
+    
+    # Invert map: index -> hotel_id
+    idx_to_hotel = {v: k for k, v in label_map.items()}
+    num_classes = len(label_map)
+    
+    # Transforms
+    test_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Dataset & Loader
+    test_dataset = TestDataset(test_df, transform=test_transform)
+    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False, 
+                             num_workers=CONFIG['num_workers'], pin_memory=True)
+    
+    # Model
+    model = timm.create_model(CONFIG['model_name'], pretrained=False, num_classes=num_classes)
+    model.load_state_dict(torch.load(os.path.join(CONFIG['output_dir'], "best_model.pth"), map_location=CONFIG['device']))
+    model = model.to(CONFIG['device'])
+    model.eval()
+    
+    results = []
+    
+    with torch.no_grad():
+        for images, image_ids in tqdm(test_loader, desc="Inference"):
+            images = images.to(CONFIG['device'])
+            outputs = model(images)
+            
+            # Get top 5
+            _, top5_indices = torch.topk(outputs, 5, dim=1)
+            top5_indices = top5_indices.cpu().numpy()
+            
+            for img_id, indices in zip(image_ids, top5_indices):
+                hotel_ids = [str(idx_to_hotel[idx]) for idx in indices]
+                results.append({
+                    "image": img_id,
+                    "hotel_id": " ".join(hotel_ids)
+                })
+    
+    # Save Submission
+    sub_df = pd.DataFrame(results)
+    sub_df.to_csv(CONFIG['submission_file'], index=False)
+    print(f"Submission saved to {CONFIG['submission_file']}")
+
+if __name__ == "__main__":
+    main()
+>>>>>>> REPLACE
+```

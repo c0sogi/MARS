@@ -1,0 +1,309 @@
+I will optimize the solution by simplifying the model architecture and adjusting hyperparameters to improve execution efficiency without sacrificing the near-perfect performance.
+
+**Strategy Outline:**
+1.  **Simplify Architecture**: I will replace the complex `Res2NeXtBlock` (which includes grouped convolutions and hierarchical connections) with a standard `BasicBlock`. This aligns with `Cite solution_lesson_node_00011`, which suggests traditional CNNs with small kernels are preferred for low-resolution inputs.
+2.  **Remove SE Blocks**: I will remove the Squeeze-and-Excitation blocks. `Cite solution_lesson_node_00013` indicates that SE blocks add computational overhead without providing performance gains on saturated metrics for this dataset.
+3.  **Optimize Network Width**: I will reduce the channel configuration from `[64, 128, 256]` to `[32, 64, 128]`. `Cite solution_lesson_node_00019` demonstrates that narrower networks (scaling width proportionally to input resolution) can match the performance of wider ones on 32x32 images while being significantly faster.
+4.  **Maintain Multi-Scale Aggregation**: I will retain the multi-scale aggregation head (concatenating features from Stage 2 and Stage 3). `Cite solution_lesson_node_00016` shows this allows lighter architectures to maintain high accuracy by preserving mid-level details.
+5.  **Hyperparameter Tuning**: I will increase the `BATCH_SIZE` from 128 to 256 to leverage the A100 GPU's capacity and speed up training epochs.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# "Super-Wide" Channel Configuration as per strategy
+MODEL_CHANNELS = [64, 128, 256]
+
+# Grouped Convolution Cardinality
+CARDINALITY = 32
+
+# ==========================================
+#           Training Configuration
+# ==========================================
+# Homogeneous Seed Averaging
+SEEDS = [0, 1, 2, 3, 4]
+
+EPOCHS = 20
+BATCH_SIZE = 128
+=======
+# "Wide" Channel Configuration (Cite solution_lesson_node_00019)
+MODEL_CHANNELS = [32, 64, 128]
+
+# ==========================================
+#           Training Configuration
+# ==========================================
+# Homogeneous Seed Averaging
+SEEDS = [0, 1, 2, 3, 4]
+
+EPOCHS = 20
+BATCH_SIZE = 256
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import (
+    MODEL_CHANNELS,
+    CARDINALITY,
+    SEEDS,
+    EPOCHS,
+    BATCH_SIZE,
+=======
+from library.config import (
+    MODEL_CHANNELS,
+    SEEDS,
+    EPOCHS,
+    BATCH_SIZE,
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block for channel-wise attention.
+    """
+
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class Res2NeXtBlock(nn.Module):
+    """
+    Custom Bottleneck Block integrating Res2Net hierarchy and ResNeXt grouping.
+    """
+
+    def __init__(self, in_planes, planes, stride=1, scale=4, cardinality=32):
+        super(Res2NeXtBlock, self).__init__()
+        # "Super-Wide" internal expansion
+        width = planes * 2
+        self.stride = stride
+        self.scale = scale
+        self.width = width
+        self.chunk_width = width // scale
+
+        # 1x1 Projection
+        self.conv1 = nn.Conv2d(in_planes, width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width)
+
+        # Calculate groups for the split convolutions
+        # We distribute the cardinality across the scales
+        self.groups = cardinality // scale
+        if self.groups < 1:
+            self.groups = 1
+
+        if stride == 1:
+            # Res2Net Hierarchical Convolutions
+            # We have (scale - 1) 3x3 convolutions
+            self.convs = nn.ModuleList(
+                [
+                    nn.Conv2d(
+                        self.chunk_width,
+                        self.chunk_width,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        groups=self.groups,
+                        bias=False,
+                    )
+                    for _ in range(scale - 1)
+                ]
+            )
+            self.bns = nn.ModuleList(
+                [nn.BatchNorm2d(self.chunk_width) for _ in range(scale - 1)]
+            )
+        else:
+            # Fallback to standard ResNeXt grouped convolution for downsampling layers
+            # to avoid spatial dimension mismatch in hierarchical addition
+            self.conv2 = nn.Conv2d(
+                width,
+                width,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=cardinality,
+                bias=False,
+            )
+            self.bn2 = nn.BatchNorm2d(width)
+
+        # 1x1 Projection
+        self.conv3 = nn.Conv2d(width, planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.se = SEBlock(planes)
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            # Strictly use 1x1 conv for shortcut
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+
+        if self.stride == 1:
+            # Res2Net Forward Pass
+            chunks = torch.split(out, self.chunk_width, dim=1)
+            y = chunks[0]  # The first chunk is the identity base
+            outputs = [y]
+
+            for i in range(self.scale - 1):
+                # Add previous output to current chunk input (Hierarchical connection)
+                if i == 0:
+                    inp = chunks[i + 1] + y
+                else:
+                    inp = chunks[i + 1] + y
+
+                y = self.relu(self.bns[i](self.convs[i](inp)))
+                outputs.append(y)
+
+            out = torch.cat(outputs, dim=1)
+        else:
+            # Standard ResNeXt Forward Pass for downsampling
+            out = self.relu(self.bn2(self.conv2(out)))
+
+        out = self.bn3(self.conv3(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+=======
+class BasicBlock(nn.Module):
+    """
+    Standard ResNet Basic Block (Cite solution_lesson_node_00011).
+    Removed SE blocks to reduce overhead (Cite solution_lesson_node_00013).
+    """
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CactusNet(nn.Module):
+    """
+    Wide SE-Res2NeXt with Multi-Scale Aggregation Head.
+    """
+
+    def __init__(self, num_classes=1):
+        super(CactusNet, self).__init__()
+        self.in_planes = MODEL_CHANNELS[0]
+
+        # Stem: 32x32 input
+        self.conv1 = nn.Conv2d(
+            3, MODEL_CHANNELS[0], kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(MODEL_CHANNELS[0])
+        self.relu = nn.ReLU(inplace=True)
+
+        # Stage 1: 32x32 -> 32x32
+        self.layer1 = self._make_layer(MODEL_CHANNELS[0], stride=1)
+
+        # Stage 2: 32x32 -> 16x16
+        self.layer2 = self._make_layer(MODEL_CHANNELS[1], stride=2)
+
+        # Stage 3: 16x16 -> 8x8
+        self.layer3 = self._make_layer(MODEL_CHANNELS[2], stride=2)
+
+        # Multi-Scale Aggregation Head
+        # Concatenating GAP of Stage 2 (128 channels) and Stage 3 (256 channels)
+        self.fc = nn.Linear(MODEL_CHANNELS[1] + MODEL_CHANNELS[2], num_classes)
+
+    def _make_layer(self, planes, stride):
+        layers = []
+        # First block handles stride/channel change
+        layers.append(
+            Res2NeXtBlock(self.in_planes, planes, stride, cardinality=CARDINALITY)
+        )
+        self.in_planes = planes
+        # Additional blocks (using 2 blocks per stage for depth)
+        layers.append(
+            Res2NeXtBlock(self.in_planes, planes, stride=1, cardinality=CARDINALITY)
+        )
+        layers.append(
+            Res2NeXtBlock(self.in_planes, planes, stride=1, cardinality=CARDINALITY)
+        )
+        return nn.Sequential(*layers)
+=======
+class CactusNet(nn.Module):
+    """
+    Standard ResNet with Multi-Scale Aggregation Head (Cite solution_lesson_node_00016).
+    """
+
+    def __init__(self, num_classes=1):
+        super(CactusNet, self).__init__()
+        self.in_planes = MODEL_CHANNELS[0]
+
+        # Stem: 32x32 input
+        self.conv1 = nn.Conv2d(
+            3, MODEL_CHANNELS[0], kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(MODEL_CHANNELS[0])
+        self.relu = nn.ReLU(inplace=True)
+
+        # Stage 1: 32x32 -> 32x32
+        self.layer1 = self._make_layer(MODEL_CHANNELS[0], stride=1)
+
+        # Stage 2: 32x32 -> 16x16
+        self.layer2 = self._make_layer(MODEL_CHANNELS[1], stride=2)
+
+        # Stage 3: 16x16 -> 8x8
+        self.layer3 = self._make_layer(MODEL_CHANNELS[2], stride=2)
+
+        # Multi-Scale Aggregation Head
+        # Concatenating GAP of Stage 2 (64 channels) and Stage 3 (128 channels)
+        self.fc = nn.Linear(MODEL_CHANNELS[1] + MODEL_CHANNELS[2], num_classes)
+
+    def _make_layer(self, planes, stride):
+        layers = []
+        # First block handles stride/channel change
+        layers.append(BasicBlock(self.in_planes, planes, stride))
+        self.in_planes = planes
+        # Additional blocks (using 2 blocks per stage for depth)
+        layers.append(BasicBlock(self.in_planes, planes, stride=1))
+        layers.append(BasicBlock(self.in_planes, planes, stride=1))
+        return nn.Sequential(*layers)
+>>>>>>> REPLACE
+```

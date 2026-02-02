@@ -1,0 +1,631 @@
+Based on the lessons learned, specifically **Lesson 00015** which highlights that deterministic geometric heuristics outperform blind stochastic sampling, and **Lesson 00011** regarding the need for strict reproducibility to evaluate small-data models, I will implement the following changes:
+
+1.  **Revert to Deterministic Middle Slice Selection:** I will modify the `MGMTDataset` to strictly select the middle slice (by index) of the MRI volume for all phases (training, validation, and testing). This eliminates the label noise introduced by stochastically sampling non-tumor slices and removes the complex ensemble logic that failed to improve performance.
+2.  **Remove Ensemble Inference:** I will simplify the evaluation and prediction loops in `library/engine.py` and `runfile.py` to handle standard 4D tensors `(Batch, Channel, Height, Width)` instead of the 5D ensemble tensors.
+3.  **Ensure Reproducibility:** I will add a `seed_worker` function and attach a `torch.Generator` to the DataLoaders in `library/data.py`. This ensures that data loading is deterministic across runs, preventing the stochastic variance that previously made performance evaluation unreliable.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Volume of Interest (VOI) Strategy
+    # We focus on the central 30% of the brain volume to capture the tumor
+    # while ignoring the skull start/end slices.
+    VOI_RANGE = (0.35, 0.65)
+
+    # Inference Ensemble Strategy
+    # Number of equidistant slices to extract from the VOI during inference
+    NUM_INFERENCE_SLICES = 5
+
+    # Debugging / Development
+=======
+    # Volume of Interest (VOI) Strategy
+    # Using deterministic middle slice selection (Cite solution_lesson_node_00015)
+    
+    # Debugging / Development
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    def __init__(self, df, file_lists_df, phase="train", transform=None):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe containing BraTS21ID and targets.
+            file_lists_df (pd.DataFrame): Dataframe containing lists of file paths for each subject.
+            phase (str): 'train', 'val', or 'test'.
+            transform (albumentations.Compose): Transforms to apply.
+        """
+        self.df = df.reset_index(drop=True)
+        # Convert file lists dataframe to a dictionary for faster lookup by BraTS21ID
+        self.file_lists = file_lists_df.set_index("BraTS21ID").to_dict("index")
+        self.phase = phase
+        self.transform = transform
+
+        # Modalities to use as channels
+        self.modalities = ["FLAIR", "T1wCE", "T2w"]
+
+    def __len__(self):
+        return len(self.df)
+
+    def _load_slice_at_depth(self, subject_id, relative_depth):
+        """
+        Loads a 3-channel image (FLAIR, T1wCE, T2w) at a specific relative depth.
+        """
+        channels = []
+        subject_files = self.file_lists.get(subject_id, {})
+
+        for mod in self.modalities:
+            files = subject_files.get(f"{mod}_files", [])
+
+            img = None
+            if len(files) > 0:
+                # Calculate index based on relative depth
+                num_files = len(files)
+                # Ensure index is within bounds [0, num_files-1]
+                idx = int(relative_depth * num_files)
+                idx = min(max(idx, 0), num_files - 1)
+
+                file_path = files[idx]
+                img = read_dicom(file_path, size=Config.IMG_SIZE)
+
+            # Handle missing files or read errors
+            if img is None:
+                img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+
+            channels.append(img)
+
+        # Stack to create (H, W, 3)
+        # OpenCV reads are usually (H, W), so stacking creates (H, W, 3)
+        img_stacked = np.stack(channels, axis=-1)
+        return img_stacked
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get target if available
+        label = (
+            torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            if "MGMT_value" in row
+            else torch.tensor(-1.0)
+        )
+
+        # Determine depths to sample
+        voi_start, voi_end = Config.VOI_RANGE
+
+        if self.phase == "train":
+            # Stochastic Sampling: Pick ONE random depth within VOI
+            depth = random.uniform(voi_start, voi_end)
+
+            image = self._load_slice_at_depth(subject_id, depth)
+
+            if self.transform:
+                augmented = self.transform(image=image)
+                image = augmented["image"]
+            else:
+                # Fallback to tensor conversion
+                image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+
+            return image, label, subject_id
+
+        else:
+            # Inference Ensemble: Pick N equidistant depths
+            depths = np.linspace(voi_start, voi_end, Config.NUM_INFERENCE_SLICES)
+
+            images = []
+            for d in depths:
+                img = self._load_slice_at_depth(subject_id, d)
+
+                if self.transform:
+                    augmented = self.transform(image=img)
+                    img_tensor = augmented["image"]
+                else:
+                    img_tensor = (
+                        torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+                    )
+
+                images.append(img_tensor)
+
+            # Stack images: (N_SLICES, C, H, W)
+            images_stacked = torch.stack(images)
+
+            return images_stacked, label, subject_id
+=======
+    def __init__(self, df, file_lists_df, phase="train", transform=None):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe containing BraTS21ID and targets.
+            file_lists_df (pd.DataFrame): Dataframe containing lists of file paths for each subject.
+            phase (str): 'train', 'val', or 'test'.
+            transform (albumentations.Compose): Transforms to apply.
+        """
+        self.df = df.reset_index(drop=True)
+        # Convert file lists dataframe to a dictionary for faster lookup by BraTS21ID
+        self.file_lists = file_lists_df.set_index("BraTS21ID").to_dict("index")
+        self.phase = phase
+        self.transform = transform
+
+        # Modalities to use as channels
+        self.modalities = ["FLAIR", "T1wCE", "T2w"]
+
+    def __len__(self):
+        return len(self.df)
+
+    def _load_middle_slice(self, subject_id):
+        """
+        Loads the middle slice (by index) for each modality.
+        Cite solution_lesson_node_00015: Deterministic geometric heuristics outperform stochastic sampling.
+        """
+        channels = []
+        subject_files = self.file_lists.get(subject_id, {})
+
+        for mod in self.modalities:
+            files = subject_files.get(f"{mod}_files", [])
+
+            img = None
+            if len(files) > 0:
+                # Deterministic Middle Slice
+                idx = len(files) // 2
+                file_path = files[idx]
+                img = read_dicom(file_path, size=Config.IMG_SIZE)
+
+            # Handle missing files or read errors
+            if img is None:
+                img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+
+            channels.append(img)
+
+        # Stack to create (H, W, 3)
+        img_stacked = np.stack(channels, axis=-1)
+        return img_stacked
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get target if available
+        label = (
+            torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            if "MGMT_value" in row
+            else torch.tensor(-1.0)
+        )
+
+        # Always load middle slice (Deterministic)
+        image = self._load_middle_slice(subject_id)
+
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            # Fallback to tensor conversion
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+
+        return image, label, subject_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_dataloaders(
+    train_metadata_path=Config.TRAIN_METADATA_PATH,
+    val_metadata_path=Config.VAL_METADATA_PATH,
+    test_metadata_path=Config.TEST_METADATA_PATH,
+    load_cached_data=True,
+):
+    """
+    Creates DataLoaders for train, validation, and test sets.
+
+    Args:
+        train_metadata_path (str): Path to training metadata CSV.
+        val_metadata_path (str): Path to validation metadata CSV.
+        test_metadata_path (str): Path to test metadata CSV.
+        load_cached_data (bool): Whether to use cached file lists.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    # 1. Load Metadata
+    df_train = pd.read_csv(train_metadata_path)
+    df_val = pd.read_csv(val_metadata_path)
+    df_test = pd.read_csv(test_metadata_path)
+
+    # Debugging: Subset data if DEBUG is enabled
+    if Config.DEBUG:
+        df_train = df_train.head(Config.DEBUG_SAMPLE_SIZE)
+        df_val = df_val.head(Config.DEBUG_SAMPLE_SIZE)
+        # Keep test set full usually, but for strict debug maybe subset
+        # df_test = df_test.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Get File Lists (Cached)
+    # We combine train and val for file list generation to ensure coverage if splitting logic changes,
+    # though usually they are separate. The utility handles caching by split name.
+
+    # Train files
+    train_files_df = get_all_file_lists(
+        df_train, load_cached_data=load_cached_data, split_name="train"
+    )
+
+    # Val files
+    val_files_df = get_all_file_lists(
+        df_val, load_cached_data=load_cached_data, split_name="val"
+    )
+
+    # Test files
+    test_files_df = get_all_file_lists(
+        df_test, load_cached_data=load_cached_data, split_name="test"
+    )
+
+    # 3. Create Datasets
+    train_dataset = MGMTDataset(
+        df_train, train_files_df, phase="train", transform=get_transforms("train")
+    )
+
+    val_dataset = MGMTDataset(
+        df_val, val_files_df, phase="val", transform=get_transforms("val")
+    )
+
+    test_dataset = MGMTDataset(
+        df_test, test_files_df, phase="test", transform=get_transforms("test")
+    )
+
+    # 4. Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader
+=======
+def seed_worker(worker_id):
+    """
+    Cite solution_lesson_node_00011: Ensure reproducibility in DataLoader workers.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def get_dataloaders(
+    train_metadata_path=Config.TRAIN_METADATA_PATH,
+    val_metadata_path=Config.VAL_METADATA_PATH,
+    test_metadata_path=Config.TEST_METADATA_PATH,
+    load_cached_data=True,
+):
+    """
+    Creates DataLoaders for train, validation, and test sets.
+
+    Args:
+        train_metadata_path (str): Path to training metadata CSV.
+        val_metadata_path (str): Path to validation metadata CSV.
+        test_metadata_path (str): Path to test metadata CSV.
+        load_cached_data (bool): Whether to use cached file lists.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    # 1. Load Metadata
+    df_train = pd.read_csv(train_metadata_path)
+    df_val = pd.read_csv(val_metadata_path)
+    df_test = pd.read_csv(test_metadata_path)
+
+    # Debugging: Subset data if DEBUG is enabled
+    if Config.DEBUG:
+        df_train = df_train.head(Config.DEBUG_SAMPLE_SIZE)
+        df_val = df_val.head(Config.DEBUG_SAMPLE_SIZE)
+        # Keep test set full usually, but for strict debug maybe subset
+        # df_test = df_test.head(Config.DEBUG_SAMPLE_SIZE)
+
+    # 2. Get File Lists (Cached)
+    # We combine train and val for file list generation to ensure coverage if splitting logic changes,
+    # though usually they are separate. The utility handles caching by split name.
+
+    # Train files
+    train_files_df = get_all_file_lists(
+        df_train, load_cached_data=load_cached_data, split_name="train"
+    )
+
+    # Val files
+    val_files_df = get_all_file_lists(
+        df_val, load_cached_data=load_cached_data, split_name="val"
+    )
+
+    # Test files
+    test_files_df = get_all_file_lists(
+        df_test, load_cached_data=load_cached_data, split_name="test"
+    )
+
+    # 3. Create Datasets
+    train_dataset = MGMTDataset(
+        df_train, train_files_df, phase="train", transform=get_transforms("train")
+    )
+
+    val_dataset = MGMTDataset(
+        df_val, val_files_df, phase="val", transform=get_transforms("val")
+    )
+
+    test_dataset = MGMTDataset(
+        df_test, test_files_df, phase="test", transform=get_transforms("test")
+    )
+
+    # 4. Create DataLoaders
+    # Cite solution_lesson_node_00011: Use generator and worker_init_fn for reproducibility
+    g = torch.Generator()
+    g.manual_seed(Config.SEED)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    return train_loader, val_loader, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set using 2.5D ensemble logic.
+    Input images shape: (B, N_SLICES, C, H, W)
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    # Use BCELoss for validation tracking since we compute probabilities manually
+    val_criterion = nn.BCELoss()
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device).unsqueeze(1)  # Shape: (B, 1)
+
+            B, N, C, H, W = images.shape
+
+            # Flatten slices into the batch dimension: (B*N, C, H, W)
+            flat_images = images.view(B * N, C, H, W)
+
+            # Forward pass
+            flat_logits = model(flat_images)  # (B*N, 1)
+            flat_probs = torch.sigmoid(flat_logits)
+
+            # Reshape back to (B, N) and average probabilities across slices
+            # This implements the ensemble voting mechanism
+            batch_probs = flat_probs.view(B, N).mean(dim=1, keepdim=True)  # (B, 1)
+
+            # Calculate loss on the aggregated predictions
+            loss = val_criterion(batch_probs, targets)
+
+            running_loss += loss.item() * B
+            dataset_size += B
+
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(batch_probs.cpu().numpy())
+
+    total_loss = running_loss / dataset_size
+
+    # Calculate ROC AUC
+    # Handle potential edge cases where a batch might have only one class
+    try:
+        auc_score = roc_auc_score(all_targets, all_preds)
+    except ValueError:
+        auc_score = 0.5
+
+    return total_loss, auc_score
+
+
+def predict_test_set(model, dataloader, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for images, _, subject_ids in dataloader:
+            images = images.to(device)
+
+            B, N, C, H, W = images.shape
+
+            # Flatten, Predict, Reshape, Average
+            flat_images = images.view(B * N, C, H, W)
+            flat_logits = model(flat_images)
+            flat_probs = torch.sigmoid(flat_logits)
+            batch_probs = flat_probs.view(B, N).mean(dim=1).cpu().numpy()
+
+            # Collect results
+            for i in range(B):
+                results.append(
+                    {"BraTS21ID": subject_ids[i].item(), "MGMT_value": batch_probs[i]}
+                )
+
+    return pd.DataFrame(results)
+=======
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    Input images shape: (B, C, H, W)
+    """
+    model.eval()
+    running_loss = 0.0
+    dataset_size = 0
+
+    all_targets = []
+    all_preds = []
+
+    # Use BCELoss for validation tracking
+    val_criterion = nn.BCELoss()
+
+    with torch.no_grad():
+        for images, targets, _ in dataloader:
+            images = images.to(device)
+            targets = targets.to(device).unsqueeze(1)  # Shape: (B, 1)
+
+            # Forward pass
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+
+            # Calculate loss
+            loss = val_criterion(probs, targets)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            dataset_size += batch_size
+
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(probs.cpu().numpy())
+
+    total_loss = running_loss / dataset_size
+
+    # Calculate ROC AUC
+    try:
+        auc_score = roc_auc_score(all_targets, all_preds)
+    except ValueError:
+        auc_score = 0.5
+
+    return total_loss, auc_score
+
+
+def predict_test_set(model, dataloader, device):
+    """
+    Generates predictions for the test set.
+    """
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for images, _, subject_ids in dataloader:
+            images = images.to(device)
+
+            # Forward pass
+            logits = model(images)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            # Collect results
+            for i in range(len(subject_ids)):
+                results.append(
+                    {"BraTS21ID": subject_ids[i].item(), "MGMT_value": probs[i][0]}
+                )
+
+    return pd.DataFrame(results)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def get_validation_predictions(model, dataloader, device):
+    """
+    Runs inference on the validation set to get raw predictions and targets
+    for failure analysis.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, targets, subject_ids in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # Input shape: (B, N_SLICES, C, H, W)
+            B, N, C, H, W = images.shape
+
+            # Flatten slices into batch dimension
+            flat_images = images.view(B * N, C, H, W)
+
+            # Forward pass
+            flat_logits = model(flat_images)
+            flat_probs = torch.sigmoid(flat_logits)
+
+            # Reshape back to (B, N) and average
+            batch_probs = flat_probs.view(B, N).mean(dim=1)
+
+            all_preds.extend(batch_probs.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+            all_ids.extend(subject_ids.numpy())
+
+    return np.array(all_ids), np.array(all_targets), np.array(all_preds)
+=======
+def get_validation_predictions(model, dataloader, device):
+    """
+    Runs inference on the validation set to get raw predictions and targets
+    for failure analysis.
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_ids = []
+
+    with torch.no_grad():
+        for images, targets, subject_ids in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+
+            # Input shape: (B, C, H, W)
+            logits = model(images)
+            probs = torch.sigmoid(logits)
+            
+            # Flatten predictions
+            batch_probs = probs.view(-1)
+
+            all_preds.extend(batch_probs.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+            all_ids.extend(subject_ids.numpy())
+
+    return np.array(all_ids), np.array(all_targets), np.array(all_preds)
+>>>>>>> REPLACE
+```

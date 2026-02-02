@@ -1,0 +1,215 @@
+To optimize the solution, I will implement a **Multi-Task Faster R-CNN** architecture. Based on **Lesson 00013** and **Lesson 00008**, adding an auxiliary global classification head (predicting study-level diagnosis) significantly improves performance by regularizing the backbone and decoupling error from object density. I will set the auxiliary loss weight to `0.5` and increase the RPN proposal capacity to `3000` to handle dense opacities (**Cite Lesson 00005, 00013**). Additionally, I will revert the image resolution to `800x800` as **Lesson 00017** demonstrated that increasing resolution to 1024x1024 caused performance degradation in this specific setup. Finally, I will add the conditional submission logic based on the validation mAP threshold.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Input image size (Resized to this dimension)
+    IMG_SIZE = 1024
+
+    # ==========================
+    # Training Configuration
+=======
+    # Input image size (Resized to this dimension)
+    IMG_SIZE = 800
+
+    # ==========================
+    # Training Configuration
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Inference Thresholds
+    DETECTION_THRESHOLD = 0.35  # Confidence threshold for keeping a box
+
+    # ==========================
+=======
+    # Inference Thresholds
+    DETECTION_THRESHOLD = 0.35  # Confidence threshold for keeping a box
+
+    # Multi-task Loss Weight
+    LAMBDA_GLOBAL_CLS = 0.5
+
+    # ==========================
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+            target["image_id"] = torch.tensor([idx])
+            target["area"] = area
+            target["iscrowd"] = iscrowd
+
+            return image, target, self.image_ids[idx]
+=======
+            target["image_id"] = torch.tensor([idx])
+            target["area"] = area
+            target["iscrowd"] = iscrowd
+            target["study_label"] = torch.tensor(class_id, dtype=torch.int64)
+
+            return image, target, self.image_ids[idx]
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
+
+
+def get_model(num_classes):
+    """
+    Initializes a Faster R-CNN model with a ResNet-50-FPN backbone.
+    The head is modified to support the specific number of classes for the task.
+
+    Args:
+        num_classes (int): The total number of classes including the background.
+                           For this task, it is 4 (0=Background, 1=Typical,
+                           2=Indeterminate, 3=Atypical).
+
+    Returns:
+        model (torch.nn.Module): The configured Faster R-CNN model.
+    """
+    # Load the pre-trained model using the default weights (COCO V1)
+    # This provides a strong feature extractor backbone.
+    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+
+    # Increase capacity for dense scenes Cite solution_lesson_node_00004
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
+        weights=weights, box_detections_per_img=200, rpn_post_nms_top_n_train=3000
+    )
+
+    # Get the number of input features for the classifier head.
+    # This is required to connect the new predictor to the existing backbone.
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+
+    # Replace the pre-trained box predictor with a new one.
+    # FastRCNNPredictor creates two heads:
+    # 1. Classification head: outputs scores for 'num_classes'
+    # 2. Regression head: outputs 4 coordinates per class (or shared)
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    return model
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import OrderedDict
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from library.config import Config
+
+
+class MultiTaskFasterRCNN(FasterRCNN):
+    """
+    Faster R-CNN with an auxiliary Global Classification Head.
+    Cite solution_lesson_node_00008, solution_lesson_node_00013
+    """
+
+    def __init__(self, backbone, num_classes=None, **kwargs):
+        super().__init__(backbone, num_classes, **kwargs)
+        # Global head: Adaptive Pooling -> Flatten -> Linear
+        # ResNet50-FPN top feature map has 256 channels
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.global_classifier = nn.Linear(256, 4)  # 4 study-level classes
+
+    def forward(self, images, targets=None):
+        if self.training:
+            if targets is None:
+                torch._assert(False, "targets should not be none when in training mode")
+            for target in targets:
+                boxes = target["boxes"]
+                if isinstance(boxes, torch.Tensor):
+                    torch._assert(
+                        len(boxes.shape) == 2 and boxes.shape[-1] == 4,
+                        "Expected target boxes to be a tensor of shape [N, 4]",
+                    )
+
+        original_image_sizes = []
+        for img in images:
+            val = img.shape[-2:]
+            torch._assert(
+                len(val) == 2,
+                "expecting the last two dimensions of the Tensor to be H and W",
+            )
+            original_image_sizes.append((val[0], val[1]))
+
+        images, targets = self.transform(images, targets)
+        features = self.backbone(images.tensors)
+
+        # Global Classification Logic
+        # FPN returns OrderedDict with keys '0', '1', '2', '3'.
+        # '3' corresponds to the highest level (lowest resolution) features.
+        global_feat = features["3"]
+        global_feat = self.global_avg_pool(global_feat)
+        global_feat = torch.flatten(global_feat, 1)
+        global_logits = self.global_classifier(global_feat)
+
+        if isinstance(features, torch.Tensor):
+            features = OrderedDict([("0", features)])
+
+        proposals, proposal_losses = self.rpn(images, features, targets)
+        detections, detector_losses = self.roi_heads(
+            features, proposals, images.image_sizes, targets
+        )
+
+        losses = {}
+        losses.update(detector_losses)
+        losses.update(proposal_losses)
+
+        if self.training:
+            # Compute auxiliary global classification loss
+            study_labels = torch.stack([t["study_label"] for t in targets])
+            global_loss = F.cross_entropy(global_logits, study_labels)
+
+            # Weighted combination
+            losses["loss_global_classifier"] = global_loss * Config.LAMBDA_GLOBAL_CLS
+            return losses
+
+        return detections
+
+
+def get_model(num_classes):
+    """
+    Initializes Multi-Task Faster R-CNN.
+    """
+    # Use ResNet50-FPN backbone
+    backbone = resnet_fpn_backbone("resnet50", weights="DEFAULT")
+
+    # Initialize Multi-Task model
+    # Cite solution_lesson_node_00005: Increase RPN capacity
+    model = MultiTaskFasterRCNN(
+        backbone,
+        num_classes,
+        rpn_post_nms_top_n_train=3000,
+        box_detections_per_img=200,
+    )
+
+    return model
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Failure Analysis
+    perform_failure_analysis(model, val_loader, device)
+
+    # 6. Inference and Submission
+    engine.inference(test_loader, best_model_path)
+=======
+    # Failure Analysis
+    perform_failure_analysis(model, val_loader, device)
+
+    # 6. Inference and Submission
+    if map_score > 0.43290277912681663:
+        engine.inference(test_loader, best_model_path)
+    else:
+        print(f"Validation mAP {map_score} did not meet threshold 0.4329. Skipping submission.")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,395 @@
+To optimize performance, I will implement the following changes based on the provided lessons:
+
+1.  **Full Dataset Training (Cite solution_lesson_node_00060):** I will remove the `DEBUG_SAMPLE_SIZE` constraint in `runfile.py`. The previous solution artificially limited training data to 500k rows via uniform sampling, which discards the vast majority of the minority class (contact events). Training on the full dataset with targeted undersampling (handled in `model_factory.py`) is essential for recovering recall.
+
+2.  **Exponential Temporal Pyramids (Cite solution_lesson_node_00086, solution_lesson_node_00042):** I will replace the "instantaneous physics" features (like Jerk and Energy) with flattened temporal windows (lags).
+    *   **Stream A (Interaction):** I will add lags ($t \in \{-15, \dots, 15\}$) to `distance` and `max_iou`. This allows the GBDT to learn the trajectory of convergence (looming) rather than just the current state.
+    *   **Stream B (Impact):** I will add lags to `v_surge`, `v_sway`, `speed`, and `acceleration`. This provides the model with the temporal context required to identify the deceleration profile of a fall/impact, which instantaneous derivatives failed to capture.
+
+3.  **Refined Feature Sets (Cite solution_lesson_node_00075, solution_lesson_node_00080):**
+    *   **Stream A:** I will prioritize `closure_rate` calculated via finite differences of position (robust to sensor noise) and remove the heuristic "consistency score".
+    *   **Stream B:** I will enforce Ego-Centric Invariance by using `v_surge` and `v_sway` (projected velocity) and removing absolute coordinates (`x`, `y`), but I will rely on the lags of these velocities rather than calculating noisy higher-order derivatives like Jerk.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Feature Engineering Configuration
+    # =========================================================================
+    # Visual Consensus Pyramids Lags
+    VISUAL_LAGS = [0, 4, 8, 15]
+
+    # Stream A: Interaction Model (Player-Player)
+    # Philosophy: Robust Consistency (Low-Order Physics + Visual Consensus)
+    # Features focus on spatial convergence and gating perspective artifacts.
+    FEATURES_STREAM_A = [
+        "distance",
+        "closure_rate",
+        "visual_looming_rate",
+        "consistency_score",
+        "speed_p1",
+        "speed_p2",
+        "accel_p1",
+        "accel_p2",
+        # Visual Pyramid Features (Consensus)
+        "max_iou_t0",
+        "min_iou_t0",
+        "iou_diff_t0",
+        "max_iou_t4",
+        "min_iou_t4",
+        "iou_diff_t4",
+        "max_iou_t8",
+        "min_iou_t8",
+        "iou_diff_t8",
+        "max_iou_t15",
+        "min_iou_t15",
+        "iou_diff_t15",
+    ]
+
+    # Stream B: Impact Model (Player-Ground)
+    # Philosophy: Sensitive Dynamics (High-Order Physics / Rotational)
+    # Features focus on inertial signatures of falls, excluding absolute position/orientation.
+    FEATURES_STREAM_B = [
+        "speed",
+        "acceleration",
+        "ego_accel_surge",
+        "ego_accel_sway",
+        "ego_jerk_surge",
+        "ego_jerk_sway",
+        "surge_energy",
+        "sway_energy",
+    ]
+=======
+    # =========================================================================
+    # Feature Engineering Configuration
+    # =========================================================================
+    # Exponential Temporal Lags (Cite solution_lesson_node_00042)
+    LAG_STEPS = [-15, -8, -4, -2, -1, 1, 2, 4, 8, 15]
+
+    # Stream A: Interaction Model (Player-Player)
+    # Philosophy: Relational Dynamics + Visual Trajectory (Cite solution_lesson_node_00086)
+    _feats_a_base = [
+        "distance", "closure_rate", "speed_p1", "speed_p2", "accel_p1", "accel_p2",
+        "max_iou_t0", "min_iou_t0", "iou_diff_t0"
+    ]
+    # Add lags for critical interaction features
+    FEATURES_STREAM_A = _feats_a_base + \
+        [f"distance_lag{k}" for k in LAG_STEPS] + \
+        [f"max_iou_lag{k}" for k in LAG_STEPS]
+
+    # Stream B: Impact Model (Player-Ground)
+    # Philosophy: Ego-Centric Invariance + Temporal Context (Cite solution_lesson_node_00075)
+    _feats_b_base = ["v_surge", "v_sway", "speed", "acceleration"]
+    # Add lags for all kinematic features to capture event shape
+    FEATURES_STREAM_B = _feats_b_base + \
+        [f"{col}_lag{k}" for col in _feats_b_base for k in LAG_STEPS]
+>>>>>>> REPLACE
+```
+
+```diff
+library/features.py
+<<<<<<< SEARCH
+    def _compute_stream_a(self, df, df_helmets):
+        """
+        Stream A: Interaction Model (Player-Player)
+        Robust Consistency: Positional Differentials + Visual Consensus
+        """
+        # Filter for Player-Player interactions
+        df_a = df[df["nfl_player_id_2"] != "G"].copy()
+
+        if len(df_a) == 0:
+            return pd.DataFrame(), np.array([]), np.array([])
+
+        # 1. Positional Differentials
+        # Calculate Distance
+        df_a["distance"] = np.sqrt(
+            (df_a["x_position_p1"] - df_a["x_position_p2"]) ** 2
+            + (df_a["y_position_p1"] - df_a["y_position_p2"]) ** 2
+        )
+
+        # Calculate Closure Rate (Time Derivative of Distance)
+        # Sort by play and step to ensure correct diff
+        df_a = df_a.sort_values(
+            ["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"]
+        )
+
+        # Group shift
+        grp = df_a.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])
+        df_a["prev_dist"] = grp["distance"].shift(1)
+        # Closure rate: Positive means getting closer. -(d_t - d_{t-1}) / 0.1
+        df_a["closure_rate"] = -(df_a["distance"] - df_a["prev_dist"]) / 0.1
+        df_a["closure_rate"] = df_a["closure_rate"].fillna(0)
+
+        # 2. Visual Features
+        # Compute IoU for Sideline and Endzone
+        iou_sideline = self._compute_iou(df_a, df_helmets, "Sideline")
+        iou_endzone = self._compute_iou(df_a, df_helmets, "Endzone")
+
+        df_a["iou_sideline"] = iou_sideline
+        df_a["iou_endzone"] = iou_endzone
+
+        # Visual Consensus
+        df_a["max_iou_t0"] = np.maximum(df_a["iou_sideline"], df_a["iou_endzone"])
+        df_a["min_iou_t0"] = np.minimum(df_a["iou_sideline"], df_a["iou_endzone"])
+        df_a["iou_diff_t0"] = np.abs(df_a["iou_sideline"] - df_a["iou_endzone"])
+
+        # 3. Visual Pyramids (Lags)
+        # We need to re-group because we just added columns
+        grp = df_a.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])
+
+        for lag in self.config.VISUAL_LAGS:
+            if lag == 0:
+                continue
+
+            # Future and Past lags? Config says just lags, usually implies past or centered.
+            # Given "Pyramids" usually implies surrounding context.
+            # Let's assume past lags for causality or symmetric if allowed.
+            # Description mentions t, t+4, t+8... but standard tracking is usually causal or symmetric window.
+            # Let's use symmetric shifts if possible, or just past.
+            # "Pyramids at sparse lags t, t+/-4..." -> Symmetric.
+
+            # Forward (Future)
+            df_a[f"max_iou_t{lag}"] = (
+                grp["max_iou_t0"].shift(-lag).fillna(-1)
+            )  # Sentinel -1 or 0
+            df_a[f"min_iou_t{lag}"] = grp["min_iou_t0"].shift(-lag).fillna(-1)
+            df_a[f"iou_diff_t{lag}"] = grp["iou_diff_t0"].shift(-lag).fillna(-1)
+
+            # We could also do backward, but Config just lists t4, t8. I'll map t4 to +4 (future) or just use one direction.
+            # Given "Predict moments of contact", future info is available in post-processing/offline.
+            # I will implement +lag (future) as it's most predictive of *impending* contact.
+
+        # 4. Visual Looming & Consistency
+        # Looming: Rate of change of Max IoU
+        df_a["prev_max_iou"] = grp["max_iou_t0"].shift(1).fillna(0)
+        df_a["visual_looming_rate"] = (df_a["max_iou_t0"] - df_a["prev_max_iou"]) / 0.1
+
+        # Consistency Score: Normalized Closure Rate - Looming
+        # Normalize closure rate roughly to 0-1 range?
+        # Or just raw difference. "Large divergence indicates phantom".
+        # Let's use raw difference.
+        df_a["consistency_score"] = df_a["closure_rate"] - (
+            df_a["visual_looming_rate"] * 10
+        )  # Scale factor heuristic
+
+        # 5. Kinematics (Renaming/Selecting)
+        df_a["speed_p1"] = df_a["speed_p1"].fillna(0)
+        df_a["speed_p2"] = df_a["speed_p2"].fillna(0)
+        df_a["accel_p1"] = df_a["acceleration_p1"].fillna(0)
+        df_a["accel_p2"] = df_a["acceleration_p2"].fillna(0)
+
+        # Select Features
+        features = self.config.FEATURES_STREAM_A
+        # Ensure all features exist
+        for col in features:
+            if col not in df_a.columns:
+                df_a[col] = 0.0
+
+        X = df_a[features].copy()
+        y = df_a["contact"].values.astype(int)
+        ids = df_a["contact_id"].values
+
+        return X, y, ids
+
+    def _compute_stream_b(self, df):
+        """
+        Stream B: Impact Model (Player-Ground)
+        Sensitive Dynamics: High-Order Physics / Rotational Differentials
+        """
+        # Filter for Player-Ground interactions
+        df_b = df[df["nfl_player_id_2"] == "G"].copy()
+
+        if len(df_b) == 0:
+            return pd.DataFrame(), np.array([]), np.array([])
+
+        # 1. Rotational Physics
+        # Convert degrees to radians
+        # direction: 0..360, orientation: 0..360
+        # We need angle of motion relative to orientation
+        # Note: In NFL data, 0 is usually Y-axis (North), 90 is X-axis (East).
+        # But relative angle difference is invariant to the zero reference.
+
+        rad_dir = np.radians(df_b["direction_p1"].fillna(0))
+        rad_orient = np.radians(df_b["orientation_p1"].fillna(0))
+        theta = rad_dir - rad_orient
+
+        speed = df_b["speed_p1"].fillna(0)
+
+        # Surge: Forward/Backward velocity relative to facing
+        df_b["v_surge"] = speed * np.cos(theta)
+        # Sway: Left/Right velocity relative to facing
+        df_b["v_sway"] = speed * np.sin(theta)
+
+        # 2. Differentials (Ego-Accel, Ego-Jerk)
+        df_b = df_b.sort_values(["game_play", "nfl_player_id_1", "step"])
+        grp = df_b.groupby(["game_play", "nfl_player_id_1"])
+
+        # Ego-Acceleration
+        df_b["prev_v_surge"] = grp["v_surge"].shift(1).fillna(0)
+        df_b["prev_v_sway"] = grp["v_sway"].shift(1).fillna(0)
+
+        df_b["ego_accel_surge"] = (df_b["v_surge"] - df_b["prev_v_surge"]) / 0.1
+        df_b["ego_accel_sway"] = (df_b["v_sway"] - df_b["prev_v_sway"]) / 0.1
+
+        # Ego-Jerk
+        df_b["prev_acc_surge"] = grp["ego_accel_surge"].shift(1).fillna(0)
+        df_b["prev_acc_sway"] = grp["ego_accel_sway"].shift(1).fillna(0)
+
+        df_b["ego_jerk_surge"] = (
+            df_b["ego_accel_surge"] - df_b["prev_acc_surge"]
+        ) / 0.1
+        df_b["ego_jerk_sway"] = (df_b["ego_accel_sway"] - df_b["prev_acc_sway"]) / 0.1
+
+        # 3. Energy
+        df_b["surge_energy"] = df_b["v_surge"] ** 2
+        df_b["sway_energy"] = df_b["v_sway"] ** 2
+
+        # 4. Invariant Baseline
+        df_b["speed"] = speed
+        df_b["acceleration"] = df_b["acceleration_p1"].fillna(0)
+
+        # Select Features
+        features = self.config.FEATURES_STREAM_B
+        for col in features:
+            if col not in df_b.columns:
+                df_b[col] = 0.0
+
+        X = df_b[features].copy()
+        y = df_b["contact"].values.astype(int)
+        ids = df_b["contact_id"].values
+
+        return X, y, ids
+=======
+    def _add_lags(self, df, cols, lags, groupby_cols):
+        """Helper to add lag features."""
+        grp = df.groupby(groupby_cols)
+        for col in cols:
+            for lag in lags:
+                # Negative lag = past, Positive lag = future
+                # shift(k) shifts data down k spots (t takes value from t-k)
+                # We want feature at t-k. So we shift(k).
+                # We want feature at t+k. So we shift(-k).
+                # Our LAG_STEPS are [-15, ..., 15].
+                # If lag is -15 (past), we want shift(15).
+                # If lag is 15 (future), we want shift(-15).
+                
+                # Note: shift(1) puts t-1 value at t.
+                shift_val = -lag 
+                # If lag is -1 (past), we want value from t-1. shift(1) brings t-1 to t.
+                # So shift(-lag) is correct?
+                # lag = -1. shift(1). Correct.
+                # lag = 1 (future). shift(-1). Correct.
+                
+                df[f"{col}_lag{lag}"] = grp[col].shift(-lag).fillna(0)
+        return df
+
+    def _compute_stream_a(self, df, df_helmets):
+        """
+        Stream A: Interaction Model (Player-Player)
+        Relational Dynamics + Visual Trajectory
+        """
+        df_a = df[df["nfl_player_id_2"] != "G"].copy()
+        if len(df_a) == 0:
+            return pd.DataFrame(), np.array([]), np.array([])
+
+        # 1. Base Features
+        df_a["distance"] = np.sqrt(
+            (df_a["x_position_p1"] - df_a["x_position_p2"]) ** 2
+            + (df_a["y_position_p1"] - df_a["y_position_p2"]) ** 2
+        )
+        
+        # Sort for temporal ops
+        df_a = df_a.sort_values(["game_play", "nfl_player_id_1", "nfl_player_id_2", "step"])
+        grp = df_a.groupby(["game_play", "nfl_player_id_1", "nfl_player_id_2"])
+        
+        # Finite Difference Closure Rate (Cite solution_lesson_node_00080)
+        df_a["prev_dist"] = grp["distance"].shift(1)
+        df_a["closure_rate"] = -(df_a["distance"] - df_a["prev_dist"]) / 0.1
+        df_a["closure_rate"] = df_a["closure_rate"].fillna(0)
+
+        # Kinematics
+        df_a["speed_p1"] = df_a["speed_p1"].fillna(0)
+        df_a["speed_p2"] = df_a["speed_p2"].fillna(0)
+        df_a["accel_p1"] = df_a["acceleration_p1"].fillna(0)
+        df_a["accel_p2"] = df_a["acceleration_p2"].fillna(0)
+
+        # 2. Visual Features
+        iou_sideline = self._compute_iou(df_a, df_helmets, "Sideline")
+        iou_endzone = self._compute_iou(df_a, df_helmets, "Endzone")
+        
+        df_a["max_iou_t0"] = np.maximum(iou_sideline, iou_endzone)
+        df_a["min_iou_t0"] = np.minimum(iou_sideline, iou_endzone)
+        df_a["iou_diff_t0"] = np.abs(iou_sideline - iou_endzone)
+
+        # 3. Add Lags (Cite solution_lesson_node_00086)
+        # We add lags for Distance (interaction trajectory) and Max IoU (visual trajectory)
+        lag_cols = ["distance", "max_iou_t0"]
+        df_a = self._add_lags(df_a, lag_cols, self.config.LAG_STEPS, 
+                              ["game_play", "nfl_player_id_1", "nfl_player_id_2"])
+
+        # Select Features
+        features = self.config.FEATURES_STREAM_A
+        for col in features:
+            if col not in df_a.columns:
+                df_a[col] = 0.0
+
+        X = df_a[features].copy()
+        y = df_a["contact"].values.astype(int)
+        ids = df_a["contact_id"].values
+        return X, y, ids
+
+    def _compute_stream_b(self, df):
+        """
+        Stream B: Impact Model (Player-Ground)
+        Ego-Centric Invariance + Temporal Context
+        """
+        df_b = df[df["nfl_player_id_2"] == "G"].copy()
+        if len(df_b) == 0:
+            return pd.DataFrame(), np.array([]), np.array([])
+
+        # 1. Ego-Centric Projection (Cite solution_lesson_node_00075)
+        rad_dir = np.radians(df_b["direction_p1"].fillna(0))
+        rad_orient = np.radians(df_b["orientation_p1"].fillna(0))
+        theta = rad_dir - rad_orient
+        speed = df_b["speed_p1"].fillna(0)
+
+        df_b["v_surge"] = speed * np.cos(theta)
+        df_b["v_sway"] = speed * np.sin(theta)
+        df_b["speed"] = speed
+        df_b["acceleration"] = df_b["acceleration_p1"].fillna(0)
+
+        # 2. Add Lags (Cite solution_lesson_node_00086)
+        # Instead of instantaneous jerk/energy, we provide the window of velocity/accel
+        df_b = df_b.sort_values(["game_play", "nfl_player_id_1", "step"])
+        lag_cols = ["v_surge", "v_sway", "speed", "acceleration"]
+        df_b = self._add_lags(df_b, lag_cols, self.config.LAG_STEPS, 
+                              ["game_play", "nfl_player_id_1"])
+
+        # Select Features
+        features = self.config.FEATURES_STREAM_B
+        for col in features:
+            if col not in df_b.columns:
+                df_b[col] = 0.0
+
+        X = df_b[features].copy()
+        y = df_b["contact"].values.astype(int)
+        ids = df_b["contact_id"].values
+        return X, y, ids
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Enforce fast baseline execution by limiting training samples
+    # 500k samples is a good balance between speed and performance for XGBoost
+    Config.DEBUG_SAMPLE_SIZE = 500000
+
+    print("Initializing Pipeline...")
+=======
+    # Use full dataset to prevent minority class loss (Cite solution_lesson_node_00060)
+    Config.DEBUG_SAMPLE_SIZE = None
+
+    print("Initializing Pipeline...")
+>>>>>>> REPLACE
+```

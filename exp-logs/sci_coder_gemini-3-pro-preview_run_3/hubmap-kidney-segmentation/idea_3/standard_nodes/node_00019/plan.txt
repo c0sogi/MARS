@@ -1,0 +1,222 @@
+The issue is that the final validation metric is being calculated by averaging the Dice scores of individual image tiles (excluding background regions) from a subsampled dataset, rather than evaluating the Dice score on the fully reconstructed validation images. This introduces bias and does not represent the true performance of the model on the task.
+
+To fix this, I will modify `runfile.py` to:
+1.  **Remove Validation Subsampling**: Ensure the validation process considers the entire validation set.
+2.  **Implement Full Image Reconstruction**: Replace the tile-based validation loop with an image-based inference loop using `predict_slide` (imported from `library.inference`). This function stitches predicted tiles back into a full-resolution mask.
+3.  **Compute Image-Level Dice**: Calculate the Dice coefficient between the reconstructed prediction mask and the full ground truth mask for each validation image, then average these scores to produce the final metric.
+
+I will also update the imports to include `predict_slide` and `rle_decode`.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.utils import set_seed, get_logger, compute_dice_score
+from library.dataset import prepare_datasets
+from library.model import build_model
+from library.losses import DeepSupervisionLoss
+from library.training import Trainer
+from library.inference import run_inference
+=======
+from library.utils import set_seed, get_logger, compute_dice_score, rle_decode
+from library.dataset import prepare_datasets
+from library.model import build_model
+from library.losses import DeepSupervisionLoss
+from library.training import Trainer
+from library.inference import run_inference, predict_slide
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    MAX_TRAIN_TILES = 4000
+    MAX_VAL_TILES = 1000
+
+    # 2. Prepare Data
+    logger.info("Preparing datasets...")
+    # Load cached data if available, otherwise generate
+    train_dataset, val_dataset = prepare_datasets(
+        tile_size=TILE_SIZE,
+        overlap=0.25,  # Reduced overlap for training efficiency
+        do_normalization=True,
+        load_cached_data=True,
+        debug=False,
+    )
+
+    # Subsample datasets to ensure runtime < 2 hours
+    if len(train_dataset.tile_df) > MAX_TRAIN_TILES:
+        logger.info(f"Subsampling training data to {MAX_TRAIN_TILES} tiles.")
+        train_dataset.tile_df = train_dataset.tile_df.sample(
+            n=MAX_TRAIN_TILES, random_state=42
+        ).reset_index(drop=True)
+
+    if len(val_dataset.tile_df) > MAX_VAL_TILES:
+        logger.info(f"Subsampling validation data to {MAX_VAL_TILES} tiles.")
+        val_dataset.tile_df = val_dataset.tile_df.sample(
+            n=MAX_VAL_TILES, random_state=42
+        ).reset_index(drop=True)
+=======
+    MAX_TRAIN_TILES = 4000
+
+    # 2. Prepare Data
+    logger.info("Preparing datasets...")
+    # Load cached data if available, otherwise generate
+    train_dataset, val_dataset = prepare_datasets(
+        tile_size=TILE_SIZE,
+        overlap=0.25,  # Reduced overlap for training efficiency
+        do_normalization=True,
+        load_cached_data=True,
+        debug=False,
+    )
+
+    # Subsample datasets to ensure runtime < 2 hours
+    if len(train_dataset.tile_df) > MAX_TRAIN_TILES:
+        logger.info(f"Subsampling training data to {MAX_TRAIN_TILES} tiles.")
+        train_dataset.tile_df = train_dataset.tile_df.sample(
+            n=MAX_TRAIN_TILES, random_state=42
+        ).reset_index(drop=True)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 6. Final Validation & Failure Analysis
+    logger.info("Loading best model for analysis...")
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    model.eval()
+
+    val_dice_scores = []
+
+    # We need to map predictions back to metadata for failure analysis.
+    # val_loader has shuffle=False, so order matches val_dataset.tile_df
+    val_metadata_df = val_dataset.tile_df.copy()
+
+    # Load global metadata to merge features
+    global_meta_df = pd.read_csv("./metadata/val.csv")
+
+    logger.info("Running validation inference...")
+    with torch.no_grad():
+        for images, masks in val_loader:
+            images = images.to(device)
+            masks = masks.cpu().numpy()
+
+            # Inference
+            outputs = model(images)
+            preds = torch.sigmoid(outputs)
+            preds_bin = (preds > 0.5).float().cpu().numpy()
+
+            # Compute Dice per sample
+            for i in range(len(masks)):
+                # masks is (B, H, W), preds_bin is (B, 1, H, W)
+                score = compute_dice_score(masks[i], preds_bin[i, 0])
+                val_dice_scores.append(score)
+
+    # Calculate Final Metric
+    final_metric = np.mean(val_dice_scores)
+    print(f"Final Validation Metric: {final_metric:.16f}")
+
+    # Failure Analysis
+    logger.info("Performing Failure Analysis...")
+    val_metadata_df["dice"] = val_dice_scores
+    val_metadata_df["error"] = 1.0 - val_metadata_df["dice"]
+
+    # Merge with global metadata to get patient/image features
+    # val_metadata_df has 'id' column
+    analysis_df = pd.merge(val_metadata_df, global_meta_df, on="id", how="left")
+
+    features_to_analyze = [
+        "age",
+        "weight_kilograms",
+        "bmi_kg/m^2",
+        "percent_cortex",
+        "percent_medulla",
+    ]
+
+    print("Failure Analysis - Correlation with Error Magnitude:")
+    for feature in features_to_analyze:
+        if feature in analysis_df.columns:
+            # Drop NaNs for correlation calculation
+            valid_data = analysis_df[[feature, "error"]].dropna()
+            if len(valid_data) > 1:
+                corr = np.corrcoef(valid_data[feature], valid_data["error"])[0, 1]
+                print(f"{feature}: {corr:.4f}")
+            else:
+                print(f"{feature}: Not enough data")
+        else:
+            print(f"{feature}: Feature not found")
+=======
+    # 6. Final Validation & Failure Analysis
+    logger.info("Loading best model for analysis...")
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    model.eval()
+
+    val_dice_scores = []
+
+    # Use the metadata dataframe which contains image-level info (paths, RLEs)
+    val_meta_df = val_dataset.metadata_df.copy()
+
+    logger.info("Running validation inference (Full Image Reconstruction)...")
+
+    # Iterate over each validation image to compute image-level Dice
+    for idx, row in val_meta_df.iterrows():
+        image_id = row['id']
+        h, w = int(row['height_pixels']), int(row['width_pixels'])
+
+        # 1. Run Inference (Stitch tiles)
+        pred_rle = predict_slide(
+            model=model,
+            image_metadata=row,
+            tile_size=TILE_SIZE,
+            overlap=0.5,
+            batch_size=BATCH_SIZE,
+            device=device,
+            do_normalization=True
+        )
+
+        # 2. Decode Masks
+        pred_mask = rle_decode(pred_rle, (h, w))
+
+        gt_rle = row['encoding']
+        gt_mask = rle_decode(gt_rle, (h, w))
+
+        # 3. Compute Dice
+        score = compute_dice_score(gt_mask, pred_mask)
+        val_dice_scores.append(score)
+        logger.info(f"Image {image_id} Val Dice: {score:.4f}")
+
+    # Calculate Final Metric
+    final_metric = np.mean(val_dice_scores)
+    print(f"Final Validation Metric: {final_metric:.16f}")
+
+    # Failure Analysis
+    logger.info("Performing Failure Analysis...")
+    val_meta_df["dice"] = val_dice_scores
+    val_meta_df["error"] = 1.0 - val_meta_df["dice"]
+
+    features_to_analyze = [
+        "age",
+        "weight_kilograms",
+        "bmi_kg/m^2",
+        "percent_cortex",
+        "percent_medulla",
+    ]
+
+    print("Failure Analysis - Correlation with Error Magnitude:")
+    for feature in features_to_analyze:
+        if feature in val_meta_df.columns:
+            # Drop NaNs for correlation calculation
+            valid_data = val_meta_df[[feature, "error"]].dropna()
+            if len(valid_data) > 1:
+                # Check for constant values to avoid RuntimeWarning
+                if valid_data[feature].std() > 0 and valid_data["error"].std() > 0:
+                    corr = np.corrcoef(valid_data[feature], valid_data["error"])[0, 1]
+                    print(f"{feature}: {corr:.4f}")
+                else:
+                    print(f"{feature}: Constant value (cannot compute correlation)")
+            else:
+                print(f"{feature}: Not enough data")
+        else:
+            print(f"{feature}: Feature not found")
+>>>>>>> REPLACE
+```

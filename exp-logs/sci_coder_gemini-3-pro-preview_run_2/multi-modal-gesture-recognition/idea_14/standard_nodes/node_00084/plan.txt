@@ -1,0 +1,302 @@
+Based on the analysis of the previous failure (Idea 14) and the lessons learned (specifically `solution_lesson_node_00082` and `solution_lesson_node_00075`), the catastrophic drop in performance (0.83 vs 0.085 error rate) was caused by the removal of explicit supervision for the auxiliary boundary/transition channel. The Gated TCN architecture requires this explicit signal to learn temporal structure effectively.
+
+My strategy is to:
+1.  **Restore Explicit Boundary Supervision**: Modify `DeepSupervisionLoss` to calculate a Binary Cross Entropy (BCE) loss on the boundary logits, deriving ground truth boundaries from the change in class labels (Cite `solution_lesson_node_00082`).
+2.  **Enable Logit Output for Boundaries**: Update the `BiLSTMEncoder` to output raw logits for the transition head instead of probabilities (removing the sigmoid), allowing for numerically stable `BCEWithLogitsLoss` and consistent concatenation with class logits (Cite `solution_lesson_node_00075`).
+3.  **Optimize Training Duration**: Increase the training epochs from 15 to 50 and patience to 10, as the previous run was extremely fast (47s) and underfitted.
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+class DeepSupervisionLoss(nn.Module):
+    """
+    Aggregates losses from all model stages (Encoder, Refinement, Sharpening).
+    Handles auxiliary channels (transition head) by slicing logits.
+    """
+
+    def __init__(self, num_classes: int = 21, smoothing_weight: float = 0.15):
+        super(DeepSupervisionLoss, self).__init__()
+        self.cls_loss_fn = MaskedWeightedCrossEntropy(num_classes=num_classes)
+        self.smooth_loss_fn = TMSELoss(threshold=0.15)
+        self.smoothing_weight = smoothing_weight
+        self.num_classes = num_classes
+
+    def forward(
+        self, outputs: list, targets: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            outputs: List of tensors from the model stages.
+                     Stage 1 & 2: (B, NumClasses + 1, T)
+                     Stage 3: (B, NumClasses, T)
+            targets: (B, T)
+            mask: (B, T)
+        """
+        total_loss = 0.0
+
+        for output in outputs:
+            # Slice the first 'num_classes' channels for classification
+            # This ignores the auxiliary 'transition' channel in Stage 1 & 2
+            cls_logits = output[:, : self.num_classes, :]
+
+            # 1. Classification Loss
+            c_loss = self.cls_loss_fn(cls_logits, targets, mask)
+
+            # 2. Smoothing Loss (T-MSE)
+            # Apply Softmax to get probabilities as per requirement
+            probs = F.softmax(cls_logits, dim=1)
+            s_loss = self.smooth_loss_fn(probs, mask)
+
+            # Aggregate
+            total_loss += c_loss + (self.smoothing_weight * s_loss)
+
+        return total_loss
+=======
+class DeepSupervisionLoss(nn.Module):
+    """
+    Aggregates losses from all model stages (Encoder, Refinement, Sharpening).
+    Handles auxiliary channels (transition head) by slicing logits.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 21,
+        smoothing_weight: float = 0.15,
+        boundary_weight: float = 1.0,
+    ):
+        super(DeepSupervisionLoss, self).__init__()
+        self.cls_loss_fn = MaskedWeightedCrossEntropy(num_classes=num_classes)
+        self.smooth_loss_fn = TMSELoss(threshold=0.15)
+        self.bce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        self.smoothing_weight = smoothing_weight
+        self.boundary_weight = boundary_weight
+        self.num_classes = num_classes
+
+    def get_boundary_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Generates boundary targets from class labels.
+        Boundary = 1 if label changes from previous frame, 0 otherwise.
+        """
+        b_targets = torch.zeros_like(targets, dtype=torch.float)
+        # Compare t with t-1. First frame is 0.
+        # Note: targets has -100 for padding, but we mask the loss anyway.
+        diff = targets[:, 1:] != targets[:, :-1]
+        b_targets[:, 1:] = diff.float()
+        return b_targets
+
+    def forward(
+        self, outputs: list, targets: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            outputs: List of tensors from the model stages.
+                     Stage 1 & 2: (B, NumClasses + 1, T)
+                     Stage 3: (B, NumClasses, T)
+            targets: (B, T)
+            mask: (B, T)
+        """
+        total_loss = 0.0
+        b_targets = self.get_boundary_targets(targets)
+
+        for i, output in enumerate(outputs):
+            # Check if this stage has auxiliary boundary channel
+            has_boundary = output.shape[1] == (self.num_classes + 1)
+
+            if has_boundary:
+                cls_logits = output[:, : self.num_classes, :]
+                bnd_logits = output[:, self.num_classes, :]  # (B, T)
+            else:
+                cls_logits = output
+
+            # 1. Classification Loss
+            c_loss = self.cls_loss_fn(cls_logits, targets, mask)
+
+            # 2. Smoothing Loss (T-MSE)
+            probs = F.softmax(cls_logits, dim=1)
+            s_loss = self.smooth_loss_fn(probs, mask)
+
+            stage_loss = c_loss + (self.smoothing_weight * s_loss)
+
+            # 3. Boundary Loss (if applicable)
+            if has_boundary:
+                # BCE with Logits
+                b_loss = self.bce_loss_fn(bnd_logits, b_targets)
+                # Apply mask
+                b_loss = (b_loss * mask).sum() / (mask.sum() + 1e-8)
+                stage_loss += self.boundary_weight * b_loss
+
+            # Aggregate
+            total_loss += stage_loss
+
+        return total_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    weight_decay = 1e-4
+    smoothing_weight = 0.15
+
+    # Inference
+=======
+    weight_decay = 1e-4
+    smoothing_weight = 0.15
+    boundary_weight = 1.0
+
+    # Inference
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    epochs = 40
+    lr = 1e-3
+=======
+    epochs = 50
+    lr = 1e-3
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, x):
+        # x: (B, C, T) -> Permute to (B, T, C)
+        x = x.permute(0, 2, 1)
+
+        feat, _ = self.lstm(x)  # (B, T, 2*H)
+
+        cls_logits = self.cls_head(feat)  # (B, T, num_classes)
+        trans_logits = self.trans_head(feat)  # (B, T, 1)
+        trans_prob = torch.sigmoid(trans_logits)
+
+        # Concatenate: (B, T, num_classes + 1)
+        out = torch.cat([cls_logits, trans_prob], dim=2)
+
+        # Permute back to (B, C, T)
+        out = out.permute(0, 2, 1)
+        return out
+=======
+    def forward(self, x):
+        # x: (B, C, T) -> Permute to (B, T, C)
+        x = x.permute(0, 2, 1)
+
+        feat, _ = self.lstm(x)  # (B, T, 2*H)
+
+        cls_logits = self.cls_head(feat)  # (B, T, num_classes)
+        trans_logits = self.trans_head(feat)  # (B, T, 1)
+        # We output logits for both class and transition to be consistent
+        # and allow BCEWithLogitsLoss
+
+        # Concatenate: (B, T, num_classes + 1)
+        out = torch.cat([cls_logits, trans_logits], dim=2)
+
+        # Permute back to (B, C, T)
+        out = out.permute(0, 2, 1)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Loss
+    criterion = DeepSupervisionLoss(
+        num_classes=Config.num_classes, smoothing_weight=Config.smoothing_weight
+    ).to(device)
+=======
+    # Loss
+    criterion = DeepSupervisionLoss(
+        num_classes=Config.num_classes,
+        smoothing_weight=Config.smoothing_weight,
+        boundary_weight=Config.boundary_weight,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+def train_model(
+    epochs=40,
+    batch_size=16,
+    lr=1e-3,
+    weight_decay=1e-4,
+    smoothing_weight=0.15,
+    patience=5,
+    median_window=7,
+    augment=True,
+    working_dir="./working/idea_14",
+    load_cached_data=True,
+):
+=======
+def train_model(
+    epochs=40,
+    batch_size=16,
+    lr=1e-3,
+    weight_decay=1e-4,
+    smoothing_weight=0.15,
+    boundary_weight=1.0,
+    patience=5,
+    median_window=7,
+    augment=True,
+    working_dir="./working/idea_14",
+    load_cached_data=True,
+):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    # 2. Model Setup
+    model = GLT_CRCN().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = DeepSupervisionLoss(
+        num_classes=21, smoothing_weight=smoothing_weight
+    ).to(device)
+=======
+    # 2. Model Setup
+    model = GLT_CRCN().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = DeepSupervisionLoss(
+        num_classes=21,
+        smoothing_weight=smoothing_weight,
+        boundary_weight=boundary_weight,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    best_model_path = train_model(
+        epochs=15,
+        batch_size=16,
+        lr=1e-3,
+        weight_decay=1e-4,
+        smoothing_weight=0.15,
+        patience=5,
+        median_window=7,
+        augment=True,
+        working_dir=working_dir,
+        load_cached_data=True,
+    )
+=======
+    best_model_path = train_model(
+        epochs=50,
+        batch_size=16,
+        lr=1e-3,
+        weight_decay=1e-4,
+        smoothing_weight=0.15,
+        boundary_weight=1.0,
+        patience=10,
+        median_window=7,
+        augment=True,
+        working_dir=working_dir,
+        load_cached_data=True,
+    )
+>>>>>>> REPLACE
+```

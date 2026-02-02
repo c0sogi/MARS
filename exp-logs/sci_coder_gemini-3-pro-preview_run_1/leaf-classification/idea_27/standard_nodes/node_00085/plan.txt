@@ -1,0 +1,270 @@
+The strategy focuses on reverting the flawed "Dual Expert" ensemble to a pure, high-precision **Oracle Approximating Shrinkage (OAS)** classifier, as recommended by the lessons.
+
+**Implementation Strategy:**
+1.  **Configuration**: Update the working directory to `idea_28` to ensure a fresh cache and avoid contamination from the failed experiment.
+2.  **Model Architecture**: Replace the `DualExpertLDA` with a `OASLinearDiscriminant`. This removes the "Empirical Covariance" expert which was identified as the source of noise and degradation (Cite solution_lesson_node_00083).
+3.  **Covariance Estimation**: Utilize the `OAS` estimator with `assume_centered=True` (Cite solution_lesson_node_00061) and directly use its `precision_` attribute (Cite solution_lesson_node_00062) to compute the discriminant weights. This avoids the numerical instability of manual solvers.
+4.  **Inference Formulation**: Implement the Linear Formulation of LDA ($x^T W + b$) instead of the distance-based one (Cite solution_lesson_node_00055) and enforce strict `float64` precision throughout the inference pipeline to maximize logarithmic scoring performance (Cite solution_lesson_node_00057, solution_lesson_node_00073).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+IDEA_DIR = os.path.join(WORKING_DIR, "idea_27")
+=======
+IDEA_DIR = os.path.join(WORKING_DIR, "idea_28")
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DualExpertLDA(BaseEstimator, ClassifierMixin):
+    """
+    Dual-Covariance Precision-Interpolated Discriminant.
+
+    Ensembles two Linear Discriminant Analysis experts by interpolating their
+    precision matrices (via weight averaging) rather than their probabilities.
+
+    Expert A: Oracle Approximating Shrinkage (OAS) - Robust, well-conditioned.
+    Expert B: Empirical Covariance + Micro-Jitter - Aggressive, captures fine detail.
+    """
+
+    def __init__(self, empirical_jitter=1e-6):
+        self.empirical_jitter = empirical_jitter
+        self.classes_ = None
+        self.coef_ = None
+        self.intercept_ = None
+        self.means_ = None
+        self.priors_ = None
+
+    def fit(self, X, y):
+        """
+        Fits the model using the dual-expert strategy.
+        """
+        # Enforce float64 precision
+        X = X.astype(np.float64)
+
+        # Validate inputs
+        X, y = check_X_y(X, y)
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+        n_samples, n_features = X.shape
+
+        # 1. Compute Common Statistics
+        # Map labels to 0..K-1
+        le = LabelEncoder()
+        y_idx = le.fit_transform(y)
+
+        self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+        self.priors_ = np.zeros(n_classes, dtype=np.float64)
+
+        # Compute means and priors
+        for k in range(n_classes):
+            mask = y_idx == k
+            X_k = X[mask]
+            self.means_[k] = np.mean(X_k, axis=0)
+            self.priors_[k] = X_k.shape[0] / n_samples
+
+        # Compute Centered Residuals R = X - mu_y
+        # This centers the data around the class means, effectively pooling covariance
+        R = X - self.means_[y_idx]
+
+        # 2. Expert A: OAS (Conservative)
+        # OAS automatically estimates shrinkage and computes precision
+        oas = OAS(assume_centered=True)
+        oas.fit(R)
+        prec_oas = oas.precision_  # Shape (n_features, n_features)
+
+        # Compute Linear Parameters for OAS
+        # W = Sigma^-1 * mu  -> Shape (n_classes, n_features)
+        W_oas = np.dot(self.means_, prec_oas)
+        # b = -0.5 * diag(mu.T * Sigma^-1 * mu) + log(prior)
+        #   = -0.5 * diag(mu * W.T) + log(prior)
+        # Element-wise mult and sum across features gives the diagonal of the product
+        term1_oas = -0.5 * np.sum(self.means_ * W_oas, axis=1)
+        b_oas = term1_oas + np.log(self.priors_)
+
+        # 3. Expert B: Empirical (Aggressive)
+        # Compute Empirical Covariance of Residuals
+        # Cov = (R.T @ R) / (N - 1)
+        cov_emp = np.dot(R.T, R) / (n_samples - 1)
+
+        # Add Micro-Jitter for numerical stability during inversion
+        cov_emp.flat[:: n_features + 1] += self.empirical_jitter
+
+        # Invert to get Precision
+        prec_emp = np.linalg.inv(cov_emp)
+
+        # Compute Linear Parameters for Empirical
+        W_emp = np.dot(self.means_, prec_emp)
+        term1_emp = -0.5 * np.sum(self.means_ * W_emp, axis=1)
+        b_emp = term1_emp + np.log(self.priors_)
+
+        # 4. Linearized Logit Fusion
+        # Interpolate parameters directly (equivalent to interpolating Precision matrices)
+        # We use a fixed 0.5/0.5 split as defined in the strategy
+        self.coef_ = 0.5 * W_oas + 0.5 * W_emp
+        self.intercept_ = 0.5 * b_oas + 0.5 * b_emp
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predicts probabilities using the fused decision boundary.
+        """
+        check_is_fitted(self)
+        X = check_array(X).astype(np.float64)
+
+        # Compute Logits: Z = X @ W.T + b
+        logits = np.dot(X, self.coef_.T) + self.intercept_
+
+        # Apply Softmax with stability shift
+        # Shift logits by max per row to avoid overflow in exp
+        logits_max = np.max(logits, axis=1, keepdims=True)
+        logits_shifted = logits - logits_max
+
+        exp_logits = np.exp(logits_shifted)
+        sum_exp = np.sum(exp_logits, axis=1, keepdims=True)
+
+        probas = exp_logits / sum_exp
+
+        return probas
+
+    def predict(self, X):
+        """
+        Predicts class labels.
+        """
+        probas = self.predict_proba(X)
+        return self.classes_[np.argmax(probas, axis=1)]
+=======
+class OASLinearDiscriminant(BaseEstimator, ClassifierMixin):
+    """
+    Linear Discriminant Analysis using Oracle Approximating Shrinkage (OAS).
+
+    This implementation focuses on maximum numerical precision and stability
+    for high-dimensional, small-sample regimes. It avoids empirical covariance
+    estimation and uses the linear formulation of the discriminant function.
+    """
+
+    def __init__(self):
+        self.classes_ = None
+        self.coef_ = None
+        self.intercept_ = None
+        self.means_ = None
+        self.priors_ = None
+
+    def fit(self, X, y):
+        """
+        Fits the model using OAS covariance estimation.
+        """
+        # Enforce float64 precision (Cite solution_lesson_node_00073)
+        X = X.astype(np.float64)
+
+        # Validate inputs
+        X, y = check_X_y(X, y)
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+        n_samples, n_features = X.shape
+
+        # 1. Compute Common Statistics
+        # Map labels to 0..K-1
+        le = LabelEncoder()
+        y_idx = le.fit_transform(y)
+
+        self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+        self.priors_ = np.zeros(n_classes, dtype=np.float64)
+
+        # Compute means and priors
+        for k in range(n_classes):
+            mask = y_idx == k
+            X_k = X[mask]
+            self.means_[k] = np.mean(X_k, axis=0)
+            self.priors_[k] = X_k.shape[0] / n_samples
+
+        # Compute Centered Residuals R = X - mu_y
+        # This centers the data around the class means, effectively pooling covariance
+        R = X - self.means_[y_idx]
+
+        # 2. Covariance Estimation via OAS
+        # Use assume_centered=True to respect the geometric centroids (Cite solution_lesson_node_00061)
+        # Use OAS over Ledoit-Wolf for Gaussianized data (Cite solution_lesson_node_00047)
+        oas = OAS(assume_centered=True)
+        oas.fit(R)
+        
+        # Use precision_ directly instead of solving linear systems (Cite solution_lesson_node_00062)
+        prec_oas = oas.precision_  # Shape (n_features, n_features)
+
+        # 3. Compute Linear Parameters (Linear Formulation)
+        # Cite solution_lesson_node_00055
+        # W = Sigma^-1 * mu  -> Shape (n_classes, n_features)
+        self.coef_ = np.dot(self.means_, prec_oas)
+        
+        # b = -0.5 * diag(mu.T * Sigma^-1 * mu) + log(prior)
+        #   = -0.5 * diag(mu * W.T) + log(prior)
+        # Element-wise mult and sum across features gives the diagonal of the product
+        term1 = -0.5 * np.sum(self.means_ * self.coef_, axis=1)
+        self.intercept_ = term1 + np.log(self.priors_)
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predicts probabilities using the linear decision boundary.
+        """
+        check_is_fitted(self)
+        # Enforce float64 precision for inference (Cite solution_lesson_node_00057)
+        X = check_array(X).astype(np.float64)
+
+        # Compute Logits: Z = X @ W.T + b
+        logits = np.dot(X, self.coef_.T) + self.intercept_
+
+        # Apply Softmax with stability shift
+        # Shift logits by max per row to avoid overflow in exp
+        logits_max = np.max(logits, axis=1, keepdims=True)
+        logits_shifted = logits - logits_max
+
+        exp_logits = np.exp(logits_shifted)
+        sum_exp = np.sum(exp_logits, axis=1, keepdims=True)
+
+        probas = exp_logits / sum_exp
+
+        return probas
+
+    def predict(self, X):
+        """
+        Predicts class labels.
+        """
+        probas = self.predict_proba(X)
+        return self.classes_[np.argmax(probas, axis=1)]
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DualExpertLDA
+from library.utils import calculate_log_loss, save_submission
+=======
+from library.model import OASLinearDiscriminant
+from library.utils import calculate_log_loss, save_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Initialize and Train Model
+    print("Initializing DualExpertLDA model...")
+    model = DualExpertLDA(empirical_jitter=1e-6)
+
+    print("Training model...")
+    model.fit(X_train, y_train)
+=======
+    # 3. Initialize and Train Model
+    print("Initializing OASLinearDiscriminant model...")
+    model = OASLinearDiscriminant()
+
+    print("Training model...")
+    model.fit(X_train, y_train)
+>>>>>>> REPLACE
+```

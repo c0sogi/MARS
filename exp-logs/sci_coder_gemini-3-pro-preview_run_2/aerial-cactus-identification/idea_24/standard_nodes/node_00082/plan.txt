@@ -1,0 +1,502 @@
+My optimization strategy focuses on simplifying the model architecture while maintaining the high capacity and feature aggregation strategies that have proven effective. I will replace the complex `Res2NeXtBlock` (which combines Res2Net, ResNeXt, and SE) with a standard, robust `SEBasicBlock` (ResNet BasicBlock + SE). This aligns with **Cite solution_lesson_node_00008**, which suggests that homogeneous ensembles of stable, standard architectures often outperform complex ones on saturated metrics. I will retain the "Wide" channel configuration (`[64, 128, 256]`) and **Multi-Scale Aggregation** (concatenating Stage 2 and Stage 3 features), as **Cite solution_lesson_node_00064** indicates these are crucial for maximizing performance on low-resolution inputs. I will also ensure the use of standard 1x1 projection shortcuts (**Cite solution_lesson_node_00063**) and keep SE blocks to aid convergence (**Cite solution_lesson_node_00012**). Finally, I will slightly increase the epoch count to ensure full convergence with the simplified architecture.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+IDEA_ID = "idea_24"
+BASE_DIR = "."
+=======
+IDEA_ID = "idea_25"
+BASE_DIR = "."
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# =============================================================================
+# MODEL ARCHITECTURE (Custom Wide SE-Res2NeXt)
+# =============================================================================
+# Backbone: 3-stage (32x32 -> 16x16 -> 8x8)
+# "Super-Wide" Channel Configuration: [64, 128, 256]
+MODEL_PARAMS = {
+    "stages": [64, 128, 256],
+    "cardinality": 32,  # Groups for ResNeXt
+    "base_width": 4,  # Width per group (can be inferred or explicit)
+    "res2net_scale": 4,  # Scale factor for Res2Net hierarchical connections
+    "se_reduction": 16,  # Reduction ratio for Squeeze-and-Excitation
+    "dropout_rate": 0.0,  # Dropout for the final dense layer
+    "use_gap": True,  # Use Global Average Pooling (vs Covariance)
+}
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS
+# =============================================================================
+SEEDS = [0, 1, 2, 3, 4]  # Homogeneous Seed Averaging
+EPOCHS = 20
+=======
+# =============================================================================
+# MODEL ARCHITECTURE (Custom Wide SE-ResNet)
+# =============================================================================
+# Backbone: 3-stage (32x32 -> 16x16 -> 8x8)
+# "Super-Wide" Channel Configuration: [64, 128, 256]
+MODEL_PARAMS = {
+    "stages": [64, 128, 256],
+    "se_reduction": 16,  # Reduction ratio for Squeeze-and-Excitation
+    "dropout_rate": 0.0,  # Dropout for the final dense layer
+    "use_gap": True,  # Use Global Average Pooling (vs Covariance)
+}
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS
+# =============================================================================
+SEEDS = [0, 1, 2, 3, 4]  # Homogeneous Seed Averaging
+EPOCHS = 30
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class Res2NeXtBlock(nn.Module):
+    """
+    Custom block integrating Res2Net hierarchical connections within a ResNeXt
+    grouped convolution topology.
+    """
+
+    def __init__(
+        self,
+        in_planes,
+        planes,
+        stride=1,
+        cardinality=32,
+        base_width=4,
+        scale=4,
+        reduction=16,
+    ):
+        super(Res2NeXtBlock, self).__init__()
+
+        # Calculate bottleneck width based on ResNeXt formula
+        # width = floor(planes * (base_width/64)) * cardinality
+        width = math.floor(planes * (base_width / 64.0)) * cardinality
+
+        self.width = width
+        self.scale = scale
+        self.stride = stride
+        self.width_per_scale = width // scale
+        self.cardinality = cardinality
+
+        if width % scale != 0:
+            raise ValueError(f"Width {width} must be divisible by scale {scale}")
+
+        # Conv1: 1x1 Projection
+        self.conv1 = nn.Conv2d(in_planes, width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width)
+
+        # Conv2: 3x3 (Res2Net + Grouped)
+        # We create a list of convolutions.
+        # If stride=1: We use hierarchical connections (scale-1 convs).
+        # If stride>1: We process all splits in parallel to handle resolution changes robustly (scale convs).
+
+        groups_per_conv = cardinality // scale
+        self.convs = nn.ModuleList()
+
+        num_convs = scale - 1
+
+        for _ in range(num_convs):
+            self.convs.append(
+                nn.Conv2d(
+                    self.width_per_scale,
+                    self.width_per_scale,
+                    kernel_size=3,
+                    stride=stride,
+                    padding=1,
+                    groups=groups_per_conv,
+                    bias=False,
+                )
+            )
+        self.bns = nn.ModuleList(
+            [nn.BatchNorm2d(self.width_per_scale) for _ in range(num_convs)]
+        )
+
+        # If stride > 1, the first split also needs downsampling
+        if stride > 1:
+            self.pool = nn.AvgPool2d(kernel_size=3, stride=stride, padding=1)
+
+        # Conv3: 1x1 Projection
+        self.conv3 = nn.Conv2d(width, planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+
+        # SE Block
+        self.se = SEBlock(planes, reduction)
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        residual = x
+
+        out = F.relu(self.bn1(self.conv1(x)))
+
+        # Split feature map into 'scale' chunks
+        spx = torch.split(out, self.width_per_scale, 1)
+
+        y = []
+
+        if self.stride == 1:
+            # Hierarchical connections
+            # First split is identity
+            sp = spx[0]
+            y.append(sp)
+            prev_y = sp
+
+            for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+                # Input to conv is current split + previous output
+                inp = spx[i + 1] + prev_y
+                out_conv = F.relu(bn(conv(inp)))
+                y.append(out_conv)
+                prev_y = out_conv
+        else:
+            # Parallel processing for downsampling layers
+            # Process first split with pool
+            y.append(self.pool(spx[0]))
+
+            # Process others with strided convs
+            for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+                out_conv = F.relu(bn(conv(spx[i + 1])))
+                y.append(out_conv)
+
+        # Concatenate scales
+        out = torch.cat(y, 1)
+
+        out = self.bn3(self.conv3(out))
+        out = self.se(out)
+
+        out += self.shortcut(residual)
+        out = F.relu(out)
+        return out
+
+
+class WideSERes2NeXt(nn.Module):
+    """
+    Wide SE-Res2NeXt Architecture with Multi-Scale Aggregation Head.
+    """
+
+    def __init__(
+        self,
+        num_classes=1,
+        stages=[64, 128, 256],
+        cardinality=32,
+        base_width=4,
+        res2net_scale=4,
+        se_reduction=16,
+        use_gap=True,
+        dropout_rate=0.0,
+    ):
+        super(WideSERes2NeXt, self).__init__()
+
+        self.in_planes = 64
+        self.use_gap = use_gap
+
+        # Initial Conv
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+
+        # Stages (3 blocks per stage)
+        # Stage 1: 32x32
+        self.layer1 = self._make_layer(
+            stages[0],
+            3,
+            stride=1,
+            cardinality=cardinality,
+            base_width=base_width,
+            scale=res2net_scale,
+            reduction=se_reduction,
+        )
+        # Stage 2: 16x16
+        self.layer2 = self._make_layer(
+            stages[1],
+            3,
+            stride=2,
+            cardinality=cardinality,
+            base_width=base_width,
+            scale=res2net_scale,
+            reduction=se_reduction,
+        )
+        # Stage 3: 8x8
+        self.layer3 = self._make_layer(
+            stages[2],
+            3,
+            stride=2,
+            cardinality=cardinality,
+            base_width=base_width,
+            scale=res2net_scale,
+            reduction=se_reduction,
+        )
+
+        # Head: Multi-Scale Aggregation
+        # Aggregates features from Stage 2 (16x16) and Stage 3 (8x8)
+        self.final_dim = stages[1] + stages[2]
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(self.final_dim, num_classes)
+
+        # Weights Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _make_layer(
+        self, planes, blocks, stride, cardinality, base_width, scale, reduction
+    ):
+        layers = []
+        layers.append(
+            Res2NeXtBlock(
+                self.in_planes,
+                planes,
+                stride,
+                cardinality,
+                base_width,
+                scale,
+                reduction,
+            )
+        )
+        self.in_planes = planes
+        for _ in range(1, blocks):
+            layers.append(
+                Res2NeXtBlock(
+                    self.in_planes, planes, 1, cardinality, base_width, scale, reduction
+                )
+            )
+        return nn.Sequential(*layers)
+=======
+class SEBasicBlock(nn.Module):
+    """
+    Standard ResNet BasicBlock with Squeeze-and-Excitation.
+    """
+
+    def __init__(self, in_planes, planes, stride=1, reduction=16):
+        super(SEBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.se = SEBlock(planes, reduction)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class WideSEResNet(nn.Module):
+    """
+    Wide SE-ResNet Architecture with Multi-Scale Aggregation Head.
+    """
+
+    def __init__(
+        self,
+        num_classes=1,
+        stages=[64, 128, 256],
+        se_reduction=16,
+        use_gap=True,
+        dropout_rate=0.0,
+    ):
+        super(WideSEResNet, self).__init__()
+
+        self.in_planes = 64
+        self.use_gap = use_gap
+
+        # Initial Conv
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+
+        # Stages (3 blocks per stage)
+        # Stage 1: 32x32
+        self.layer1 = self._make_layer(
+            stages[0], 3, stride=1, reduction=se_reduction
+        )
+        # Stage 2: 16x16
+        self.layer2 = self._make_layer(
+            stages[1], 3, stride=2, reduction=se_reduction
+        )
+        # Stage 3: 8x8
+        self.layer3 = self._make_layer(
+            stages[2], 3, stride=2, reduction=se_reduction
+        )
+
+        # Head: Multi-Scale Aggregation
+        # Aggregates features from Stage 2 (16x16) and Stage 3 (8x8)
+        self.final_dim = stages[1] + stages[2]
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(self.final_dim, num_classes)
+
+        # Weights Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, planes, blocks, stride, reduction):
+        layers = []
+        layers.append(
+            SEBasicBlock(self.in_planes, planes, stride, reduction)
+        )
+        self.in_planes = planes
+        for _ in range(1, blocks):
+            layers.append(SEBasicBlock(self.in_planes, planes, 1, reduction))
+        return nn.Sequential(*layers)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        x = self.layer1(x)  # 32x32
+
+        feat2 = self.layer2(x)  # 16x16
+        feat3 = self.layer3(feat2)  # 8x8
+
+        # Multi-Scale Aggregation
+        # Global Average Pooling on both stages
+        gap2 = F.adaptive_avg_pool2d(feat2, 1).view(feat2.size(0), -1)
+        gap3 = F.adaptive_avg_pool2d(feat3, 1).view(feat3.size(0), -1)
+
+        combined = torch.cat([gap2, gap3], dim=1)
+        combined = self.dropout(combined)
+        out = self.fc(combined)
+        return out
+=======
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        x = self.layer1(x)  # 32x32
+
+        feat2 = self.layer2(x)  # 16x16
+        feat3 = self.layer3(feat2)  # 8x8
+
+        # Multi-Scale Aggregation
+        # Global Average Pooling on both stages
+        gap2 = F.adaptive_avg_pool2d(feat2, 1).view(feat2.size(0), -1)
+        gap3 = F.adaptive_avg_pool2d(feat3, 1).view(feat3.size(0), -1)
+
+        combined = torch.cat([gap2, gap3], dim=1)
+        combined = self.dropout(combined)
+        out = self.fc(combined)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Init Model
+        model = WideSERes2NeXt(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            cardinality=config.MODEL_PARAMS["cardinality"],
+            base_width=config.MODEL_PARAMS["base_width"],
+            res2net_scale=config.MODEL_PARAMS["res2net_scale"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+=======
+        # Init Model
+        model = WideSEResNet(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Initialize Model
+        net = model.WideSERes2NeXt(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            cardinality=config.MODEL_PARAMS["cardinality"],
+            base_width=config.MODEL_PARAMS["base_width"],
+            res2net_scale=config.MODEL_PARAMS["res2net_scale"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+=======
+        # Initialize Model
+        net = model.WideSEResNet(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Initialize Model
+        net = model.WideSERes2NeXt(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            cardinality=config.MODEL_PARAMS["cardinality"],
+            base_width=config.MODEL_PARAMS["base_width"],
+            res2net_scale=config.MODEL_PARAMS["res2net_scale"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+=======
+        # Initialize Model
+        net = model.WideSEResNet(
+            num_classes=config.NUM_CLASSES,
+            stages=config.MODEL_PARAMS["stages"],
+            se_reduction=config.MODEL_PARAMS["se_reduction"],
+            use_gap=config.MODEL_PARAMS["use_gap"],
+            dropout_rate=config.MODEL_PARAMS["dropout_rate"],
+        ).to(device)
+>>>>>>> REPLACE
+```

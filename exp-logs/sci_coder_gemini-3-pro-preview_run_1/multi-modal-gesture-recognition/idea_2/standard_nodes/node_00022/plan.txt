@@ -1,0 +1,612 @@
+Based on the analysis of previous results and lessons learned, I will optimize the solution by simplifying the architecture and refining the normalization strategy. Specifically, I will:
+
+1.  **Simplify Architecture (Cite Lesson 00019):** Replace the Multi-Stage Refinement Network (MSRN) with a simpler **Multi-Stream GRU** model. The previous MSRN approach (Lesson 00019) degraded performance compared to a simpler baseline (0.2100 vs 0.1981), suggesting that aggressive temporal smoothing via refinement modules is detrimental for the Levenshtein metric.
+2.  **Refine Normalization (Cite Lesson 00021):** Remove the `InstanceNorm1d` layers from the model stems. Instead, I will rely entirely on the **Global Z-score Normalization** provided by the `GestureDataset`. Lesson 00021 showed that independent global normalization coupled with independent projection stems significantly improved performance (to 0.1369), whereas instance normalization removes critical relative amplitude information.
+3.  **Optimize Hyperparameters (Cite Lesson 00011):** Increase the temporal convolution kernel size in the feature stems from 5 to 7 to capture slightly wider local context before the recurrent layers.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    STEM_KERNEL_SIZE = 5
+    DROPOUT = 0.3
+
+    # Recurrent Layer
+=======
+    STEM_KERNEL_SIZE = 7
+    DROPOUT = 0.3
+
+    # Recurrent Layer
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FeatureStem(nn.Module):
+    """
+    Stage 1: Generation Stage.
+    Processes raw multi-modal inputs into initial frame-wise predictions.
+    """
+
+    def __init__(self):
+        super(FeatureStem, self).__init__()
+
+        # 1. Modality Normalization
+        # Using InstanceNorm1d with affine=False to enforce Z-score standardization (0 mean, 1 var)
+        # per sample, per channel, independently.
+        self.norm_skeleton = nn.InstanceNorm1d(Config.INPUT_DIM_SKELETON, affine=False)
+        self.norm_audio = nn.InstanceNorm1d(Config.INPUT_DIM_AUDIO, affine=False)
+
+        # 2. Projection Blocks
+        self.proj_skeleton = ProjectionBlock(
+            Config.INPUT_DIM_SKELETON,
+            Config.PROJECTION_DIM,
+            Config.STEM_KERNEL_SIZE,
+            Config.DROPOUT,
+        )
+        self.proj_audio = ProjectionBlock(
+            Config.INPUT_DIM_AUDIO,
+            Config.PROJECTION_DIM,
+            Config.STEM_KERNEL_SIZE,
+            Config.DROPOUT,
+        )
+
+        # 3. Fusion
+        # Concatenation results in 2 * PROJECTION_DIM channels
+        fusion_dim = Config.PROJECTION_DIM * 2
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
+
+        # 4. Sequence Modeling
+        self.gru = nn.GRU(
+            input_size=fusion_dim,
+            hidden_size=Config.HIDDEN_DIM,
+            num_layers=Config.GRU_LAYERS,
+            batch_first=True,
+            bidirectional=Config.BIDIRECTIONAL,
+            dropout=Config.DROPOUT if Config.GRU_LAYERS > 1 else 0.0,
+        )
+
+        # 5. Classifier Head (Stage 1 Output)
+        gru_output_dim = (
+            Config.HIDDEN_DIM * 2 if Config.BIDIRECTIONAL else Config.HIDDEN_DIM
+        )
+        self.classifier = nn.Linear(gru_output_dim, Config.NUM_CLASSES)
+
+    def forward(self, skeleton, audio):
+        """
+        Args:
+            skeleton: (Batch, Time, InputDim_Skel)
+            audio: (Batch, Time, InputDim_Audio)
+        Returns:
+            logits: (Batch, Time, NumClasses)
+        """
+        # Permute to (Batch, Channels, Time) for Conv1d and InstanceNorm
+        skel_t = skeleton.transpose(1, 2)
+        audio_t = audio.transpose(1, 2)
+
+        # Modality Normalization
+        skel_t = self.norm_skeleton(skel_t)
+        audio_t = self.norm_audio(audio_t)
+
+        # Projection
+        skel_feat = self.proj_skeleton(skel_t)
+        audio_feat = self.proj_audio(audio_t)
+
+        # Fusion
+        # Concatenate along channel dimension
+        fused = torch.cat([skel_feat, audio_feat], dim=1)
+
+        # Permute back to (Batch, Time, Channels) for LayerNorm and GRU
+        fused = fused.transpose(1, 2)
+        fused = self.fusion_norm(fused)
+
+        # Sequence Modeling
+        gru_out, _ = self.gru(fused)
+
+        # Classification
+        logits = self.classifier(gru_out)
+
+        return logits
+
+
+class RefinementModule(nn.Module):
+    """
+    Stage 2: Refinement Stage.
+    Cleans and corrects Stage 1 predictions using temporal context.
+    """
+
+    def __init__(self):
+        super(RefinementModule, self).__init__()
+
+        layers = []
+        input_dim = Config.NUM_CLASSES
+        hidden_dim = Config.PROJECTION_DIM  # Lightweight intermediate dimension
+
+        # Stack of Dilated Convolutions
+        for i in range(Config.REFINE_LAYERS):
+            dilation = 2**i
+            kernel_size = Config.REFINE_KERNEL_SIZE
+            padding = (kernel_size - 1) * dilation // 2
+
+            # Input dim for first layer is NumClasses, else HiddenDim
+            in_c = input_dim if i == 0 else hidden_dim
+            # Output dim for last layer is NumClasses, else HiddenDim
+            out_c = input_dim if i == (Config.REFINE_LAYERS - 1) else hidden_dim
+
+            conv = nn.Conv1d(
+                in_c, out_c, kernel_size=kernel_size, padding=padding, dilation=dilation
+            )
+
+            layers.append(conv)
+
+            # Activation and Dropout for intermediate layers
+            if i < (Config.REFINE_LAYERS - 1):
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(Config.DROPOUT))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, stage1_logits):
+        """
+        Args:
+            stage1_logits: (Batch, Time, NumClasses)
+        Returns:
+            stage2_logits: (Batch, Time, NumClasses)
+        """
+        # Permute to (Batch, Channels, Time) for Conv1d
+        x = stage1_logits.transpose(1, 2)
+
+        # Apply refinement network
+        # We add a residual connection if dimensions match, but here we are transforming
+        # logits to logits, so essentially learning a residual correction
+        correction = self.net(x)
+
+        # Permute back
+        out = correction.transpose(1, 2)
+
+        # Residual connection: Output = Input + Correction
+        # This helps gradient flow and implies the module learns "what to fix"
+        return stage1_logits + out
+
+
+class MSRN(nn.Module):
+    """
+    Multi-Stage Refinement Network.
+    Combines FeatureStem and RefinementModule.
+    """
+
+    def __init__(self):
+        super(MSRN, self).__init__()
+        self.stem = FeatureStem()
+        self.refinement = RefinementModule()
+
+    def forward(self, skeleton, audio):
+        """
+        Args:
+            skeleton: (Batch, Time, InputDim_Skel)
+            audio: (Batch, Time, InputDim_Audio)
+        Returns:
+            stage1_logits: (Batch, Time, NumClasses)
+            stage2_logits: (Batch, Time, NumClasses)
+        """
+        # Stage 1: Generation
+        stage1_logits = self.stem(skeleton, audio)
+
+        # Stage 2: Refinement
+        # We pass the logits directly. The refinement module learns to smooth them.
+        stage2_logits = self.refinement(stage1_logits)
+
+        return stage1_logits, stage2_logits
+=======
+class MultiStreamGRU(nn.Module):
+    """
+    Multi-Stream GRU Network.
+    Implements independent feature stems for Skeleton and Audio, followed by fusion and GRU.
+    Relies on global normalization provided by the DataLoader.
+    Cite Lesson 00021: Decoupling Heterogeneous Modalities.
+    Cite Lesson 00019: Simpler RNN (removing refinement).
+    """
+
+    def __init__(self):
+        super(MultiStreamGRU, self).__init__()
+
+        # 1. Projection Blocks (Independent Stems)
+        self.proj_skeleton = ProjectionBlock(
+            Config.INPUT_DIM_SKELETON,
+            Config.PROJECTION_DIM,
+            Config.STEM_KERNEL_SIZE,
+            Config.DROPOUT,
+        )
+        self.proj_audio = ProjectionBlock(
+            Config.INPUT_DIM_AUDIO,
+            Config.PROJECTION_DIM,
+            Config.STEM_KERNEL_SIZE,
+            Config.DROPOUT,
+        )
+
+        # 2. Fusion
+        # Concatenation results in 2 * PROJECTION_DIM channels
+        fusion_dim = Config.PROJECTION_DIM * 2
+        # Cite Lesson 00011: LayerNorm after fusion
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
+
+        # 3. Sequence Modeling
+        self.gru = nn.GRU(
+            input_size=fusion_dim,
+            hidden_size=Config.HIDDEN_DIM,
+            num_layers=Config.GRU_LAYERS,
+            batch_first=True,
+            bidirectional=Config.BIDIRECTIONAL,
+            dropout=Config.DROPOUT if Config.GRU_LAYERS > 1 else 0.0,
+        )
+
+        # 4. Classifier Head
+        gru_output_dim = (
+            Config.HIDDEN_DIM * 2 if Config.BIDIRECTIONAL else Config.HIDDEN_DIM
+        )
+        self.classifier = nn.Linear(gru_output_dim, Config.NUM_CLASSES)
+
+    def forward(self, skeleton, audio):
+        """
+        Args:
+            skeleton: (Batch, Time, InputDim_Skel)
+            audio: (Batch, Time, InputDim_Audio)
+        Returns:
+            logits: (Batch, Time, NumClasses)
+        """
+        # Permute to (Batch, Channels, Time) for Conv1d
+        skel_t = skeleton.transpose(1, 2)
+        audio_t = audio.transpose(1, 2)
+
+        # Projection (Note: No InstanceNorm here, relying on Global Norm)
+        skel_feat = self.proj_skeleton(skel_t)
+        audio_feat = self.proj_audio(audio_t)
+
+        # Fusion
+        # Concatenate along channel dimension
+        fused = torch.cat([skel_feat, audio_feat], dim=1)
+
+        # Permute back to (Batch, Time, Channels) for LayerNorm and GRU
+        fused = fused.transpose(1, 2)
+        fused = self.fusion_norm(fused)
+
+        # Sequence Modeling
+        gru_out, _ = self.gru(fused)
+
+        # Classification
+        logits = self.classifier(gru_out)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+class HierarchicalLoss(nn.Module):
+    """
+    Implements the Hierarchical Loss for the Multi-Stage Refinement Network.
+    It computes the sum of Cross-Entropy losses for both the Generation Stage (Stage 1)
+    and the Refinement Stage (Stage 2).
+
+    Features:
+    - Class Weighting: Applies a specific weight to the background class to balance recall/precision.
+    - Label Smoothing: Regularizes the model by smoothing target labels.
+    - Ignore Index: Handles padded sequences by ignoring a specific target value (default -100).
+    """
+
+    def __init__(self, ignore_index=-100):
+        """
+        Args:
+            ignore_index (int): The target value to ignore during loss computation
+                                (usually used for padding). Default: -100.
+        """
+        super(HierarchicalLoss, self).__init__()
+
+        # 1. Define Class Weights
+        # Initialize weights to 1.0 for all classes
+        weights = torch.ones(Config.NUM_CLASSES)
+
+        # Apply specific weight to the Background class (Index 0)
+        # This helps in balancing precision and recall for the null class
+        if Config.NUM_CLASSES > 0:
+            weights[0] = Config.BACKGROUND_WEIGHT
+
+        # 2. Initialize CrossEntropyLoss
+        # We pass the weights and label smoothing configuration here.
+        # The loss module handles moving weights to the appropriate device
+        # when .to(device) is called on this module.
+        self.criterion = nn.CrossEntropyLoss(
+            weight=weights,
+            ignore_index=ignore_index,
+            label_smoothing=Config.LABEL_SMOOTHING,
+            reduction="mean",
+        )
+
+    def forward(self, stage1_logits, stage2_logits, targets):
+        """
+        Computes the hierarchical loss.
+
+        Args:
+            stage1_logits (torch.Tensor): Logits from the Generation Stage.
+                                          Shape: (Batch, Time, NumClasses)
+            stage2_logits (torch.Tensor): Logits from the Refinement Stage.
+                                          Shape: (Batch, Time, NumClasses)
+            targets (torch.Tensor): Ground truth labels.
+                                    Shape: (Batch, Time)
+
+        Returns:
+            torch.Tensor: The scalar loss value (sum of stage 1 and stage 2 losses).
+        """
+        # Reshape inputs for CrossEntropyLoss
+        # The criterion expects (N, C) for logits and (N) for targets,
+        # where N is the total number of time steps across the batch (Batch * Time).
+
+        # Flatten Stage 1 Logits: (B, T, C) -> (B*T, C)
+        s1_flat = stage1_logits.view(-1, Config.NUM_CLASSES)
+
+        # Flatten Stage 2 Logits: (B, T, C) -> (B*T, C)
+        s2_flat = stage2_logits.view(-1, Config.NUM_CLASSES)
+
+        # Flatten Targets: (B, T) -> (B*T)
+        targets_flat = targets.view(-1)
+
+        # Compute losses for each stage
+        loss_stage1 = self.criterion(s1_flat, targets_flat)
+        loss_stage2 = self.criterion(s2_flat, targets_flat)
+
+        # Sum the losses
+        total_loss = loss_stage1 + loss_stage2
+
+        return total_loss
+=======
+class SequenceLoss(nn.Module):
+    """
+    Standard Cross Entropy Loss for sequence labeling.
+    Features: Class Weighting, Label Smoothing, Ignore Index.
+    """
+
+    def __init__(self, ignore_index=-100):
+        super(SequenceLoss, self).__init__()
+
+        # 1. Define Class Weights
+        weights = torch.ones(Config.NUM_CLASSES)
+        if Config.NUM_CLASSES > 0:
+            weights[0] = Config.BACKGROUND_WEIGHT
+
+        # 2. Initialize CrossEntropyLoss
+        self.criterion = nn.CrossEntropyLoss(
+            weight=weights,
+            ignore_index=ignore_index,
+            label_smoothing=Config.LABEL_SMOOTHING,
+            reduction="mean",
+        )
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (Batch, Time, NumClasses)
+            targets: (Batch, Time)
+        """
+        # Flatten: (B*T, C)
+        logits_flat = logits.view(-1, Config.NUM_CLASSES)
+        # Flatten: (B*T)
+        targets_flat = targets.view(-1)
+
+        return self.criterion(logits_flat, targets_flat)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import MSRN
+from library.losses import HierarchicalLoss
+from library.data_loader import GestureDataset, collate_fn
+=======
+from library.model import MultiStreamGRU
+from library.losses import SequenceLoss
+from library.data_loader import GestureDataset, collate_fn
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # 3. Model
+        self.model = MSRN().to(self.device)
+
+        # 4. Loss, Optimizer, Scheduler
+        self.criterion = HierarchicalLoss(ignore_index=-100).to(self.device)
+=======
+        # 3. Model
+        self.model = MultiStreamGRU().to(self.device)
+
+        # 4. Loss, Optimizer, Scheduler
+        self.criterion = SequenceLoss(ignore_index=-100).to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Forward pass
+            s1_logits, s2_logits = self.model(skeleton, audio)
+
+            # Compute Loss
+            loss = self.criterion(s1_logits, s2_logits, labels)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+            # Optimizer Step
+            self.optimizer.step()
+
+            # Metrics
+            total_loss += loss.item()
+            # We use Stage 2 logits for accuracy as it's the final prediction
+            total_acc += self._calculate_accuracy(s2_logits, labels)
+            num_batches += 1
+=======
+            # Forward pass
+            logits = self.model(skeleton, audio)
+
+            # Compute Loss
+            loss = self.criterion(logits, labels)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+            # Optimizer Step
+            self.optimizer.step()
+
+            # Metrics
+            total_loss += loss.item()
+            total_acc += self._calculate_accuracy(logits, labels)
+            num_batches += 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                s1_logits, s2_logits = self.model(skeleton, audio)
+
+                loss = self.criterion(s1_logits, s2_logits, labels)
+
+                total_loss += loss.item()
+                total_acc += self._calculate_accuracy(s2_logits, labels)
+                num_batches += 1
+=======
+                logits = self.model(skeleton, audio)
+
+                loss = self.criterion(logits, labels)
+
+                total_loss += loss.item()
+                total_acc += self._calculate_accuracy(logits, labels)
+                num_batches += 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import MSRN
+from library.data_loader import GestureDataset, collate_fn
+=======
+from library.model import MultiStreamGRU
+from library.data_loader import GestureDataset, collate_fn
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    def _load_model(self):
+        """
+        Initializes the model architecture and loads the best saved weights.
+        """
+        model = MSRN()
+        if os.path.exists(Config.MODEL_SAVE_PATH):
+=======
+    def _load_model(self):
+        """
+        Initializes the model architecture and loads the best saved weights.
+        """
+        model = MultiStreamGRU()
+        if os.path.exists(Config.MODEL_SAVE_PATH):
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                # Forward pass
+                _, stage2_logits = self.model(skeleton, audio)
+
+                # Get predictions: (B, T)
+                predictions = torch.argmax(stage2_logits, dim=2).cpu().numpy()
+=======
+                # Forward pass
+                logits = self.model(skeleton, audio)
+
+                # Get predictions: (B, T)
+                predictions = torch.argmax(logits, dim=2).cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.trainer import Trainer
+from library.inference import InferenceManager
+from library.model import MSRN
+from library.data_loader import GestureDataset, collate_fn
+=======
+from library.trainer import Trainer
+from library.inference import InferenceManager
+from library.model import MultiStreamGRU
+from library.data_loader import GestureDataset, collate_fn
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def calculate_validation_metric(device):
+    """
+    Runs inference on validation set, computes Levenshtein error rate,
+    and returns the metric along with a DataFrame for failure analysis.
+    """
+    # Load Best Model
+    model = MSRN().to(device)
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+=======
+def calculate_validation_metric(device):
+    """
+    Runs inference on validation set, computes Levenshtein error rate,
+    and returns the metric along with a DataFrame for failure analysis.
+    """
+    # Load Best Model
+    model = MultiStreamGRU().to(device)
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Inference
+            _, stage2_logits = model(skeleton, audio)
+            predictions = torch.argmax(stage2_logits, dim=2).cpu().numpy()
+=======
+            # Inference
+            logits = model(skeleton, audio)
+            predictions = torch.argmax(logits, dim=2).cpu().numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Submission
+    threshold = 0.1981
+    if metric < threshold:
+        print(f"Metric {metric} < {threshold}. Generating submission...")
+=======
+    # 4. Submission
+    threshold = 0.1369
+    if metric < threshold:
+        print(f"Metric {metric} < {threshold}. Generating submission...")
+>>>>>>> REPLACE
+```

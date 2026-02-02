@@ -1,0 +1,471 @@
+To optimize the solution and address the numerical instability (NaN loss) and poor performance observed in the previous run, I will implement the following changes based on the provided lessons:
+
+1.  **Simplify Feature Engineering (Cite solution_lesson_node_00020):** Instead of the complex `ECEF -> ENU` transformation chain which likely caused numerical instability, I will use a **flat-earth approximation** to convert Latitude/Longitude degrees into local meters. This isolates errors and avoids coupling dimensions unnecessarily.
+2.  **Robust Input Scaling:** The `MeanUncertainty` feature was observed to have extreme outliers (max 1e9). I will apply a `log1p` transformation to this feature before scaling to prevent gradient explosion.
+3.  **Explicit Dynamics (Cite solution_lesson_node_00005, solution_lesson_node_00006):** I will explicitly calculate and include the first-order differences (velocities) of the position in meters (North, East, Up) as input features.
+4.  **Target Scaling (Cite solution_lesson_node_00001):** Targets will be calculated as the difference between Ground Truth and WLS Baseline in **meters** (North, East) using the same flat-earth projection, ensuring they are naturally scaled for the network (range ~0-100m).
+5.  **Training Stability:** I will add gradient clipping in the training loop to further prevent NaNs.
+
+Here are the code modifications:
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the Great Circle distance between two points on the Earth.
+
+    Args:
+        lat1, lon1: First point coordinates in degrees.
+        lat2, lon2: Second point coordinates in degrees.
+
+    Returns:
+        distance: Distance in meters.
+    """
+    R = 6371000.0  # Earth radius in meters
+
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+    return R * c
+=======
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the Great Circle distance between two points on the Earth.
+
+    Args:
+        lat1, lon1: First point coordinates in degrees.
+        lat2, lon2: Second point coordinates in degrees.
+
+    Returns:
+        distance: Distance in meters.
+    """
+    R = 6371000.0  # Earth radius in meters
+
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+    return R * c
+
+
+def flat_earth_projection(lat, lon, ref_lat, ref_lon):
+    """
+    Converts lat/lon to local meters (North, East) relative to a reference point
+    using a flat earth approximation.
+    Cite solution_lesson_node_00020: Minimize Coordinate Transformations.
+    """
+    R = 6371000.0
+    dlat = np.radians(lat - ref_lat)
+    dlon = np.radians(lon - ref_lon)
+    
+    # North offset in meters
+    north_m = dlat * R
+    
+    # East offset in meters (adjusted for latitude)
+    east_m = dlon * R * np.cos(np.radians(ref_lat))
+    
+    return north_m, east_m
+
+
+def inverse_flat_earth_projection(north_m, east_m, ref_lat, ref_lon):
+    """
+    Converts local meters (North, East) back to lat/lon.
+    """
+    R = 6371000.0
+    
+    dlat = np.degrees(north_m / R)
+    dlon = np.degrees(east_m / (R * np.cos(np.radians(ref_lat))))
+    
+    lat = ref_lat + dlat
+    lon = ref_lon + dlon
+    
+    return lat, lon
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def process_features(df):
+    """
+    Generates relative metric features (ENU) and velocities.
+    """
+    # Convert WLS ECEF to LLA
+    wls_lat, wls_lon, wls_alt = ecef_to_lla(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+    )
+
+    df["WlsLat"] = wls_lat
+    df["WlsLon"] = wls_lon
+    df["WlsAlt"] = wls_alt
+
+    # We construct "Relative" features.
+    # However, the windowing function logic above just slices existing columns.
+    # To make the window "Relative to Center", we need to do it AFTER windowing or
+    # use a clever trick.
+    # Trick: The network needs translation invariance.
+    # Instead of absolute ECEF or LLA, we can use the difference between
+    # current epoch WLS and previous epoch WLS (Velocity) as inputs,
+    # plus maybe a local shape relative to the window center.
+
+    # Implementing "Relative to Window Center" efficiently:
+    # It is computationally expensive to re-center every window in a loop.
+    # Approximation:
+    # 1. Calculate global ENU relative to the FIRST point of the trip.
+    # 2. Inside the window, subtract the center's ENU from neighbors.
+    # This preserves the metric shape perfectly locally.
+
+    # Calculate ENU relative to trip start
+    df["TripStartLat"] = df.groupby("tripId")["WlsLat"].transform("first")
+    df["TripStartLon"] = df.groupby("tripId")["WlsLon"].transform("first")
+    df["TripStartAlt"] = df.groupby("tripId")["WlsAlt"].transform("first")
+
+    # Vectorized ECEF to ENU relative to trip start
+    # Note: ecef_to_enu takes scalar ref lat/lon usually, but we can pass arrays if implementation supports it.
+    # The provided utils ecef_to_enu uses numpy, so passing arrays for ref should work if dimensions match.
+
+    e, n, u = ecef_to_enu(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+        df["TripStartLat"].values,
+        df["TripStartLon"].values,
+        df["TripStartAlt"].values,
+    )
+
+    df["GlobalE"] = e
+    df["GlobalN"] = n
+    df["GlobalU"] = u
+
+    # Calculate Velocities (First order difference)
+    # Fill NA for first element with 0
+    df["VelE"] = df.groupby("tripId")["GlobalE"].diff().fillna(0)
+    df["VelN"] = df.groupby("tripId")["GlobalN"].diff().fillna(0)
+    df["VelU"] = df.groupby("tripId")["GlobalU"].diff().fillna(0)
+
+    # Fill missing signal metrics
+    df["MeanCn0"] = df["MeanCn0"].fillna(0)
+    df["MeanUncertainty"] = df["MeanUncertainty"].fillna(
+        100
+    )  # High uncertainty default
+    df["SatelliteCount"] = df["SatelliteCount"].fillna(0)
+
+    return df
+=======
+def process_features(df):
+    """
+    Generates relative metric features and velocities using flat-earth approximation.
+    Cite solution_lesson_node_00020: Minimize Coordinate Transformations.
+    """
+    # Convert WLS ECEF to LLA
+    wls_lat, wls_lon, wls_alt = ecef_to_lla(
+        df["WlsPositionXEcefMeters"].values,
+        df["WlsPositionYEcefMeters"].values,
+        df["WlsPositionZEcefMeters"].values,
+    )
+
+    df["WlsLat"] = wls_lat
+    df["WlsLon"] = wls_lon
+    df["WlsAlt"] = wls_alt
+
+    # Calculate Global Metric Coordinates relative to trip start
+    # This avoids ECEF->ENU instability.
+    # We use the first point of the trip as the reference for the whole trip.
+    df["RefLat"] = df.groupby("tripId")["WlsLat"].transform("first")
+    df["RefLon"] = df.groupby("tripId")["WlsLon"].transform("first")
+    df["RefAlt"] = df.groupby("tripId")["WlsAlt"].transform("first")
+
+    # Use flat earth projection for robust relative coordinates
+    # R = 6371000
+    # dy (North) = dLat * R
+    # dx (East) = dLon * R * cos(Lat)
+    
+    R = 6371000.0
+    dlat_rad = np.radians(df["WlsLat"] - df["RefLat"])
+    dlon_rad = np.radians(df["WlsLon"] - df["RefLon"])
+    ref_lat_rad = np.radians(df["RefLat"])
+    
+    df["GlobalN"] = dlat_rad * R
+    df["GlobalE"] = dlon_rad * R * np.cos(ref_lat_rad)
+    df["GlobalU"] = df["WlsAlt"] - df["RefAlt"]
+
+    # Calculate Velocities (First order difference)
+    # Cite solution_lesson_node_00005: Explicit Trajectory Dynamics
+    # Cite solution_lesson_node_00006: Vertical Dynamics
+    df["VelE"] = df.groupby("tripId")["GlobalE"].diff().fillna(0)
+    df["VelN"] = df.groupby("tripId")["GlobalN"].diff().fillna(0)
+    df["VelU"] = df.groupby("tripId")["GlobalU"].diff().fillna(0)
+
+    # Fill missing signal metrics and Log Transform Uncertainty
+    # Uncertainty can be very large, causing NaNs in gradients. Log1p stabilizes it.
+    df["MeanCn0"] = df["MeanCn0"].fillna(0)
+    
+    unc = df["MeanUncertainty"].fillna(100)
+    df["MeanUncertainty"] = np.log1p(unc)
+    
+    df["SatelliteCount"] = df["SatelliteCount"].fillna(0)
+
+    return df
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Targets (for train/val)
+    y = None
+    if mode in ["train", "val"]:
+        # Calculate Ground Truth ENU relative to WLS
+        # We use the WLS position of the current epoch as reference
+        # Target = GT - WLS (in meters)
+
+        # GT LLA
+        gt_lat = merged["LatitudeDegrees"].values
+        gt_lon = merged["LongitudeDegrees"].values
+        gt_alt = merged["AltitudeMeters"].values
+
+        # WLS LLA
+        wls_lat = merged["WlsLat"].values
+        wls_lon = merged["WlsLon"].values
+        wls_alt = merged["WlsAlt"].values
+
+        # Convert GT LLA to ECEF
+        gt_x, gt_y, gt_z = lla_to_ecef(gt_lat, gt_lon, gt_alt)
+
+        # Convert GT ECEF to ENU relative to WLS LLA
+        t_e, t_n, t_u = ecef_to_enu(gt_x, gt_y, gt_z, wls_lat, wls_lon, wls_alt)
+
+        # Target: Delta East, Delta North
+        y = np.stack([t_e, t_n], axis=1)
+
+        # Filter outliers (optional, but good for stability)
+        # mask = (np.abs(y) < 1000).all(axis=1) # Filter > 1km errors?
+        # For now, keep all, robust loss handles outliers.
+=======
+    # Targets (for train/val)
+    y = None
+    if mode in ["train", "val"]:
+        # Calculate Ground Truth residuals in meters relative to WLS
+        # Target = GT - WLS (in meters)
+        # Cite solution_lesson_node_00001: Target Scaling (Meters)
+        
+        gt_lat = merged["LatitudeDegrees"].values
+        gt_lon = merged["LongitudeDegrees"].values
+        
+        wls_lat = merged["WlsLat"].values
+        wls_lon = merged["WlsLon"].values
+        
+        # Use simple flat earth projection for targets to match input feature logic
+        # and avoid ECEF conversion instability
+        R = 6371000.0
+        dlat = np.radians(gt_lat - wls_lat)
+        dlon = np.radians(gt_lon - wls_lon)
+        
+        # North offset
+        t_n = dlat * R
+        # East offset (using WLS lat for cosine projection)
+        t_e = dlon * R * np.cos(np.radians(wls_lat))
+        
+        # Target: Delta East, Delta North
+        y = np.stack([t_e, t_n], axis=1)
+        
+        # Replace any NaNs/Infs in target with 0 (though unlikely with this method)
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # Scaling
+    # We fit scaler on Train, apply to Val/Test
+    # Reshape X to (N*W, F) for scaling
+    N, W, F = X.shape
+    X_flat = X.reshape(-1, F)
+
+    if mode == "train":
+        scaler = StandardScaler()
+        X_flat = scaler.fit_transform(X_flat)
+        # Save scaler params
+        scaler_params = {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()}
+        with open(Config.SCALER_PATH, "w") as f:
+            json.dump(scaler_params, f)
+    else:
+        # Load scaler
+        if os.path.exists(Config.SCALER_PATH):
+            with open(Config.SCALER_PATH, "r") as f:
+                params = json.load(f)
+            scaler = StandardScaler()
+            scaler.mean_ = np.array(params["mean"])
+            scaler.scale_ = np.array(params["scale"])
+            X_flat = scaler.transform(X_flat)
+        else:
+            print("Warning: Scaler not found, using local scaling (suboptimal).")
+            scaler = StandardScaler()
+            X_flat = scaler.fit_transform(X_flat)
+
+    X = X_flat.reshape(N, W, F)
+=======
+    # Scaling
+    # We fit scaler on Train, apply to Val/Test
+    # Reshape X to (N*W, F) for scaling
+    N, W, F = X.shape
+    X_flat = X.reshape(-1, F)
+    
+    # Handle NaNs in X before scaling
+    X_flat = np.nan_to_num(X_flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if mode == "train":
+        scaler = StandardScaler()
+        X_flat = scaler.fit_transform(X_flat)
+        # Save scaler params
+        scaler_params = {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()}
+        with open(Config.SCALER_PATH, "w") as f:
+            json.dump(scaler_params, f)
+    else:
+        # Load scaler
+        if os.path.exists(Config.SCALER_PATH):
+            with open(Config.SCALER_PATH, "r") as f:
+                params = json.load(f)
+            scaler = StandardScaler()
+            scaler.mean_ = np.array(params["mean"])
+            scaler.scale_ = np.array(params["scale"])
+            X_flat = scaler.transform(X_flat)
+        else:
+            print("Warning: Scaler not found, using local scaling (suboptimal).")
+            scaler = StandardScaler()
+            X_flat = scaler.fit_transform(X_flat)
+
+    X = X_flat.reshape(N, W, F)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        loss.backward()
+        optimizer.step()
+
+        # Accumulate loss weighted by batch size
+        running_loss += loss.item() * inputs.size(0)
+=======
+        loss.backward()
+        
+        # Gradient Clipping to prevent NaNs
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+
+        # Accumulate loss weighted by batch size
+        running_loss += loss.item() * inputs.size(0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 4. Reconstruct Absolute Coordinates
+    print("Reconstructing absolute coordinates...")
+
+    # Extract baseline WLS coordinates from metadata
+    wls_lat = df_test_meta["WlsLat"].values
+    wls_lon = df_test_meta["WlsLon"].values
+    wls_alt = df_test_meta["WlsAlt"].values
+
+    pred_e = predictions[:, 0]
+    pred_n = predictions[:, 1]
+    # We assume 0 vertical offset as we only predict horizontal residuals
+    pred_u = np.zeros_like(pred_e)
+
+    # Convert predicted ENU offsets back to ECEF relative to the WLS baseline
+    pred_x, pred_y, pred_z = enu_to_ecef(
+        pred_e, pred_n, pred_u, wls_lat, wls_lon, wls_alt
+    )
+
+    # Convert ECEF to Geodetic (Lat, Lon)
+    pred_lat, pred_lon, _ = ecef_to_lla(pred_x, pred_y, pred_z)
+=======
+    # 4. Reconstruct Absolute Coordinates
+    print("Reconstructing absolute coordinates...")
+
+    # Extract baseline WLS coordinates from metadata
+    wls_lat = df_test_meta["WlsLat"].values
+    wls_lon = df_test_meta["WlsLon"].values
+    
+    pred_e = predictions[:, 0]
+    pred_n = predictions[:, 1]
+    
+    # Inverse Flat Earth Projection
+    R = 6371000.0
+    
+    # Delta Lat in degrees
+    dlat_deg = np.degrees(pred_n / R)
+    
+    # Delta Lon in degrees
+    dlon_deg = np.degrees(pred_e / (R * np.cos(np.radians(wls_lat))))
+    
+    pred_lat = wls_lat + dlat_deg
+    pred_lon = wls_lon + dlon_deg
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Reconstruct Absolute Coordinates
+    # The model predicts the offset from the WLS baseline in meters (East, North)
+    # We need to convert these offsets back to Lat/Lon
+
+    print("Reconstructing coordinates...")
+    # Extract baselines
+    wls_lat = df_val_meta["WlsLat"].values
+    wls_lon = df_val_meta["WlsLon"].values
+    wls_alt = df_val_meta["WlsAlt"].values
+
+    # Predicted local offsets
+    pred_e = preds[:, 0]
+    pred_n = preds[:, 1]
+    pred_u = np.zeros_like(pred_e)  # We only predict horizontal
+
+    # Convert ENU offsets to ECEF relative to WLS baseline
+    pred_x, pred_y, pred_z = enu_to_ecef(
+        pred_e, pred_n, pred_u, wls_lat, wls_lon, wls_alt
+    )
+
+    # Convert ECEF to Geodetic
+    pred_lat, pred_lon, _ = ecef_to_lla(pred_x, pred_y, pred_z)
+=======
+    # 3. Reconstruct Absolute Coordinates
+    # The model predicts the offset from the WLS baseline in meters (East, North)
+    # We need to convert these offsets back to Lat/Lon
+
+    print("Reconstructing coordinates...")
+    # Extract baselines
+    wls_lat = df_val_meta["WlsLat"].values
+    wls_lon = df_val_meta["WlsLon"].values
+    
+    # Predicted local offsets
+    pred_e = preds[:, 0]
+    pred_n = preds[:, 1]
+    
+    # Inverse Flat Earth Projection
+    R = 6371000.0
+    dlat_deg = np.degrees(pred_n / R)
+    dlon_deg = np.degrees(pred_e / (R * np.cos(np.radians(wls_lat))))
+    
+    pred_lat = wls_lat + dlat_deg
+    pred_lon = wls_lon + dlon_deg
+>>>>>>> REPLACE
+```

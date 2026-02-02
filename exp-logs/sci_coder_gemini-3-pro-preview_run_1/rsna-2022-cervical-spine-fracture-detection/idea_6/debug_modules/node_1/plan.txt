@@ -1,0 +1,339 @@
+The `ModuleNotFoundError` is caused by a top-level import of the missing `nibabel` library in `library/datasets.py`. To fix this, I will wrap the import statement in a `try...except ImportError` block to make the dependency optional (Cite debug_lesson_9). Furthermore, I will refactor the `SegmentationDataset` class to detect if `nibabel` is missing and automatically fall back to using bounding box annotations from `train_bounding_boxes.csv` to generate segmentation masks (Cite debug_lesson_7). This ensures the pipeline can proceed in environments where `nibabel` is unavailable.
+
+```diff
+library/datasets.py
+<<<<<<< SEARCH
+import cv2
+import pydicom
+import nibabel as nib
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+=======
+import cv2
+import pydicom
+try:
+    import nibabel as nib
+    HAS_NIBABEL = True
+except ImportError:
+    HAS_NIBABEL = False
+    nib = None
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+>>>>>>> REPLACE
+```
+
+```diff
+library/datasets.py
+<<<<<<< SEARCH
+    def __init__(self, metadata_df, transform=None, cache_nifti=True):
+        self.metadata = metadata_df[
+            metadata_df["has_segmentation"] == True
+        ].reset_index(drop=True)
+        self.transform = transform
+        self.cache_nifti = cache_nifti
+        self.nifti_cache = {}
+        self.dicom_lists_cache = {}
+
+        # Define augmentations if none provided
+=======
+    def __init__(self, metadata_df, transform=None, cache_nifti=True):
+        self.transform = transform
+        self.cache_nifti = cache_nifti
+        self.nifti_cache = {}
+        self.dicom_lists_cache = {}
+        self.use_nifti = HAS_NIBABEL
+
+        if self.use_nifti:
+            self.metadata = metadata_df[
+                metadata_df["has_segmentation"] == True
+            ].reset_index(drop=True)
+        else:
+            # Fallback: Use studies with bounding boxes
+            print("Nibabel not found. Switching SegmentationDataset to Bounding Box fallback mode.")
+            if os.path.exists(config.TRAIN_BBOXES_PATH):
+                self.bbox_df = pd.read_csv(config.TRAIN_BBOXES_PATH)
+                valid_uids = set(self.bbox_df["StudyInstanceUID"].unique())
+                self.metadata = metadata_df[
+                    metadata_df["StudyInstanceUID"].isin(valid_uids)
+                ].reset_index(drop=True)
+                # Group bboxes by study for fast access
+                self.bbox_grouped = self.bbox_df.groupby("StudyInstanceUID")
+            else:
+                print("Warning: Train bounding boxes not found. Dataset will be empty.")
+                self.metadata = pd.DataFrame()
+
+        # Define augmentations if none provided
+>>>>>>> REPLACE
+```
+
+```diff
+library/datasets.py
+<<<<<<< SEARCH
+    def __len__(self):
+        # We define length as number of studies * approx slices?
+        # Or just iterate studies?
+        # Standard practice: One epoch = iteration over all slices.
+        # But we have variable slices. Let's index by (study_idx, slice_idx).
+        # To avoid pre-calculating all slices, we can just randomly sample a slice from a study
+        # effectively making the epoch length = number of studies.
+        # For better coverage, we can multiply length.
+        return (
+            len(self.metadata) * 50
+        )  # Heuristic: sample 50 slices per study per epoch
+=======
+    def __len__(self):
+        if len(self.metadata) == 0:
+            return 0
+        return (
+            len(self.metadata) * 50
+        )  # Heuristic: sample 50 slices per study per epoch
+>>>>>>> REPLACE
+```
+
+```diff
+library/datasets.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        # Map linear index to study
+        study_idx = idx % len(self.metadata)
+        row = self.metadata.iloc[study_idx]
+        study_uid = row["StudyInstanceUID"]
+
+        # Paths
+        image_dir = os.path.join(config.INPUT_DIR, row["image_path"])
+        seg_path = os.path.join(config.INPUT_DIR, row["segmentation_path"])
+
+        # 1. Load Segmentation Volume (Cached)
+        if study_uid not in self.nifti_cache:
+            try:
+                nii = nib.load(seg_path)
+                nii = nib.as_closest_canonical(nii)  # Reorient to RAS
+                vol = nii.get_fdata()
+                # vol shape: (X, Y, Z) usually.
+                # We need to ensure orientation matches DICOM.
+                # NIfTI RAS: x=Right, y=Anterior, z=Superior.
+                # DICOM Axial: usually looked at from feet up.
+                # We will assume Z-axis of vol corresponds to sorted DICOMs.
+                if self.cache_nifti:
+                    self.nifti_cache[study_uid] = vol
+            except Exception as e:
+                # Fallback: return zeros
+                print(f"Error loading NIfTI {seg_path}: {e}")
+                vol = np.zeros((512, 512, 100))  # Dummy
+                if self.cache_nifti:
+                    self.nifti_cache[study_uid] = vol
+        else:
+            vol = self.nifti_cache[study_uid]
+
+        # 2. Load DICOM List (Cached)
+        if study_uid not in self.dicom_lists_cache:
+            dicom_files = load_and_sort_dicoms(image_dir)
+            if self.cache_nifti:
+                self.dicom_lists_cache[study_uid] = dicom_files
+        else:
+            dicom_files = self.dicom_lists_cache[study_uid]
+
+        # 3. Select a Slice
+        # We want to sample slices that contain segmentation labels more often
+        num_slices = min(len(dicom_files), vol.shape[2])
+
+        # Try to find a slice with annotations
+        attempts = 0
+        selected_z = 0
+        while attempts < 10:
+            z_idx = np.random.randint(0, num_slices)
+            # Check if mask has content (classes 1-7)
+            mask_slice = vol[:, :, z_idx]
+            # Classes 1-7 are C1-C7. 8+ are Thoracic.
+            if np.any((mask_slice >= 1) & (mask_slice <= 7)):
+                selected_z = z_idx
+                break
+            attempts += 1
+            selected_z = z_idx  # Fallback to random
+
+        # 4. Load Image and Mask
+        slice_info = dicom_files[selected_z]  # (slice_num, z_pos, path)
+        img_path = slice_info[2]
+
+        # Load and Window Image
+        img = utils.load_dicom_array(img_path)
+        img = utils.apply_windowing(
+            img, config.BONE_WINDOW_CENTER, config.BONE_WINDOW_WIDTH
+        )
+
+        # Get Mask Slice
+        # Note: NIfTI (X, Y, Z) -> Transpose to (Y, X) to match DICOM (Rows, Cols)
+        # Usually NIfTI is (Left-Right, Posterior-Anterior, Inf-Sup).
+        # DICOM pixel array is (Rows/Y, Cols/X).
+        # We transpose the mask slice.
+        mask = vol[:, :, selected_z].T
+
+        # Filter Labels: Keep 1-7, set others to 0
+        mask_filtered = np.where((mask >= 1) & (mask <= 7), mask, 0).astype(np.float32)
+
+        # Resize/Augment
+        # Albumentations expects HWC
+        # Image is HW, Mask is HW.
+        # Expand dims for image to HWC (HW1)
+        # Mask is class indices, keep as HW? No, usually masks are HW for segmentation.
+
+        if self.transform:
+            # Albumentations handles image (H,W) or (H,W,C)
+            augmented = self.transform(image=img, mask=mask_filtered)
+            img_tensor = augmented[
+                "image"
+            ]  # (1, H, W) due to ToTensorV2? No, usually (C, H, W) if input was C.
+            mask_tensor = augmented["mask"]  # (H, W) or (1, H, W)
+
+            # Ensure mask is Long for CrossEntropy
+            mask_tensor = mask_tensor.long()
+
+            # Image needs to be float
+            img_tensor = img_tensor.float()
+
+            # If ToTensorV2 didn't add channel dim to image (if input was 2D)
+            if img_tensor.ndim == 2:
+                img_tensor = img_tensor.unsqueeze(0)
+
+        else:
+            img_tensor = torch.from_numpy(img).unsqueeze(0).float()
+            mask_tensor = torch.from_numpy(mask_filtered).long()
+
+        # One-hot encode mask? No, CrossEntropyLoss expects class indices (H, W).
+
+        return img_tensor, mask_tensor
+=======
+    def __getitem__(self, idx):
+        # Map linear index to study
+        study_idx = idx % len(self.metadata)
+        row = self.metadata.iloc[study_idx]
+        study_uid = row["StudyInstanceUID"]
+
+        # Paths
+        image_dir = os.path.join(config.INPUT_DIR, row["image_path"])
+
+        # Load DICOM List (Cached)
+        if study_uid not in self.dicom_lists_cache:
+            dicom_files = load_and_sort_dicoms(image_dir)
+            if self.cache_nifti:
+                self.dicom_lists_cache[study_uid] = dicom_files
+        else:
+            dicom_files = self.dicom_lists_cache[study_uid]
+        
+        # Handle empty dicom folders
+        if not dicom_files:
+             # Return dummy
+             return torch.zeros((1, config.FULL_IMAGE_SIZE, config.FULL_IMAGE_SIZE)), torch.zeros((config.FULL_IMAGE_SIZE, config.FULL_IMAGE_SIZE)).long()
+
+        if self.use_nifti:
+            return self._getitem_nifti(study_uid, row, dicom_files)
+        else:
+            return self._getitem_bbox(study_uid, row, dicom_files)
+
+    def _getitem_nifti(self, study_uid, row, dicom_files):
+        seg_path = os.path.join(config.INPUT_DIR, row["segmentation_path"])
+
+        # 1. Load Segmentation Volume (Cached)
+        if study_uid not in self.nifti_cache:
+            try:
+                nii = nib.load(seg_path)
+                nii = nib.as_closest_canonical(nii)  # Reorient to RAS
+                vol = nii.get_fdata()
+                if self.cache_nifti:
+                    self.nifti_cache[study_uid] = vol
+            except Exception as e:
+                print(f"Error loading NIfTI {seg_path}: {e}")
+                vol = np.zeros((512, 512, 100))  # Dummy
+                if self.cache_nifti:
+                    self.nifti_cache[study_uid] = vol
+        else:
+            vol = self.nifti_cache[study_uid]
+
+        # 3. Select a Slice
+        num_slices = min(len(dicom_files), vol.shape[2])
+        attempts = 0
+        selected_z = 0
+        while attempts < 10:
+            z_idx = np.random.randint(0, num_slices)
+            mask_slice = vol[:, :, z_idx]
+            if np.any((mask_slice >= 1) & (mask_slice <= 7)):
+                selected_z = z_idx
+                break
+            attempts += 1
+            selected_z = z_idx
+
+        # 4. Load Image and Mask
+        slice_info = dicom_files[selected_z]
+        img_path = slice_info[2]
+        img = utils.load_dicom_array(img_path)
+        img = utils.apply_windowing(
+            img, config.BONE_WINDOW_CENTER, config.BONE_WINDOW_WIDTH
+        )
+
+        mask = vol[:, :, selected_z].T
+        mask_filtered = np.where((mask >= 1) & (mask <= 7), mask, 0).astype(np.float32)
+
+        return self._apply_transform(img, mask_filtered)
+
+    def _getitem_bbox(self, study_uid, row, dicom_files):
+        # Get bboxes for this study
+        if study_uid in self.bbox_grouped.groups:
+            bboxes = self.bbox_grouped.get_group(study_uid)
+        else:
+            bboxes = pd.DataFrame()
+
+        # Select a slice
+        # Try to pick a slice that has a bbox
+        if len(bboxes) > 0:
+            # Pick a random bbox
+            bbox_row = bboxes.sample(1).iloc[0]
+            target_slice = int(bbox_row["slice_number"])
+            
+            # Find index in dicom_files matching this slice number
+            matches = [i for i, x in enumerate(dicom_files) if x[0] == target_slice]
+            if matches:
+                selected_idx = matches[0]
+            else:
+                selected_idx = np.random.randint(0, len(dicom_files))
+        else:
+            selected_idx = np.random.randint(0, len(dicom_files))
+            
+        slice_info = dicom_files[selected_idx]
+        img_path = slice_info[2]
+        img = utils.load_dicom_array(img_path)
+        img = utils.apply_windowing(
+            img, config.BONE_WINDOW_CENTER, config.BONE_WINDOW_WIDTH
+        )
+        
+        # Create Mask from BBox
+        mask = np.zeros(img.shape, dtype=np.float32)
+        
+        if len(bboxes) > 0:
+            slice_bboxes = bboxes[bboxes["slice_number"] == slice_info[0]]
+            for _, bb in slice_bboxes.iterrows():
+                x, y, w, h = bb["x"], bb["y"], bb["width"], bb["height"]
+                x1, y1 = int(x), int(y)
+                x2, y2 = int(x + w), int(y + h)
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(mask.shape[1], x2); y2 = min(mask.shape[0], y2)
+                
+                mask[y1:y2, x1:x2] = 1.0 # Class 1
+
+        return self._apply_transform(img, mask)
+
+    def _apply_transform(self, img, mask):
+        if self.transform:
+            augmented = self.transform(image=img, mask=mask)
+            img_tensor = augmented["image"]
+            mask_tensor = augmented["mask"]
+            mask_tensor = mask_tensor.long()
+            img_tensor = img_tensor.float()
+            if img_tensor.ndim == 2:
+                img_tensor = img_tensor.unsqueeze(0)
+        else:
+            img_tensor = torch.from_numpy(img).unsqueeze(0).float()
+            mask_tensor = torch.from_numpy(mask).long()
+        return img_tensor, mask_tensor
+>>>>>>> REPLACE
+```

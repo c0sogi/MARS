@@ -1,0 +1,543 @@
+To optimize the solution, I will implement a targeted simplification of the model and a robust evaluation strategy based on the provided lessons.
+
+1.  **Model Simplification (Cite Lessons 31, 35, 69, 45):** I will revert the complex `SpatiallyRegularizedSECNN` to a `SimpleCNN`. This involves removing Squeeze-and-Excitation (SE) blocks (prone to overfitting on small data), removing Spatial Dropout (causes instability in early layers), and removing the custom hierarchical pooling (standard Global Max Pooling is more robust). I will also remove the manual weight initialization to rely on PyTorch defaults (Kaiming Uniform).
+2.  **Evaluation Strategy (Cite Lesson 44):** The previous solution failed because it compared an Out-Of-Fold (OOF) metric (single model performance) against a threshold derived from a Hold-Out Ensemble (ensemble performance). To fix this and reduce variance, I will modify `runfile.py` to strictly reserve 20% of the data as a hold-out set. I will train the 5-fold models on the remaining 80% and evaluate their **ensemble average** on the hold-out set. This matches the methodology of the "Current Best" solution.
+3.  **Hyperparameters (Cite Lesson 19):** I will reduce the dropout rate in the classification head to 0.2 and ensure the channel configuration remains `[64, 128, 128, 128]` to preserve texture features (Cite Lesson 50).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Regularization
+    # Spatial Dropout applied within convolutional blocks
+    SPATIAL_DROPOUT_RATE = 0.1
+    # Dropout applied in the classification head
+    HEAD_DROPOUT_RATE = 0.5
+=======
+    # Regularization
+    # Dropout applied in the classification head
+    # Reduced to 0.2 as per Lesson 19 (Current Best used 0.2)
+    HEAD_DROPOUT_RATE = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SELayer(nn.Module):
+    """
+    Squeeze-and-Excitation Module.
+    Recalibrates channel-wise feature responses by explicitly modelling interdependencies between channels.
+    """
+
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        # Ensure hidden dimension is at least 1
+        hidden_dim = max(1, channel // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, hidden_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class ConvBlock(nn.Module):
+    """
+    Standard Convolutional Block for the Spatially-Regularized CNN.
+    Sequence: Conv2d -> BN -> ReLU -> Dropout2d -> SE -> MaxPool2d.
+    """
+
+    def __init__(self, in_channels, out_channels, dropout_rate):
+        super(ConvBlock, self).__init__()
+        # Plain convolution (no residual) to enforce filtering
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        # Spatial Dropout drops entire feature maps
+        self.dropout = nn.Dropout2d(p=dropout_rate)
+        self.se = SELayer(out_channels)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.se(x)
+        x = self.pool(x)
+        return x
+
+
+class SpatiallyRegularizedSECNN(nn.Module):
+    """
+    Custom 4-Stage Convolutional Network.
+    Features:
+    - Plain CNN backbone (aggressive downsampling).
+    - Spatial Dropout for structural regularization.
+    - Selective Hierarchical Pooling (Block 3 & 4).
+    - Raw Scale Fusion with Incidence Angle.
+    """
+
+    def __init__(self):
+        super(SpatiallyRegularizedSECNN, self).__init__()
+
+        # Hyperparameters
+        channels = Config.CHANNEL_SIZES  # Expected: [64, 128, 128, 128]
+        spatial_dropout = Config.SPATIAL_DROPOUT_RATE
+        head_dropout = Config.HEAD_DROPOUT_RATE
+
+        # Backbone Stages
+        self.block1 = ConvBlock(Config.IN_CHANNELS, channels[0], spatial_dropout)
+        self.block2 = ConvBlock(channels[0], channels[1], spatial_dropout)
+        self.block3 = ConvBlock(channels[1], channels[2], spatial_dropout)
+        self.block4 = ConvBlock(channels[2], channels[3], spatial_dropout)
+
+        # Global Pooling (Max Pooling for sparse, high-intensity signals)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classification Head
+        # Fusion Input: Block 3 Features + Block 4 Features + Incidence Angle
+        fusion_dim = channels[2] + channels[3] + 1
+        hidden_dim = 256  # Moderate capacity
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        PyTorch Default Initialization (Kaiming Uniform / Fan-In).
+        Explicitly avoids fan_out or fixed scales.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_in", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, mode="fan_in", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, inc_angle):
+        """
+        Forward pass.
+        Args:
+            x (torch.Tensor): Image input [Batch, 3, 75, 75]
+            inc_angle (torch.Tensor): Incidence angle input [Batch]
+        """
+        # Stage 1
+        x1 = self.block1(x)
+
+        # Stage 2
+        x2 = self.block2(x1)
+
+        # Stage 3
+        x3 = self.block3(x2)
+
+        # Stage 4
+        x4 = self.block4(x3)
+
+        # Selective Pooling: Extract features from Block 3 and Block 4
+        # Flatten: [Batch, C, 1, 1] -> [Batch, C]
+        feat_3 = self.global_pool(x3).view(x3.size(0), -1)
+        feat_4 = self.global_pool(x4).view(x4.size(0), -1)
+
+        # Prepare angle for concatenation
+        angle = inc_angle.view(-1, 1)
+
+        # Fusion
+        fused = torch.cat([feat_3, feat_4, angle], dim=1)
+
+        # Classification
+        logits = self.head(fused)
+
+        return logits
+=======
+class ConvBlock(nn.Module):
+    """
+    Standard Convolutional Block.
+    Sequence: Conv2d -> BN -> ReLU -> MaxPool2d.
+    Removed Spatial Dropout (Cite Lesson 69) and SE Blocks (Cite Lesson 31).
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(ConvBlock, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        return x
+
+
+class SimpleCNN(nn.Module):
+    """
+    Simple 4-Stage Convolutional Network.
+    Optimized based on Lessons:
+    - No SE Blocks (Lesson 31).
+    - No Spatial Dropout (Lesson 69).
+    - Standard Global Max Pooling on final layer only (Lesson 35).
+    - Default Initialization (Lesson 45).
+    - Shallow Dense Head (Lesson 40).
+    """
+
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+
+        # Hyperparameters
+        channels = Config.CHANNEL_SIZES  # Expected: [64, 128, 128, 128]
+        head_dropout = Config.HEAD_DROPOUT_RATE
+
+        # Backbone Stages
+        self.block1 = ConvBlock(Config.IN_CHANNELS, channels[0])
+        self.block2 = ConvBlock(channels[0], channels[1])
+        self.block3 = ConvBlock(channels[1], channels[2])
+        self.block4 = ConvBlock(channels[2], channels[3])
+
+        # Global Pooling (Max Pooling for sparse, high-intensity signals)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classification Head
+        # Fusion Input: Block 4 Features + Incidence Angle
+        fusion_dim = channels[3] + 1
+        hidden_dim = 512  # As per Lesson 40 "Current Best"
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x, inc_angle):
+        """
+        Forward pass.
+        Args:
+            x (torch.Tensor): Image input [Batch, 3, 75, 75]
+            inc_angle (torch.Tensor): Incidence angle input [Batch]
+        """
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+
+        # Global Max Pooling
+        x = self.global_pool(x).view(x.size(0), -1)
+
+        # Prepare angle for concatenation
+        angle = inc_angle.view(-1, 1)
+
+        # Fusion
+        fused = torch.cat([x, angle], dim=1)
+
+        # Classification
+        logits = self.head(fused)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SpatiallyRegularizedSECNN
+from library.data_loader import (
+    load_and_process_data,
+    create_fold_loaders,
+    create_test_loader,
+)
+from library.trainer import train_fold, validate
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # Create submission directory
+    os.makedirs("./submission", exist_ok=True)
+
+    # 2. Data Loading
+    print("Loading and processing data...")
+    # We use debug=False to train on full data for best performance within time limit
+    # load_cached_data=True to use pre-generated .npy files
+    X_train, angles_train, y_train, X_test, angles_test, ids_test = (
+        load_and_process_data(debug=Config.DEBUG, load_cached_data=True)
+    )
+
+    # 3. Cross-Validation Loop
+    print(f"Starting {Config.NUM_FOLDS}-Fold Cross-Validation...")
+
+    # Array to store Out-Of-Fold predictions
+    oof_preds = np.zeros(len(y_train))
+
+    # StratifiedKFold for indices
+    # We must use the same seed and parameters as the internal splitter to ensure alignment
+    skf = StratifiedKFold(
+        n_splits=Config.NUM_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Store fold scores
+    fold_scores = []
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
+        print(f"\nProcessing Fold {fold_idx}...")
+
+        # Create DataLoaders
+        train_loader, val_loader = create_fold_loaders(
+            X_train, angles_train, y_train, fold_idx
+        )
+
+        # Initialize Model
+        model = SpatiallyRegularizedSECNN().to(device)
+
+        # Train
+        # train_fold returns the best validation loss during training
+        train_fold(fold_idx, model, train_loader, val_loader, device)
+
+        # Load Best Model for Inference
+        best_checkpoint_path = os.path.join(
+            Config.CHECKPOINT_DIR, f"model_best_fold_{fold_idx}.pth"
+        )
+        load_checkpoint(best_checkpoint_path, model)
+
+        # Validate on Hold-out set for this fold
+        criterion = torch.nn.BCEWithLogitsLoss()
+        val_loss, preds, targets = validate(model, val_loader, criterion, device)
+
+        # Store predictions
+        # val_loader iterates sequentially over the subset X_train[val_idx]
+        oof_preds[val_idx] = preds.flatten()
+
+        fold_score = log_loss(targets, preds)
+        fold_scores.append(fold_score)
+        print(f"Fold {fold_idx} Log Loss: {fold_score:.6f}")
+
+    # 4. Final Validation Metric
+    final_metric = log_loss(y_train, oof_preds)
+    # Printing full precision as requested
+    print(f"\nFinal Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate absolute error
+    errors = np.abs(y_train - oof_preds)
+
+    # Calculate image statistics for correlation
+    # X_train is (N, 3, 75, 75). Channel 0 is HH, Channel 1 is HV.
+    # We flatten spatial dims for stats: (N, 3, 5625)
+    X_flat = X_train.reshape(X_train.shape[0], 3, -1)
+
+    b1_mean = X_flat[:, 0, :].mean(axis=1)
+    b1_std = X_flat[:, 0, :].std(axis=1)
+    b2_mean = X_flat[:, 1, :].mean(axis=1)
+    b2_std = X_flat[:, 1, :].std(axis=1)
+
+    # Create analysis dataframe
+    analysis_df = pd.DataFrame(
+        {
+            "error": errors,
+            "inc_angle": angles_train,
+            "b1_mean": b1_mean,
+            "b1_std": b1_std,
+            "b2_mean": b2_mean,
+            "b2_std": b2_std,
+        }
+    )
+
+    # Compute correlations
+    correlations = analysis_df.corr()["error"].sort_values(ascending=False)
+    print("Correlation between Error Magnitude and Features:")
+    print(correlations)
+
+    # 6. Submission Generation
+    threshold = 0.18145903282502943
+    if final_metric < threshold:
+        print(
+            f"\nMetric ({final_metric}) is lower than threshold ({threshold}). Generating submission..."
+        )
+
+        test_loader = create_test_loader(X_test, angles_test, ids_test)
+
+        # Array to store predictions from each fold: (N_test, N_folds)
+        fold_test_preds = np.zeros((len(X_test), Config.NUM_FOLDS))
+
+        for fold_idx in range(Config.NUM_FOLDS):
+            print(f"Predicting with Fold {fold_idx} model...")
+            model = SpatiallyRegularizedSECNN().to(device)
+            best_checkpoint_path = os.path.join(
+                Config.CHECKPOINT_DIR, f"model_best_fold_{fold_idx}.pth"
+            )
+            load_checkpoint(best_checkpoint_path, model)
+=======
+from sklearn.model_selection import train_test_split
+from library.model import SimpleCNN
+from library.data_loader import (
+    load_and_process_data,
+    create_fold_loaders,
+    create_test_loader,
+    IcebergDataset
+)
+from torch.utils.data import DataLoader
+from library.trainer import train_fold, validate
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = Config.DEVICE
+    print(f"Using device: {device}")
+
+    # Create submission directory
+    os.makedirs("./submission", exist_ok=True)
+
+    # 2. Data Loading
+    print("Loading and processing data...")
+    X_train, angles_train, y_train, X_test, angles_test, ids_test = (
+        load_and_process_data(debug=Config.DEBUG, load_cached_data=True)
+    )
+
+    # 3. Hold-Out Split Strategy (Cite Lesson 44)
+    # We reserve 20% of the data for the final ensemble evaluation to match the "Current Best" methodology.
+    print("Splitting data into Development (80%) and Hold-Out (20%)...")
+    X_dev, X_holdout, angles_dev, angles_holdout, y_dev, y_holdout = train_test_split(
+        X_train, angles_train, y_train, 
+        test_size=0.2, 
+        random_state=Config.SEED, 
+        stratify=y_train
+    )
+
+    # 4. Cross-Validation Loop on Development Set
+    print(f"Starting {Config.NUM_FOLDS}-Fold Cross-Validation on Development Set...")
+
+    # StratifiedKFold for indices on X_dev
+    skf = StratifiedKFold(
+        n_splits=Config.NUM_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_dev, y_dev)):
+        print(f"\nProcessing Fold {fold_idx}...")
+
+        # Create DataLoaders using the subset X_dev
+        train_loader, val_loader = create_fold_loaders(
+            X_dev, angles_dev, y_dev, fold_idx
+        )
+
+        # Initialize Model (SimpleCNN)
+        model = SimpleCNN().to(device)
+
+        # Train
+        train_fold(fold_idx, model, train_loader, val_loader, device)
+
+    # 5. Hold-Out Ensemble Evaluation
+    print(f"\nEvaluating Ensemble on Hold-Out Set ({len(X_holdout)} samples)...")
+    
+    # Create Hold-Out Loader
+    holdout_dataset = IcebergDataset(X_holdout, angles_holdout, y=y_holdout, transform=None)
+    holdout_loader = DataLoader(
+        holdout_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=(Config.DEVICE == "cuda"),
+    )
+
+    # Collect predictions from all 5 models
+    holdout_preds_matrix = np.zeros((len(X_holdout), Config.NUM_FOLDS))
+    
+    for fold_idx in range(Config.NUM_FOLDS):
+        model = SimpleCNN().to(device)
+        best_checkpoint_path = os.path.join(
+            Config.CHECKPOINT_DIR, f"model_best_fold_{fold_idx}.pth"
+        )
+        load_checkpoint(best_checkpoint_path, model)
+        
+        criterion = torch.nn.BCEWithLogitsLoss()
+        _, preds, _ = validate(model, holdout_loader, criterion, device)
+        holdout_preds_matrix[:, fold_idx] = preds.flatten()
+
+    # Average predictions (Ensemble)
+    ensemble_preds = holdout_preds_matrix.mean(axis=1)
+    
+    # 6. Final Validation Metric
+    final_metric = log_loss(y_holdout, ensemble_preds)
+    # Printing full precision as requested
+    print(f"\nFinal Validation Metric: {final_metric}")
+
+    # 7. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    # Calculate absolute error on Hold-Out set
+    errors = np.abs(y_holdout - ensemble_preds)
+
+    # Calculate image statistics for correlation on Hold-Out set
+    X_flat = X_holdout.reshape(X_holdout.shape[0], 3, -1)
+
+    b1_mean = X_flat[:, 0, :].mean(axis=1)
+    b1_std = X_flat[:, 0, :].std(axis=1)
+    b2_mean = X_flat[:, 1, :].mean(axis=1)
+    b2_std = X_flat[:, 1, :].std(axis=1)
+
+    # Create analysis dataframe
+    analysis_df = pd.DataFrame(
+        {
+            "error": errors,
+            "inc_angle": angles_holdout,
+            "b1_mean": b1_mean,
+            "b1_std": b1_std,
+            "b2_mean": b2_mean,
+            "b2_std": b2_std,
+        }
+    )
+
+    # Compute correlations
+    correlations = analysis_df.corr()["error"].sort_values(ascending=False)
+    print("Correlation between Error Magnitude and Features:")
+    print(correlations)
+
+    # 8. Submission Generation
+    threshold = 0.18145903282502943
+    if final_metric < threshold:
+        print(
+            f"\nMetric ({final_metric}) is lower than threshold ({threshold}). Generating submission..."
+        )
+
+        test_loader = create_test_loader(X_test, angles_test, ids_test)
+
+        # Array to store predictions from each fold: (N_test, N_folds)
+        fold_test_preds = np.zeros((len(X_test), Config.NUM_FOLDS))
+
+        for fold_idx in range(Config.NUM_FOLDS):
+            print(f"Predicting with Fold {fold_idx} model...")
+            model = SimpleCNN().to(device)
+            best_checkpoint_path = os.path.join(
+                Config.CHECKPOINT_DIR, f"model_best_fold_{fold_idx}.pth"
+            )
+            load_checkpoint(best_checkpoint_path, model)
+>>>>>>> REPLACE
+```

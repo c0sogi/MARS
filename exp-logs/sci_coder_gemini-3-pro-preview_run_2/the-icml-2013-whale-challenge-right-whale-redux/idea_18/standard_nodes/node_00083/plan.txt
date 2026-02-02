@@ -1,0 +1,668 @@
+My implementation strategy focuses on optimizing both the training efficiency and the model's generalization capability by leveraging specific lessons learned.
+
+1.  **Multi-Objective Checkpointing (Cite Lesson 82):** I will refactor the training loop to train each architecture (EfficientNet-B0 and ResNet34) only once per fold but save *two* checkpoints: one that maximizes Validation AUC and one that minimizes Validation Loss. This effectively halves the computational cost compared to the previous approach of training separate models for each objective, allowing me to increase the number of epochs within the time limit.
+2.  **Enhanced Regularization (Cite Lesson 71):** I will increase the `FREQ_MASK_PARAM` to 25 and introduce `TIME_MASK_PARAM=20`. Lesson 71 suggests that aggressive frequency masking is beneficial for narrow-band signals (like whale calls) to force the model to learn temporal dependencies.
+3.  **Label Smoothing:** I will replace the standard `BCEWithLogitsLoss` with `timm.loss.BinaryCrossEntropy` using a smoothing factor of 0.05. This helps improve model calibration and prevents overfitting on noisy labels.
+4.  **Training Schedule:** I will increase `Config.EPOCHS` to 15 (from the previous override of 4) to ensure the models have sufficient time to converge, made possible by the efficiency gains from step 1.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PROJECT_NAME = "RightWhaleDetection"
+    IDEA_NAME = "idea_18"
+    SEED = 42
+=======
+    PROJECT_NAME = "RightWhaleDetection"
+    IDEA_NAME = "idea_19"
+    SEED = 42
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # SpecAugment
+    FREQ_MASK_PARAM = 20
+    TIME_MASK_PARAM = 0  # Usually less critical for short clips, but can be added
+    MASK_MODE = "mean"  # Mask with mean value
+=======
+    # SpecAugment
+    FREQ_MASK_PARAM = 25  # Increased for narrow-band signals (Cite Lesson 71)
+    TIME_MASK_PARAM = 20  # Added time masking for robustness
+    MASK_MODE = "mean"  # Mask with mean value
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+from library.config import Config
+from library.utils import calculate_metrics
+
+
+class ModelTrainer:
+    """
+    Manages the training lifecycle for a single fold.
+    Handles training loop, validation, optimization, and checkpointing
+    based on the specified objective (AUC or Loss).
+    """
+
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        objective="auc",
+        save_name="model",
+    ):
+        """
+        Args:
+            model: The PyTorch model to train.
+            train_loader: DataLoader for training data.
+            val_loader: DataLoader for validation data.
+            optimizer: Optimizer instance.
+            scheduler: Learning rate scheduler.
+            device: 'cuda' or 'cpu'.
+            objective (str): 'auc' or 'loss'. Determines the metric for checkpointing.
+            save_name (str): Filename base for saving checkpoints.
+        """
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.objective = objective
+        self.save_name = save_name
+
+        # Binary Cross Entropy with Logits (more stable than BCELoss + Sigmoid)
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        # Checkpoint directory
+        self.checkpoint_dir = Config.CHECKPOINT_DIR
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # Tracking best metrics
+        self.best_val_loss = float("inf")
+        self.best_val_auc = float("-inf")
+
+    def train_one_epoch(self):
+        """Runs one epoch of training."""
+        self.model.train()
+        running_loss = 0.0
+        dataset_size = 0
+
+        for inputs, targets in self.train_loader:
+            inputs = inputs.to(self.device)
+            # Ensure targets are [Batch, 1] to match model output
+            targets = targets.to(self.device).unsqueeze(1)
+
+            batch_size = inputs.size(0)
+            dataset_size += batch_size
+
+            self.optimizer.zero_grad()
+
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets)
+
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item() * batch_size
+
+        epoch_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return epoch_loss
+
+    def validate(self):
+        """Evaluates the model on the validation set."""
+        self.model.eval()
+        running_loss = 0.0
+        dataset_size = 0
+
+        all_targets = []
+        all_preds = []
+
+        with torch.no_grad():
+            for inputs, targets in self.val_loader:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device).unsqueeze(1)
+
+                batch_size = inputs.size(0)
+                dataset_size += batch_size
+
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+
+                running_loss += loss.item() * batch_size
+
+                # Apply sigmoid to get probabilities for AUC calculation
+                probs = torch.sigmoid(outputs)
+
+                all_targets.append(targets.cpu().numpy())
+                all_preds.append(probs.cpu().numpy())
+
+        val_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+
+        # Concatenate for metric calculation
+        if len(all_targets) > 0:
+            all_targets = np.concatenate(all_targets)
+            all_preds = np.concatenate(all_preds)
+            val_auc = calculate_metrics(all_targets, all_preds)
+        else:
+            val_auc = 0.5
+
+        return val_loss, val_auc
+
+    def fit(self, epochs=Config.EPOCHS, patience=Config.PATIENCE):
+        """
+        Runs the full training loop with Early Stopping.
+
+        Args:
+            epochs (int): Maximum number of epochs.
+            patience (int): Early stopping patience.
+        """
+        print(
+            f"Starting training for {self.save_name} | Objective: {self.objective} | Epochs: {epochs} | Patience: {patience}"
+        )
+
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            train_loss = self.train_one_epoch()
+            val_loss, val_auc = self.validate()
+
+            # Step the scheduler
+            if self.scheduler:
+                self.scheduler.step()
+
+            # Log metrics (Full precision)
+            print(
+                f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss} | Val Loss: {val_loss} | Val AUC: {val_auc}"
+            )
+
+            # Checkpoint Logic based on Objective
+            improved = False
+            if self.objective == "auc":
+                # Maximize AUC
+                if val_auc > self.best_val_auc:
+                    self.best_val_auc = val_auc
+                    improved = True
+            elif self.objective == "loss":
+                # Minimize Loss
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    improved = True
+
+            if improved:
+                print(f"Metric improved. Saving checkpoint to {self.save_name}.pth")
+                self.save_checkpoint()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
+
+        # Load the best model weights before finishing
+        self.load_best_model()
+
+    def save_checkpoint(self):
+        """Saves the model state dict."""
+        path = os.path.join(self.checkpoint_dir, f"{self.save_name}.pth")
+        torch.save(self.model.state_dict(), path)
+
+    def load_best_model(self):
+        """Loads the best model state dict from disk."""
+        path = os.path.join(self.checkpoint_dir, f"{self.save_name}.pth")
+        if os.path.exists(path):
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
+            print(f"Restored best model from {path}")
+        else:
+            print(f"Warning: Checkpoint {path} not found.")
+=======
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+from timm.loss import BinaryCrossEntropy
+from library.config import Config
+from library.utils import calculate_metrics
+
+
+class ModelTrainer:
+    """
+    Manages the training lifecycle for a single fold.
+    Handles training loop, validation, optimization, and checkpointing.
+    Supports Multi-Objective Checkpointing (saving both Best AUC and Best Loss models).
+    """
+
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        save_names,
+    ):
+        """
+        Args:
+            model: The PyTorch model to train.
+            train_loader: DataLoader for training data.
+            val_loader: DataLoader for validation data.
+            optimizer: Optimizer instance.
+            scheduler: Learning rate scheduler.
+            device: 'cuda' or 'cpu'.
+            save_names (dict): Dictionary mapping objectives ('auc', 'loss') to filenames.
+        """
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.save_names = save_names
+
+        # Use Label Smoothing for better calibration and generalization
+        self.criterion = BinaryCrossEntropy(smoothing=0.05)
+
+        # Checkpoint directory
+        self.checkpoint_dir = Config.CHECKPOINT_DIR
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # Tracking best metrics
+        self.best_val_loss = float("inf")
+        self.best_val_auc = float("-inf")
+
+    def train_one_epoch(self):
+        """Runs one epoch of training."""
+        self.model.train()
+        running_loss = 0.0
+        dataset_size = 0
+
+        for inputs, targets in self.train_loader:
+            inputs = inputs.to(self.device)
+            # Ensure targets are [Batch, 1] to match model output
+            targets = targets.to(self.device).unsqueeze(1)
+
+            batch_size = inputs.size(0)
+            dataset_size += batch_size
+
+            self.optimizer.zero_grad()
+
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets)
+
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item() * batch_size
+
+        epoch_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+        return epoch_loss
+
+    def validate(self):
+        """Evaluates the model on the validation set."""
+        self.model.eval()
+        running_loss = 0.0
+        dataset_size = 0
+
+        all_targets = []
+        all_preds = []
+
+        with torch.no_grad():
+            for inputs, targets in self.val_loader:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device).unsqueeze(1)
+
+                batch_size = inputs.size(0)
+                dataset_size += batch_size
+
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, targets)
+
+                running_loss += loss.item() * batch_size
+
+                # Apply sigmoid to get probabilities for AUC calculation
+                probs = torch.sigmoid(outputs)
+
+                all_targets.append(targets.cpu().numpy())
+                all_preds.append(probs.cpu().numpy())
+
+        val_loss = running_loss / dataset_size if dataset_size > 0 else 0.0
+
+        # Concatenate for metric calculation
+        if len(all_targets) > 0:
+            all_targets = np.concatenate(all_targets)
+            all_preds = np.concatenate(all_preds)
+            val_auc = calculate_metrics(all_targets, all_preds)
+        else:
+            val_auc = 0.5
+
+        return val_loss, val_auc
+
+    def fit(self, epochs=Config.EPOCHS, patience=Config.PATIENCE):
+        """
+        Runs the full training loop with Early Stopping.
+        Saves checkpoints for both Best AUC and Best Loss (Cite Lesson 82).
+        """
+        print(f"Starting training... Epochs: {epochs} | Patience: {patience}")
+
+        patience_counter = 0
+        best_epoch_auc = -1
+        best_epoch_loss = -1
+
+        for epoch in range(epochs):
+            train_loss = self.train_one_epoch()
+            val_loss, val_auc = self.validate()
+
+            # Step the scheduler
+            if self.scheduler:
+                self.scheduler.step()
+
+            # Log metrics
+            print(
+                f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val AUC: {val_auc:.6f}"
+            )
+
+            # Checkpoint Logic: Save BOTH best AUC and best Loss
+            # Cite Lesson 82: Multi-Objective Checkpoint Ensembling
+            improved = False
+            
+            if val_auc > self.best_val_auc:
+                self.best_val_auc = val_auc
+                self.save_checkpoint(self.save_names["auc"])
+                print(f"  [+] New Best AUC: {val_auc:.6f}")
+                improved = True
+                best_epoch_auc = epoch
+
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint(self.save_names["loss"])
+                print(f"  [+] New Best Loss: {val_loss:.6f}")
+                improved = True
+                best_epoch_loss = epoch
+
+            # Early Stopping Logic
+            # We use a combined patience: stop if NEITHER metric has improved for 'patience' epochs
+            if improved:
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
+        
+        print(f"Training finished. Best AUC: {self.best_val_auc:.6f} (Epoch {best_epoch_auc+1}), Best Loss: {self.best_val_loss:.6f} (Epoch {best_epoch_loss+1})")
+
+    def save_checkpoint(self, name):
+        """Saves the model state dict."""
+        path = os.path.join(self.checkpoint_dir, f"{name}.pth")
+        torch.save(self.model.state_dict(), path)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# =============================================================================
+# Configuration Overrides for Fast Baseline
+# =============================================================================
+# Limit epochs to ensure execution within time limits while maintaining performance.
+# Pre-trained models converge quickly on spectrograms.
+Config.EPOCHS = 4
+Config.BATCH_SIZE = 128
+Config.NUM_WORKERS = 4
+
+
+def train_ensemble():
+    """
+    Orchestrates the training of the 5-fold 4-config ensemble.
+    Trains ONLY on the training set (train.csv) to preserve val.csv as hold-out.
+    """
+    print("Loading training metadata...")
+    # Cite debug_lesson_12: Strictly Segregate Hold-Out Data
+    train_df = pd.read_csv(Config.TRAIN_CSV)
+
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Stratified K-Fold on TRAIN data only
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Loop through Folds
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["label"])):
+        print(f"\n{'='*40}\nStarting Fold {fold}/{Config.N_FOLDS - 1}\n{'='*40}")
+
+        # Split Dataframes
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
+
+        # Create Datasets
+        train_dataset = WhaleDataset(fold_train_df, phase="train")
+        val_dataset = WhaleDataset(fold_val_df, phase="val")
+
+        # Create Sampler for Class Imbalance
+        targets = fold_train_df["label"].values
+        class_counts = np.bincount(targets.astype(int))
+        class_weights = 1.0 / np.maximum(class_counts, 1)
+        sample_weights = class_weights[targets.astype(int)]
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights).double(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        # Create DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            sampler=sampler,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Train each Configuration
+        for config in Config.ENSEMBLE_CONFIGS:
+            save_name = f"{config['name']}_fold_{fold}"
+            checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f"{save_name}.pth")
+
+            if os.path.exists(checkpoint_path):
+                print(f"Checkpoint {save_name} already exists. Skipping training.")
+                continue
+
+            print(
+                f"Training Config: {config['name']} (Objective: {config['objective']})"
+            )
+
+            # Initialize Model
+            model = WhaleClassifier(config["arch"], pretrained=True)
+            model.to(device)
+
+            # Optimizer & Scheduler
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=Config.LEARNING_RATE,
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=Config.MIN_LR
+            )
+
+            # Trainer
+            trainer = ModelTrainer(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                objective=config["objective"],
+                save_name=save_name,
+            )
+
+            # Fit
+            trainer.fit(epochs=Config.EPOCHS, patience=Config.PATIENCE)
+
+            # Cleanup to save memory
+            del model, optimizer, scheduler, trainer
+            torch.cuda.empty_cache()
+=======
+# =============================================================================
+# Configuration Overrides
+# =============================================================================
+# Increase epochs for better convergence, utilizing the efficiency of multi-objective checkpointing.
+Config.EPOCHS = 15
+Config.BATCH_SIZE = 128
+Config.NUM_WORKERS = 4
+
+
+def train_ensemble():
+    """
+    Orchestrates the training of the 5-fold ensemble.
+    Trains ONLY on the training set (train.csv) to preserve val.csv as hold-out.
+    Implements Multi-Objective Checkpointing (Cite Lesson 82) to save AUC and Loss models in one run.
+    """
+    print("Loading training metadata...")
+    # Cite debug_lesson_12: Strictly Segregate Hold-Out Data
+    train_df = pd.read_csv(Config.TRAIN_CSV)
+
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Stratified K-Fold on TRAIN data only
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Define Architectures to Train
+    # We map the architecture to the names expected by Config.ENSEMBLE_CONFIGS
+    architectures_to_train = [
+        {
+            "arch": Config.ARCH_EFFICIENTNET,
+            "save_names": {"auc": "effnet_b0_auc", "loss": "effnet_b0_loss"},
+        },
+        {
+            "arch": Config.ARCH_RESNET,
+            "save_names": {"auc": "resnet34_auc", "loss": "resnet34_loss"},
+        },
+    ]
+
+    # Loop through Folds
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["label"])):
+        print(f"\n{'='*40}\nStarting Fold {fold}/{Config.N_FOLDS - 1}\n{'='*40}")
+
+        # Split Dataframes
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
+
+        # Create Datasets
+        train_dataset = WhaleDataset(fold_train_df, phase="train")
+        val_dataset = WhaleDataset(fold_val_df, phase="val")
+
+        # Create Sampler for Class Imbalance
+        targets = fold_train_df["label"].values
+        class_counts = np.bincount(targets.astype(int))
+        class_weights = 1.0 / np.maximum(class_counts, 1)
+        sample_weights = class_weights[targets.astype(int)]
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights).double(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        # Create DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            sampler=sampler,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Train each Architecture
+        for model_info in architectures_to_train:
+            arch = model_info["arch"]
+            base_names = model_info["save_names"]
+            
+            # Construct full save names with fold
+            save_names = {
+                "auc": f"{base_names['auc']}_fold_{fold}",
+                "loss": f"{base_names['loss']}_fold_{fold}",
+            }
+            
+            # Check if both checkpoints exist
+            path_auc = os.path.join(Config.CHECKPOINT_DIR, f"{save_names['auc']}.pth")
+            path_loss = os.path.join(Config.CHECKPOINT_DIR, f"{save_names['loss']}.pth")
+
+            if os.path.exists(path_auc) and os.path.exists(path_loss):
+                print(f"Checkpoints for {arch} fold {fold} already exist. Skipping.")
+                continue
+
+            print(f"Training Architecture: {arch}")
+
+            # Initialize Model
+            model = WhaleClassifier(arch, pretrained=True)
+            model.to(device)
+
+            # Optimizer & Scheduler
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=Config.LEARNING_RATE,
+                weight_decay=Config.WEIGHT_DECAY,
+            )
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=Config.EPOCHS, eta_min=Config.MIN_LR
+            )
+
+            # Trainer
+            trainer = ModelTrainer(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                save_names=save_names,
+            )
+
+            # Fit
+            trainer.fit(epochs=Config.EPOCHS, patience=Config.PATIENCE)
+
+            # Cleanup to save memory
+            del model, optimizer, scheduler, trainer
+            torch.cuda.empty_cache()
+>>>>>>> REPLACE
+```

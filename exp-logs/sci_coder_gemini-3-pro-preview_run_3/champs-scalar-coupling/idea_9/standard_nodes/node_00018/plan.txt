@@ -1,0 +1,226 @@
+My implementation strategy focuses on fixing the critical data corruption bug and scaling up the training process.
+
+1.  **Fix Silent Data Corruption (Cite solution_lesson_node_00017):** The primary failure in the previous run (LogMAE ~2.0, Correlation 1.0) was caused by the `Standardizer` class comparing integer type indices (from the dataset) with string keys (from the stats dictionary). This resulted in an empty mask and zeroed-out targets. I will rewrite `Standardizer` in `library/utils.py` to use vectorized tensor indexing (`means[types]`) instead of dictionary iteration, ensuring correct normalization.
+
+2.  **Scale to Full Dataset (Cite solution_lesson_node_00014):** The previous run was restricted to `DEBUG` mode (8,000 samples), which is insufficient for the complex Dual-Graph architecture. I will modify `runfile.py` to disable debug mode and train on the full dataset (~4 million samples).
+
+3.  **Optimize Hyperparameters for A100:** To handle the full dataset within the 4-hour limit, I will increase `BATCH_SIZE` to 512 (utilizing the 40GB GPU memory) and set `MAX_EPOCHS` to 15, which should be sufficient for convergence given the dataset size.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+class Standardizer:
+    """
+    Handles per-type standardization of targets.
+    """
+
+    def __init__(self):
+        self.stats = {}  # {type: {'mean': float, 'std': float}}
+
+    def fit(self, df, target_col="scalar_coupling_constant", type_col="type"):
+        """
+        Computes mean and std for each coupling type.
+        """
+        self.stats = {}
+        grouped = df.groupby(type_col)[target_col].agg(["mean", "std"])
+
+        for t, row in grouped.iterrows():
+            self.stats[str(t)] = {"mean": float(row["mean"]), "std": float(row["std"])}
+        return self
+
+    def transform(self, values, types):
+        """
+        Standardizes values based on their type.
+        z = (y - mean) / std
+        """
+        if isinstance(values, torch.Tensor):
+            device = values.device
+            is_tensor = True
+            values = values.detach().cpu().numpy()
+        else:
+            is_tensor = False
+
+        result = np.zeros_like(values, dtype=np.float32)
+
+        # We assume types corresponds to values index-wise
+        # Optimize by processing masks for each known type
+        for t, stat in self.stats.items():
+            mask = types == t
+            if np.any(mask):
+                result[mask] = (values[mask] - stat["mean"]) / (stat["std"] + 1e-9)
+
+        if is_tensor:
+            return torch.tensor(result, dtype=torch.float32, device=device)
+        return result
+
+    def inverse_transform(self, values, types):
+        """
+        Reverts standardized values to original scale.
+        y = z * std + mean
+        """
+        if isinstance(values, torch.Tensor):
+            device = values.device
+            is_tensor = True
+            values = values.detach().cpu().numpy()
+        else:
+            is_tensor = False
+
+        result = np.zeros_like(values, dtype=np.float32)
+
+        for t, stat in self.stats.items():
+            mask = types == t
+            if np.any(mask):
+                result[mask] = values[mask] * stat["std"] + stat["mean"]
+
+        if is_tensor:
+            return torch.tensor(result, dtype=torch.float32, device=device)
+        return result
+
+    def save(self, path):
+        """Saves statistics to a JSON file."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.stats, f, indent=4)
+
+    def load(self, path):
+        """Loads statistics from a JSON file."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Stats file not found at {path}")
+        with open(path, "r") as f:
+            self.stats = json.load(f)
+        return self
+=======
+class Standardizer:
+    """
+    Handles per-type standardization of targets using vectorized lookup.
+    Cite solution_lesson_node_00017: Canonical Indexing Prevents Silent Data Corruption.
+    """
+
+    def __init__(self):
+        self.num_types = len(Config.COUPLING_TYPES)
+        # Initialize with defaults (mean=0, std=1)
+        self.means = torch.zeros(self.num_types)
+        self.stds = torch.ones(self.num_types)
+        self.type_map = {t: i for i, t in enumerate(Config.COUPLING_TYPES)}
+        self.fitted = False
+
+    def fit(self, df, target_col="scalar_coupling_constant", type_col="type"):
+        """
+        Computes mean and std for each coupling type.
+        """
+        grouped = df.groupby(type_col)[target_col].agg(["mean", "std"])
+        
+        # Fill tensors
+        for t_str, row in grouped.iterrows():
+            if t_str in self.type_map:
+                idx = self.type_map[t_str]
+                self.means[idx] = float(row["mean"])
+                self.stds[idx] = float(row["std"])
+        
+        self.fitted = True
+        return self
+
+    def transform(self, values, types):
+        """
+        Standardizes values based on their type.
+        z = (y - mean) / std
+        """
+        if isinstance(values, torch.Tensor):
+            device = values.device
+            if self.means.device != device:
+                self.means = self.means.to(device)
+                self.stds = self.stds.to(device)
+            
+            # Vectorized lookup
+            m = self.means[types]
+            s = self.stds[types]
+            return (values - m) / (s + 1e-9)
+        else:
+            # Numpy fallback
+            m = self.means.numpy()[types]
+            s = self.stds.numpy()[types]
+            return (values - m) / (s + 1e-9)
+
+    def inverse_transform(self, values, types):
+        """
+        Reverts standardized values to original scale.
+        y = z * std + mean
+        """
+        if isinstance(values, torch.Tensor):
+            device = values.device
+            if self.means.device != device:
+                self.means = self.means.to(device)
+                self.stds = self.stds.to(device)
+            
+            m = self.means[types]
+            s = self.stds[types]
+            return values * s + m
+        else:
+            # Numpy fallback
+            m = self.means.numpy()[types]
+            s = self.stds.numpy()[types]
+            return values * s + m
+
+    def save(self, path):
+        """Saves statistics to a JSON file."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stats_dict = {
+            "means": self.means.cpu().tolist(),
+            "stds": self.stds.cpu().tolist()
+        }
+        with open(path, "w") as f:
+            json.dump(stats_dict, f, indent=4)
+
+    def load(self, path):
+        """Loads statistics from a JSON file."""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Stats file not found at {path}")
+        with open(path, "r") as f:
+            stats_dict = json.load(f)
+        
+        self.means = torch.tensor(stats_dict["means"])
+        self.stds = torch.tensor(stats_dict["stds"])
+        self.fitted = True
+        return self
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 0. Configuration Overrides for Fast Baseline
+    # ==========================================
+    # Force DEBUG mode to ensure the script completes within the time limit
+    Config.DEBUG = True
+    Config.DEBUG_SAMPLE_SIZE = 8000  # Small subset for speed
+    Config.MAX_EPOCHS = 3  # Minimal epochs for baseline
+    Config.BATCH_SIZE = 64
+    Config.NUM_WORKERS = 2
+=======
+    # ==========================================
+    # 0. Configuration Overrides for Optimized Run
+    # ==========================================
+    # Cite solution_lesson_node_00014: Train on full dataset
+    Config.DEBUG = False
+    Config.DEBUG_SAMPLE_SIZE = 0
+    
+    # Optimize for A100
+    Config.MAX_EPOCHS = 15
+    Config.BATCH_SIZE = 512
+    Config.NUM_WORKERS = 12
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    SEED = 42
+    DEBUG = False  # Set to True to run on a small subset for debugging
+    DEBUG_SAMPLE_SIZE = 5000  # Number of molecules to use in debug mode
+=======
+    SEED = 42
+    DEBUG = False
+    DEBUG_SAMPLE_SIZE = 0
+>>>>>>> REPLACE
+```

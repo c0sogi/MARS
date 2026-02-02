@@ -1,0 +1,277 @@
+Based on the analysis of the previous solution and the provided lessons, the strategy is to prioritize model convergence over architectural complexity.
+
+1.  **Prioritize Convergence (Cite solution_lesson_node_00013)**: The previous run failed to beat the baseline because it trained for only 1 epoch. I will increase the training duration to **3 epochs** to allow the DeBERTa-v3-Large model to properly converge.
+2.  **Simplify Architecture (Cite solution_lesson_node_00013)**: I will remove the "Multi-Layer Fusion" and custom projection layers, reverting to a standard architecture that uses the `[CLS]` token from the last hidden state. This reduces computational overhead and aligns with the findings that simple architectures often outperform complex ones when compute is limited.
+3.  **Remove AWP**: I will disable Adversarial Weight Perturbation. While AWP can improve generalization, it requires double forward/backward passes. Removing it frees up the compute budget necessary to support the increase in epochs.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --- Training Configuration ---
+    n_folds = 5
+    epochs = 5
+    train_batch_size = 8  # Adjusted for A100 40GB with Large model
+    valid_batch_size = 16
+    gradient_accumulation_steps = 1
+    max_grad_norm = 1000.0
+
+    # --- Optimizer & Scheduler ---
+    learning_rate = 2e-5
+    min_lr = 1e-6
+    weight_decay = 0.01
+    eps = 1e-6
+    betas = (0.9, 0.999)
+    scheduler_type = "cosine"
+    warmup_ratio = 0.1
+
+    # --- Adversarial Weight Perturbation (AWP) ---
+    use_awp = True
+    awp_lr = 1e-4
+    awp_eps = 1e-2
+    awp_start_epoch = 1  # Start AWP after the first epoch
+=======
+    # --- Training Configuration ---
+    n_folds = 5
+    epochs = 3
+    train_batch_size = 16  # Adjusted for A100 40GB with Large model
+    valid_batch_size = 32
+    gradient_accumulation_steps = 1
+    max_grad_norm = 1000.0
+
+    # --- Optimizer & Scheduler ---
+    learning_rate = 2e-5
+    min_lr = 1e-6
+    weight_decay = 0.01
+    eps = 1e-6
+    betas = (0.9, 0.999)
+    scheduler_type = "cosine"
+    warmup_ratio = 0.1
+
+    # --- Adversarial Weight Perturbation (AWP) ---
+    use_awp = False
+    awp_lr = 1e-4
+    awp_eps = 1e-2
+    awp_start_epoch = 1  # Start AWP after the first epoch
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # --- Multi-Layer Fusion Setup ---
+        self.num_layers_fusion = 4
+        self.hidden_size = self.config.hidden_size
+
+        # Fusion Projection Layer
+        # Input: Concatenation of 4 layers (4 * hidden_size)
+        # Output: Projected back to hidden_size
+        self.fusion_layer = nn.Linear(
+            self.hidden_size * self.num_layers_fusion, self.hidden_size
+        )
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+        self.activation = nn.Tanh()
+
+        # --- Classification Head ---
+        self.dropout = nn.Dropout(Config.fc_dropout)
+        self.fc = nn.Linear(self.hidden_size, Config.target_size)
+
+        # Initialize weights for custom layers
+        self._init_weights(self.fusion_layer)
+        self._init_weights(self.fc)
+=======
+        self.hidden_size = self.config.hidden_size
+
+        # --- Classification Head ---
+        self.dropout = nn.Dropout(Config.fc_dropout)
+        self.fc = nn.Linear(self.hidden_size, Config.target_size)
+
+        # Initialize weights for custom layers
+        self._init_weights(self.fc)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass.
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs.
+            attention_mask (torch.Tensor): Attention mask.
+
+        Returns:
+            torch.Tensor: Logits of shape (batch_size, 5).
+        """
+        # Pass through backbone
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Retrieve all hidden states (tuple of tensors)
+        # outputs.hidden_states contains: (embeddings, layer_1, ..., layer_24)
+        all_hidden_states = outputs.hidden_states
+
+        # Extract [CLS] tokens (index 0) from the last 'num_layers_fusion' layers
+        cls_embeddings = []
+        for i in range(1, self.num_layers_fusion + 1):
+            # Access layers from the end: -1, -2, -3, -4
+            layer_output = all_hidden_states[-i]
+            # Take the [CLS] token embedding
+            cls_token = layer_output[:, 0, :]
+            cls_embeddings.append(cls_token)
+
+        # Concatenate features along the feature dimension
+        # Shape: (batch_size, 4 * hidden_size)
+        fused_features = torch.cat(cls_embeddings, dim=1)
+
+        # Apply Weighted Projection (Fusion)
+        x = self.fusion_layer(fused_features)
+        x = self.layer_norm(x)
+        x = self.activation(x)
+
+        # Apply Classification Head
+        x = self.dropout(x)
+        logits = self.fc(x)
+
+        return logits
+=======
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass.
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs.
+            attention_mask (torch.Tensor): Attention mask.
+
+        Returns:
+            torch.Tensor: Logits of shape (batch_size, 5).
+        """
+        # Pass through backbone
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Extract [CLS] token from the last hidden state
+        last_hidden_state = outputs.last_hidden_state
+        cls_token = last_hidden_state[:, 0, :]
+
+        # Apply Classification Head
+        x = self.dropout(cls_token)
+        logits = self.fc(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.utils import seed_everything, compute_pearson_score, get_cpc_texts
+from library.data import PhraseDataset
+from library.model import CustomDeberta
+from library.awp import AWP
+from library.train import train_fn, valid_fn
+
+
+def main():
+    # --- 1. Configuration & Setup ---
+    seed_everything(Config.seed)
+
+    # Override Config for Fast Baseline on A100
+    Config.epochs = 1  # 1 Epoch is sufficient for large models on this size
+    Config.train_batch_size = 16  # Increase batch size for speed (A100 40GB)
+    Config.valid_batch_size = 32
+    Config.awp_start_epoch = 0  # Apply AWP from the start since we only have 1 epoch
+    Config.num_workers = 4
+
+    print(
+        f"Configuration: Epochs={Config.epochs}, Batch={Config.train_batch_size}, AWP Start={Config.awp_start_epoch}"
+    )
+
+    device = Config.device
+=======
+from library.config import Config
+from library.utils import seed_everything, compute_pearson_score, get_cpc_texts
+from library.data import PhraseDataset
+from library.model import CustomDeberta
+from library.train import train_fn, valid_fn
+
+
+def main():
+    # --- 1. Configuration & Setup ---
+    seed_everything(Config.seed)
+    
+    # Ensure num_workers is set for A100 environment
+    Config.num_workers = 4
+
+    print(
+        f"Configuration: Epochs={Config.epochs}, Batch={Config.train_batch_size}"
+    )
+
+    device = Config.device
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Loss, Scaler, AWP
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        scaler = GradScaler()
+        awp = AWP(model, optimizer, scaler=scaler) if Config.use_awp else None
+
+        # Training Loop
+        best_pearson = -1.0
+        model_save_path = os.path.join(Config.output_dir, f"model_fold_{fold}.bin")
+
+        for epoch in range(Config.epochs):
+            train_loss = train_fn(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                epoch,
+                scheduler,
+                device,
+                awp,
+                scaler,
+            )
+=======
+        # Loss, Scaler
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+        scaler = GradScaler()
+        
+        # Training Loop
+        best_pearson = -1.0
+        model_save_path = os.path.join(Config.output_dir, f"model_fold_{fold}.bin")
+
+        for epoch in range(Config.epochs):
+            train_loss = train_fn(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                epoch,
+                scheduler,
+                device,
+                None, # No AWP
+                scaler,
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Cleanup
+        del model, optimizer, scheduler, scaler, awp, train_loader, val_loader
+        torch.cuda.empty_cache()
+        gc.collect()
+=======
+        # Cleanup
+        del model, optimizer, scheduler, scaler, train_loader, val_loader
+        torch.cuda.empty_cache()
+        gc.collect()
+>>>>>>> REPLACE
+```

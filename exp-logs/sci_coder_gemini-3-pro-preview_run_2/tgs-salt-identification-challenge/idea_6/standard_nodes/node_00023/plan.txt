@@ -1,0 +1,348 @@
+I will optimize the solution by replacing the `BCEDiceLoss` with `BCELovaszLoss` (BCE + Lovasz-Hinge) to directly optimize the Jaccard Index (Cite solution_lesson_node_00021). I will also lower the learning rate to `1e-4` to prevent catastrophic forgetting during fine-tuning (Cite solution_lesson_node_00022) and increase the training epochs to 50 to accommodate the slower convergence of Lovasz loss (Cite solution_lesson_node_00018). Finally, I will remove the ineffective depth regression stage (Cite solution_lesson_node_00022) and instead use mean-imputation (normalized value 0.0) for the test set depths, providing a neutral prior for the depth-aware architecture (Cite solution_lesson_node_00001).
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.utils import calc_map
+from library.models import DepthRegressor, DepthAwareLinkNet34
+
+# Constants
+CHECKPOINT_DIR = "./working/idea_6/"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed=42):
+    """Sets the seed for reproducibility."""
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+class BCEDiceLoss(nn.Module):
+    """
+    Combined BCEWithLogitsLoss and Dice Loss.
+    """
+
+    def __init__(self, bce_weight=0.5, smooth=1.0):
+        super(BCEDiceLoss, self).__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = 1.0 - bce_weight
+        self.smooth = smooth
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, pred, target):
+        # BCE Loss
+        bce = self.bce_loss(pred, target)
+
+        # Dice Loss
+        pred_sigmoid = torch.sigmoid(pred)
+
+        # Flatten
+        pred_flat = pred_sigmoid.view(-1)
+        target_flat = target.view(-1)
+
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum()
+
+        dice = 1 - ((2.0 * intersection + self.smooth) / (union + self.smooth))
+
+        return self.bce_weight * bce + self.dice_weight * dice
+
+
+# -----------------------------------------------------------------------------
+# Regression Engine (Stage 1)
+# -----------------------------------------------------------------------------
+
+
+def train_regressor_epoch(model, loader, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    criterion = nn.MSELoss()
+
+    for batch in loader:
+        images = batch[0]
+        depths = batch[-2]
+
+        images = images.to(device)
+        depths = depths.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, depths)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def validate_regressor_epoch(model, loader, device):
+    model.eval()
+    running_loss = 0.0
+    criterion = nn.MSELoss()
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch[0]
+            depths = batch[-2]
+
+            images = images.to(device)
+            depths = depths.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, depths)
+
+            running_loss += loss.item() * images.size(0)
+
+    return running_loss / len(loader.dataset)
+
+
+def run_regression_training(train_loader, val_loader, epochs=20, lr=1e-4, patience=5):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    set_seed(42)
+
+    model = DepthRegressor().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    best_model_path = os.path.join(CHECKPOINT_DIR, "best_regressor.pth")
+
+    print("Starting Regression Training...")
+
+    for epoch in range(epochs):
+        start_time = time.time()
+
+        train_loss = train_regressor_epoch(model, train_loader, optimizer, DEVICE)
+        val_loss = validate_regressor_epoch(model, val_loader, DEVICE)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{epochs} | "
+            f"Train MSE: {train_loss} | "
+            f"Val MSE: {val_loss} | "
+            f"Time: {time.time() - start_time:.2f}s"
+        )
+
+        # Checkpointing
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), best_model_path)
+            patience_counter = 0
+            print(f"  -> Saved best regressor model (Loss: {best_val_loss})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("  -> Early stopping triggered.")
+                break
+
+    print("Regression Training Complete.")
+    return best_model_path
+
+
+def predict_depths(model_path, loader):
+    """
+    Generates depth predictions using the trained regressor.
+    """
+    model = DepthRegressor().to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    predictions = []
+
+    with torch.no_grad():
+        for images, _, _ in loader:
+            images = images.to(DEVICE)
+            outputs = model(images)
+            predictions.append(outputs.cpu().numpy())
+
+    return np.concatenate(predictions, axis=0)
+=======
+from library.utils import calc_map
+from library.models import DepthAwareLinkNet34
+
+# Constants
+CHECKPOINT_DIR = "./working/idea_6/"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed=42):
+    """Sets the seed for reproducibility."""
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+# -----------------------------------------------------------------------------
+# Lovasz-Hinge Loss Implementation
+# -----------------------------------------------------------------------------
+def lovasz_grad(gt_sorted):
+    """
+    Computes gradient of the Lovasz extension w.r.t sorted errors
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.cumsum(0)
+    union = gts + (1 - gt_sorted).cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:  # cover 1-pixel case
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+def lovasz_hinge_flat(logits, labels):
+    """
+    Binary Lovasz hinge loss
+      logits: [P] Variable, logits at each pixel (between -\infty and +\infty)
+      labels: [P] Tensor, binary ground truth masks (0 or 1)
+    """
+    if len(labels) == 0:
+        # only void pixels, the gradients should be 0
+        return logits.sum() * 0.0
+    signs = 2.0 * labels.float() - 1.0
+    errors = 1.0 - logits * signs
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    perm = perm.data
+    gt_sorted = labels.float()[perm]
+    grad = lovasz_grad(gt_sorted)
+    loss = torch.dot(F.relu(errors_sorted), grad)
+    return loss
+
+
+def lovasz_hinge(logits, labels, ignore=None):
+    """
+    Binary Lovasz hinge loss
+      logits: [B, H, W] Variable, logits at each pixel (between -\infty and +\infty)
+      labels: [B, H, W] Tensor, binary ground truth masks (0 or 1)
+      ignore: void class id
+    """
+    logits = logits.view(-1)
+    labels = labels.view(-1)
+    if ignore is None:
+        return lovasz_hinge_flat(logits, labels)
+    valid = labels != ignore
+    vlogits = logits[valid]
+    vlabels = labels[valid]
+    return lovasz_hinge_flat(vlogits, vlabels)
+
+
+class BCELovaszLoss(nn.Module):
+    """
+    Combined BCEWithLogitsLoss and Lovasz-Hinge Loss.
+    """
+
+    def __init__(self):
+        super(BCELovaszLoss, self).__init__()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, pred, target):
+        # BCE Loss
+        bce = self.bce_loss(pred, target)
+        # Lovasz Loss
+        lov = lovasz_hinge(pred, target)
+        return 0.5 * bce + 0.5 * lov
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def run_segmentation_training(
+    train_loader, val_loader, epochs=50, lr=1e-3, patience=10
+):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    set_seed(42)
+
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    criterion = BCEDiceLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+=======
+def run_segmentation_training(
+    train_loader, val_loader, epochs=50, lr=1e-4, patience=10
+):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    set_seed(42)
+
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    criterion = BCELovaszLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.engine import (
+    run_regression_training,
+    predict_depths,
+    run_segmentation_training,
+    predict_segmentation,
+    DepthAwareLinkNet34,
+    DEVICE,
+)
+=======
+from library.engine import (
+    run_segmentation_training,
+    predict_segmentation,
+    DepthAwareLinkNet34,
+    DEVICE,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # Stage 1: Depth Regression
+    # ---------------------------------------------------------
+    print("\n--- Stage 1: Depth Regression ---")
+    # Train regressor to learn depth from image texture
+    reg_model_path = run_regression_training(
+        train_loader, val_loader, epochs=15, lr=1e-4, patience=5
+    )
+
+    print("Imputing Test Depths...")
+    # Impute depths for the test set
+    test_imputed_depths = predict_depths(reg_model_path, test_loader)
+
+    # ---------------------------------------------------------
+    # Stage 2: Segmentation
+    # ---------------------------------------------------------
+    print("\n--- Stage 2: Segmentation Training ---")
+    # Train segmenter using ground truth depths
+    seg_model_path = run_segmentation_training(
+        train_loader, val_loader, epochs=30, lr=1e-3, patience=8
+    )
+=======
+    # ---------------------------------------------------------
+    # Stage 1: Depth Imputation (Mean)
+    # ---------------------------------------------------------
+    print("\n--- Stage 1: Depth Imputation ---")
+    # Use mean depth (normalized to 0.0) for test set imputation
+    # This avoids noise from a weak regressor (Cite solution_lesson_node_00022)
+    print("Imputing Test Depths with Mean Value (0.0)...")
+    test_imputed_depths = np.zeros(len(test_loader.dataset))
+
+    # ---------------------------------------------------------
+    # Stage 2: Segmentation Training
+    # ---------------------------------------------------------
+    print("\n--- Stage 2: Segmentation Training ---")
+    # Train segmenter using ground truth depths
+    # Lower LR and longer training for Lovasz Loss (Cite solution_lesson_node_00018, 00022)
+    seg_model_path = run_segmentation_training(
+        train_loader, val_loader, epochs=50, lr=1e-4, patience=15
+    )
+>>>>>>> REPLACE
+```

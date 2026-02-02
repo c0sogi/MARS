@@ -1,0 +1,237 @@
+My strategy focuses on implementing the **Latent Fusion** architecture described in Lesson 00060 and Lesson 00052, which was identified as the key differentiator between the "Current Best" (DSPRNet) and the underperforming "New Solution" (EADSNet/CRDSNet).
+
+**Key Changes:**
+1.  **Architecture Upgrade (Cite Lesson 00060, 00052)**: I will modify `CRDSNet` in `library/model.py` to project the linear autoregressive features (`Baseline_FVC`, `Time`) into a high-dimensional latent space (64-dim) before fusing them with the deep image features. This contrasts with the previous implementation which fused them in the low-dimensional output space. This "over-parameterization" of the linear stream facilitates optimization of the strong linear signal.
+2.  **Shared Head for Uncertainty (Cite Lesson 00055)**: By fusing in the latent space, the final projection head (predicting both $\mu$ and $\sigma$) will have direct access to the strong linear priors from the autoregressive stream, ensuring robust uncertainty estimation.
+3.  **Training Duration**: I will increase `NUM_EPOCHS` in `runfile.py` from 20 to 25 to allow the slightly deeper architecture sufficient time to converge, matching the convergence profile (Epoch 14-24) noted in the lessons.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # ---------------------------------------------------------------------
+        # Stream A: Constrained Linear Residual (The Autoregressive Anchor)
+        # ---------------------------------------------------------------------
+        # Inputs: Baseline_FVC_Scaled (1) + Relative_Time (1) = 2
+        # Outputs: mu_linear, sigma_linear (logits)
+        # Bias is False to strictly anchor the residual to the input magnitude.
+        # We explicitly exclude static metadata from this stream.
+        self.stream_a = nn.Linear(2, 2, bias=False)
+
+        # ---------------------------------------------------------------------
+        # Stream B: Deep Interaction Residual (The Correction)
+        # ---------------------------------------------------------------------
+        # 1. Image Backbone (EfficientNet-B2)
+        # We use 3 input channels because we select 3 slices (Anchor + 2 Boundaries)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,  # Remove classification head
+            global_pool="avg",  # Global Average Pooling
+            in_chans=Config.NUM_SLICES,
+        )
+
+        # 2. Fine-Tuning Strategy: Unfreeze top 2 stages, freeze rest
+        # First, freeze everything
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the last 2 blocks (stages) of the feature extractor
+        # In timm EfficientNet, .blocks is a Sequential of stages
+        if hasattr(self.backbone, "blocks"):
+            for block in self.backbone.blocks[-2:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+
+        # Unfreeze the conv_head and bn2 (Standard EfficientNet top layers)
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # 3. Projection Layer
+        # Projects high-dim backbone output (1408) to bottleneck (64)
+        self.img_projector = nn.Linear(
+            self.backbone.num_features, Config.PROJECTION_DIM
+        )
+
+        # 4. MLP for Residual Learning
+        # Input: Projected Image (64) + All Clinical Scalars (6)
+        mlp_input_dim = Config.PROJECTION_DIM + Config.TABULAR_INPUT_DIM
+
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            # No Dropout explicitly to prevent signal dilution of the residual
+            nn.Linear(64, 2),  # mu_deep, sigma_deep (logits)
+        )
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images: (Batch, 3, 260, 260) - Preprocessed CT slices
+            tabular: (Batch, 6) - Clinical features
+                     Cols: [Baseline_FVC_Scaled, Relative_Time, Age_Scaled, Sex, Smoking, Percent]
+        Returns:
+            preds: (Batch, 2) -> [mu_scaled, sigma_scaled]
+        """
+
+        # ---------------------------------------------------------------------
+        # Stream A Execution (Autoregressive Anchor)
+        # ---------------------------------------------------------------------
+        # Isolate Autoregressive inputs: Baseline FVC (idx 0) and Relative Time (idx 1)
+        # STRICTLY exclude static metadata (Age, Sex, Smoking, Percent) from this branch
+        input_a = tabular[:, [0, 1]]
+        out_a = self.stream_a(input_a)
+        mu_lin, sigma_lin_logit = out_a[:, 0], out_a[:, 1]
+
+        # ---------------------------------------------------------------------
+        # Stream B Execution (Deep Residual)
+        # ---------------------------------------------------------------------
+        # 1. Image Feature Extraction
+        features = self.backbone(images)  # (Batch, 1408)
+        img_emb = self.img_projector(features)  # (Batch, 64)
+
+        # 2. Context Injection
+        # Concatenate projected image with ALL clinical scalars (including static ones)
+        # This allows the model to learn complex interactions (e.g., Smoking + Fibrosis patterns)
+        fused = torch.cat([img_emb, tabular], dim=1)  # (Batch, 70)
+
+        # 3. Residual Prediction
+        out_b = self.mlp(fused)
+        mu_deep, sigma_deep_logit = out_b[:, 0], out_b[:, 1]
+
+        # ---------------------------------------------------------------------
+        # Constraint-Aware Fusion
+        # ---------------------------------------------------------------------
+        # Mean: Additive Residual
+        # The final prediction is the Linear Anchor + Deep Correction
+        mu_scaled = mu_lin + mu_deep
+
+        # Sigma: Sum logits -> Softplus -> Add Structural Floor
+        # We sum the logits from both streams to combine uncertainty estimates.
+        # Softplus ensures positivity.
+        # Adding epsilon_std enforces the metric's 70ml floor in the standardized space.
+        sigma_total_logit = sigma_lin_logit + sigma_deep_logit
+        sigma_scaled = F.softplus(sigma_total_logit) + self.epsilon_std
+
+        # Stack for output (Batch, 2)
+        return torch.stack([mu_scaled, sigma_scaled], dim=1)
+=======
+        # ---------------------------------------------------------------------
+        # Stream A: Constrained Linear Residual (The Autoregressive Anchor)
+        # ---------------------------------------------------------------------
+        # Inputs: Baseline_FVC_Scaled (1) + Relative_Time (1) = 2
+        # Outputs: Latent Representation (64)
+        # Cite Lesson 00060: Over-parameterize the linear stream by projecting to latent space.
+        self.stream_a = nn.Linear(2, Config.PROJECTION_DIM, bias=False)
+
+        # ---------------------------------------------------------------------
+        # Stream B: Deep Interaction Residual (The Correction)
+        # ---------------------------------------------------------------------
+        # 1. Image Backbone (EfficientNet-B2)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,  # Remove classification head
+            global_pool="avg",  # Global Average Pooling
+            in_chans=Config.NUM_SLICES,
+        )
+
+        # 2. Fine-Tuning Strategy: Unfreeze top 2 stages, freeze rest
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.backbone, "blocks"):
+            for block in self.backbone.blocks[-2:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # 3. Projection Layer
+        self.img_projector = nn.Linear(
+            self.backbone.num_features, Config.PROJECTION_DIM
+        )
+
+        # 4. MLP for Residual Learning
+        # Input: Projected Image (64) + All Clinical Scalars (6)
+        mlp_input_dim = Config.PROJECTION_DIM + Config.TABULAR_INPUT_DIM
+
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, Config.PROJECTION_DIM), # Output matches latent dim (64)
+        )
+
+        # ---------------------------------------------------------------------
+        # Shared Head
+        # ---------------------------------------------------------------------
+        # Cite Lesson 00055: Do not isolate strong priors from uncertainty.
+        # Fused Latent (64) -> Output (2)
+        self.head = nn.Linear(Config.PROJECTION_DIM, 2)
+
+    def forward(self, images, tabular):
+        """
+        Args:
+            images: (Batch, 3, 260, 260) - Preprocessed CT slices
+            tabular: (Batch, 6) - Clinical features
+        Returns:
+            preds: (Batch, 2) -> [mu_scaled, sigma_scaled]
+        """
+
+        # ---------------------------------------------------------------------
+        # Stream A Execution (Autoregressive Anchor)
+        # ---------------------------------------------------------------------
+        # Isolate Autoregressive inputs: Baseline FVC (idx 0) and Relative Time (idx 1)
+        input_a = tabular[:, [0, 1]]
+        latent_a = self.stream_a(input_a) # (Batch, 64)
+
+        # ---------------------------------------------------------------------
+        # Stream B Execution (Deep Residual)
+        # ---------------------------------------------------------------------
+        features = self.backbone(images)  # (Batch, 1408)
+        img_emb = self.img_projector(features)  # (Batch, 64)
+
+        # Context Injection
+        fused_input = torch.cat([img_emb, tabular], dim=1)  # (Batch, 70)
+        latent_b = self.mlp(fused_input) # (Batch, 64)
+
+        # ---------------------------------------------------------------------
+        # Latent Fusion & Prediction
+        # ---------------------------------------------------------------------
+        # Cite Lesson 00052: Sum in latent space before final projection
+        latent_sum = latent_a + latent_b
+        
+        logits = self.head(latent_sum)
+        mu_scaled, sigma_logit = logits[:, 0], logits[:, 1]
+
+        # Sigma: Softplus + Structural Floor
+        sigma_scaled = F.softplus(sigma_logit) + self.epsilon_std
+
+        # Stack for output (Batch, 2)
+        return torch.stack([mu_scaled, sigma_scaled], dim=1)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 1. Setup
+    # Override epochs for fast baseline execution
+    Config.NUM_EPOCHS = 20
+    seed_everything(Config.SEED)
+=======
+    # 1. Setup
+    # Override epochs for fast baseline execution
+    Config.NUM_EPOCHS = 25
+    seed_everything(Config.SEED)
+>>>>>>> REPLACE
+```

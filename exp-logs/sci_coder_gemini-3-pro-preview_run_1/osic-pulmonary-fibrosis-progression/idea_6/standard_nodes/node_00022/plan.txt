@@ -1,0 +1,433 @@
+Based on the analysis of the previous solution and the provided lessons, I will optimize the model by simplifying the fusion mechanism and enforcing constraints architecturally.
+
+**Optimization Strategy:**
+1.  **Simplify Fusion Architecture (Cite Lesson 20):** I will replace the complex "Tabular-Query Spatial-Attention" mechanism with a robust "Global Fusion" strategy. This involves applying Global Average Pooling to the visual backbones (EfficientNet-B0) to obtain compact descriptor vectors (1280-dim) and concatenating them with the tabular embedding. Lesson 20 indicates that for small datasets, global descriptors outperform spatial attention maps by preventing overfitting to spurious local correlations.
+2.  **Enforce Constraints Architecturally (Cite Lesson 21):** I will modify the regression head to apply a `Softplus` activation to the uncertainty outputs (`sigma_base`, `sigma_growth`). This ensures strictly positive variance predictions by design. Consequently, I will remove the hard clipping (`torch.clamp(sigma, min=70)`) from the training loss function to avoid "dead zones" where gradients vanish, allowing the model to learn from all samples.
+3.  **Preserve Skip Connections (Cite Lesson 18):** The tabular embedding will be concatenated directly with the visual features, ensuring the regression head has direct access to strong clinical priors (like Age and Baseline Percent).
+
+Here are the code modifications:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working & Output Directories
+    working_dir = "./working"
+    idea_dir = os.path.join(working_dir, "idea_6")
+    cache_dir = idea_dir  # For caching processed data
+    model_save_path = os.path.join(idea_dir, "best_model.pth")
+=======
+    # Working & Output Directories
+    working_dir = "./working"
+    idea_dir = os.path.join(working_dir, "idea_7")
+    cache_dir = idea_dir  # For caching processed data
+    model_save_path = os.path.join(idea_dir, "best_model.pth")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Attention Mechanism
+    # The visual features from EfficientNet-B0 before pooling are 1280 channels
+    visual_feature_dim = 1280
+    projection_dim = 128  # Dimension for Query/Key/Value projections
+=======
+    # Attention Mechanism
+    # The visual features from EfficientNet-B0 before pooling are 1280 channels
+    visual_feature_dim = 1280
+    # projection_dim removed as we switched to global pooling
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class VisualBackbone(nn.Module):
+    """
+    EfficientNet-B0 backbone for spatial feature extraction.
+    Returns the final convolutional feature map (C x H x W) without pooling.
+    """
+
+    def __init__(self, pretrained=True):
+        super(VisualBackbone, self).__init__()
+        # Load EfficientNet-B0
+        # We use 'DEFAULT' weights if available or pretrained=True for compatibility
+        try:
+            weights = "DEFAULT" if pretrained else None
+            self.backbone = torchvision.models.efficientnet_b0(weights=weights)
+        except TypeError:
+            # Fallback for older torchvision versions
+            self.backbone = torchvision.models.efficientnet_b0(pretrained=pretrained)
+
+        # We only need the feature extraction part
+        # Input: (B, 3, 224, 224) -> Output: (B, 1280, 7, 7)
+        self.features = self.backbone.features
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class TabularEncoder(nn.Module):
+    """
+    Encodes clinical metadata (Age, Sex, Smoking, Percent) into a latent Query vector.
+    """
+
+    def __init__(self, input_dim, hidden_dim):
+        super(TabularEncoder, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class CrossModalAttention(nn.Module):
+    """
+    Cross-Attention mechanism: Tabular Vector (Query) attends to Spatial Visual Grid (Key/Value).
+    """
+
+    def __init__(self, visual_dim, query_dim, projection_dim):
+        super(CrossModalAttention, self).__init__()
+        self.visual_dim = visual_dim
+        self.query_dim = query_dim
+        self.projection_dim = projection_dim
+        # Register scale as buffer for device safety
+        self.register_buffer(
+            "scale", torch.sqrt(torch.tensor(projection_dim, dtype=torch.float32))
+        )
+
+        # Projections
+        self.W_q = nn.Linear(query_dim, projection_dim)
+        self.W_k = nn.Linear(visual_dim, projection_dim)
+        # We keep Value dimension same as input visual dimension to preserve feature richness
+        self.W_v = nn.Linear(visual_dim, visual_dim)
+
+    def forward(self, visual_feats, tabular_query):
+        """
+        Args:
+            visual_feats: (B, C, H, W) -> Spatial Grid
+            tabular_query: (B, D_tab) -> Context
+        Returns:
+            context_vector: (B, C)
+        """
+        b, c, h, w = visual_feats.size()
+        n = h * w
+
+        # Flatten visual features: (B, C, H, W) -> (B, N, C)
+        # Permute to (B, H, W, C) then flatten spatial dims
+        visual_flat = visual_feats.permute(0, 2, 3, 1).view(b, n, c)
+
+        # 1. Project Query
+        # (B, D_tab) -> (B, 1, D_proj)
+        query = self.W_q(tabular_query).unsqueeze(1)
+
+        # 2. Project Key
+        # (B, N, C) -> (B, N, D_proj)
+        key = self.W_k(visual_flat)
+
+        # 3. Project Value
+        # (B, N, C) -> (B, N, C)
+        value = self.W_v(visual_flat)
+
+        # 4. Compute Attention Scores
+        # (B, 1, D_proj) @ (B, D_proj, N) -> (B, 1, N)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # 5. Weighted Sum
+        # (B, 1, N) @ (B, N, C) -> (B, 1, C)
+        context = torch.matmul(attn_weights, value)
+
+        # Remove singleton dimension -> (B, C)
+        return context.squeeze(1)
+
+
+class ParametricHead(nn.Module):
+    """
+    Regression head predicting trajectory parameters.
+    Input: Concatenation of [Visual_Axial, Visual_Coronal, Tabular_Query]
+    Output: [alpha, sigma_base, sigma_growth]
+    """
+
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.2):
+        super(ParametricHead, self).__init__()
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 3),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Initialize the final layer to output reasonable starting values.
+        alpha ~ 0
+        sigma_base ~ 100 (to be safely above the clip threshold of 70)
+        sigma_growth ~ 0
+        """
+        final_layer = self.head[-1]
+        nn.init.xavier_uniform_(final_layer.weight)
+
+        # Set biases: [alpha, sigma_base, sigma_growth]
+        # We want sigma_base to start > 70 to ensure gradients flow through the max(sigma, 70) op.
+        # 100 is a safe starting point.
+        bias_init = torch.tensor([0.0, 100.0, 0.0])
+        final_layer.bias.data = bias_init
+
+    def forward(self, x):
+        return self.head(x)
+
+
+class TQSAN(nn.Module):
+    """
+    Tabular-Query Spatial-Attention Network.
+    """
+
+    def __init__(self):
+        super(TQSAN, self).__init__()
+
+        # Hyperparameters
+        self.visual_dim = Config.visual_feature_dim
+        self.tab_dim = Config.tabular_hidden_dim
+        self.proj_dim = Config.projection_dim
+
+        # 1. Independent Visual Backbones
+        self.backbone_axial = VisualBackbone(pretrained=Config.pretrained)
+        self.backbone_coronal = VisualBackbone(pretrained=Config.pretrained)
+
+        # 2. Tabular Encoder
+        self.tab_encoder = TabularEncoder(
+            input_dim=Config.n_tabular_features, hidden_dim=self.tab_dim
+        )
+
+        # 3. Cross-Modal Attention Modules (One per view)
+        self.attn_axial = CrossModalAttention(
+            visual_dim=self.visual_dim,
+            query_dim=self.tab_dim,
+            projection_dim=self.proj_dim,
+        )
+        self.attn_coronal = CrossModalAttention(
+            visual_dim=self.visual_dim,
+            query_dim=self.tab_dim,
+            projection_dim=self.proj_dim,
+        )
+
+        # 4. Parametric Head
+        # Input size = Visual_Axial (1280) + Visual_Coronal (1280) + Tabular_Skip (128)
+        head_input_dim = (self.visual_dim * 2) + self.tab_dim
+        self.head = ParametricHead(
+            input_dim=head_input_dim, dropout=Config.dropout_rate
+        )
+
+    def forward(self, axial_img, coronal_img, tabular_features):
+        """
+        Args:
+            axial_img: (B, 3, 224, 224)
+            coronal_img: (B, 3, 224, 224)
+            tabular_features: (B, 4)
+        Returns:
+            preds: (B, 3) -> [alpha, sigma_base, sigma_growth]
+        """
+        # 1. Extract Spatial Features
+        # (B, 1280, 7, 7)
+        feat_axial = self.backbone_axial(axial_img)
+        feat_coronal = self.backbone_coronal(coronal_img)
+
+        # 2. Encode Tabular Query
+        # (B, 128)
+        query = self.tab_encoder(tabular_features)
+
+        # 3. Apply Cross-Modal Attention
+        # (B, 1280)
+        ctx_axial = self.attn_axial(feat_axial, query)
+        ctx_coronal = self.attn_coronal(feat_coronal, query)
+
+        # 4. Feature Fusion (Skip Connection)
+        # Concatenate: [Axial_Ctx, Coronal_Ctx, Tabular_Query]
+        combined = torch.cat([ctx_axial, ctx_coronal, query], dim=1)
+
+        # 5. Prediction
+        preds = self.head(combined)
+
+        return preds
+=======
+class VisualBackbone(nn.Module):
+    """
+    EfficientNet-B0 backbone for spatial feature extraction.
+    Returns the final global average pooled feature vector.
+    Cite solution_lesson_node_00020: Prefer fusing global descriptors over spatial attention maps when training data is scarce.
+    """
+
+    def __init__(self, pretrained=True):
+        super(VisualBackbone, self).__init__()
+        # Load EfficientNet-B0
+        try:
+            weights = "DEFAULT" if pretrained else None
+            self.backbone = torchvision.models.efficientnet_b0(weights=weights)
+        except TypeError:
+            self.backbone = torchvision.models.efficientnet_b0(pretrained=pretrained)
+
+        # We need features + pooling
+        self.features = self.backbone.features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        return torch.flatten(x, 1)
+
+
+class TabularEncoder(nn.Module):
+    """
+    Encodes clinical metadata (Age, Sex, Smoking, Percent) into a latent vector.
+    """
+
+    def __init__(self, input_dim, hidden_dim):
+        super(TabularEncoder, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class ParametricHead(nn.Module):
+    """
+    Regression head predicting trajectory parameters.
+    Input: Concatenation of [Visual_Axial, Visual_Coronal, Tabular_Embed]
+    Output: [alpha, sigma_base, sigma_growth]
+    
+    Cite solution_lesson_node_00021: Enforce physical constraints via architectural activation functions.
+    """
+
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.2):
+        super(ParametricHead, self).__init__()
+        self.head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 3),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        final_layer = self.head[-1]
+        nn.init.xavier_uniform_(final_layer.weight)
+        
+        # Initialize biases
+        # alpha ~ 0
+        # sigma_base ~ 100 (inverse softplus of 100 is approx 100)
+        # sigma_growth ~ 0
+        bias_init = torch.tensor([0.0, 100.0, -5.0]) # -5 for sigma_growth makes it small positive after softplus
+        final_layer.bias.data = bias_init
+
+    def forward(self, x):
+        raw = self.head(x)
+        
+        # Unpack
+        alpha = raw[:, 0:1]
+        raw_sigma_base = raw[:, 1:2]
+        raw_sigma_growth = raw[:, 2:3]
+        
+        # Apply Softplus to ensure positivity
+        sigma_base = F.softplus(raw_sigma_base)
+        sigma_growth = F.softplus(raw_sigma_growth)
+        
+        return torch.cat([alpha, sigma_base, sigma_growth], dim=1)
+
+
+class TQSAN(nn.Module):
+    """
+    Dual-Axis Network with Global Fusion.
+    Replaces Attention with Global Pooling + Concatenation.
+    """
+
+    def __init__(self):
+        super(TQSAN, self).__init__()
+
+        # Hyperparameters
+        self.visual_dim = Config.visual_feature_dim
+        self.tab_dim = Config.tabular_hidden_dim
+
+        # 1. Independent Visual Backbones
+        self.backbone_axial = VisualBackbone(pretrained=Config.pretrained)
+        self.backbone_coronal = VisualBackbone(pretrained=Config.pretrained)
+
+        # 2. Tabular Encoder
+        self.tab_encoder = TabularEncoder(
+            input_dim=Config.n_tabular_features, hidden_dim=self.tab_dim
+        )
+
+        # 3. Parametric Head
+        # Input size = Visual_Axial (1280) + Visual_Coronal (1280) + Tabular_Embed (128)
+        head_input_dim = (self.visual_dim * 2) + self.tab_dim
+        self.head = ParametricHead(
+            input_dim=head_input_dim, dropout=Config.dropout_rate
+        )
+
+    def forward(self, axial_img, coronal_img, tabular_features):
+        # 1. Extract Global Spatial Features
+        # (B, 1280)
+        feat_axial = self.backbone_axial(axial_img)
+        feat_coronal = self.backbone_coronal(coronal_img)
+
+        # 2. Encode Tabular Data
+        # (B, 128)
+        tab_embed = self.tab_encoder(tabular_features)
+
+        # 3. Concatenate (Fusion)
+        # Cite solution_lesson_node_00018: Concatenate structured features directly to the fused representation.
+        combined = torch.cat([feat_axial, feat_coronal, tab_embed], dim=1)
+
+        # 4. Prediction
+        preds = self.head(combined)
+
+        return preds
+>>>>>>> REPLACE
+```
+
+```diff
+library/loss.py
+<<<<<<< SEARCH
+        # Apply clipping to Sigma (min 70 ml)
+        sigma_clipped = torch.clamp(sigma, min=self.min_sigma)
+
+        # 3. Calculate Error (Delta)
+        # Delta = min(|True - Pred|, 1000)
+        delta = torch.abs(target_fvc - fvc_pred)
+        delta_clipped = torch.clamp(delta, max=self.max_delta)
+
+        # 4. Compute Loss components
+        # Loss = (sqrt(2) * delta_clipped) / sigma_clipped + ln(sqrt(2) * sigma_clipped)
+        term1 = (self.sqrt_2 * delta_clipped) / sigma_clipped
+        term2 = torch.log(self.sqrt_2 * sigma_clipped)
+
+        loss = term1 + term2
+
+        return loss.mean()
+=======
+        # Cite solution_lesson_node_00021: Enforce constraints via architecture rather than clamping in loss.
+        # We do NOT clamp sigma for the training loss calculation to avoid zero gradients.
+        # The model architecture guarantees sigma > 0 via Softplus.
+        
+        # 3. Calculate Error (Delta)
+        # Delta = min(|True - Pred|, 1000)
+        delta = torch.abs(target_fvc - fvc_pred)
+        delta_clipped = torch.clamp(delta, max=self.max_delta)
+
+        # 4. Compute Loss components
+        # Loss = (sqrt(2) * delta_clipped) / sigma + ln(sqrt(2) * sigma)
+        # We use the raw (positive) sigma for gradient flow.
+        term1 = (self.sqrt_2 * delta_clipped) / sigma
+        term2 = torch.log(self.sqrt_2 * sigma)
+
+        loss = term1 + term2
+
+        return loss.mean()
+>>>>>>> REPLACE
+```

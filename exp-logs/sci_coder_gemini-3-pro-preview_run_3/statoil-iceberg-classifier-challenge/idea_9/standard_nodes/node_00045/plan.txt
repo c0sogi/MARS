@@ -1,0 +1,583 @@
+My strategy involves three key changes based on the provided lessons:
+1.  **Model Architecture**: I will replace the `SRNResNet` with a `SimpleCNN`. This architecture aligns with **Lesson 00026** (capping channel width), **Lesson 00007** (Global Max Pooling), and **Lesson 00040** (Shallow dense head). It avoids the complexity of ResNets which can be unstable on this small dataset.
+2.  **Evaluation Strategy**: I will modify `runfile.py` to strictly separate the training set (for Cross-Validation) and the validation set (for Hold-Out Ensemble evaluation). This directly addresses **Lesson 00044**, ensuring we compare an *ensemble* metric against the threshold, rather than a single-model OOF metric.
+3.  **Classifier Regularization**: I will ensure Dropout is applied only *after* the first dense layer in the classifier head, as per **Lesson 00017**, to preserve the information in the compact feature vector.
+
+I will update `library/model.py` to define the `SimpleCNN` and `runfile.py` to implement the ensemble-on-holdout training loop.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SpatialDropoutResBlock(nn.Module):
+    """
+    A Residual Block with Spatial Dropout (Dropout2d) inserted between convolutions.
+    This acts as a structural regularizer for the CNN feature maps.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1, dropout_rate=0.0):
+        super(SpatialDropoutResBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Spatial Dropout drops entire channels, promoting independence
+        self.dropout = nn.Dropout2d(p=dropout_rate)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class SRNResNet(nn.Module):
+    """
+    Spatially-Regularized Narrow ResNet (SRN-ResNet).
+    Designed for small-scale radar data with high noise.
+    Features:
+    - Narrow channel width (capped at 128)
+    - Spatial Dropout regularization
+    - Global Max Pooling
+    - Late Fusion with Incidence Angle
+    """
+
+    def __init__(self):
+        super(SRNResNet, self).__init__()
+
+        # Load hyperparameters from Config
+        stem_filters = Config.STEM_FILTERS
+        stage_filters = Config.STAGE_FILTERS
+        spatial_dropout = Config.SPATIAL_DROPOUT_RATE
+        classifier_dropout = Config.CLASSIFIER_DROPOUT_RATE
+        hidden_dim = Config.CLASSIFIER_HIDDEN_DIM
+        input_channels = Config.IN_CHANNELS
+
+        # 1. Convolutional Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                input_channels, stem_filters, kernel_size=3, padding=1, bias=False
+            ),
+            nn.BatchNorm2d(stem_filters),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Residual Backbone
+        # Stage 1: 64 -> 64 (Stride 1)
+        self.layer1 = self._make_layer(
+            stem_filters, stage_filters[0], stride=1, dropout_rate=spatial_dropout
+        )
+
+        # Stage 2: 64 -> 64 (Stride 2 for downsampling)
+        self.layer2 = self._make_layer(
+            stage_filters[0], stage_filters[1], stride=2, dropout_rate=spatial_dropout
+        )
+
+        # Stage 3: 64 -> 128 (Stride 2 for downsampling)
+        self.layer3 = self._make_layer(
+            stage_filters[1], stage_filters[2], stride=2, dropout_rate=spatial_dropout
+        )
+
+        # 3. Global Max Pooling
+        # Preserves peak signal intensity (iceberg signature)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # 4. Classifier Head
+        # Input dim = Final CNN Channels + 1 (Incidence Angle)
+        clf_in_dim = stage_filters[2] + 1
+
+        self.classifier = nn.Sequential(
+            nn.Linear(clf_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=classifier_dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Initialize weights
+        self._init_weights()
+
+    def _make_layer(self, in_channels, out_channels, stride, dropout_rate):
+        """
+        Constructs a ResNet stage with 2 blocks.
+        """
+        layers = []
+        # First block handles stride and channel dimension change
+        layers.append(
+            SpatialDropoutResBlock(in_channels, out_channels, stride, dropout_rate)
+        )
+        # Second block maintains dimensions
+        layers.append(
+            SpatialDropoutResBlock(out_channels, out_channels, 1, dropout_rate)
+        )
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        """
+        Kaiming initialization for layers.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, angle):
+        """
+        Forward pass.
+        Args:
+            x (torch.Tensor): Image input (B, 3, 75, 75)
+            angle (torch.Tensor): Incidence angle input (B,)
+        Returns:
+            torch.Tensor: Logits (B, 1)
+        """
+        # Backbone
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        # Pooling
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)
+
+        # Late Fusion
+        # Ensure angle is (B, 1)
+        angle = angle.view(-1, 1)
+        x = torch.cat([x, angle], dim=1)
+
+        # Classification
+        x = self.classifier(x)
+
+        return x
+=======
+class SimpleCNN(nn.Module):
+    """
+    Simple 4-layer CNN with Global Max Pooling.
+    Optimized for small-scale radar data classification.
+    Cite Lesson 00015: Simplicity and Inductive Bias.
+    Cite Lesson 00007: Global Max Pooling.
+    Cite Lesson 00026: Structural Regularization via Channel Width Constraints.
+    """
+
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+
+        # Block 1: 3 -> 64
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Block 2: 64 -> 128
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Block 3: 128 -> 128
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Block 4: 128 -> 128
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Global Max Pooling (Cite Lesson 00005, 00007)
+        self.global_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Classifier Head
+        # Input: 128 (CNN features) + 1 (Incidence Angle)
+        # Cite Lesson 00017: Avoid Input Dropout on Compact Feature Vectors
+        # Cite Lesson 00040: Simplicity in Dense Classifier Heads (Single Hidden Layer)
+        self.classifier = nn.Sequential(
+            nn.Linear(129, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(512, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, angle):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)
+
+        # Late Fusion
+        angle = angle.view(-1, 1)
+        x = torch.cat([x, angle], dim=1)
+
+        x = self.classifier(x)
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import SRNResNet
+=======
+from library.model import SimpleCNN
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize model
+    model = SRNResNet().to(device)
+=======
+    # Initialize model
+    # Cite Lesson 00015: Simple architectures often outperform complex ones on small data
+    model = SimpleCNN().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        # Load Best Model for Inference
+        model = SRNResNet().to(device)
+=======
+        # Load Best Model for Inference
+        model = SimpleCNN().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SRNResNet
+=======
+from library.model import SimpleCNN
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Adjust Config for fast baseline execution
+    Config.EPOCHS = 20
+
+    print("Loading and processing data...")
+    # 2. Data Loading
+    # load_and_process_data returns splits based on metadata/train.csv and metadata/val.csv
+    data = load_and_process_data(load_cached_data=True)
+
+    X_train_split = data["X_train"]
+    y_train_split = data["y_train"]
+    angles_train_split = data["angles_train"]
+
+    X_val_split = data["X_val"]
+    y_val_split = data["y_val"]
+    angles_val_split = data["angles_val"]
+
+    # Combine for 5-Fold CV strategy (as per Idea)
+    # We concatenate [Train, Val] so we can perform CV on the full available labeled data.
+    # We track the split point to extract hold-out metrics later.
+    X_full = np.concatenate([X_train_split, X_val_split], axis=0)
+    y_full = np.concatenate([y_train_split, y_val_split], axis=0)
+    angles_full = np.concatenate([angles_train_split, angles_val_split], axis=0)
+
+    # Test Data
+    X_test = data["X_test"]
+    angles_test = data["angles_test"]
+    ids_test = data["ids_test"]
+
+    print(f"Total labeled samples: {len(X_full)}")
+    print(f"Test samples: {len(X_test)}")
+
+    # 3. 5-Fold Cross-Validation
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Storage for OOF predictions (to calculate metric) and Test predictions (for submission)
+    oof_preds = np.zeros(len(y_full))
+    test_preds_sum = np.zeros((len(X_test), 1))
+
+    # Augmentation for training
+    train_transform = transforms.Compose(
+        [transforms.RandomHorizontalFlip(p=0.5), transforms.RandomVerticalFlip(p=0.5)]
+    )
+
+    # Test Loader (Fixed)
+    test_ds = IcebergDataset(X_test, angles_test, y=None, transform=None)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=(Config.DEVICE == "cuda"),
+    )
+
+    print("\nStarting 5-Fold Cross-Validation...")
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_full, y_full)):
+        print(f"\n--- Fold {fold} ---")
+
+        # Split Data
+        X_tr, X_v = X_full[train_idx], X_full[val_idx]
+        y_tr, y_v = y_full[train_idx], y_full[val_idx]
+        ang_tr, ang_v = angles_full[train_idx], angles_full[val_idx]
+
+        # Create Datasets
+        train_ds = IcebergDataset(X_tr, ang_tr, y_tr, transform=train_transform)
+        val_ds = IcebergDataset(X_v, ang_v, y_v, transform=None)
+
+        # Create Loaders
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=(Config.DEVICE == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=(Config.DEVICE == "cuda"),
+        )
+
+        # Train (run_fold handles training loop and saving best model)
+        run_fold(fold, train_loader, val_loader, device)
+
+        # Load Best Model for Inference
+        model = SRNResNet().to(device)
+        ckpt_path = Config.get_checkpoint_path(fold)
+        load_checkpoint(ckpt_path, model, device=Config.DEVICE)
+
+        # Predict on Validation Fold (OOF)
+        fold_val_preds = predict(model, val_loader, device)
+        oof_preds[val_idx] = fold_val_preds.flatten()
+
+        # Predict on Test Set
+        fold_test_preds = predict(model, test_loader, device)
+        test_preds_sum += fold_test_preds
+
+        # Cleanup to save memory
+        del model, train_loader, val_loader, train_ds, val_ds
+        torch.cuda.empty_cache()
+
+    # 4. Evaluation
+    # We must report the metric on the "hold-out validation set".
+    # Since we concatenated [Train, Val], the hold-out set corresponds to the indices starting from len(X_train_split).
+    val_start_idx = len(X_train_split)
+    holdout_preds = oof_preds[val_start_idx:]
+    holdout_targets = y_full[val_start_idx:]
+
+    # Calculate Metric
+    final_metric = log_loss(holdout_targets, holdout_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    errors = np.abs(holdout_targets - holdout_preds)
+
+    # Extract features for correlation analysis from the holdout set (X_val_split)
+    # X is (N, 3, 75, 75). Band 1 is index 0, Band 2 is index 1.
+    b1_mean = np.mean(X_val_split[:, 0, :, :], axis=(1, 2))
+    b2_mean = np.mean(X_val_split[:, 1, :, :], axis=(1, 2))
+    inc_angles = angles_val_split
+=======
+    # Adjust Config for fast baseline execution
+    Config.EPOCHS = 30  # Increased slightly for SimpleCNN convergence
+
+    print("Loading and processing data...")
+    # 2. Data Loading
+    data = load_and_process_data(load_cached_data=True)
+
+    # Cite Lesson 00044: Do not directly compare Out-Of-Fold (OOF) metrics with Hold-Out Ensemble metrics.
+    # We strictly separate Train and Val to perform Ensemble Evaluation on Val.
+    X_train = data["X_train"]
+    y_train = data["y_train"]
+    angles_train = data["angles_train"]
+
+    X_val = data["X_val"]
+    y_val = data["y_val"]
+    angles_val = data["angles_val"]
+
+    # Test Data
+    X_test = data["X_test"]
+    angles_test = data["angles_test"]
+    ids_test = data["ids_test"]
+
+    print(f"Training samples: {len(X_train)}")
+    print(f"Hold-out Validation samples: {len(X_val)}")
+    print(f"Test samples: {len(X_test)}")
+
+    # 3. 5-Fold Cross-Validation on TRAIN set
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Storage for Ensemble Predictions
+    val_preds_sum = np.zeros((len(X_val), 1))
+    test_preds_sum = np.zeros((len(X_test), 1))
+
+    # Augmentation for training
+    train_transform = transforms.Compose(
+        [transforms.RandomHorizontalFlip(p=0.5), transforms.RandomVerticalFlip(p=0.5)]
+    )
+
+    # Fixed Loaders for Evaluation
+    val_ds = IcebergDataset(X_val, angles_val, y_val, transform=None)
+    val_loader_fixed = DataLoader(
+        val_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=(Config.DEVICE == "cuda"),
+    )
+
+    test_ds = IcebergDataset(X_test, angles_test, y=None, transform=None)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=(Config.DEVICE == "cuda"),
+    )
+
+    print("\nStarting 5-Fold Cross-Validation (Ensemble Training)...")
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
+        print(f"\n--- Fold {fold} ---")
+
+        # Split Data (Internal CV on Training Set)
+        X_tr, X_v = X_train[train_idx], X_train[val_idx]
+        y_tr, y_v = y_train[train_idx], y_train[val_idx]
+        ang_tr, ang_v = angles_train[train_idx], angles_train[val_idx]
+
+        # Create Datasets
+        train_ds = IcebergDataset(X_tr, ang_tr, y_tr, transform=train_transform)
+        val_ds = IcebergDataset(X_v, ang_v, y_v, transform=None)
+
+        # Create Loaders
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=(Config.DEVICE == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=(Config.DEVICE == "cuda"),
+        )
+
+        # Train
+        run_fold(fold, train_loader, val_loader, device)
+
+        # Load Best Model for Inference
+        model = SimpleCNN().to(device)
+        ckpt_path = Config.get_checkpoint_path(fold)
+        load_checkpoint(ckpt_path, model, device=Config.DEVICE)
+
+        # Predict on Fixed Hold-out Validation Set (Ensembling)
+        # Cite Lesson 00016: Variance Reduction via Cross-Validation Ensembling
+        fold_val_preds = predict(model, val_loader_fixed, device)
+        val_preds_sum += fold_val_preds
+
+        # Predict on Test Set
+        fold_test_preds = predict(model, test_loader, device)
+        test_preds_sum += fold_test_preds
+
+        # Cleanup
+        del model, train_loader, val_loader, train_ds, val_ds
+        torch.cuda.empty_cache()
+
+    # 4. Evaluation (Ensemble)
+    avg_val_preds = val_preds_sum / Config.N_FOLDS
+    
+    # Calculate Metric
+    final_metric = log_loss(y_val, avg_val_preds)
+    print(f"Final Validation Metric (Ensemble on Hold-out): {final_metric}")
+
+    # 5. Failure Analysis
+    print("\n--- Failure Analysis ---")
+    errors = np.abs(y_val - avg_val_preds.flatten())
+
+    # Extract features for correlation analysis from the holdout set (X_val)
+    # X is (N, 3, 75, 75). Band 1 is index 0, Band 2 is index 1.
+    b1_mean = np.mean(X_val[:, 0, :, :], axis=(1, 2))
+    b2_mean = np.mean(X_val[:, 1, :, :], axis=(1, 2))
+    inc_angles = angles_val
+>>>>>>> REPLACE
+```

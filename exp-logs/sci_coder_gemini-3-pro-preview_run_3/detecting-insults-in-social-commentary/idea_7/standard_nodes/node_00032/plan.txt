@@ -1,0 +1,577 @@
+To optimize performance, I will revert the backbone architecture to **RoBERTa-Large**, which previously achieved the highest score and demonstrated better efficiency than DeBERTa-v3 for this explicit sentiment task (Cite Lesson 00020). I will disable **Adversarial Weight Perturbation (AWP)** to eliminate its high computational cost, allowing me to increase the training duration from 2 to 4 epochs without exceeding the time limit (Cite Lesson 00030). Crucially, I will modify the training loop to implement **Best-Model Checkpointing**: instead of saving the model at the end of the fixed training run, I will evaluate the AUC on the validation set after each epoch and save the weights corresponding to the best performance, ensuring we capture the model at its peak before overfitting occurs (Cite Lesson 00030).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    MODEL_NAME = "microsoft/deberta-v3-large"
+    MAX_LEN = 160
+    DROPOUT = 0.2
+    NUM_CLASSES = 1
+
+    # Freezing strategy: Embeddings + Bottom N layers
+    FREEZE_LAYERS = 6
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEEDS = [42, 43, 44]
+    EPOCHS = 4
+
+    # Batch Size Configuration
+    # Effective Batch Size = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
+    # 4 * 8 = 32
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 16
+    GRAD_ACCUM_STEPS = 8
+
+    # Optimizer
+    LEARNING_RATE = 1e-5
+    WEIGHT_DECAY = 0.01
+    MAX_GRAD_NORM = 1.0
+    SCHEDULER_TYPE = "cosine"
+    WARMUP_RATIO = 0.1
+
+    # ==========================================
+    # Adversarial Weight Perturbation (AWP)
+    # ==========================================
+    USE_AWP = True
+    AWP_LR = 1e-4
+    AWP_EPS = 1e-2
+    # Start AWP after this many epochs (can be float, e.g., 0.5)
+    AWP_START_EPOCH = 1.0
+=======
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    MODEL_NAME = "roberta-large"
+    MAX_LEN = 160
+    DROPOUT = 0.2
+    NUM_CLASSES = 1
+
+    # Freezing strategy: Embeddings + Bottom N layers
+    FREEZE_LAYERS = 6
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEEDS = [42, 43, 44]
+    EPOCHS = 4
+
+    # Batch Size Configuration
+    # Effective Batch Size = TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS
+    # 4 * 8 = 32
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 16
+    GRAD_ACCUM_STEPS = 8
+
+    # Optimizer
+    LEARNING_RATE = 1e-5
+    WEIGHT_DECAY = 0.01
+    MAX_GRAD_NORM = 1.0
+    SCHEDULER_TYPE = "cosine"
+    WARMUP_RATIO = 0.1
+
+    # ==========================================
+    # Adversarial Weight Perturbation (AWP)
+    # ==========================================
+    USE_AWP = False
+    AWP_LR = 1e-4
+    AWP_EPS = 1e-2
+    # Start AWP after this many epochs (can be float, e.g., 0.5)
+    AWP_START_EPOCH = 1.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.awp import AWP
+
+# Initialize Logger
+logger = get_logger("train")
+
+
+def train_fn(
+    dataloader, model, criterion, optimizer, scheduler, awp, device, epoch, config
+):
+    """
+    Training loop for one epoch with Gradient Accumulation and AWP.
+    """
+    model.train()
+
+    # Use Mixed Precision for efficiency on A100
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+
+    total_loss = 0.0
+    global_step = 0
+
+    num_batches = len(dataloader)
+
+    for step, batch in enumerate(dataloader):
+        # Move inputs to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        targets = batch["target"].to(device).unsqueeze(1)  # (Batch, 1)
+
+        batch_size = input_ids.size(0)
+
+        # ==========================================
+        # 1. Standard Forward Pass
+        # ==========================================
+        with torch.cuda.amp.autocast(enabled=True):
+            outputs = model(input_ids, attention_mask)
+            loss = criterion(outputs, targets)
+
+        # Scale loss for gradient accumulation
+        loss = loss / config.GRAD_ACCUM_STEPS
+
+        # ==========================================
+        # 2. Standard Backward Pass
+        # ==========================================
+        scaler.scale(loss).backward()
+
+        # Accumulate loss for logging
+        total_loss += loss.item() * config.GRAD_ACCUM_STEPS
+
+        # ==========================================
+        # 3. Optimization Step (with AWP)
+        # ==========================================
+        if (step + 1) % config.GRAD_ACCUM_STEPS == 0 or (step + 1) == num_batches:
+
+            # Adversarial Weight Perturbation
+            if config.USE_AWP and epoch >= config.AWP_START_EPOCH:
+                # Perturb weights based on gradients from standard backward
+                awp.attack()
+
+                # Secondary Forward/Backward with perturbed weights
+                with torch.cuda.amp.autocast(enabled=True):
+                    adv_outputs = model(input_ids, attention_mask)
+                    adv_loss = criterion(adv_outputs, targets)
+                    # We don't divide adv_loss by grad_accum_steps here if we want strong regularization,
+                    # but typically we match the scale. Let's match scale.
+                    adv_loss = adv_loss / config.GRAD_ACCUM_STEPS
+
+                scaler.scale(adv_loss).backward()
+
+                # Restore original weights
+                awp.restore()
+
+            # Unscale gradients before clipping
+            scaler.unscale_(optimizer)
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+
+            # Optimizer Step
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            # Scheduler Step
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step += 1
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+
+def run_training(seed):
+=======
+# Initialize Logger
+logger = get_logger("train")
+
+
+def train_fn(
+    dataloader, model, criterion, optimizer, scheduler, device, epoch, config
+):
+    """
+    Training loop for one epoch with Gradient Accumulation.
+    """
+    model.train()
+
+    # Use Mixed Precision for efficiency on A100
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+
+    total_loss = 0.0
+    global_step = 0
+
+    num_batches = len(dataloader)
+
+    for step, batch in enumerate(dataloader):
+        # Move inputs to device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        targets = batch["target"].to(device).unsqueeze(1)  # (Batch, 1)
+
+        batch_size = input_ids.size(0)
+
+        # ==========================================
+        # 1. Standard Forward Pass
+        # ==========================================
+        with torch.cuda.amp.autocast(enabled=True):
+            outputs = model(input_ids, attention_mask)
+            loss = criterion(outputs, targets)
+
+        # Scale loss for gradient accumulation
+        loss = loss / config.GRAD_ACCUM_STEPS
+
+        # ==========================================
+        # 2. Standard Backward Pass
+        # ==========================================
+        scaler.scale(loss).backward()
+
+        # Accumulate loss for logging
+        total_loss += loss.item() * config.GRAD_ACCUM_STEPS
+
+        # ==========================================
+        # 3. Optimization Step
+        # ==========================================
+        if (step + 1) % config.GRAD_ACCUM_STEPS == 0 or (step + 1) == num_batches:
+
+            # Unscale gradients before clipping
+            scaler.unscale_(optimizer)
+
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.MAX_GRAD_NORM)
+
+            # Optimizer Step
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            # Scheduler Step
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step += 1
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+
+def run_training(seed):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 4. AWP Initialization
+    # ==========================================
+    awp = None
+    if Config.USE_AWP:
+        awp = AWP(
+            model,
+            optimizer,
+            adv_lr=Config.AWP_LR,
+            adv_eps=Config.AWP_EPS,
+            start_epoch=Config.AWP_START_EPOCH,
+        )
+        logger.info("AWP Initialized.")
+
+    # ==========================================
+    # 5. Training Loop
+    # ==========================================
+    criterion = nn.BCEWithLogitsLoss()
+
+    for epoch in range(Config.EPOCHS):
+        start_time = time.time()
+
+        avg_loss = train_fn(
+            train_loader,
+            model,
+            criterion,
+            optimizer,
+            scheduler,
+            awp,
+            device,
+            epoch,
+            Config,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Epoch {epoch+1}/{Config.EPOCHS} | Loss: {avg_loss:.6f} | Time: {elapsed:.0f}s"
+        )
+=======
+    # ==========================================
+    # 5. Training Loop
+    # ==========================================
+    criterion = nn.BCEWithLogitsLoss()
+
+    for epoch in range(Config.EPOCHS):
+        start_time = time.time()
+
+        avg_loss = train_fn(
+            train_loader,
+            model,
+            criterion,
+            optimizer,
+            scheduler,
+            device,
+            epoch,
+            Config,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Epoch {epoch+1}/{Config.EPOCHS} | Loss: {avg_loss:.6f} | Time: {elapsed:.0f}s"
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.awp import AWP
+from library.train import train_fn
+from library.inference import inference_fn
+
+# Initialize Logger
+logger = get_logger("runfile")
+
+
+def main():
+    # ==========================================
+    # 1. Configuration Overrides for Fast Baseline
+    # ==========================================
+    # We reduce epochs to ensure the run completes quickly while still learning.
+    # We use 3 seeds to maintain the robustness of the ensemble strategy.
+    Config.EPOCHS = 2
+    Config.SEEDS = [42, 43, 44]
+    Config.DEBUG = False
+
+    logger.info("Configuration set for fast baseline.")
+    logger.info(f"Epochs: {Config.EPOCHS}")
+    logger.info(f"Seeds: {Config.SEEDS}")
+
+    # ==========================================
+    # 2. Data Loading
+    # ==========================================
+    logger.info("Loading datasets...")
+    # Load Train and Validation sets separately to ensure strict hold-out validation
+    df_train = load_processed_data(Config.TRAIN_PATH, "train_runfile.parquet")
+    df_val = load_processed_data(Config.VAL_PATH, "val_runfile.parquet")
+
+    logger.info(f"Train shape: {df_train.shape}")
+    logger.info(f"Val shape: {df_val.shape}")
+
+    # Initialize Tokenizer and Device
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+    device = torch.device(Config.DEVICE)
+
+    # ==========================================
+    # 3. Training Loop
+    # ==========================================
+    # We implement the loop here to control data splitting explicitly
+    for seed in Config.SEEDS:
+        seed_everything(seed)
+        logger.info(f"--- Starting Training for Seed {seed} ---")
+
+        # Prepare DataLoader for training
+        train_loader = get_dataloader(
+            df_train,
+            tokenizer,
+            batch_size=Config.TRAIN_BATCH_SIZE,
+            shuffle=True,
+            max_len=Config.MAX_LEN,
+        )
+
+        # Initialize Model
+        model = InsultModel(Config.MODEL_NAME)
+        model.to(device)
+
+        # Initialize Optimizer
+        optimizer = AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Initialize Scheduler
+        num_update_steps_per_epoch = len(train_loader) // Config.GRAD_ACCUM_STEPS
+        max_train_steps = Config.EPOCHS * num_update_steps_per_epoch
+        num_warmup_steps = int(max_train_steps * Config.WARMUP_RATIO)
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=max_train_steps,
+        )
+
+        # Initialize AWP (Adversarial Weight Perturbation)
+        awp = None
+        if Config.USE_AWP:
+            awp = AWP(
+                model,
+                optimizer,
+                adv_lr=Config.AWP_LR,
+                adv_eps=Config.AWP_EPS,
+                start_epoch=Config.AWP_START_EPOCH,
+            )
+
+        # Loss Function
+        criterion = nn.BCEWithLogitsLoss()
+
+        # Train for specified epochs
+        for epoch in range(Config.EPOCHS):
+            avg_loss = train_fn(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                scheduler,
+                awp,
+                device,
+                epoch,
+                Config,
+            )
+            logger.info(
+                f"Seed {seed} | Epoch {epoch+1}/{Config.EPOCHS} | Loss: {avg_loss:.6f}"
+            )
+
+        # Save Model Weights
+        save_path = os.path.join(Config.OUTPUT_DIR, f"model_seed_{seed}.bin")
+        torch.save(model.state_dict(), save_path)
+        logger.info(f"Model saved: {save_path}")
+
+        # Cleanup to free memory
+        del model, optimizer, scheduler, awp, train_loader
+        torch.cuda.empty_cache()
+=======
+from library.train import train_fn
+from library.inference import inference_fn
+
+# Initialize Logger
+logger = get_logger("runfile")
+
+
+def main():
+    # ==========================================
+    # 1. Configuration Overrides
+    # ==========================================
+    # Revert to RoBERTa-Large and increase epochs as AWP is disabled.
+    Config.MODEL_NAME = "roberta-large"
+    Config.USE_AWP = False
+    Config.EPOCHS = 4
+    Config.SEEDS = [42, 43, 44]
+    Config.DEBUG = False
+
+    logger.info("Configuration set for optimized run.")
+    logger.info(f"Model: {Config.MODEL_NAME}")
+    logger.info(f"Epochs: {Config.EPOCHS}")
+    logger.info(f"Seeds: {Config.SEEDS}")
+
+    # ==========================================
+    # 2. Data Loading
+    # ==========================================
+    logger.info("Loading datasets...")
+    # Load Train and Validation sets separately to ensure strict hold-out validation
+    df_train = load_processed_data(Config.TRAIN_PATH, "train_runfile.parquet")
+    df_val = load_processed_data(Config.VAL_PATH, "val_runfile.parquet")
+
+    logger.info(f"Train shape: {df_train.shape}")
+    logger.info(f"Val shape: {df_val.shape}")
+
+    # Initialize Tokenizer and Device
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+    device = torch.device(Config.DEVICE)
+
+    # Prepare Validation DataLoader (used for checkpointing)
+    val_loader = get_dataloader(
+        df_val,
+        tokenizer,
+        batch_size=Config.VALID_BATCH_SIZE,
+        shuffle=False,
+        max_len=Config.MAX_LEN,
+        is_test=True,
+    )
+    val_targets = df_val["Insult"].values
+
+    # ==========================================
+    # 3. Training Loop
+    # ==========================================
+    for seed in Config.SEEDS:
+        seed_everything(seed)
+        logger.info(f"--- Starting Training for Seed {seed} ---")
+
+        # Prepare DataLoader for training
+        train_loader = get_dataloader(
+            df_train,
+            tokenizer,
+            batch_size=Config.TRAIN_BATCH_SIZE,
+            shuffle=True,
+            max_len=Config.MAX_LEN,
+        )
+
+        # Initialize Model
+        model = InsultModel(Config.MODEL_NAME)
+        model.to(device)
+
+        # Initialize Optimizer
+        optimizer = AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Initialize Scheduler
+        num_update_steps_per_epoch = len(train_loader) // Config.GRAD_ACCUM_STEPS
+        max_train_steps = Config.EPOCHS * num_update_steps_per_epoch
+        num_warmup_steps = int(max_train_steps * Config.WARMUP_RATIO)
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=max_train_steps,
+        )
+
+        # Loss Function
+        criterion = nn.BCEWithLogitsLoss()
+
+        # Track Best Model
+        best_auc = 0.0
+        best_epoch = 0
+        save_path = os.path.join(Config.OUTPUT_DIR, f"model_seed_{seed}.bin")
+
+        # Train for specified epochs
+        for epoch in range(Config.EPOCHS):
+            avg_loss = train_fn(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                scheduler,
+                device,
+                epoch,
+                Config,
+            )
+            
+            # Validation Step
+            val_preds = inference_fn(model, val_loader, device)
+            val_auc = roc_auc_score(val_targets, val_preds)
+
+            logger.info(
+                f"Seed {seed} | Epoch {epoch+1}/{Config.EPOCHS} | Loss: {avg_loss:.6f} | Val AUC: {val_auc:.6f}"
+            )
+
+            # Save Best Model
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_epoch = epoch + 1
+                torch.save(model.state_dict(), save_path)
+                logger.info(f"New best model saved at epoch {best_epoch} with AUC {best_auc:.6f}")
+
+        logger.info(f"Finished Seed {seed}. Best AUC: {best_auc:.6f} at Epoch {best_epoch}")
+
+        # Cleanup to free memory
+        del model, optimizer, scheduler, train_loader
+        torch.cuda.empty_cache()
+>>>>>>> REPLACE
+```

@@ -1,0 +1,243 @@
+The execution failure `InvalidSubmissionError: Submission and answers DataFrames must have the same number of rows` indicates that the pipeline dropped rows from the test set, resulting in an incomplete submission file. This happened because the `process_trip` function performs an `inner` join between the metadata (required timestamps) and the sensor data, and subsequently drops rows where the baseline WLS position is missing (`NaN`). In the test set, raw GNSS data can be sparse or missing, leading to missing baseline positions. However, the competition requires a prediction for *every* timestamp in the sample submission.
+
+To fix this, I will:
+1.  **Update Cache Directory**: Change `CACHE_DIR` in `library/config.py` to `idea_4` to ensure the pipeline ignores the previously generated (incomplete) datasets and regenerates them with the new logic (Cite debug_lesson_3).
+2.  **Modify Feature Engineering**: In `library/features.py`:
+    *   Update `process_trip` to accept a `split` argument.
+    *   Use a `left` join instead of `inner` join when merging metadata with sensor features to preserve all required timestamps.
+    *   For the `test` split, instead of dropping rows with missing baseline positions, fill them using linear interpolation and forward/backward filling. This ensures every timestamp has a valid baseline to apply predictions to.
+    *   Update `generate_dataset` to pass the `split_name` to `process_trip`.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+CACHE_DIR = os.path.join(WORKING_DIR, "idea_3")
+=======
+CACHE_DIR = os.path.join(WORKING_DIR, "idea_4")
+>>>>>>> REPLACE
+```
+
+```diff
+library/features.py
+<<<<<<< SEARCH
+def process_trip(trip_id, trip_meta_df):
+    """
+    Processes a single trip: loads raw data, aggregates, merges with metadata.
+    """
+    # Extract path info from the first row of metadata for this trip
+    first_row = trip_meta_df.iloc[0]
+    gnss_rel_path = first_row["gnss_path"]
+    imu_rel_path = first_row["imu_path"]
+
+    gnss_path = os.path.join(INPUT_DIR, gnss_rel_path)
+    imu_path = os.path.join(INPUT_DIR, imu_rel_path)
+
+    # --- Load GNSS ---
+    # We need WLS positions and signal features
+    try:
+        gnss_df = pd.read_csv(gnss_path, usecols=GNSS_COLS)
+    except Exception as e:
+        print(f"Error loading GNSS for {trip_id}: {e}")
+        return pd.DataFrame()
+
+    # --- Load IMU ---
+    try:
+        imu_df = pd.read_csv(imu_path, usecols=IMU_COLS)
+    except Exception as e:
+        print(f"Error loading IMU for {trip_id}: {e}")
+        # Continue without IMU if missing
+        imu_df = pd.DataFrame(columns=IMU_COLS)
+
+    # --- Aggregate Features ---
+    gnss_feats = aggregate_gnss(gnss_df)
+    imu_feats = aggregate_imu(imu_df)
+
+    # --- Extract Baseline WLS Position ---
+    # WLS position is repeated for every satellite at the same timestamp.
+    # We drop duplicates to get one position per timestamp.
+    wls_df = (
+        gnss_df[
+            [
+                "utcTimeMillis",
+                "WlsPositionXEcefMeters",
+                "WlsPositionYEcefMeters",
+                "WlsPositionZEcefMeters",
+            ]
+        ]
+        .drop_duplicates(subset="utcTimeMillis")
+        .set_index("utcTimeMillis")
+    )
+
+    # Convert ECEF to LLA
+    lat, lon, alt = ecef_to_lla(
+        wls_df["WlsPositionXEcefMeters"].values,
+        wls_df["WlsPositionYEcefMeters"].values,
+        wls_df["WlsPositionZEcefMeters"].values,
+    )
+
+    wls_df["lat_wls"] = lat
+    wls_df["lon_wls"] = lon
+    wls_df["alt_wls"] = alt
+
+    # Drop ECEF columns to save space
+    wls_df = wls_df.drop(
+        columns=[
+            "WlsPositionXEcefMeters",
+            "WlsPositionYEcefMeters",
+            "WlsPositionZEcefMeters",
+        ]
+    )
+
+    # --- Merge Everything ---
+    # Join features to WLS positions (all indexed by utcTimeMillis)
+    trip_features = wls_df.join(gnss_feats, how="left").join(imu_feats, how="left")
+
+    # Reset index to make 'utcTimeMillis' a column for merging with metadata
+    trip_features = trip_features.reset_index().rename(
+        columns={"utcTimeMillis": "UnixTimeMillis"}
+    )
+
+    # --- Merge with Metadata (Ground Truth / Targets) ---
+    # The metadata contains the specific timestamps we need to predict/train on.
+    # We perform an inner join to keep only the relevant rows.
+    merged_df = pd.merge(trip_meta_df, trip_features, on="UnixTimeMillis", how="inner")
+
+    # Drop rows where baseline WLS position is missing to prevent NaN targets/metrics
+    # Cite debug_lesson_2: Sanitize Regression Targets, Not Just Input Features
+    merged_df = merged_df.dropna(subset=["lat_wls", "lon_wls"])
+=======
+def process_trip(trip_id, trip_meta_df, split="train"):
+    """
+    Processes a single trip: loads raw data, aggregates, merges with metadata.
+    """
+    # Extract path info from the first row of metadata for this trip
+    first_row = trip_meta_df.iloc[0]
+    gnss_rel_path = first_row["gnss_path"]
+    imu_rel_path = first_row["imu_path"]
+
+    gnss_path = os.path.join(INPUT_DIR, gnss_rel_path)
+    imu_path = os.path.join(INPUT_DIR, imu_rel_path)
+
+    # --- Load GNSS ---
+    # We need WLS positions and signal features
+    try:
+        gnss_df = pd.read_csv(gnss_path, usecols=GNSS_COLS)
+    except Exception as e:
+        # For test set, we must return a dataframe even if GNSS is missing
+        if split == "test":
+            gnss_df = pd.DataFrame(columns=GNSS_COLS)
+        else:
+            print(f"Error loading GNSS for {trip_id}: {e}")
+            return pd.DataFrame()
+
+    # --- Load IMU ---
+    try:
+        imu_df = pd.read_csv(imu_path, usecols=IMU_COLS)
+    except Exception as e:
+        # Continue without IMU if missing
+        imu_df = pd.DataFrame(columns=IMU_COLS)
+
+    # --- Aggregate Features ---
+    if not gnss_df.empty:
+        gnss_feats = aggregate_gnss(gnss_df)
+    else:
+        gnss_feats = pd.DataFrame()
+
+    if not imu_df.empty:
+        imu_feats = aggregate_imu(imu_df)
+    else:
+        imu_feats = pd.DataFrame()
+
+    # --- Extract Baseline WLS Position ---
+    if not gnss_df.empty:
+        # WLS position is repeated for every satellite at the same timestamp.
+        # We drop duplicates to get one position per timestamp.
+        wls_df = (
+            gnss_df[
+                [
+                    "utcTimeMillis",
+                    "WlsPositionXEcefMeters",
+                    "WlsPositionYEcefMeters",
+                    "WlsPositionZEcefMeters",
+                ]
+            ]
+            .drop_duplicates(subset="utcTimeMillis")
+            .set_index("utcTimeMillis")
+        )
+
+        # Convert ECEF to LLA
+        lat, lon, alt = ecef_to_lla(
+            wls_df["WlsPositionXEcefMeters"].values,
+            wls_df["WlsPositionYEcefMeters"].values,
+            wls_df["WlsPositionZEcefMeters"].values,
+        )
+
+        wls_df["lat_wls"] = lat
+        wls_df["lon_wls"] = lon
+        wls_df["alt_wls"] = alt
+
+        # Drop ECEF columns to save space
+        wls_df = wls_df.drop(
+            columns=[
+                "WlsPositionXEcefMeters",
+                "WlsPositionYEcefMeters",
+                "WlsPositionZEcefMeters",
+            ]
+        )
+    else:
+        wls_df = pd.DataFrame(columns=["lat_wls", "lon_wls", "alt_wls"])
+
+    # --- Merge Everything ---
+    # Join features to WLS positions (all indexed by utcTimeMillis)
+    # Use outer join to ensure we keep timestamps from both GNSS and IMU if they differ
+    trip_features = wls_df.join(gnss_feats, how="outer").join(imu_feats, how="outer")
+
+    # Reset index to make 'utcTimeMillis' a column for merging with metadata
+    trip_features = trip_features.reset_index().rename(
+        columns={"index": "UnixTimeMillis", "utcTimeMillis": "UnixTimeMillis"}
+    )
+
+    # --- Merge with Metadata (Ground Truth / Targets) ---
+    # The metadata contains the specific timestamps we need to predict/train on.
+    # Use LEFT join to preserve all required timestamps from metadata (crucial for test)
+    merged_df = pd.merge(trip_meta_df, trip_features, on="UnixTimeMillis", how="left")
+
+    # Handle missing baseline positions
+    if split == "test":
+        # For test set, we cannot drop rows. We must interpolate missing baselines.
+        merged_df = merged_df.sort_values("UnixTimeMillis")
+        wls_cols = ["lat_wls", "lon_wls", "alt_wls"]
+        
+        # Interpolate missing values
+        merged_df[wls_cols] = merged_df[wls_cols].interpolate(method='linear', limit_direction='both')
+        
+        # Forward/Backward fill for edges
+        merged_df[wls_cols] = merged_df[wls_cols].ffill().bfill()
+        
+        # Fill any remaining NaNs with 0 (fallback)
+        merged_df[wls_cols] = merged_df[wls_cols].fillna(0.0)
+    else:
+        # For train/val, drop rows where baseline WLS position is missing to prevent NaN targets/metrics
+        # Cite debug_lesson_2: Sanitize Regression Targets, Not Just Input Features
+        merged_df = merged_df.dropna(subset=["lat_wls", "lon_wls"])
+>>>>>>> REPLACE
+```
+
+```diff
+library/features.py
+<<<<<<< SEARCH
+    for trip_id in trip_ids:
+        trip_meta = meta_df[meta_df["tripId"] == trip_id].copy()
+        trip_data = process_trip(trip_id, trip_meta)
+        if not trip_data.empty:
+            processed_dfs.append(trip_data)
+=======
+    for trip_id in trip_ids:
+        trip_meta = meta_df[meta_df["tripId"] == trip_id].copy()
+        trip_data = process_trip(trip_id, trip_meta, split=split_name)
+        if not trip_data.empty:
+            processed_dfs.append(trip_data)
+>>>>>>> REPLACE
+```

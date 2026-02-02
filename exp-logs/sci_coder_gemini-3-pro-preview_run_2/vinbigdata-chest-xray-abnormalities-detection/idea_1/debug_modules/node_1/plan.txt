@@ -1,0 +1,280 @@
+The issue is caused by a mismatch between the dimensions of the fallback image (640x640, generated when image loading fails) and the bounding box coordinates from the metadata (which correspond to the original, likely much larger, image dimensions). When `albumentations` attempts to augment the fallback image using the original bounding boxes, the coordinates (e.g., `x_min=1184`) exceed the image dimensions (640), causing a `ValueError`.
+
+To fix this, I will modify `library/data.py` to:
+1.  Update `load_image` to return a `valid` flag indicating whether the image was successfully loaded from disk or if the fallback was used. I will also add `cv2` (OpenCV) as an additional loading attempt since it is available in the environment.
+2.  Update `__getitem__` to check this `valid` flag. If the image is invalid (fallback), the code will skip parsing the bounding boxes and return empty boxes. This prevents passing out-of-bounds coordinates to `albumentations`, effectively treating unreadable images as having "No finding" (or simply background samples) to avoid crashing the training loop.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import rasterio
+import tensorflow as tf
+
+# Import from library
+from library.config import Config
+from library.utils import collate_fn
+
+
+class LungDataset(Dataset):
+=======
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import rasterio
+import tensorflow as tf
+import cv2
+
+# Import from library
+from library.config import Config
+from library.utils import collate_fn
+
+
+class LungDataset(Dataset):
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    def load_image(self, file_path):
+        """
+        Loads an image from disk.
+        Strategy:
+        1. Try rasterio (GDAL) which often supports DICOM.
+        2. Fallback to TensorFlow's decode_image.
+        3. Preprocess: Convert to RGB, Normalize [0,1].
+        """
+        image = None
+
+        # Attempt 1: Rasterio
+        try:
+            with rasterio.open(file_path) as src:
+                # rasterio reads as (Count, H, W)
+                img_data = src.read()
+                # Transpose to (H, W, C)
+                image = np.transpose(img_data, (1, 2, 0))
+        except Exception:
+            pass
+
+        # Attempt 2: TensorFlow Fallback
+        if image is None:
+            try:
+                if os.path.exists(file_path):
+                    file_content = tf.io.read_file(file_path)
+                    # channels=0 allows original channels, we fix to RGB later
+                    img_tensor = tf.io.decode_image(
+                        file_content, channels=0, expand_animations=False
+                    )
+                    image = img_tensor.numpy()
+            except Exception:
+                pass
+
+        # Fallback for failures (should be rare/non-existent)
+        if image is None:
+            # Return black image
+            image = np.zeros(
+                (Config.IMAGE_SIZE, Config.IMAGE_SIZE, 3), dtype=np.float32
+            )
+
+        # Ensure Numpy Array
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        # Handle Dimensions
+        # If (H, W) -> (H, W, 1)
+        if image.ndim == 2:
+            image = np.expand_dims(image, axis=-1)
+
+        # If (H, W, 1) -> (H, W, 3)
+        if image.shape[-1] == 1:
+            image = np.repeat(image, 3, axis=-1)
+
+        # If (H, W, 4) -> (H, W, 3) (Remove Alpha)
+        if image.shape[-1] == 4:
+            image = image[:, :, :3]
+
+        # Normalize to [0, 1]
+        # DICOMs can be high bit-depth (12, 16).
+        image = image.astype(np.float32)
+        img_min = image.min()
+        img_max = image.max()
+        if img_max > img_min:
+            image = (image - img_min) / (img_max - img_min)
+        else:
+            image = np.zeros_like(image)
+
+        return image
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        records = self.annotations[image_id]
+
+        # Load Image
+        file_path = records[0]["file_path"]
+        image = self.load_image(file_path)
+
+        # Parse Annotations
+        boxes = []
+        labels = []
+
+        for row in records:
+            # Check if 'class_id' exists (it should for train/val)
+            if "class_id" in row:
+                cid = row["class_id"]
+                # Class 14 is "No finding" -> Skip adding a box
+                if cid == 14:
+                    continue
+
+                # Get coordinates
+                if "x_min" in row:
+                    x_min, y_min = row["x_min"], row["y_min"]
+                    x_max, y_max = row["x_max"], row["y_max"]
+
+                    # Basic validation
+                    if x_max > x_min and y_max > y_min:
+                        boxes.append([x_min, y_min, x_max, y_max])
+                        # Map Dataset Class (0-13) to Model Class (1-14)
+                        # Model Class 0 is reserved for background
+                        labels.append(cid + 1)
+
+        # Convert to numpy
+        boxes = np.array(boxes, dtype=np.float32)
+        labels = np.array(labels, dtype=np.int64)
+=======
+    def load_image(self, file_path):
+        """
+        Loads an image from disk.
+        Strategy:
+        1. Try rasterio (GDAL) which often supports DICOM.
+        2. Try OpenCV.
+        3. Fallback to TensorFlow's decode_image.
+        4. Preprocess: Convert to RGB, Normalize [0,1].
+
+        Returns:
+            image: The loaded image.
+            valid: Boolean indicating if the image was successfully loaded from disk.
+        """
+        image = None
+        valid = True
+
+        # Attempt 1: Rasterio
+        try:
+            with rasterio.open(file_path) as src:
+                # rasterio reads as (Count, H, W)
+                img_data = src.read()
+                # Transpose to (H, W, C)
+                image = np.transpose(img_data, (1, 2, 0))
+        except Exception:
+            pass
+
+        # Attempt 2: OpenCV
+        if image is None:
+            try:
+                image = cv2.imread(file_path)
+                if image is not None:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            except Exception:
+                pass
+
+        # Attempt 3: TensorFlow Fallback
+        if image is None:
+            try:
+                if os.path.exists(file_path):
+                    file_content = tf.io.read_file(file_path)
+                    # channels=0 allows original channels, we fix to RGB later
+                    img_tensor = tf.io.decode_image(
+                        file_content, channels=0, expand_animations=False
+                    )
+                    image = img_tensor.numpy()
+            except Exception:
+                pass
+
+        # Fallback for failures (should be rare/non-existent)
+        if image is None:
+            # Return black image
+            image = np.zeros(
+                (Config.IMAGE_SIZE, Config.IMAGE_SIZE, 3), dtype=np.float32
+            )
+            valid = False
+
+        # Ensure Numpy Array
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        # Handle Dimensions
+        # If (H, W) -> (H, W, 1)
+        if image.ndim == 2:
+            image = np.expand_dims(image, axis=-1)
+
+        # If (H, W, 1) -> (H, W, 3)
+        if image.shape[-1] == 1:
+            image = np.repeat(image, 3, axis=-1)
+
+        # If (H, W, 4) -> (H, W, 3) (Remove Alpha)
+        if image.shape[-1] == 4:
+            image = image[:, :, :3]
+
+        # Normalize to [0, 1]
+        # DICOMs can be high bit-depth (12, 16).
+        image = image.astype(np.float32)
+        img_min = image.min()
+        img_max = image.max()
+        if img_max > img_min:
+            image = (image - img_min) / (img_max - img_min)
+        else:
+            image = np.zeros_like(image)
+
+        return image, valid
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        records = self.annotations[image_id]
+
+        # Load Image
+        file_path = records[0]["file_path"]
+        image, valid_image = self.load_image(file_path)
+
+        # Parse Annotations
+        boxes = []
+        labels = []
+
+        # Only parse boxes if we have a valid image.
+        # If valid_image is False, we have a dummy black image with different dimensions
+        # than the original, so the original boxes would be invalid (out of bounds).
+        if valid_image:
+            for row in records:
+                # Check if 'class_id' exists (it should for train/val)
+                if "class_id" in row:
+                    cid = row["class_id"]
+                    # Class 14 is "No finding" -> Skip adding a box
+                    if cid == 14:
+                        continue
+
+                    # Get coordinates
+                    if "x_min" in row:
+                        x_min, y_min = row["x_min"], row["y_min"]
+                        x_max, y_max = row["x_max"], row["y_max"]
+
+                        # Basic validation
+                        if x_max > x_min and y_max > y_min:
+                            boxes.append([x_min, y_min, x_max, y_max])
+                            # Map Dataset Class (0-13) to Model Class (1-14)
+                            # Model Class 0 is reserved for background
+                            labels.append(cid + 1)
+
+        # Convert to numpy
+        boxes = np.array(boxes, dtype=np.float32)
+        labels = np.array(labels, dtype=np.int64)
+>>>>>>> REPLACE
+```

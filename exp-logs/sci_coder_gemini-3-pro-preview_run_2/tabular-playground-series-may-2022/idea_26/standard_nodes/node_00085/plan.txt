@@ -1,0 +1,263 @@
+To optimize the solution, I will implement the following changes based on the provided lessons:
+
+1.  **Optimization Schedule (Lesson 53, 45):** Increase the training duration from 10 to 35 epochs to allow the model to fully converge, utilizing the full "tail" of the learning rate schedule. The batch size remains at 1024 (Lesson 44).
+2.  **Architectural Refinement (Lesson 49, 51, 54):** Modify the `GLUResBlock` in the residual backbone to use **Batch Normalization** instead of Layer Normalization. Adopt the **Pre-Activation Direct GLU** topology (`BN -> Linear -> GLU -> Dropout`) and remove the redundant second linear projection and Stochastic Depth (`DropPath`), which were adding complexity without gain (Lesson 84).
+3.  **Initialization Strategy (Lesson 71, 72):** Remove the explicit Xavier initialization for the backbone's linear layers, reverting to PyTorch's robust defaults (Kaiming/He) which are better suited for GLU/ReLU-like activations. I will retain the specific initialization for the Transformer and Positional Embeddings.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+EPOCHS = 40
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-2
+EMBED_DIM = 32
+BACKBONE_STAGES = [512, 256, 128]
+BLOCKS_PER_STAGE = 3
+DROP_PATH_MAX = 0.2
+DROPOUT = 0.35
+=======
+EPOCHS = 35
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-2
+EMBED_DIM = 32
+BACKBONE_STAGES = [512, 256, 128]
+BLOCKS_PER_STAGE = 3
+DROP_PATH_MAX = 0.0
+DROPOUT = 0.35
+>>>>>>> REPLACE
+```
+
+```diff
+library/network.py
+<<<<<<< SEARCH
+class DropPath(nn.Module):
+    """
+    Drop paths (Stochastic Depth) per sample.
+    """
+
+    def __init__(self, drop_prob=0.0):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        # Work with any number of dimensions, assuming batch size is dim 0
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+class GLUResBlock(nn.Module):
+    """
+    Pre-Activation Direct GLU Residual Block.
+    Structure: x_out = x + DropPath(Linear(Dropout(GLU(Linear(Norm(x))))))
+    """
+
+    def __init__(self, in_features, drop_path=0.0, dropout=0.35):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_features)
+        # GLU splits input in half, so we project to 2 * in_features
+        self.fc1 = nn.Linear(in_features, in_features * 2)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(in_features, in_features)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Explicit Xavier Uniform initialization for GLU Linear layers
+        nn.init.xavier_uniform_(self.fc1.weight)
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        if self.fc2.bias is not None:
+            nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        # Standard GLU: splits last dim into a and b, returns a * sigmoid(b)
+        # However, PyTorch F.glu uses sigmoid by default.
+        # The prompt mentions "Activation: Explicitly set activation='gelu'" for Transformer.
+        # For GLU block, it says "Direct GLU". We use standard F.glu.
+        x = F.glu(x, dim=-1)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.drop_path(x)
+        return shortcut + x
+=======
+class GLUResBlock(nn.Module):
+    """
+    Pre-Activation Direct GLU Residual Block with Batch Normalization.
+    Structure: x_out = x + Dropout(GLU(Linear(BN(x))))
+    Cite Lesson 49: Batch Normalization vs Layer Normalization
+    Cite Lesson 51: Direct Gated topology (Projection d->2d followed by GLU reduction to d)
+    Cite Lesson 54: Pre-Activation Topology
+    """
+
+    def __init__(self, in_features, dropout=0.35):
+        super().__init__()
+        self.norm = nn.BatchNorm1d(in_features)
+        # GLU splits input in half, so we project to 2 * in_features
+        self.fc = nn.Linear(in_features, in_features * 2)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm(x)
+        x = self.fc(x)
+        x = F.glu(x, dim=-1)
+        x = self.dropout(x)
+        return shortcut + x
+>>>>>>> REPLACE
+```
+
+```diff
+library/network.py
+<<<<<<< SEARCH
+        for i, stage_dim in enumerate(BACKBONE_STAGES):
+            stage_blocks = []
+
+            # Transition/Projection if dimension changes (except first stage which matches stem)
+            if i > 0:
+                proj = nn.Linear(BACKBONE_STAGES[i - 1], stage_dim)
+                nn.init.xavier_uniform_(proj.weight)
+                nn.init.zeros_(proj.bias)
+                stage_blocks.append(proj)
+                current_dim = stage_dim
+
+            # Stack Residual Blocks
+            for _ in range(BLOCKS_PER_STAGE):
+                # Linear schedule for DropPath
+                dpr = DROP_PATH_MAX * global_block_idx / (total_blocks - 1)
+                stage_blocks.append(
+                    GLUResBlock(current_dim, drop_path=dpr, dropout=DROPOUT)
+                )
+                global_block_idx += 1
+
+            self.stages.append(nn.Sequential(*stage_blocks))
+
+        # Output Head
+        self.head = nn.Linear(BACKBONE_STAGES[-1], 1)
+
+        self._init_stem_head()
+
+    def _init_stem_head(self):
+        # Xavier Uniform for Stem and Head
+        nn.init.xavier_uniform_(self.stem.weight)
+        nn.init.zeros_(self.stem.bias)
+        nn.init.xavier_uniform_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+=======
+        for i, stage_dim in enumerate(BACKBONE_STAGES):
+            stage_blocks = []
+
+            # Transition/Projection if dimension changes (except first stage which matches stem)
+            if i > 0:
+                proj = nn.Linear(BACKBONE_STAGES[i - 1], stage_dim)
+                stage_blocks.append(proj)
+                current_dim = stage_dim
+
+            # Stack Residual Blocks
+            for _ in range(BLOCKS_PER_STAGE):
+                # Cite Lesson 84: Progressive Compression (Funneling) over Isotropic Regularized Blocks
+                # Removing DropPath (Stochastic Depth) as it adds complexity without gain.
+                stage_blocks.append(
+                    GLUResBlock(current_dim, dropout=DROPOUT)
+                )
+                global_block_idx += 1
+
+            self.stages.append(nn.Sequential(*stage_blocks))
+
+        # Output Head
+        self.head = nn.Linear(BACKBONE_STAGES[-1], 1)
+        # Removed explicit initialization for stem/head/proj to rely on PyTorch defaults (Cite Lesson 71)
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+from library.config import GLUBlock
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    # 2. Traverse Modules
+    for name, module in model.named_modules():
+        # GLU Linear Layers
+        if isinstance(module, GLUBlock):
+            # Apply Xavier Uniform to fc1
+            if hasattr(module, "fc1") and isinstance(module.fc1, nn.Linear):
+                nn.init.xavier_uniform_(module.fc1.weight)
+                if module.fc1.bias is not None:
+                    nn.init.zeros_(module.fc1.bias)
+
+            # Apply Xavier Uniform to fc2
+            if hasattr(module, "fc2") and isinstance(module.fc2, nn.Linear):
+                nn.init.xavier_uniform_(module.fc2.weight)
+                if module.fc2.bias is not None:
+                    nn.init.zeros_(module.fc2.bias)
+
+        # Transformer Attention
+        elif isinstance(module, nn.MultiheadAttention):
+=======
+    # 2. Traverse Modules
+    for name, module in model.named_modules():
+        # Cite Lesson 71: Avoid blanket application of Xavier initialization in networks using GLU/GELU.
+        # We rely on PyTorch defaults (Kaiming/LeCun) for the backbone linear layers.
+
+        # Transformer Attention
+        if isinstance(module, nn.MultiheadAttention):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import (
+    DEVICE,
+    SEED,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    CACHE_DIR,
+)
+=======
+from library.config import (
+    DEVICE,
+    SEED,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+    CACHE_DIR,
+    EPOCHS,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Execution
+    # Fast baseline: limit to 10 epochs to ensure completion within 2 hours
+    # The A100 is fast, but we strictly follow the guideline to limit steps.
+    FAST_EPOCHS = 10
+    print(f"Starting training for {FAST_EPOCHS} epochs...")
+    trainer.fit(train_loader, val_loader, epochs=FAST_EPOCHS)
+=======
+    # 5. Execution
+    # Cite Lesson 53: Conservation of Gradient Updates in Batch Scaling
+    # Cite Lesson 45: Optimizing Convergence Tails via Scheduler-Epoch Alignment
+    print(f"Starting training for {EPOCHS} epochs...")
+    trainer.fit(train_loader, val_loader, epochs=EPOCHS)
+>>>>>>> REPLACE
+```

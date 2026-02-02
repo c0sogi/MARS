@@ -1,0 +1,217 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import torch
+import cv2
+from sklearn.metrics import log_loss
+
+# Import from provided libraries
+from library.config import Config
+from library.utils import seed_everything, calculate_metric, Logger
+from library.dataset import _process_data
+from library.training import run_regime_a
+from library.models import create_model
+from library.inference import predict_tta
+from library.dataset import get_dataloaders, get_test_dataloader, get_label_map
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+
+    # Initialize Logger
+    logger = Logger(os.path.join(Config.WORK_DIR, "runfile.log"))
+    logger.log("Starting Runfile Execution (Optimized)...")
+
+    # 2. Data Processing
+    # Ensure data is cached and ready
+    logger.log("Processing Data...")
+    _process_data(load_cached_data=True)
+
+    # 3. Training Loop (5-Fold Cross Validation)
+    n_folds = Config.N_FOLDS
+    device = torch.device(Config.DEVICE)
+
+    # Containers for OOF and Test predictions
+    oof_preds_list = []
+    oof_targets_list = []
+    oof_ids_list = []
+
+    test_preds_accum = None
+    test_ids = None
+
+    # Load Test Loader (Shared)
+    test_loader = get_test_dataloader(load_cached_data=True)
+    # Extract test IDs once
+    t_ids = []
+    for _, _, i in test_loader:
+        t_ids.extend(i)
+    test_ids = np.array(t_ids)
+
+    for fold_idx in range(n_folds):
+        logger.log(f"\n=== Processing Fold {fold_idx}/{n_folds-1} ===")
+
+        model_path = os.path.join(Config.WORK_DIR, f"convnext_base_fold_{fold_idx}.pth")
+
+        # Train if not exists
+        if not os.path.exists(model_path):
+            logger.log(f"Training Fold {fold_idx}...")
+            run_regime_a(fold_idx, debug=False)
+        else:
+            logger.log(f"Fold {fold_idx} model already exists. Skipping training.")
+
+        # Load Model
+        logger.log(f"Loading model for inference...")
+        model = create_model(
+            Config.MODEL_A_NAME, num_classes=Config.NUM_CLASSES, pretrained=False
+        )
+        state_dict = torch.load(model_path, map_location=device)
+
+        # Strip 'module.' prefix if present (SWA artifact)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == "n_averaged":
+                continue
+            if k.startswith("module."):
+                new_state_dict[k[7:]] = v
+            else:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict)
+        model.to(device)
+        model.eval()
+
+        # --- OOF Inference ---
+        _, val_loader = get_dataloaders(fold_idx, load_cached_data=True)
+
+        # Predict with TTA
+        preds = predict_tta(model, val_loader, device)
+
+        # Get targets and IDs
+        targets = []
+        ids = []
+        for _, t, i in val_loader:
+            targets.append(t.numpy())
+            ids.extend(i)
+        targets = np.concatenate(targets)
+
+        oof_preds_list.append(preds)
+        oof_targets_list.append(targets)
+        oof_ids_list.extend(ids)
+
+        # --- Test Inference ---
+        t_preds = predict_tta(model, test_loader, device)
+
+        if test_preds_accum is None:
+            test_preds_accum = t_preds
+        else:
+            test_preds_accum += t_preds
+
+        # Cleanup
+        del model
+        torch.cuda.empty_cache()
+
+    # 4. Aggregation
+    oof_probs = np.concatenate(oof_preds_list, axis=0)
+    y_oof = np.concatenate(oof_targets_list, axis=0)
+    oof_ids = np.array(oof_ids_list)
+
+    # Average Test Predictions
+    final_test_probs = test_preds_accum / n_folds
+
+    # 5. Validation Assessment
+    final_metric = calculate_metric(y_oof, oof_probs)
+
+    # REQUIRED OUTPUT FORMAT
+    print(f"Final Validation Metric: {final_metric}")
+    logger.log(f"Final Validation Metric: {final_metric}")
+
+    # 6. Failure Analysis
+    logger.log("\n=== Failure Analysis ===")
+
+    # Calculate error magnitude per sample
+    epsilon = 1e-15
+    oof_probs_clipped = np.clip(oof_probs, epsilon, 1 - epsilon)
+
+    rows = np.arange(len(y_oof))
+    true_class_probs = oof_probs_clipped[rows, y_oof]
+    error_magnitudes = -np.log(true_class_probs)
+
+    # Map OOF IDs to file paths
+    train_meta = pd.read_csv(Config.TRAIN_METADATA)
+    val_meta = pd.read_csv(Config.VAL_METADATA)
+    full_meta = pd.concat([train_meta, val_meta], ignore_index=True)
+
+    id_to_path = pd.Series(full_meta.file_path.values, index=full_meta.id).to_dict()
+
+    # Collect image stats
+    widths = []
+    heights = []
+    aspect_ratios = []
+
+    logger.log("Computing image statistics for failure analysis...")
+    for img_id in oof_ids:
+        rel_path = id_to_path.get(img_id)
+        if rel_path:
+            full_path = os.path.join(Config.INPUT_DIR, rel_path)
+            img = cv2.imread(full_path)
+            if img is not None:
+                h, w = img.shape[:2]
+                widths.append(w)
+                heights.append(h)
+                aspect_ratios.append(w / h)
+            else:
+                widths.append(0)
+                heights.append(0)
+                aspect_ratios.append(0)
+        else:
+            widths.append(0)
+            heights.append(0)
+            aspect_ratios.append(0)
+
+    widths = np.array(widths)
+    heights = np.array(heights)
+    aspect_ratios = np.array(aspect_ratios)
+
+    # Calculate Correlations
+    valid_mask = widths > 0
+
+    if np.sum(valid_mask) > 0:
+        corr_w = np.corrcoef(error_magnitudes[valid_mask], widths[valid_mask])[0, 1]
+        corr_h = np.corrcoef(error_magnitudes[valid_mask], heights[valid_mask])[0, 1]
+        corr_ar = np.corrcoef(error_magnitudes[valid_mask], aspect_ratios[valid_mask])[
+            0, 1
+        ]
+
+        print("Failure Analysis: Correlation with Error Magnitude")
+        print(f"Width: {corr_w:.4f}")
+        print(f"Height: {corr_h:.4f}")
+        print(f"Aspect Ratio: {corr_ar:.4f}")
+
+        logger.log(f"Correlation Error vs Width: {corr_w:.4f}")
+        logger.log(f"Correlation Error vs Height: {corr_h:.4f}")
+        logger.log(f"Correlation Error vs Aspect Ratio: {corr_ar:.4f}")
+    else:
+        logger.log("Could not compute correlations due to missing images.")
+
+    # 7. Submission
+    threshold = 0.12970461086690332
+    if final_metric < threshold:
+        logger.log(f"Metric {final_metric} < {threshold}. Generating submission...")
+
+        label_map = get_label_map()
+        idx_to_breed = {v: k for k, v in label_map.items()}
+        columns = [idx_to_breed[i] for i in range(Config.NUM_CLASSES)]
+
+        df = pd.DataFrame(final_test_probs, columns=columns)
+        df.insert(0, "id", test_ids)
+
+        os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+        df.to_csv(Config.SUBMISSION_PATH, index=False)
+        logger.log(f"Submission saved to {Config.SUBMISSION_PATH}")
+    else:
+        logger.log(f"Metric {final_metric} >= {threshold}. Submission skipped.")
+
+
+if __name__ == "__main__":
+    main()

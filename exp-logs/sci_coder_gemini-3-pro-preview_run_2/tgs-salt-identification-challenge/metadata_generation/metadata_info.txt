@@ -1,0 +1,324 @@
+# Python Script for Metadata Generation
+```
+import os
+import pandas as pd
+import numpy as np
+import glob
+from sklearn.model_selection import train_test_split
+
+# Constants
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+IMG_SIZE = 101
+
+
+def rle_to_coverage(rle_string):
+    """Calculates the number of pixels in the mask from RLE string."""
+    if pd.isna(rle_string) or rle_string == "":
+        return 0
+
+    # RLE format: start length start length ...
+    rle_list = [int(x) for x in rle_string.split()]
+    # Sum the lengths (every second element)
+    return sum(rle_list[1::2])
+
+
+def check_files_exist(df, path_cols, base_dir, sample_size=1000):
+    """Checks if files exist for a random sample of paths."""
+    if len(df) == 0:
+        return
+
+    sample = df.sample(n=min(len(df), sample_size), random_state=RANDOM_STATE)
+
+    for col in path_cols:
+        missing_count = 0
+        missing_samples = []
+
+        for rel_path in sample[col]:
+            full_path = os.path.join(base_dir, rel_path)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_samples) < 5:
+                    missing_samples.append(rel_path)
+
+        missing_ratio = missing_count / len(sample)
+        if missing_ratio > 0.5:
+            print(f"Sample of missing files for column '{col}':")
+            for p in missing_samples:
+                print(f" - {p}")
+            raise FileNotFoundError(
+                f"Missing file ratio {missing_ratio:.2f} for column {col} exceeds threshold 0.5"
+            )
+        else:
+            print(
+                f"File existence check passed for {col} (missing ratio: {missing_ratio:.2f})"
+            )
+
+
+def main():
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Loading raw data...")
+    # Load csvs
+    train_df = pd.read_csv(os.path.join(INPUT_DIR, "train.csv"))
+    depths_df = pd.read_csv(os.path.join(INPUT_DIR, "depths.csv"))
+
+    # Merge depths
+    train_df = pd.merge(train_df, depths_df, on="id", how="left")
+
+    # Construct file paths (relative to input dir)
+    train_df["image_path"] = "train/images/" + train_df["id"] + ".png"
+    train_df["mask_path"] = "train/masks/" + train_df["id"] + ".png"
+
+    # Calculate coverage for stratification
+    print("Calculating salt coverage for stratification...")
+    train_df["salt_pixels"] = train_df["rle_mask"].apply(rle_to_coverage)
+    train_df["salt_coverage"] = train_df["salt_pixels"] / (IMG_SIZE * IMG_SIZE)
+
+    # Create coverage classes for stratification
+    # We bin coverage into 10 quantiles.
+    # Note: Many images have 0 salt, so we treat 0 as a separate class or ensure bins handle it.
+    # A simple way for this specific dataset is to bin the non-zero coverage and keep 0 separate,
+    # or just use pd.cut with enough bins.
+    # Here we define a simplified class: 0 coverage vs >0 quantized.
+
+    def get_coverage_class(coverage):
+        if coverage == 0:
+            return 0
+        # Quantize non-zero coverage into 10 bins (1-10)
+        return int(np.ceil(coverage * 10))
+
+    train_df["coverage_class"] = train_df["salt_coverage"].apply(get_coverage_class)
+
+    print("Splitting train/validation sets...")
+    # Stratified split
+    train_meta, val_meta = train_test_split(
+        train_df,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=train_df["coverage_class"],
+    )
+
+    # Process Test Data
+    print("Processing test data...")
+    test_images = glob.glob(os.path.join(INPUT_DIR, "test/images/*.png"))
+    test_ids = [os.path.basename(f).replace(".png", "") for f in test_images]
+    test_df = pd.DataFrame({"id": test_ids})
+
+    # Merge depths for test
+    test_df = pd.merge(test_df, depths_df, on="id", how="left")
+    test_df["image_path"] = "test/images/" + test_df["id"] + ".png"
+
+    # Save Metadata
+    print("Saving metadata...")
+    train_meta.to_csv(os.path.join(METADATA_DIR, "train.csv"), index=False)
+    val_meta.to_csv(os.path.join(METADATA_DIR, "val.csv"), index=False)
+    test_df.to_csv(os.path.join(METADATA_DIR, "test.csv"), index=False)
+
+    print("Metadata generation complete.")
+
+    # ==========================================
+    # Verification Steps
+    # ==========================================
+    print("\n--- Verification ---")
+
+    # Reload datasets
+    df_train = pd.read_csv(os.path.join(METADATA_DIR, "train.csv"))
+    df_val = pd.read_csv(os.path.join(METADATA_DIR, "val.csv"))
+    df_test = pd.read_csv(os.path.join(METADATA_DIR, "test.csv"))
+
+    # 1. Summary Statistics
+    print(f"Train set shape: {df_train.shape}")
+    print(f"Val set shape: {df_val.shape}")
+    print(f"Test set shape: {df_test.shape}")
+
+    print("\nClass distribution (Coverage Class) in Train:")
+    print(df_train["coverage_class"].value_counts(normalize=True).sort_index())
+    print("\nClass distribution (Coverage Class) in Val:")
+    print(df_val["coverage_class"].value_counts(normalize=True).sort_index())
+
+    # 2. Check File Paths
+    print("\nChecking file paths...")
+    check_files_exist(df_train, ["image_path", "mask_path"], INPUT_DIR)
+    check_files_exist(df_val, ["image_path", "mask_path"], INPUT_DIR)
+    check_files_exist(df_test, ["image_path"], INPUT_DIR)
+
+    # 3. Verify Split Logic
+    total_train_val = len(df_train) + len(df_val)
+    val_ratio = len(df_val) / total_train_val
+    print(f"\nActual Validation Ratio: {val_ratio:.4f}")
+
+    if not (0.19 < val_ratio < 0.21):
+        raise AssertionError(
+            f"Validation split ratio {val_ratio} is not approximately 0.2"
+        )
+
+    # Verify Stratification
+    # We check if the distribution of coverage classes is similar using Kolmogorov-Smirnov or just simple variance check.
+    # For this task, we'll check if the difference in proportions for any class is within a tolerance.
+    train_dist = df_train["coverage_class"].value_counts(normalize=True).sort_index()
+    val_dist = df_val["coverage_class"].value_counts(normalize=True).sort_index()
+
+    # Align indices (in case some bin is missing in one set, though unlikely with stratified split)
+    all_classes = sorted(list(set(train_dist.index) | set(val_dist.index)))
+    for c in all_classes:
+        t_prop = train_dist.get(c, 0)
+        v_prop = val_dist.get(c, 0)
+        diff = abs(t_prop - v_prop)
+        # Tolerance: 0.05 is generous, but allows for small sample variations in bins
+        if diff > 0.05:
+            raise AssertionError(
+                f"Stratification failed for class {c}: Train prop {t_prop:.3f}, Val prop {v_prop:.3f}"
+            )
+
+    print("All verification checks passed successfully.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+# Script Execution Output:
+Loading raw data...
+Calculating salt coverage for stratification...
+Splitting train/validation sets...
+Processing test data...
+Saving metadata...
+Metadata generation complete.
+
+--- Verification ---
+Train set shape: (2400, 8)
+Val set shape: (600, 8)
+Test set shape: (1000, 3)
+
+Class distribution (Coverage Class) in Train:
+coverage_class
+0     0.390000
+1     0.138750
+2     0.079167
+3     0.060000
+4     0.043333
+5     0.055417
+6     0.053333
+7     0.040833
+8     0.035833
+9     0.041250
+10    0.062083
+Name: proportion, dtype: float64
+
+Class distribution (Coverage Class) in Val:
+coverage_class
+0     0.390000
+1     0.138333
+2     0.078333
+3     0.060000
+4     0.043333
+5     0.055000
+6     0.053333
+7     0.041667
+8     0.036667
+9     0.041667
+10    0.061667
+Name: proportion, dtype: float64
+
+Checking file paths...
+File existence check passed for image_path (missing ratio: 0.00)
+File existence check passed for mask_path (missing ratio: 0.00)
+File existence check passed for image_path (missing ratio: 0.00)
+File existence check passed for mask_path (missing ratio: 0.00)
+File existence check passed for image_path (missing ratio: 0.00)
+
+Actual Validation Ratio: 0.2000
+All verification checks passed successfully.
+Execution time: a moment (time limit is an hour).
+
+# Document
+Based on the analysis of the provided Python script and its execution output, here is the documentation for the files generated in the `./metadata` directory.
+
+### 1. `./metadata/train.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for the training portion of the dataset (80% of the original labeled data). It includes unique identifiers, depth information, relative file paths for images and masks, raw Run-Length Encoding (RLE) mask strings, and calculated statistics regarding salt coverage used for stratification.
+    *   **Purpose:** This file is the primary manifest used to load the training dataset. It allows data loaders to map image IDs to their corresponding pixel data and ground truth masks. The coverage statistics (`salt_coverage`, `coverage_class`) are included to analyze class imbalance or implement sampling strategies during training.
+
+*   **Schema / Structure:**
+    *   **Format:** CSV (Comma Separated Values)
+    *   **Rows:** 2400
+    *   **Columns:**
+        *   `id` (String): Unique 10-character identifier for the image.
+        *   `rle_mask` (String): The ground truth segmentation mask in Run-Length Encoding format.
+        *   `z` (Integer): The depth of the imaged location (from `depths.csv`).
+        *   `image_path` (String): Relative path to the source image (e.g., `train/images/000e218f21.png`).
+        *   `mask_path` (String): Relative path to the ground truth mask image (e.g., `train/masks/000e218f21.png`).
+        *   `salt_pixels` (Integer): The total count of pixels classified as salt in the mask.
+        *   `salt_coverage` (Float): The proportion of the image covered by salt (0.0 to 1.0).
+        *   `coverage_class` (Integer): A quantized bin (0-10) representing the salt coverage, used for stratified splitting.
+
+    *   **Example Row:**
+        ```csv
+        id,rle_mask,z,image_path,mask_path,salt_pixels,salt_coverage,coverage_class
+        000e218f21,"1 1",841,train/images/000e218f21.png,train/masks/000e218f21.png,1,0.000098,1
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_train = pd.read_csv("./metadata/train.csv")
+    ```
+
+---
+
+### 2. `./metadata/val.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains the metadata for the validation portion of the dataset (20% of the original labeled data). It contains the exact same schema and data types as `train.csv`.
+    *   **Purpose:** This file serves as the hold-out validation set for evaluating model performance during training. It was generated using a stratified split based on `coverage_class` to ensure the distribution of salt amounts mirrors the training set (e.g., preserving the ratio of empty images vs. salt-heavy images).
+
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Rows:** 600
+    *   **Columns:** Identical to `train.csv`.
+        *   `id`, `rle_mask`, `z`, `image_path`, `mask_path`, `salt_pixels`, `salt_coverage`, `coverage_class`.
+
+    *   **Example Row:**
+        ```csv
+        id,rle_mask,z,image_path,mask_path,salt_pixels,salt_coverage,coverage_class
+        0050766ae2,"1 1",780,train/images/0050766ae2.png,train/masks/0050766ae2.png,1,0.000098,1
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_val = pd.read_csv("./metadata/val.csv")
+    ```
+
+---
+
+### 3. `./metadata/test.csv`
+
+*   **Content and Purpose:**
+    *   **Content:** This file contains metadata for the unlabeled test images. It includes the image IDs, their recorded depths, and the relative file paths to the images.
+    *   **Purpose:** This file is used to generate the final submission. The model should iterate through these entries, load the image from `image_path`, predict the salt mask, and format the result into RLE for submission. Note that this file does *not* contain masks or coverage statistics.
+
+*   **Schema / Structure:**
+    *   **Format:** CSV
+    *   **Rows:** 1000
+    *   **Columns:**
+        *   `id` (String): Unique identifier extracted from the filename.
+        *   `z` (Integer): The depth of the imaged location (merged from `depths.csv`).
+        *   `image_path` (String): Relative path to the test image (e.g., `test/images/003c477d7c.png`).
+
+    *   **Example Row:**
+        ```csv
+        id,z,image_path
+        003c477d7c,500,test/images/003c477d7c.png
+        ```
+
+*   **Loading Method:**
+    ```python
+    import pandas as pd
+    df_test = pd.read_csv("./metadata/test.csv")
+    ```

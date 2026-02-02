@@ -1,0 +1,364 @@
+Based on the analysis of the previous solution and the provided lessons, the performance degradation (from 0.1085 to 0.1255) was primarily caused by the introduction of **Instance Normalization** in the TCN refinement stages (Cite solution_lesson_node_00066) and the switch from **AdamW** to **Adam** combined with aggressive **Geometric Augmentation** (Cite solution_lesson_node_00067).
+
+To restore and optimize performance, I will:
+1.  **Remove Instance Normalization:** Revert the `DilatedResidualLayer` to use standard dilated convolutions without normalization, as normalization destroys magnitude information in sparse confidence signals.
+2.  **Switch to AdamW:** Use `optim.AdamW` with weight decay to provide robust regularization for the recurrent-convolutional architecture.
+3.  **Disable Geometric Augmentation:** Remove the rotation and scaling augmentation from the data loader, as it can introduce noise into the derived velocity features and degrade performance for 3D skeleton data.
+4.  **Increase Model Capacity:** Increase `TCN_NUM_CHANNELS` from 64 to 128 and `LSTM_DROPOUT`/`TCN_DROPOUT` to 0.3 to improve the model's ability to capture complex temporal patterns without overfitting (Cite solution_lesson_node_00034).
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Stage 2 & 3: Normalized Deep TCN (Refinement)
+    TCN_NUM_LAYERS = 10
+    TCN_NUM_CHANNELS = 64
+    TCN_KERNEL_SIZE = 3
+    TCN_DROPOUT = 0.2
+
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    LEARNING_RATE = 1e-3
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 50
+    PATIENCE = 10  # Early stopping patience
+
+    # Class Weights for Loss Function
+    # Aggressive weighting: 0.1 for Background (Index 0), 1.0 for all Gestures (Indices 1-20)
+    CLASS_WEIGHTS = [0.1] + [1.0] * 20
+
+    # -------------------------------------------------------------------------
+    # Augmentation Configuration
+    # -------------------------------------------------------------------------
+    # Geometric Augmentation Parameters
+    AUG_ROTATION_RANGE = 30  # Degrees (+/-)
+    AUG_SCALE_RANGE = 0.2  # Scale factor (+/- 20%)
+=======
+    # Stage 2 & 3: Deep TCN (Refinement)
+    TCN_NUM_LAYERS = 10
+    TCN_NUM_CHANNELS = 128
+    TCN_KERNEL_SIZE = 3
+    TCN_DROPOUT = 0.3
+
+    # -------------------------------------------------------------------------
+    # Training Configuration
+    # -------------------------------------------------------------------------
+    LEARNING_RATE = 1e-3
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 60
+    PATIENCE = 15  # Early stopping patience
+
+    # Class Weights for Loss Function
+    # Aggressive weighting: 0.1 for Background (Index 0), 1.0 for all Gestures (Indices 1-20)
+    CLASS_WEIGHTS = [0.1] + [1.0] * 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Stage 1: Recurrent Encoder (Bi-LSTM)
+    LSTM_HIDDEN_SIZE = 256
+    LSTM_LAYERS = 2
+    LSTM_DROPOUT = 0.0  # Dropout between LSTM layers
+=======
+    # Stage 1: Recurrent Encoder (Bi-LSTM)
+    LSTM_HIDDEN_SIZE = 256
+    LSTM_LAYERS = 2
+    LSTM_DROPOUT = 0.3  # Dropout between LSTM layers
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedResidualLayer(nn.Module):
+    """
+    Single Residual Block for the TCN with Instance Normalization.
+    Structure: DilatedConv -> InstanceNorm -> ReLU -> Dropout -> 1x1Conv -> InstanceNorm -> ReLU -> Dropout -> Residual
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(DilatedResidualLayer, self).__init__()
+
+        # Padding to maintain temporal dimension
+        # For kernel_size 3, padding = dilation
+        padding = (kernel_size - 1) * dilation // 2
+
+        self.conv_dilated = nn.Conv1d(
+            channels, channels, kernel_size, padding=padding, dilation=dilation
+        )
+        self.norm1 = nn.InstanceNorm1d(channels, affine=True)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv_1x1 = nn.Conv1d(channels, channels, 1)
+        self.norm2 = nn.InstanceNorm1d(channels, affine=True)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Channels, Time)
+        out = self.conv_dilated(x)
+        out = self.norm1(out)
+        out = F.relu(out)
+        out = self.dropout1(out)
+
+        out = self.conv_1x1(out)
+        out = self.norm2(out)
+        out = F.relu(out)
+        out = self.dropout2(out)
+
+        return x + out
+
+
+class InstanceNormTCN(nn.Module):
+    """
+    Stage 2 & 3: Temporal Convolutional Network for Refinement.
+    Uses dilated convolutions with Instance Normalization to refine probabilities.
+    """
+
+    def __init__(self):
+        super(InstanceNormTCN, self).__init__()
+
+        num_layers = Config.TCN_NUM_LAYERS
+        num_channels = Config.TCN_NUM_CHANNELS
+        kernel_size = Config.TCN_KERNEL_SIZE
+        dropout = Config.TCN_DROPOUT
+        num_classes = Config.NUM_CLASSES
+
+        # Entry layer: Map probabilities (num_classes) to hidden channels
+        self.conv_in = nn.Conv1d(num_classes, num_channels, 1)
+
+        # Stack of dilated residual layers
+        layers = []
+        for i in range(num_layers):
+            dilation = 2**i
+            layers.append(
+                DilatedResidualLayer(num_channels, kernel_size, dilation, dropout)
+            )
+        self.layers = nn.ModuleList(layers)
+
+        # Exit layer: Map hidden channels back to logits
+        self.conv_out = nn.Conv1d(num_channels, num_classes, 1)
+
+    def forward(self, x):
+        # x: (Batch, Time, NumClasses) - Input probabilities
+
+        # Transpose for Conv1d: (Batch, NumClasses, Time)
+        x = x.permute(0, 2, 1)
+
+        out = self.conv_in(x)
+
+        for layer in self.layers:
+            out = layer(out)
+
+        out = self.conv_out(out)
+
+        # Transpose back: (Batch, Time, NumClasses)
+        logits = out.permute(0, 2, 1)
+
+        return logits
+
+
+class NMD_CRCN(nn.Module):
+    """
+    Normalized Masked Dual-Stage Cascaded Recurrent-Convolutional Network.
+
+    Pipeline:
+    1. Features -> BiLSTM -> Logits1
+    2. Softmax(Logits1) * Mask -> TCN1 -> Logits2
+    3. Softmax(Logits2) * Mask -> TCN2 -> Logits3
+    """
+
+    def __init__(self):
+        super(NMD_CRCN, self).__init__()
+
+        self.stage1 = BiLSTMEncoder()
+        self.stage2 = InstanceNormTCN()
+        self.stage3 = InstanceNormTCN()
+=======
+class DilatedResidualLayer(nn.Module):
+    """
+    Single Residual Block for the TCN.
+    Structure: DilatedConv -> ReLU -> Dropout -> 1x1Conv -> ReLU -> Dropout -> Residual
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout):
+        super(DilatedResidualLayer, self).__init__()
+
+        # Padding to maintain temporal dimension
+        padding = (kernel_size - 1) * dilation // 2
+
+        self.conv_dilated = nn.Conv1d(
+            channels, channels, kernel_size, padding=padding, dilation=dilation
+        )
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv_1x1 = nn.Conv1d(channels, channels, 1)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Channels, Time)
+        out = self.conv_dilated(x)
+        out = F.relu(out)
+        out = self.dropout1(out)
+
+        out = self.conv_1x1(out)
+        out = F.relu(out)
+        out = self.dropout2(out)
+
+        return x + out
+
+
+class RefinementTCN(nn.Module):
+    """
+    Stage 2 & 3: Temporal Convolutional Network for Refinement.
+    Uses dilated convolutions to refine probabilities.
+    """
+
+    def __init__(self):
+        super(RefinementTCN, self).__init__()
+
+        num_layers = Config.TCN_NUM_LAYERS
+        num_channels = Config.TCN_NUM_CHANNELS
+        kernel_size = Config.TCN_KERNEL_SIZE
+        dropout = Config.TCN_DROPOUT
+        num_classes = Config.NUM_CLASSES
+
+        # Entry layer: Map probabilities (num_classes) to hidden channels
+        self.conv_in = nn.Conv1d(num_classes, num_channels, 1)
+
+        # Stack of dilated residual layers
+        layers = []
+        for i in range(num_layers):
+            dilation = 2**i
+            layers.append(
+                DilatedResidualLayer(num_channels, kernel_size, dilation, dropout)
+            )
+        self.layers = nn.ModuleList(layers)
+
+        # Exit layer: Map hidden channels back to logits
+        self.conv_out = nn.Conv1d(num_channels, num_classes, 1)
+
+    def forward(self, x):
+        # x: (Batch, Time, NumClasses) - Input probabilities
+
+        # Transpose for Conv1d: (Batch, NumClasses, Time)
+        x = x.permute(0, 2, 1)
+
+        out = self.conv_in(x)
+
+        for layer in self.layers:
+            out = layer(out)
+
+        out = self.conv_out(out)
+
+        # Transpose back: (Batch, Time, NumClasses)
+        logits = out.permute(0, 2, 1)
+
+        return logits
+
+
+class NMD_CRCN(nn.Module):
+    """
+    Masked Dual-Stage Cascaded Recurrent-Convolutional Network.
+    (Name kept for compatibility, but Normalization removed)
+
+    Pipeline:
+    1. Features -> BiLSTM -> Logits1
+    2. Softmax(Logits1) * Mask -> TCN1 -> Logits2
+    3. Softmax(Logits2) * Mask -> TCN2 -> Logits3
+    """
+
+    def __init__(self):
+        super(NMD_CRCN, self).__init__()
+
+        self.stage1 = BiLSTMEncoder()
+        self.stage2 = RefinementTCN()
+        self.stage3 = RefinementTCN()
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def _augment_skeleton(self, skeleton):
+        """
+        Applies physically consistent geometric augmentation.
+        skeleton: (T, J, 3)
+        """
+        T, J, C = skeleton.shape
+
+        # 1. Random Rotation (around Y axis - vertical, or general)
+        # Let's do a general small rotation to simulate camera angle changes
+        # Euler angles in degrees
+        rx = np.random.uniform(-Config.AUG_ROTATION_RANGE, Config.AUG_ROTATION_RANGE)
+        ry = np.random.uniform(-Config.AUG_ROTATION_RANGE, Config.AUG_ROTATION_RANGE)
+        rz = np.random.uniform(-Config.AUG_ROTATION_RANGE, Config.AUG_ROTATION_RANGE)
+
+        # Convert to radians
+        rx, ry, rz = np.radians(rx), np.radians(ry), np.radians(rz)
+
+        # Rotation matrices
+        Rx = np.array(
+            [[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]]
+        )
+        Ry = np.array(
+            [[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]]
+        )
+        Rz = np.array(
+            [[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]]
+        )
+
+        # Combined rotation
+        R = Rz @ Ry @ Rx
+
+        # Apply rotation: (T*J, 3) @ R.T -> (T*J, 3)
+        flat_skel = skeleton.reshape(-1, 3)
+        rotated_skel = flat_skel @ R.T
+
+        # 2. Random Scaling
+        scale = 1.0 + np.random.uniform(-Config.AUG_SCALE_RANGE, Config.AUG_SCALE_RANGE)
+        augmented_skel = rotated_skel * scale
+
+        return augmented_skel.reshape(T, J, 3)
+
+    def __getitem__(self, idx):
+        # Load raw data
+        skel = self.skeletons[idx].astype(np.float32)  # (T, J, 3)
+        audio = self.audios[idx].astype(np.float32)  # (T, MFCC)
+        label = self.labels[idx].astype(np.int64)  # (T,)
+
+        # Augmentation
+        if self.is_train:
+            skel = self._augment_skeleton(skel)
+
+        # Feature Engineering
+        # 1. Velocity (Physically Consistent: computed AFTER augmentation)
+=======
+    def __getitem__(self, idx):
+        # Load raw data
+        skel = self.skeletons[idx].astype(np.float32)  # (T, J, 3)
+        audio = self.audios[idx].astype(np.float32)  # (T, MFCC)
+        label = self.labels[idx].astype(np.int64)  # (T,)
+
+        # Feature Engineering
+        # 1. Velocity
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Optimizer & Scheduler
+        self.optimizer = optim.Adam(self.model.parameters(), lr=Config.LEARNING_RATE)
+        # Reduce LR on plateau to fine-tune convergence
+=======
+        # Optimizer & Scheduler
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), lr=Config.LEARNING_RATE, weight_decay=1e-2
+        )
+        # Reduce LR on plateau to fine-tune convergence
+>>>>>>> REPLACE
+```

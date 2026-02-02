@@ -1,0 +1,460 @@
+I will optimize the solution by reverting the categorical sequence encoder from a Conformer to a standard **Transformer Encoder** (Cite Lesson 00125), as pure self-attention outperforms convolution-hybrid architectures for short discrete sequences. I will configure the Transformer with **Post-Normalization** (Cite Lesson 00095) and initialize the token embeddings with **unit variance** (Cite Lesson 00114) while keeping the additive positional embeddings at **low variance** (Cite Lesson 00081). Furthermore, I will reduce the backbone depth to **2 blocks per stage** (Cite Lesson 00075) to prevent over-parameterization and ensure **no normalization** is applied to the embeddings immediately before fusion (Cite Lesson 00124).
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ConformerConvModule(nn.Module):
+    """
+    Convolution Module for Conformer.
+    Structure: Pointwise -> GLU -> Depthwise -> BN -> Swish -> Pointwise.
+    """
+
+    def __init__(self, dim, kernel_size=3, dropout=0.0):
+        super().__init__()
+        # Pointwise 1: Expand for GLU (dim -> 2*dim)
+        self.pw1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
+        # Depthwise: dim -> dim
+        self.dw = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=dim,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm1d(dim)
+        self.act = nn.SiLU()
+        # Pointwise 2: dim -> dim
+        self.pw2 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Input: (N, L, D) -> Transpose to (N, D, L) for Conv1d
+        x = x.transpose(1, 2)
+
+        x = self.pw1(x)
+        x = F.glu(x, dim=1)
+
+        x = self.dw(x)
+        x = self.bn(x)
+        x = self.act(x)
+
+        x = self.pw2(x)
+        x = self.dropout(x)
+
+        # Transpose back: (N, D, L) -> (N, L, D)
+        x = x.transpose(1, 2)
+        return x
+
+
+class ConformerBlock(nn.Module):
+    """
+    Post-Norm Conformer Block.
+    Sub-layers: MHSA -> Conv -> FF.
+    Norm is applied after residual connection: x = Norm(x + Drop(SubLayer(x))).
+    """
+
+    def __init__(self, dim, num_heads=4, kernel_size=3, dropout=0.1, drop_path=0.0):
+        super().__init__()
+
+        # 1. Multi-Head Self-Attention
+        self.mhsa = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.drop1 = nn.Dropout(dropout)
+
+        # 2. Convolution Module
+        self.conv = ConformerConvModule(dim, kernel_size=kernel_size, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.drop2 = nn.Dropout(dropout)
+
+        # 3. Feed Forward (SwiGLU)
+        # Structure matches backbone: Linear(d->2d) -> SwiGLU(2d->d)
+        self.ff_linear = nn.Linear(dim, 2 * dim)
+        self.ff_swiglu = SwiGLU()
+        self.norm3 = nn.LayerNorm(dim)
+        self.drop3 = nn.Dropout(dropout)
+
+        self.drop_path = (
+            timm.layers.DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
+
+    def forward(self, x):
+        # MHSA
+        resid = x
+        x_att, _ = self.mhsa(x, x, x)
+        x = self.norm1(resid + self.drop_path(self.drop1(x_att)))
+
+        # Conv
+        resid = x
+        x_conv = self.conv(x)
+        x = self.norm2(resid + self.drop_path(self.drop2(x_conv)))
+
+        # FF
+        resid = x
+        x_ff = self.ff_swiglu(self.ff_linear(x))
+        x = self.norm3(resid + self.drop_path(self.drop3(x_ff)))
+
+        return x
+
+
+class ResFunnelBlock(nn.Module):
+=======
+class ResFunnelBlock(nn.Module):
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class PostNormConformerSwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # --- Stream 1: Categorical (Conformer) ---
+        self.vocab_size = 32  # Safe upper bound for A-Z
+        self.emb_dim = 32
+        self.seq_len = 10
+
+        self.embedding = nn.Embedding(self.vocab_size, self.emb_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, self.emb_dim))
+
+        # 2 Conformer Layers
+        self.conformer_layers = nn.ModuleList(
+            [
+                ConformerBlock(
+                    self.emb_dim,
+                    num_heads=4,
+                    kernel_size=3,
+                    dropout=0.1,
+                    drop_path=0.05,
+                )
+                for _ in range(2)
+            ]
+        )
+
+        # --- Stream 2: Continuous ---
+        self.num_cont_features = 30
+
+        # --- Fusion ---
+        # Flattened Conformer (10 * 32 = 320) + Continuous (30) = 350
+        self.fusion_input_dim = (self.seq_len * self.emb_dim) + self.num_cont_features
+        self.backbone_dim = 512
+        self.stem = nn.Linear(self.fusion_input_dim, self.backbone_dim)
+
+        # --- Backbone ---
+        # Stages: 512 -> 256 -> 128
+        # 3 blocks per stage
+        dims = [512, 256, 128]
+        depths = [3, 3, 3]
+        total_blocks = sum(depths)
+
+        # Linear Stochastic Depth Schedule 0.0 -> 0.2
+        dpr = [x.item() for x in torch.linspace(0, 0.2, total_blocks)]
+
+        self.stages = nn.ModuleList()
+        self.transitions = nn.ModuleList()
+
+        curr_dim = dims[0]
+        block_idx = 0
+
+        # Build Stages
+        for stage_idx in range(3):
+            # Blocks
+            blocks = []
+            for _ in range(depths[stage_idx]):
+                blocks.append(
+                    ResFunnelBlock(curr_dim, dropout=0.35, drop_path=dpr[block_idx])
+                )
+                block_idx += 1
+            self.stages.append(nn.Sequential(*blocks))
+
+            # Transition (if not last stage)
+            if stage_idx < 2:
+                next_dim = dims[stage_idx + 1]
+                self.transitions.append(
+                    nn.Sequential(nn.LayerNorm(curr_dim), nn.Linear(curr_dim, next_dim))
+                )
+                curr_dim = next_dim
+
+        # --- Head ---
+        self.head = nn.Linear(curr_dim, 1)
+
+        # --- Initialization ---
+        self.apply(self._init_weights)
+        # Explicit Pos Embed Init (Low Variance Noise)
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # Kaiming Uniform for SwiGLU/Stem
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            # Kaiming Uniform for Conv
+            nn.init.kaiming_uniform_(m.weight, mode="fan_in", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Embedding):
+            # Unit Variance for Embeddings
+            nn.init.normal_(m.weight, mean=0.0, std=1.0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.MultiheadAttention):
+            # Xavier for Attention
+            if m.in_proj_weight is not None:
+                nn.init.xavier_uniform_(m.in_proj_weight)
+            if m.out_proj.weight is not None:
+                nn.init.xavier_uniform_(m.out_proj.weight)
+            if m.in_proj_bias is not None:
+                nn.init.constant_(m.in_proj_bias, 0)
+            if m.out_proj.bias is not None:
+                nn.init.constant_(m.out_proj.bias, 0)
+
+    def forward(self, continuous, categorical):
+        # Stream 1: Categorical
+        # categorical: (N, 10)
+        x_cat = self.embedding(categorical)  # (N, 10, 32)
+        x_cat = x_cat + self.pos_embed
+
+        for layer in self.conformer_layers:
+            x_cat = layer(x_cat)
+
+        x_cat_flat = x_cat.flatten(1)  # (N, 320)
+
+        # Stream 2: Continuous (N, 30) - Passed raw
+
+        # Fusion
+        x = torch.cat([x_cat_flat, continuous], dim=1)  # (N, 350)
+        x = self.stem(x)  # (N, 512)
+
+        # Backbone
+        # Stage 1
+        x = self.stages[0](x)
+        x = self.transitions[0](x)
+        # Stage 2
+        x = self.stages[1](x)
+        x = self.transitions[1](x)
+        # Stage 3
+        x = self.stages[2](x)
+
+        # Head
+        x = self.head(x)
+        return torch.sigmoid(x).squeeze(-1)
+=======
+class HybridSwiGLUResFunnel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # --- Stream 1: Categorical (Transformer) ---
+        # Cite solution_lesson_node_00125: Prefer pure Self-Attention over Conformer
+        self.vocab_size = 32
+        self.emb_dim = 32
+        self.seq_len = 10
+
+        self.embedding = nn.Embedding(self.vocab_size, self.emb_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, self.emb_dim))
+
+        # Standard Transformer Encoder
+        # Cite solution_lesson_node_00095: Post-Norm for shallow networks
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.emb_dim,
+            nhead=4,
+            dim_feedforward=self.emb_dim * 2,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # --- Stream 2: Continuous ---
+        self.num_cont_features = 30
+
+        # --- Fusion ---
+        # Flattened Transformer (10 * 32 = 320) + Continuous (30) = 350
+        self.fusion_input_dim = (self.seq_len * self.emb_dim) + self.num_cont_features
+        self.backbone_dim = 512
+        self.stem = nn.Linear(self.fusion_input_dim, self.backbone_dim)
+
+        # --- Backbone ---
+        # Stages: 512 -> 256 -> 128
+        # Cite solution_lesson_node_00075: Moderate depth (2 blocks per stage)
+        dims = [512, 256, 128]
+        depths = [2, 2, 2]
+        total_blocks = sum(depths)
+
+        # Linear Stochastic Depth Schedule 0.0 -> 0.2
+        dpr = [x.item() for x in torch.linspace(0, 0.2, total_blocks)]
+
+        self.stages = nn.ModuleList()
+        self.transitions = nn.ModuleList()
+
+        curr_dim = dims[0]
+        block_idx = 0
+
+        # Build Stages
+        for stage_idx in range(3):
+            # Blocks
+            blocks = []
+            for _ in range(depths[stage_idx]):
+                blocks.append(
+                    ResFunnelBlock(curr_dim, dropout=0.35, drop_path=dpr[block_idx])
+                )
+                block_idx += 1
+            self.stages.append(nn.Sequential(*blocks))
+
+            # Transition (if not last stage)
+            if stage_idx < 2:
+                next_dim = dims[stage_idx + 1]
+                # Cite solution_lesson_node_00088: Pre-Norm Transition
+                self.transitions.append(
+                    nn.Sequential(nn.LayerNorm(curr_dim), nn.Linear(curr_dim, next_dim))
+                )
+                curr_dim = next_dim
+
+        # --- Head ---
+        self.head = nn.Linear(curr_dim, 1)
+
+        # --- Initialization ---
+        self.apply(self._init_weights)
+        # Explicit Pos Embed Init (Low Variance) Cite solution_lesson_node_00081
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # Kaiming Uniform for SwiGLU/Stem
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Embedding):
+            # Unit Variance for Embeddings Cite solution_lesson_node_00114
+            nn.init.normal_(m.weight, mean=0.0, std=1.0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.MultiheadAttention):
+            # Xavier for Attention Cite solution_lesson_node_00072
+            if m.in_proj_weight is not None:
+                nn.init.xavier_uniform_(m.in_proj_weight)
+            if m.out_proj.weight is not None:
+                nn.init.xavier_uniform_(m.out_proj.weight)
+            if m.in_proj_bias is not None:
+                nn.init.constant_(m.in_proj_bias, 0)
+            if m.out_proj.bias is not None:
+                nn.init.constant_(m.out_proj.bias, 0)
+
+    def forward(self, continuous, categorical):
+        # Stream 1: Categorical
+        # categorical: (N, 10)
+        x_cat = self.embedding(categorical)  # (N, 10, 32)
+        x_cat = x_cat + self.pos_embed
+
+        x_cat = self.transformer(x_cat)
+
+        x_cat_flat = x_cat.flatten(1)  # (N, 320)
+
+        # Stream 2: Continuous (N, 30) - Passed raw
+        # Cite solution_lesson_node_00124: Do not mix normalization scopes (No LayerNorm here)
+
+        # Fusion
+        x = torch.cat([x_cat_flat, continuous], dim=1)  # (N, 350)
+        x = self.stem(x)  # (N, 512)
+
+        # Backbone
+        # Stage 1
+        x = self.stages[0](x)
+        x = self.transitions[0](x)
+        # Stage 2
+        x = self.stages[1](x)
+        x = self.transitions[1](x)
+        # Stage 3
+        x = self.stages[2](x)
+
+        # Head
+        x = self.head(x)
+        return torch.sigmoid(x).squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import PostNormConformerSwiGLU
+=======
+from library.model import HybridSwiGLUResFunnel
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def run_training_experiment(
+    epochs=40, batch_size=1024, patience=10, load_cached_data=True
+):
+    """
+    Main function to setup and run the training experiment.
+    """
+    seed_everything(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Data Loading
+    train_loader, val_loader, test_loader, test_ids = get_dataloaders(
+        batch_size=batch_size, load_cached_data=load_cached_data, num_workers=4
+    )
+
+    # 2. Model Setup
+    model = PostNormConformerSwiGLU().to(device)
+
+    # 3. Optimizer (Decoupled Weight Decay)
+    optimizer_params = get_optimizer_params(model, weight_decay=1e-2)
+=======
+def run_training_experiment(
+    epochs=40, batch_size=1024, patience=10, load_cached_data=True
+):
+    """
+    Main function to setup and run the training experiment.
+    """
+    seed_everything(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Data Loading
+    train_loader, val_loader, test_loader, test_ids = get_dataloaders(
+        batch_size=batch_size, load_cached_data=load_cached_data, num_workers=4
+    )
+
+    # 2. Model Setup
+    model = HybridSwiGLUResFunnel().to(device)
+
+    # 3. Optimizer (Decoupled Weight Decay)
+    optimizer_params = get_optimizer_params(model, weight_decay=1e-2)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import PostNormConformerSwiGLU
+=======
+from library.model import HybridSwiGLUResFunnel
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = PostNormConformerSwiGLU().to(device)
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = HybridSwiGLUResFunnel().to(device)
+>>>>>>> REPLACE
+```

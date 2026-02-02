@@ -1,0 +1,85 @@
+The `ArrowMemoryError` is caused by cache thrashing in the `IceCubeDataset` when used with a `DataLoader` that has `shuffle=True`. The dataset caches large decompressed Parquet files (approx. 1.5GB each in RAM) keyed by `batch_id`. When the data is shuffled globally, the access pattern becomes random across hundreds of batch files, causing the cache hit rate to drop to near zero. This forces the worker processes to constantly load, parse, and discard massive DataFrames, leading to high memory churn and fragmentation that eventually exhausts the available RAM (Cite debug_lesson_2).
+
+To fix this, I will modify `runfile.py` to:
+1.  **Cluster the training data by `batch_id`**: Instead of a global random shuffle, I will organize the `train_meta` DataFrame such that all events from the same batch are contiguous.
+2.  **Implement Block Shuffling**: To preserve training stochasticity, I will shuffle the order of the batches and shuffle the events *within* each batch.
+3.  **Disable `shuffle=True` in the DataLoader**: This ensures the worker processes access the data in the sorted, batch-clustered order, maximizing cache hits (loading each file once and processing all its events) and stabilizing memory usage.
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print(f"Sampling {N_TRAIN} training events and {N_VAL} validation events...")
+    train_meta = train_meta.sample(n=N_TRAIN, random_state=SEED).reset_index(drop=True)
+
+    # Sort validation by batch_id to optimize IO (sequential file reading)
+    val_meta = (
+        val_meta.sample(n=N_VAL, random_state=SEED)
+        .sort_values("batch_id")
+        .reset_index(drop=True)
+    )
+
+    # Initialize Datasets
+    # Cite debug_lesson_1: Account for Decompression Expansion.
+    # 170MB Parquet -> ~1.5GB DataFrame.
+    # Old limit: 40 * 1.5GB * 4 workers = 240GB (OOM).
+    # New limit: 5 * 1.5GB * 4 workers = 30GB (Safe).
+    print("Initializing Datasets...")
+    train_dataset = IceCubeDataset(train_meta, mode="train", cache_limit=5)
+    val_dataset = IceCubeDataset(val_meta, mode="train", cache_limit=5)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+=======
+    print(f"Sampling {N_TRAIN} training events and {N_VAL} validation events...")
+    # Sample training data
+    train_meta = train_meta.sample(n=N_TRAIN, random_state=SEED)
+
+    # Cite debug_lesson_2: Avoid File-Level Caching with Randomized DataLoaders.
+    # To prevent cache thrashing and OOM, we cluster events by batch_id.
+    # We shuffle the order of batches and events within batches to maintain stochasticity
+    # while ensuring sequential file access.
+
+    # 1. Assign random order to batches
+    unique_batches = train_meta["batch_id"].unique()
+    np.random.shuffle(unique_batches)
+    batch_order_map = {bid: i for i, bid in enumerate(unique_batches)}
+    train_meta["batch_order"] = train_meta["batch_id"].map(batch_order_map)
+
+    # 2. Assign random order to events (for within-batch shuffling)
+    train_meta["event_order"] = np.random.rand(len(train_meta))
+
+    # 3. Sort and clean up
+    train_meta = train_meta.sort_values(["batch_order", "event_order"]).reset_index(drop=True)
+    train_meta = train_meta.drop(columns=["batch_order", "event_order"])
+
+    # Sort validation by batch_id to optimize IO (sequential file reading)
+    val_meta = (
+        val_meta.sample(n=N_VAL, random_state=SEED)
+        .sort_values("batch_id")
+        .reset_index(drop=True)
+    )
+
+    # Initialize Datasets
+    # Cite debug_lesson_1: Account for Decompression Expansion.
+    # 170MB Parquet -> ~1.5GB DataFrame.
+    # Old limit: 40 * 1.5GB * 4 workers = 240GB (OOM).
+    # New limit: 5 * 1.5GB * 4 workers = 30GB (Safe).
+    print("Initializing Datasets...")
+    train_dataset = IceCubeDataset(train_meta, mode="train", cache_limit=5)
+    val_dataset = IceCubeDataset(val_meta, mode="train", cache_limit=5)
+
+    # Cite debug_lesson_2: Disable global shuffling to preserve batch clustering.
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+>>>>>>> REPLACE
+```

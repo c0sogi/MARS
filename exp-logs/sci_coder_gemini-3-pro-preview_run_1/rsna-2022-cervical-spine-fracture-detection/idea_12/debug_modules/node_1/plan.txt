@@ -1,0 +1,344 @@
+I will fix the `ModuleNotFoundError` by making the `nibabel` dependency optional and implementing a fallback strategy using bounding boxes, as suggested by the error analysis.
+
+1.  **`library/data.py`**: I will wrap the `nibabel` import in a `try-except` block to prevent the crash (Cite debug_lesson_9). I will then refactor `SegmentationDataset` to check for `HAS_NIBABEL`. If the library is missing, the dataset will fallback to generating segmentation masks using the bounding box data (`train_bounding_boxes.csv`) and standard `cv2` drawing functions (Cite debug_lesson_7).
+2.  **`library/trainer.py`**: I will update the `train_localizer` method to import `HAS_NIBABEL` and conditionally filter the training data. If `nibabel` is missing, it will select samples that have bounding boxes (`has_bounding_box`) instead of requiring segmentation files (`has_segmentation`).
+3.  **`runfile.py`**: I will modify the `run_demo` function to ensure the mini-training dataset includes samples with bounding boxes, ensuring the fallback logic in the trainer has valid data to process.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+import nibabel as nib
+from library.config import Config
+from library.utils import window_dicom
+=======
+try:
+    import nibabel as nib
+    HAS_NIBABEL = True
+except ImportError:
+    nib = None
+    HAS_NIBABEL = False
+
+from library.config import Config
+from library.utils import window_dicom
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class SegmentationDataset(Dataset):
+    def __init__(self, metadata_df, transform=None):
+        """
+        Args:
+            metadata_df: DataFrame containing 'StudyInstanceUID' and 'segmentation_path'.
+                         Must be filtered for has_segmentation=True.
+            transform: Optional albumentations transform.
+        """
+        self.df = metadata_df[metadata_df["has_segmentation"]].reset_index(drop=True)
+        self.transform = transform
+
+        # Pre-calculate slice mapping to avoid opening NIFTI every time
+        # For simplicity in this implementation, we will load NIFTI on the fly
+        # but cache the file paths.
+        self.samples = []
+
+        # Expand dataframe to slice level (this can be slow, so we limit to a subset or do it efficiently)
+        # To keep initialization fast, we will just store study info and randomly sample slices in __getitem__
+        # or iterate if we want full coverage.
+        # For training a UNet, random sampling from volumes is common.
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        study_id = row["StudyInstanceUID"]
+        seg_path = os.path.join(Config.INPUT_DIR, row["segmentation_path"])
+        img_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+        # 1. Load NIFTI
+        try:
+            nii = nib.load(seg_path)
+            nii_data = (
+                nii.get_fdata()
+            )  # (H, W, D) or (D, H, W) depending on orientation
+            # NIFTI orientation in this dataset is usually sagittal, need to reverse/permute to match axial DICOMs
+            # Standard fix for this dataset:
+            nii_data = nii_data[:, ::-1, ::-1].transpose(
+                2, 1, 0
+            )  # Approximate re-orientation to Axial
+        except Exception:
+            # Return dummy if failed
+            return self.dummy_item()
+
+        # 2. Get Dicom Files
+        dcm_files = glob.glob(os.path.join(img_dir, "*.dcm"))
+        # Sort by instance number (which usually aligns with Z axis of NIFTI)
+        dcm_files.sort(key=lambda x: int(os.path.basename(x).split(".")[0]))
+
+        num_slices = len(dcm_files)
+        num_seg_slices = nii_data.shape[0]
+
+        # 3. Select a random slice that has some annotation (to learn efficiently)
+        # Try finding a slice with mask > 0
+        attempts = 0
+        selected_idx = 0
+        while attempts < 10:
+            selected_idx = np.random.randint(0, min(num_slices, num_seg_slices))
+            if np.sum(nii_data[selected_idx]) > 0:
+                break
+            attempts += 1
+
+        # 4. Load Image and Mask
+        dcm_path = dcm_files[selected_idx]
+        image = load_dicom_array(dcm_path, size=Config.IMG_SIZE_MODEL)
+
+        mask = nii_data[selected_idx]
+        mask = cv2.resize(
+            mask,
+            (Config.IMG_SIZE_MODEL, Config.IMG_SIZE_MODEL),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        # Normalize image
+        image = (image - Config.PIXEL_MEAN) / Config.PIXEL_STD
+        image = np.expand_dims(image, axis=0)  # (1, H, W)
+
+        # Mask is (H, W) with values 0-7.
+        # Convert to long tensor
+        mask = torch.tensor(mask, dtype=torch.long)
+        image = torch.tensor(image, dtype=torch.float32)
+
+        return image, mask
+=======
+class SegmentationDataset(Dataset):
+    def __init__(self, metadata_df, transform=None):
+        """
+        Args:
+            metadata_df: DataFrame containing 'StudyInstanceUID'.
+                         If HAS_NIBABEL, filtered by 'has_segmentation'.
+                         Else, filtered by 'has_bounding_box'.
+            transform: Optional albumentations transform.
+        """
+        self.df = metadata_df.reset_index(drop=True)
+        self.transform = transform
+        self.bbox_df = None
+
+        if not HAS_NIBABEL:
+            # Load bounding boxes for fallback
+            if os.path.exists(Config.TRAIN_BBOX_PATH):
+                self.bbox_df = pd.read_csv(Config.TRAIN_BBOX_PATH)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        study_id = row["StudyInstanceUID"]
+        img_dir = os.path.join(Config.INPUT_DIR, row["image_path"])
+
+        # -----------------------------------------------------
+        # Path A: Use NIFTI Segmentation (Preferred)
+        # -----------------------------------------------------
+        if HAS_NIBABEL:
+            seg_path = os.path.join(Config.INPUT_DIR, row["segmentation_path"])
+            try:
+                nii = nib.load(seg_path)
+                nii_data = nii.get_fdata()
+                # Re-orient: Sagittal -> Axial approx
+                nii_data = nii_data[:, ::-1, ::-1].transpose(2, 1, 0)
+            except Exception:
+                return self.dummy_item()
+
+            dcm_files = glob.glob(os.path.join(img_dir, "*.dcm"))
+            dcm_files.sort(key=lambda x: int(os.path.basename(x).split(".")[0]))
+
+            num_slices = len(dcm_files)
+            num_seg_slices = nii_data.shape[0]
+
+            # Select random slice with annotation
+            attempts = 0
+            selected_idx = 0
+            while attempts < 10:
+                selected_idx = np.random.randint(0, min(num_slices, num_seg_slices))
+                if np.sum(nii_data[selected_idx]) > 0:
+                    break
+                attempts += 1
+
+            dcm_path = dcm_files[selected_idx]
+            image = load_dicom_array(dcm_path, size=Config.IMG_SIZE_MODEL)
+
+            mask = nii_data[selected_idx]
+            mask = cv2.resize(
+                mask,
+                (Config.IMG_SIZE_MODEL, Config.IMG_SIZE_MODEL),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        # -----------------------------------------------------
+        # Path B: Fallback using Bounding Boxes
+        # -----------------------------------------------------
+        else:
+            if self.bbox_df is None:
+                return self.dummy_item()
+
+            # Get bboxes for this study
+            study_bboxes = self.bbox_df[self.bbox_df["StudyInstanceUID"] == study_id]
+            if len(study_bboxes) == 0:
+                return self.dummy_item()
+
+            # Pick a random slice that has a bbox
+            sample_row = study_bboxes.sample(1).iloc[0]
+            slice_num = int(sample_row["slice_number"])
+            dcm_path = os.path.join(img_dir, f"{slice_num}.dcm")
+
+            if not os.path.exists(dcm_path):
+                return self.dummy_item()
+
+            image = load_dicom_array(dcm_path, size=Config.IMG_SIZE_MODEL)
+
+            # Create Mask from BBox
+            # Initialize with 0 (Background)
+            mask = np.zeros(
+                (Config.IMG_SIZE_MODEL, Config.IMG_SIZE_MODEL), dtype=np.float32
+            )
+
+            # Determine Class Label (1-7)
+            # We check the study-level labels in self.df
+            # If C1 is 1, we use 1. If multiple, we pick the first one found.
+            label_val = 1  # Default
+            for c_idx, c_col in enumerate(
+                ["C1", "C2", "C3", "C4", "C5", "C6", "C7"], start=1
+            ):
+                if c_col in row and row[c_col] == 1:
+                    label_val = c_idx
+                    break
+
+            # Scale BBox to Model Size
+            scale = Config.IMG_SIZE_MODEL / Config.IMG_SIZE_ORIG
+            x = int(sample_row["x"] * scale)
+            y = int(sample_row["y"] * scale)
+            w = int(sample_row["width"] * scale)
+            h = int(sample_row["height"] * scale)
+
+            # Draw filled rectangle
+            cv2.rectangle(mask, (x, y), (x + w, y + h), float(label_val), -1)
+
+        # -----------------------------------------------------
+        # Common Post-Processing
+        # -----------------------------------------------------
+        # Normalize image
+        image = (image - Config.PIXEL_MEAN) / Config.PIXEL_STD
+        image = np.expand_dims(image, axis=0)  # (1, H, W)
+
+        # Convert to tensors
+        mask = torch.tensor(mask, dtype=torch.long)
+        image = torch.tensor(image, dtype=torch.float32)
+
+        return image, mask
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.data import (
+    SegmentationDataset,
+    DualStreamSliceDataset,
+    FeatureSequenceDataset,
+    prepare_slice_dataframe,
+    load_dicom_array,
+)
+=======
+from library.data import (
+    SegmentationDataset,
+    DualStreamSliceDataset,
+    FeatureSequenceDataset,
+    prepare_slice_dataframe,
+    load_dicom_array,
+    HAS_NIBABEL,
+)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # Stage 1: Localizer Training
+    # ---------------------------------------------------------
+    def train_localizer(self, epochs=Config.EPOCHS_SEG):
+        self.logger.info("Starting Stage 1: Localizer Training")
+
+        # Data
+        train_meta = pd.read_csv(Config.TRAIN_METADATA_PATH)
+        # Filter for segmentation availability
+        seg_meta = train_meta[train_meta["has_segmentation"]].reset_index(drop=True)
+
+        # Split into train/val for segmentation (simple split as dataset is small)
+        val_size = int(len(seg_meta) * 0.2)
+        train_seg_df = seg_meta.iloc[:-val_size]
+        val_seg_df = seg_meta.iloc[-val_size:]
+
+        train_dataset = SegmentationDataset(train_seg_df)
+        val_dataset = SegmentationDataset(val_seg_df)
+=======
+    # ---------------------------------------------------------
+    # Stage 1: Localizer Training
+    # ---------------------------------------------------------
+    def train_localizer(self, epochs=Config.EPOCHS_SEG):
+        self.logger.info("Starting Stage 1: Localizer Training")
+
+        train_meta = pd.read_csv(Config.TRAIN_METADATA_PATH)
+
+        # Filter Logic: Use segmentation if available, else use bounding box if nibabel missing
+        if HAS_NIBABEL:
+            seg_meta = train_meta[train_meta["has_segmentation"]].reset_index(drop=True)
+            self.logger.info(
+                f"Using {len(seg_meta)} samples with NIFTI segmentations."
+            )
+        else:
+            self.logger.warning(
+                "Nibabel missing. Using samples with Bounding Boxes for fallback."
+            )
+            # Ensure we have has_bounding_box column
+            if "has_bounding_box" in train_meta.columns:
+                seg_meta = train_meta[train_meta["has_bounding_box"]].reset_index(
+                    drop=True
+                )
+            else:
+                self.logger.error("No has_bounding_box column found.")
+                seg_meta = pd.DataFrame()
+            self.logger.info(f"Using {len(seg_meta)} samples with Bounding Boxes.")
+
+        if len(seg_meta) == 0:
+            self.logger.error("No training data available for Localizer.")
+            return
+
+        val_size = max(1, int(len(seg_meta) * 0.2))
+        train_seg_df = seg_meta.iloc[:-val_size]
+        val_seg_df = seg_meta.iloc[-val_size:]
+
+        train_dataset = SegmentationDataset(train_seg_df)
+        val_dataset = SegmentationDataset(val_seg_df)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Filter train set to include some samples WITH segmentation for Stage 1
+    # and some random ones for diversity
+    seg_samples = orig_train[orig_train["has_segmentation"]].head(3)
+    non_seg_samples = orig_train[~orig_train["has_segmentation"]].head(2)
+    mini_train = pd.concat([seg_samples, non_seg_samples]).reset_index(drop=True)
+=======
+    # Filter train set to include samples with segmentations AND bounding boxes
+    # This ensures fallback logic has data if nibabel is missing
+    seg_samples = orig_train[orig_train["has_segmentation"]].head(3)
+    bbox_samples = orig_train[orig_train["has_bounding_box"]].head(3)
+    non_seg_samples = orig_train[~orig_train["has_segmentation"]].head(2)
+    
+    mini_train = pd.concat([seg_samples, bbox_samples, non_seg_samples]).drop_duplicates().reset_index(drop=True)
+>>>>>>> REPLACE
+```

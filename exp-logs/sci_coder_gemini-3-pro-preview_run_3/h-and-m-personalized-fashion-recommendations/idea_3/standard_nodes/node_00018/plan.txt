@@ -1,0 +1,802 @@
+Based on the lessons learned, specifically `solution_lesson_node_00010` (fragility of learned rankers) and `solution_lesson_node_00017` (superiority of sequential heuristics over complex embeddings), I will optimize the solution by reverting to the robust single-stage **Time-Aware Transition Graph** and enhancing it with specific optimizations found in the lessons.
+
+**Implementation Strategy:**
+
+1.  **Hyperparameter Optimization (Cite `solution_lesson_node_00011`):** In `library/config.py`, I will switch the time decay from an exponential factor (0.98) to a power-law exponent (2.0), increase the repurchase weight (`HISTORY_WEIGHT_ALPHA`) to 1.5, and set a history item limit of 30.
+2.  **Sparse Engine Optimization:**
+    *   In `library/sparse_engine.py`, I will modify the `fit` method to use the power-law decay formula: $w = 1 / (1 + \text{days})^{2.0}$ (Cite `solution_lesson_node_00002`).
+    *   I will implement **Importance-Based History Truncation (Cite `solution_lesson_node_00012`)** in `predict` by constructing the user query vector $Q$ from the full history window, summing weights per item, and retaining only the top-30 weighted items.
+    *   I will implement **Direct CSR Access (Cite `solution_lesson_node_00016`)** in `predict` to drastically speed up the extraction of top-12 recommendations from the sparse score matrix $S$.
+3.  **Pipeline Simplification:** I will modify `runfile.py` to remove the ineffective LightGBM Ranker stage. The solution will rely solely on the optimized `SparseGraphRetriever` for both validation and submission.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Decay factor for time-weighting interactions in the co-occurrence matrix
+# Higher values (closer to 1.0) preserve older history more; lower values prioritize recent trends.
+TIME_DECAY_FACTOR = 0.98
+
+# Weight for the user's own history in the final score calculation
+# Score = (User_History @ Transition_Matrix) + (ALPHA * User_History)
+HISTORY_WEIGHT_ALPHA = 0.45
+=======
+# Decay parameters for time-weighting interactions
+# Using power-law decay: w = 1 / (1 + days) ** EXPONENT
+# Cite solution_lesson_node_00011
+TIME_DECAY_EXPONENT = 2.0
+
+# Limit for user history items (Importance-Based Truncation)
+# Cite solution_lesson_node_00012
+HISTORY_ITEM_LIMIT = 30
+
+# Weight for the user's own history in the final score calculation
+# Score = (User_History @ Transition_Matrix) + (ALPHA * User_History)
+# Cite solution_lesson_node_00011
+HISTORY_WEIGHT_ALPHA = 1.5
+>>>>>>> REPLACE
+```
+
+```diff
+library/sparse_engine.py
+<<<<<<< SEARCH
+    def __init__(self):
+        self.top_k = config.TOP_K_RETRIEVAL
+        self.decay_factor = config.TIME_DECAY_FACTOR
+        self.alpha = config.HISTORY_WEIGHT_ALPHA
+        self.working_dir = config.WORKING_DIR
+=======
+    def __init__(self):
+        self.top_k = config.TOP_K_RETRIEVAL
+        self.decay_exponent = config.TIME_DECAY_EXPONENT
+        self.history_limit = config.HISTORY_ITEM_LIMIT
+        self.alpha = config.HISTORY_WEIGHT_ALPHA
+        self.working_dir = config.WORKING_DIR
+>>>>>>> REPLACE
+```
+
+```diff
+library/sparse_engine.py
+<<<<<<< SEARCH
+            # --- B. Time Decay Weights ---
+            print("Calculating time decay...")
+            max_date = transactions_df["t_dat"].max()
+            # Calculate days diff
+            days_diff = (max_date - transactions_df["t_dat"]).dt.days.values
+            # w = decay ^ days
+            weights = np.power(self.decay_factor, days_diff).astype(np.float32)
+
+            # --- C. Build User History Matrix (R) ---
+=======
+            # --- B. Time Decay Weights ---
+            print("Calculating time decay...")
+            max_date = transactions_df["t_dat"].max()
+            # Calculate days diff
+            days_diff = (max_date - transactions_df["t_dat"]).dt.days.values
+            # w = 1 / (1 + days)^exponent (Cite solution_lesson_node_00002)
+            weights = (1.0 / (days_diff + 1) ** self.decay_exponent).astype(np.float32)
+
+            # --- C. Build User History Matrix (R) ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/sparse_engine.py
+<<<<<<< SEARCH
+    def predict(
+        self,
+        customer_ids: Union[List, np.ndarray],
+        user_history_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """
+        Generates candidates for the given customers.
+
+        Args:
+            customer_ids: List of customer_id strings to predict for.
+            user_history_df: Optional DataFrame containing history for these users.
+                             If None, uses the history stored in self.user_history_matrix (from fit).
+                             If provided, constructs a temporary query vector.
+
+        Returns:
+            DataFrame with columns [customer_id, article_id, score, rank]
+        """
+        if self.transition_matrix is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+
+        n_targets = len(customer_ids)
+        print(f"[SparseGraphRetriever] Generating candidates for {n_targets} users...")
+
+        # 1. Build Query Matrix (Q)
+        if user_history_df is not None:
+            # Construct Q from provided history (e.g., for validation set users)
+            # Map IDs using the fitted mappers
+            # Filter history to only include known items
+            valid_mask = user_history_df["article_id"].isin(self.art_to_idx)
+            filtered_hist = user_history_df[valid_mask].copy()
+
+            # We also need to handle new users in the history df if they aren't in cust_to_idx?
+            # Actually, for the query matrix, we just need rows 0..n_targets-1 corresponding to customer_ids input.
+            # We need to map customer_ids input to 0..N for the query matrix rows.
+            target_map = {cid: i for i, cid in enumerate(customer_ids)}
+
+            # Filter history for target users
+            filtered_hist = filtered_hist[filtered_hist["customer_id"].isin(target_map)]
+
+            q_rows = filtered_hist["customer_id"].map(target_map).values
+            q_cols = filtered_hist["article_id"].map(self.art_to_idx).values
+
+            # Calculate weights (decay)
+            max_date = filtered_hist["t_dat"].max()
+            days_diff = (max_date - filtered_hist["t_dat"]).dt.days.values
+            q_data = np.power(self.decay_factor, days_diff).astype(np.float32)
+
+            query_matrix = sp.csr_matrix(
+                (q_data, (q_rows, q_cols)),
+                shape=(n_targets, len(self.article_ids)),
+                dtype=np.float32,
+            )
+        else:
+            # Use internal history
+            # Map requested customers to internal indices
+            # Handle cold start (users not in training data)
+            internal_indices = []
+            valid_mask = []  # Boolean mask for customer_ids
+
+            for cid in customer_ids:
+                if cid in self.cust_to_idx:
+                    internal_indices.append(self.cust_to_idx[cid])
+                    valid_mask.append(True)
+                else:
+                    internal_indices.append(0)  # Placeholder, will be masked out
+                    valid_mask.append(False)
+
+            valid_mask = np.array(valid_mask)
+
+            if valid_mask.any():
+                # Slice the pre-computed R matrix
+                # Note: Slicing CSR by rows is efficient
+                subset_indices = np.array(internal_indices)[valid_mask]
+                query_matrix_subset = self.user_history_matrix[subset_indices]
+
+                # Reconstruct full query matrix (including empty rows for cold users)
+                # This is a bit expensive. Better strategy:
+                # Compute scores for valid users, then merge.
+                pass
+            else:
+                query_matrix_subset = None
+
+        # 2. Compute Scores
+        # S = Q @ T + alpha * Q
+        # We handle the "valid_mask" logic here to avoid creating massive empty sparse matrices
+
+        results = []
+
+        # We process in batches to manage memory
+        batch_size = 1000
+
+        # Prepare fallback candidates (Global Popularity)
+        # Pre-map popularity to internal indices? No, we need article_ids at output.
+        # But for filling scores, we need internal indices.
+        pop_indices = [
+            self.art_to_idx[aid]
+            for aid in self.global_popularity
+            if aid in self.art_to_idx
+        ]
+
+        # Loop over customers
+        # To optimize, we use the matrix operation for valid users
+
+        # Identify valid users (those who have history either in internal R or provided df)
+        if user_history_df is None:
+            # Indices in self.user_history_matrix
+            target_indices = []
+            is_cold = []
+            for cid in customer_ids:
+                if cid in self.cust_to_idx:
+                    target_indices.append(self.cust_to_idx[cid])
+                    is_cold.append(False)
+                else:
+                    target_indices.append(-1)
+                    is_cold.append(True)
+
+            # Get valid subset
+            valid_indices = [i for i in target_indices if i != -1]
+            if valid_indices:
+                Q_valid = self.user_history_matrix[valid_indices]
+            else:
+                Q_valid = None
+        else:
+            # Q is already built for all targets (cold users have empty rows in Q)
+            Q_valid = query_matrix
+            is_cold = [False] * n_targets  # Logic handled by empty rows in Q
+
+        # Compute Scores for valid portion
+        if Q_valid is not None and Q_valid.nnz > 0:
+            # Sparse Matrix Multiplication
+            # S = Q . T + alpha * Q
+            scores_valid = Q_valid.dot(self.transition_matrix)
+            scores_valid += self.alpha * Q_valid
+        else:
+            scores_valid = None
+
+        # 3. Extract Top K
+        # Iterate and construct result
+
+        valid_idx_counter = 0
+
+        for i, cid in enumerate(customer_ids):
+            # Check if user was cold (not in training set)
+            # If user_history_df was provided, is_cold is False, but row might be empty
+
+            user_scores = None
+
+            if not is_cold[i]:
+                # Get row from scores_valid
+                if scores_valid is not None:
+                    row = scores_valid[valid_idx_counter]
+                    valid_idx_counter += 1
+
+                    if row.nnz > 0:
+                        user_scores = row
+
+            # Extract candidates
+            cands = []
+            cand_scores = []
+
+            if user_scores is not None:
+                # Get top K from sparse row
+                # row is 1 x n_items CSR
+                _, idxs = row.nonzero()
+                vals = row.data
+
+                if len(idxs) > self.top_k:
+                    # Argpartition to get top K
+                    top_k_args = np.argpartition(vals, -self.top_k)[-self.top_k :]
+                    best_idxs = idxs[top_k_args]
+                    best_vals = vals[top_k_args]
+
+                    # Sort descending
+                    sort_order = np.argsort(best_vals)[::-1]
+                    best_idxs = best_idxs[sort_order]
+                    best_vals = best_vals[sort_order]
+                else:
+                    # Take all
+                    sort_order = np.argsort(vals)[::-1]
+                    best_idxs = idxs[sort_order]
+                    best_vals = vals[sort_order]
+
+                # Map back to article_ids
+                cands = self.article_ids[best_idxs]
+                cand_scores = best_vals
+
+            # Fallback / Fill
+            # If we have fewer than K candidates, fill with popularity
+            if len(cands) < self.top_k:
+                n_needed = self.top_k - len(cands)
+                # Filter popularity to exclude already selected
+                existing = set(cands)
+                fill = []
+                fill_scores = []
+                for pop_item in self.global_popularity:
+                    if pop_item not in existing:
+                        fill.append(pop_item)
+                        fill_scores.append(0.0)  # Zero score for fallback
+                        if len(fill) == n_needed:
+                            break
+
+                cands = np.concatenate([cands, fill])
+                cand_scores = np.concatenate([cand_scores, fill_scores])
+
+            # Create rows
+            # customer_id, article_id, score, rank
+            for rank, (aid, score) in enumerate(zip(cands, cand_scores)):
+                results.append(
+                    {
+                        "customer_id": cid,
+                        "article_id": aid,
+                        "score": float(score),
+                        "rank": rank + 1,
+                    }
+                )
+
+        return pd.DataFrame(results)
+=======
+    def _prune_query_matrix(self, Q: sp.csr_matrix) -> sp.csr_matrix:
+        """
+        Implements Importance-Based History Truncation (Cite solution_lesson_node_00012).
+        Keeps only the top K weighted items per user in the query vector.
+        """
+        k = self.history_limit
+        if k <= 0:
+            return Q
+            
+        new_data = []
+        new_indices = []
+        new_indptr = [0]
+        
+        # Iterate over CSR rows directly
+        for i in range(Q.shape[0]):
+            start, end = Q.indptr[i], Q.indptr[i+1]
+            if start == end:
+                new_indptr.append(new_indptr[-1])
+                continue
+                
+            row_data = Q.data[start:end]
+            row_indices = Q.indices[start:end]
+            
+            if len(row_data) > k:
+                # Keep top K by weight
+                top_k_idx = np.argpartition(row_data, -k)[-k:]
+                row_data = row_data[top_k_idx]
+                row_indices = row_indices[top_k_idx]
+                
+            new_data.extend(row_data)
+            new_indices.extend(row_indices)
+            new_indptr.append(len(new_data))
+            
+        return sp.csr_matrix((new_data, new_indices, new_indptr), shape=Q.shape)
+
+    def predict(
+        self,
+        customer_ids: Union[List, np.ndarray],
+        user_history_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """
+        Generates candidates for the given customers using direct sparse matrix operations.
+        """
+        if self.transition_matrix is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+
+        n_targets = len(customer_ids)
+        print(f"[SparseGraphRetriever] Generating candidates for {n_targets} users...")
+
+        # 1. Build Query Matrix (Q)
+        if user_history_df is not None:
+            # Filter history to only include known items
+            valid_mask = user_history_df["article_id"].isin(self.art_to_idx)
+            filtered_hist = user_history_df[valid_mask].copy()
+
+            target_map = {cid: i for i, cid in enumerate(customer_ids)}
+            filtered_hist = filtered_hist[filtered_hist["customer_id"].isin(target_map)]
+
+            q_rows = filtered_hist["customer_id"].map(target_map).values
+            q_cols = filtered_hist["article_id"].map(self.art_to_idx).values
+
+            # Power-law decay for query weights
+            max_date = filtered_hist["t_dat"].max()
+            days_diff = (max_date - filtered_hist["t_dat"]).dt.days.values
+            q_data = (1.0 / (days_diff + 1) ** self.decay_exponent).astype(np.float32)
+
+            Q = sp.csr_matrix(
+                (q_data, (q_rows, q_cols)),
+                shape=(n_targets, len(self.article_ids)),
+                dtype=np.float32,
+            )
+            # Sum duplicates (multiple purchases of same item)
+            Q.sum_duplicates()
+        else:
+            # Use internal history (R)
+            # Map requested customers to internal indices
+            internal_indices = []
+            row_map = [] # maps Q row index to R row index
+            
+            for i, cid in enumerate(customer_ids):
+                if cid in self.cust_to_idx:
+                    internal_indices.append(self.cust_to_idx[cid])
+                    row_map.append(i)
+            
+            if internal_indices:
+                # Extract rows from R
+                R_subset = self.user_history_matrix[internal_indices]
+                
+                # Create Q with correct shape (n_targets, n_items)
+                # We construct it by creating a new CSR from R_subset data
+                # but re-mapping row indices to 0..n_targets
+                # This is slightly complex, so we just use vstack or simpler:
+                # Create empty Q
+                Q = sp.lil_matrix((n_targets, len(self.article_ids)), dtype=np.float32)
+                # Fill valid rows (slow for large N, but acceptable for inference batches)
+                # Optimization: Construct CSR directly
+                
+                # Get R_subset in COO to shift row indices
+                R_coo = R_subset.tocoo()
+                # R_coo.row goes 0..len(internal_indices)
+                # We need to map these to the original indices in customer_ids (row_map)
+                new_rows = np.array(row_map)[R_coo.row]
+                
+                Q = sp.csr_matrix(
+                    (R_coo.data, (new_rows, R_coo.col)),
+                    shape=(n_targets, len(self.article_ids)),
+                    dtype=np.float32
+                )
+            else:
+                Q = sp.csr_matrix((n_targets, len(self.article_ids)), dtype=np.float32)
+
+        # 2. Prune Query Matrix (Importance-Based Truncation)
+        Q = self._prune_query_matrix(Q)
+
+        # 3. Compute Scores: S = Q @ T + alpha * Q
+        if Q.nnz > 0:
+            S = Q.dot(self.transition_matrix)
+            S += self.alpha * Q
+        else:
+            S = sp.csr_matrix((n_targets, len(self.article_ids)), dtype=np.float32)
+
+        # 4. Extract Top K (Direct CSR Access - Cite solution_lesson_node_00016)
+        results = []
+        
+        # Pre-calculate fallback
+        fallback_ids = self.global_popularity[:self.top_k]
+        fallback_scores = np.zeros(len(fallback_ids))
+        
+        for i in range(n_targets):
+            cid = customer_ids[i]
+            start, end = S.indptr[i], S.indptr[i+1]
+            
+            cands = []
+            cand_scores = []
+            
+            if start < end:
+                row_data = S.data[start:end]
+                row_inds = S.indices[start:end]
+                
+                if len(row_data) > self.top_k:
+                    # Argpartition for top K
+                    top_k_idx = np.argpartition(row_data, -self.top_k)[-self.top_k:]
+                    best_data = row_data[top_k_idx]
+                    best_inds = row_inds[top_k_idx]
+                    
+                    # Sort descending
+                    sort_order = np.argsort(best_data)[::-1]
+                    cands = self.article_ids[best_inds[sort_order]]
+                    cand_scores = best_data[sort_order]
+                else:
+                    # Take all
+                    sort_order = np.argsort(row_data)[::-1]
+                    cands = self.article_ids[row_inds[sort_order]]
+                    cand_scores = row_data[sort_order]
+            
+            # Fallback
+            if len(cands) < self.top_k:
+                n_needed = self.top_k - len(cands)
+                existing = set(cands)
+                fill = [x for x in fallback_ids if x not in existing][:n_needed]
+                fill_scores = np.zeros(len(fill))
+                
+                cands = np.concatenate([cands, fill])
+                cand_scores = np.concatenate([cand_scores, fill_scores])
+            
+            # Store results
+            for rank, (aid, score) in enumerate(zip(cands, cand_scores)):
+                results.append({
+                    "customer_id": cid,
+                    "article_id": aid,
+                    "score": float(score),
+                    "rank": rank + 1
+                })
+
+        return pd.DataFrame(results)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library import ranker_prep
+from library import ranker_model
+
+
+# ==========================================
+# METRIC IMPLEMENTATION
+# ==========================================
+=======
+# from library import ranker_prep  # Removed (Cite solution_lesson_node_00010)
+# from library import ranker_model # Removed (Cite solution_lesson_node_00010)
+from library import sparse_engine
+
+
+# ==========================================
+# METRIC IMPLEMENTATION
+# ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+def main():
+    utils.seed_everything(config.SEED)
+
+    print("Starting End-to-End Orchestration...")
+
+    # ---------------------------------------------------------
+    # 1. Dataset Construction
+    # ---------------------------------------------------------
+    print("\n[Step 1/5] Constructing Ranker Datasets...")
+    dataset_builder = ranker_prep.RankerDatasetBuilder()
+
+    # Build Train Set (Candidates from Train History -> Train Target)
+    train_df = dataset_builder.build_ranker_train_set(load_cached_data=True)
+
+    # Build Val Set (Candidates from Val History -> Val Target)
+    val_df = dataset_builder.build_ranker_val_set(load_cached_data=True)
+
+    # ---------------------------------------------------------
+    # 2. Model Training
+    # ---------------------------------------------------------
+    print("\n[Step 2/5] Training Ranker...")
+    ranker = ranker_model.LGBMRankerWrapper()
+    ranker.fit(train_df, val_df)
+
+    # Free up training memory
+    del train_df
+    gc.collect()
+
+    # ---------------------------------------------------------
+    # 3. Validation & Metrics
+    # ---------------------------------------------------------
+    print("\n[Step 3/5] Validating Model...")
+
+    # Predict scores for validation set
+    val_scores = ranker.predict(val_df)
+    val_df["predicted_score"] = val_scores
+
+    # Select Top 12 Predictions per User
+    print("Selecting top 12 candidates per user...")
+    # Sort by user and score
+    val_df_sorted = val_df.sort_values(
+        ["customer_id", "predicted_score"], ascending=[True, False]
+    )
+    top_preds = val_df_sorted.groupby("customer_id").head(12)
+
+    # Create dictionary: customer_id -> list of predicted article_ids
+    preds_map = top_preds.groupby("customer_id")["article_id"].apply(list).to_dict()
+
+    # Get Ground Truth
+    print("Loading Ground Truth...")
+    gt_map = get_ground_truth(split="val", days=7)
+
+    # Align predictions and ground truth
+    # Note: We only score users who are in the ground truth (active in target week)
+    # val_df contains candidates for users active in target week (handled by dataset builder)
+
+    common_users = set(gt_map.keys()).intersection(set(preds_map.keys()))
+
+    actuals = []
+    predictions = []
+
+    for uid in common_users:
+        actuals.append(gt_map[uid])
+        predictions.append(preds_map[uid])
+
+    # Handle users in GT but with no predictions (e.g. retriever found 0 candidates? Unlikely with fallback)
+    # If they are missing from preds_map, it counts as empty prediction.
+    missing_users = set(gt_map.keys()) - set(preds_map.keys())
+    for uid in missing_users:
+        actuals.append(gt_map[uid])
+        predictions.append([])
+
+    # Compute MAP@12
+    val_metric = mapk(actuals, predictions, k=12)
+    print(f"Final Validation Metric: {val_metric:.16f}")
+
+    # ---------------------------------------------------------
+    # 4. Failure Analysis
+    # ---------------------------------------------------------
+    print("\n[Step 4/5] Performing Failure Analysis...")
+
+    # Calculate AP per user to define "Error"
+    user_aps = []
+    user_ids = []
+
+    # Re-iterate to capture per-user AP
+    # We iterate over common_users + missing_users
+    all_eval_users = list(common_users) + list(missing_users)
+
+    for uid in all_eval_users:
+        act = gt_map[uid]
+        pred = preds_map.get(uid, [])
+        ap = apk(act, pred, k=12)
+        user_aps.append(ap)
+        user_ids.append(uid)
+
+    error_df = pd.DataFrame(
+        {"customer_id": user_ids, "ap": user_aps, "error": 1.0 - np.array(user_aps)}
+    )
+
+    # Merge with Customer Metadata
+    customers = data_loader.load_customers(load_cached_data=True)
+
+    # Preprocess customers for correlation (encode categoricals)
+    cust_features = [
+        "age",
+        "FN",
+        "Active",
+        "club_member_status",
+        "fashion_news_frequency",
+    ]
+
+    # Handle simple encoding for correlation
+    customers_encoded = customers.copy()
+    # Fill NaNs
+    customers_encoded["age"] = customers_encoded["age"].fillna(
+        customers_encoded["age"].median()
+    )
+    customers_encoded["FN"] = customers_encoded["FN"].fillna(0)
+    customers_encoded["Active"] = customers_encoded["Active"].fillna(0)
+
+    for col in ["club_member_status", "fashion_news_frequency"]:
+        if customers_encoded[col].dtype == "object":
+            customers_encoded[col] = pd.factorize(customers_encoded[col])[0]
+
+    analysis_df = error_df.merge(
+        customers_encoded[["customer_id"] + cust_features], on="customer_id", how="left"
+    )
+
+    # Compute Correlation
+    print("Correlation between Error (1-AP) and User Features:")
+    corr_matrix = analysis_df[["error"] + cust_features].corr()
+    print(corr_matrix["error"].sort_values(ascending=False))
+
+    # ---------------------------------------------------------
+    # 5. Submission
+    # ---------------------------------------------------------
+    threshold = 0.026059042
+
+    if val_metric > threshold:
+        print(
+            f"\n[Step 5/5] Metric ({val_metric:.6f}) > Threshold ({threshold}). Generating Submission..."
+        )
+
+        # Build Inference Set (Retriever fit on Full History)
+        test_df = dataset_builder.build_inference_set(load_cached_data=True)
+
+        # Generate Submission
+        sub_path = config.SUBMISSION_DIR / "submission.csv"
+        ranker.generate_submission(test_df, sub_path)
+    else:
+        print(
+            f"\n[Step 5/5] Metric ({val_metric:.6f}) <= Threshold ({threshold}). Skipping Submission."
+        )
+=======
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+def main():
+    utils.seed_everything(config.SEED)
+
+    print("Starting Optimized Single-Stage Pipeline...")
+    
+    # 1. Load Data
+    print("\n[Step 1/4] Loading Data...")
+    # We need to split train into history and ground truth for validation
+    train_meta = data_loader.load_transactions(split="train")
+    
+    # Define validation split (Last 7 days of training data)
+    # Note: The original 'val_metadata' is a hold-out set of users.
+    # To properly validate the model's ability to predict 'next 7 days', 
+    # we should use the 'val_metadata' users, split their history into (History, Target).
+    
+    val_meta = data_loader.load_transactions(split="val")
+    
+    def split_history_target(df, days=7):
+        if "t_dat" not in df.columns:
+            df["t_dat"] = pd.to_datetime(df["t_dat"])
+        max_date = df["t_dat"].max()
+        cutoff = max_date - pd.Timedelta(days=days)
+        history = df[df["t_dat"] < cutoff].copy()
+        target = df[df["t_dat"] >= cutoff].copy()
+        return history, target
+
+    # Prepare Validation Data
+    # We fit on Train (full) + Val (history) -> Predict Val (target)
+    # Actually, to simulate the test scenario (predicting for users based on their history),
+    # we fit the transition matrix on the massive Train set.
+    # Then we use the Val users' history to predict their target.
+    
+    val_history, val_target = split_history_target(val_meta, days=7)
+    
+    # 2. Fit Retriever
+    print("\n[Step 2/4] Fitting Sparse Graph Retriever...")
+    retriever = sparse_engine.SparseGraphRetriever()
+    # Fit on Train set (captures global trends and transitions)
+    # We can also include Val history in the fit to capture those users' transitions, 
+    # but strictly speaking, we should fit on Train and infer on Val.
+    # However, the transition matrix benefits from more data.
+    # Let's fit on Train + Val History to be robust.
+    full_train_history = pd.concat([train_meta, val_history], ignore_index=True)
+    retriever.fit(full_train_history, load_cached_data=False)
+    
+    # 3. Validation
+    print("\n[Step 3/4] Validating...")
+    val_users = val_target["customer_id"].unique()
+    print(f"Predicting for {len(val_users)} validation users...")
+    
+    # Predict
+    # We pass val_history so the retriever knows the recent items for these users
+    preds_df = retriever.predict(val_users, user_history_df=val_history)
+    
+    # Convert to map
+    preds_map = preds_df.groupby("customer_id")["article_id"].apply(list).to_dict()
+    
+    # Ground Truth
+    gt_df = val_target.groupby("customer_id")["article_id"].agg(set).reset_index()
+    gt_map = dict(zip(gt_df["customer_id"], gt_df["article_id"]))
+    
+    # Compute Metric
+    common_users = set(gt_map.keys()).intersection(set(preds_map.keys()))
+    actuals, predictions = [], []
+    
+    for uid in common_users:
+        actuals.append(gt_map[uid])
+        predictions.append(preds_map[uid])
+        
+    # Missing
+    missing = set(gt_map.keys()) - set(preds_map.keys())
+    for uid in missing:
+        actuals.append(gt_map[uid])
+        predictions.append([])
+        
+    val_metric = mapk(actuals, predictions, k=12)
+    print(f"Final Validation Metric: {val_metric:.16f}")
+    
+    # Failure Analysis
+    print("\n[Step 4/4] Failure Analysis...")
+    user_aps, user_ids = [], []
+    all_eval = list(common_users) + list(missing)
+    for uid in all_eval:
+        ap = apk(gt_map[uid], preds_map.get(uid, []), k=12)
+        user_aps.append(ap)
+        user_ids.append(uid)
+        
+    error_df = pd.DataFrame({"customer_id": user_ids, "error": 1.0 - np.array(user_aps)})
+    customers = data_loader.load_customers(load_cached_data=True)
+    
+    # Encode for correlation
+    cust_enc = customers.copy()
+    cust_enc["age"] = cust_enc["age"].fillna(cust_enc["age"].median())
+    cust_enc["FN"] = cust_enc["FN"].fillna(0)
+    cust_enc["Active"] = cust_enc["Active"].fillna(0)
+    for col in ["club_member_status", "fashion_news_frequency"]:
+        if cust_enc[col].dtype == "object":
+            cust_enc[col] = pd.factorize(cust_enc[col])[0]
+            
+    analysis = error_df.merge(cust_enc, on="customer_id", how="left")
+    feats = ["age", "FN", "Active", "club_member_status", "fashion_news_frequency"]
+    print(analysis[["error"] + feats].corr()["error"].sort_values(ascending=False))
+    
+    # Submission
+    threshold = 0.026059042
+    if val_metric > threshold:
+        print(f"\nMetric ({val_metric:.6f}) > Threshold. Generating Submission...")
+        
+        # Fit on EVERYTHING (Train + Val Full)
+        full_data = pd.concat([train_meta, val_meta], ignore_index=True)
+        retriever.fit(full_data, load_cached_data=False)
+        
+        # Load Test Users
+        sample_sub = data_loader.load_sample_submission()
+        test_users = sample_sub["customer_id"].unique()
+        
+        # Predict
+        test_preds = retriever.predict(test_users, user_history_df=full_data)
+        
+        # Format
+        sub_df = test_preds.groupby("customer_id")["article_id"].apply(
+            lambda x: " ".join(str(aid).zfill(10) for aid in x)
+        ).reset_index()
+        sub_df.columns = ["customer_id", "prediction"]
+        
+        # Merge with all test users
+        submission = sample_sub[["customer_id"]].merge(sub_df, on="customer_id", how="left")
+        submission["prediction"] = submission["prediction"].fillna("")
+        
+        out_path = config.SUBMISSION_DIR / "submission.csv"
+        submission.to_csv(out_path, index=False)
+        print("Submission saved.")
+    else:
+        print(f"Metric ({val_metric:.6f}) <= Threshold. Skipping.")
+>>>>>>> REPLACE
+```

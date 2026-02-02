@@ -1,0 +1,392 @@
+To optimize the solution, I will implement several targeted improvements based on the analysis of the previous run and the provided lesson.
+
+**Strategy:**
+
+1.  **Enhance Model Stability and Capacity (`library/model.py`)**:
+    *   **Batch Normalization Placement**: Move Batch Normalization in `CGCNNLayer` to be applied *before* the activation functions (Softplus/Sigmoid). This is standard practice to stabilize training dynamics and prevent the large loss spikes observed.
+    *   **Regularization**: Introduce `Dropout` in the `CGCNN` model after the global pooling step to improve generalization.
+    *   **Capacity**: Increase the default `atom_fea_len` and `h_fea_len` to 128 to allow the model to learn richer representations of the crystal structures.
+
+2.  **Stabilize Training (`library/trainer.py`)**:
+    *   **Gradient Clipping**: Implement gradient clipping in the `train_epoch` loop. This is crucial to prevent the "exploding gradient" problem that likely caused the massive validation loss spikes in the previous run.
+
+3.  **Optimize Hyperparameters & Logic (`runfile.py`)**:
+    *   **Geometric Context**: Increase `RADIUS` from 5.0 to 6.0. By capturing a larger local neighborhood, the RBF expansion (Cite solution_lesson_node_00002) can model longer-range atomic interactions, which are physically significant.
+    *   **Training Schedule**: Decrease `LR` to `1e-3` and increase `BATCH_SIZE` to `128` for smoother convergence. Increase `EPOCHS` to `80` to allow the model sufficient time to converge with the lower learning rate.
+    *   **Conditional Submission**: Enforce the requirement to generate a submission *only* if the validation RMSLE improves upon the baseline of ~0.0591.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, atom_in_fea, edge_index, edge_fea):
+        """
+        Args:
+            atom_in_fea (Tensor): [N, atom_fea_len] Node features.
+            edge_index (Tensor): [2, E] Edge indices (src, dst).
+            edge_fea (Tensor): [E, edge_fea_len] Edge features.
+        Returns:
+            Tensor: [N, atom_fea_len] Updated node features.
+        """
+        # Get source and target node features
+        # edge_index[0] is source, edge_index[1] is destination
+        src_idx = edge_index[0]
+        dst_idx = edge_index[1]
+
+        atom_src = atom_in_fea[src_idx]  # [E, F]
+        atom_dst = atom_in_fea[dst_idx]  # [E, F]
+
+        # Concatenate features for messages: z_ij = [v_i, v_j, u_ij]
+        z = torch.cat([atom_src, atom_dst, edge_fea], dim=1)  # [E, 2F + F_edge]
+
+        # Compute gated activation
+        # Filter: Softplus(Linear(z))
+        # Gate: Sigmoid(Linear(z))
+        # Message = Filter * Gate
+        filter_out = self.bn_softplus(F.softplus(self.softplus_linear(z)))
+        gate_out = self.bn_sigmoid(torch.sigmoid(self.sigmoid_linear(z)))
+
+        message = filter_out * gate_out  # [E, F]
+
+        # Aggregate messages to destination nodes using scatter_add
+        # dst_idx is the index to scatter into
+        # dim=0 because we are aggregating rows
+        # dim_size is number of atoms to ensure output shape matches atom_in_fea
+        aggr_message = scatter(
+            message, dst_idx, dim=0, dim_size=atom_in_fea.size(0), reduce="add"
+        )
+
+        # Residual connection
+        atom_out_fea = atom_in_fea + aggr_message
+
+        return atom_out_fea
+=======
+    def forward(self, atom_in_fea, edge_index, edge_fea):
+        """
+        Args:
+            atom_in_fea (Tensor): [N, atom_fea_len] Node features.
+            edge_index (Tensor): [2, E] Edge indices (src, dst).
+            edge_fea (Tensor): [E, edge_fea_len] Edge features.
+        Returns:
+            Tensor: [N, atom_fea_len] Updated node features.
+        """
+        # Get source and target node features
+        # edge_index[0] is source, edge_index[1] is destination
+        src_idx = edge_index[0]
+        dst_idx = edge_index[1]
+
+        atom_src = atom_in_fea[src_idx]  # [E, F]
+        atom_dst = atom_in_fea[dst_idx]  # [E, F]
+
+        # Concatenate features for messages: z_ij = [v_i, v_j, u_ij]
+        z = torch.cat([atom_src, atom_dst, edge_fea], dim=1)  # [E, 2F + F_edge]
+
+        # Compute gated activation
+        # Apply BN before activation for better stability
+        filter_out = F.softplus(self.bn_softplus(self.softplus_linear(z)))
+        gate_out = torch.sigmoid(self.bn_sigmoid(self.sigmoid_linear(z)))
+
+        message = filter_out * gate_out  # [E, F]
+
+        # Aggregate messages to destination nodes using scatter_add
+        # dst_idx is the index to scatter into
+        # dim=0 because we are aggregating rows
+        # dim_size is number of atoms to ensure output shape matches atom_in_fea
+        aggr_message = scatter(
+            message, dst_idx, dim=0, dim_size=atom_in_fea.size(0), reduce="add"
+        )
+
+        # Residual connection
+        atom_out_fea = atom_in_fea + aggr_message
+
+        return atom_out_fea
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def __init__(
+        self,
+        orig_atom_fea_len=4,  # 4 types of atoms: Al, Ga, In, O
+        atom_fea_len=64,
+        n_conv=3,
+        h_fea_len=128,
+        n_h=1,
+        n_targets=2,
+        radius=5.0,
+        n_rbf=40,
+    ):
+        super(CGCNN, self).__init__()
+
+        # Embedding for atom types (0:O, 1:Al, 2:Ga, 3:In)
+        self.embedding = nn.Embedding(orig_atom_fea_len, atom_fea_len)
+
+        # RBF Expansion for edge distances
+        self.rbf_expansion = RBFExpansion(vmin=0, vmax=radius, bins=n_rbf)
+
+        # Stack of Convolution layers
+        self.convs = nn.ModuleList(
+            [
+                CGCNNLayer(atom_fea_len=atom_fea_len, edge_fea_len=n_rbf)
+                for _ in range(n_conv)
+            ]
+        )
+
+        # Global pooling to Output MLP
+        self.conv_to_fc = nn.Linear(atom_fea_len, h_fea_len)
+        self.bn_hidden = nn.BatchNorm1d(h_fea_len)
+
+        if n_h > 1:
+            self.fcs = nn.ModuleList(
+                [nn.Linear(h_fea_len, h_fea_len) for _ in range(n_h - 1)]
+            )
+            self.bns = nn.ModuleList(
+                [nn.BatchNorm1d(h_fea_len) for _ in range(n_h - 1)]
+            )
+        else:
+            self.fcs = nn.ModuleList([])
+            self.bns = nn.ModuleList([])
+
+        self.fc_out = nn.Linear(h_fea_len, n_targets)
+
+        self.n_h = n_h
+
+    def forward(self, atom_fea, edge_index, edge_dist, batch_index):
+        """
+        Args:
+            atom_fea (Tensor): [N] Atom type indices.
+            edge_index (Tensor): [2, E] Edge connectivity.
+            edge_dist (Tensor): [E] Edge distances.
+            batch_index (Tensor): [N] Batch index for each node (for pooling).
+        Returns:
+            Tensor: [B, n_targets] Predictions.
+        """
+        # 1. Node Embedding
+        x = self.embedding(atom_fea)  # [N, atom_fea_len]
+
+        # 2. Edge Embedding (RBF)
+        edge_fea = self.rbf_expansion(edge_dist)  # [E, n_rbf]
+
+        # 3. Convolution Layers
+        for conv in self.convs:
+            x = conv(x, edge_index, edge_fea)
+
+        # 4. Global Pooling
+        # Aggregate node features into graph features
+        # We use mean pooling to be invariant to crystal size in a stable way
+        crys_fea = scatter(x, batch_index, dim=0, reduce="mean")  # [B, atom_fea_len]
+
+        # 5. MLP
+        crys_fea = F.softplus(self.conv_to_fc(crys_fea))
+        crys_fea = self.bn_hidden(crys_fea)
+
+        for i in range(self.n_h - 1):
+            crys_fea = F.softplus(self.fcs[i](crys_fea))
+            crys_fea = self.bns[i](crys_fea)
+
+        out = self.fc_out(crys_fea)
+
+        return out
+=======
+    def __init__(
+        self,
+        orig_atom_fea_len=4,  # 4 types of atoms: Al, Ga, In, O
+        atom_fea_len=128,
+        n_conv=3,
+        h_fea_len=128,
+        n_h=1,
+        n_targets=2,
+        radius=5.0,
+        n_rbf=40,
+        dropout=0.2,
+    ):
+        super(CGCNN, self).__init__()
+
+        # Embedding for atom types (0:O, 1:Al, 2:Ga, 3:In)
+        self.embedding = nn.Embedding(orig_atom_fea_len, atom_fea_len)
+
+        # RBF Expansion for edge distances
+        self.rbf_expansion = RBFExpansion(vmin=0, vmax=radius, bins=n_rbf)
+
+        # Stack of Convolution layers
+        self.convs = nn.ModuleList(
+            [
+                CGCNNLayer(atom_fea_len=atom_fea_len, edge_fea_len=n_rbf)
+                for _ in range(n_conv)
+            ]
+        )
+
+        # Global pooling to Output MLP
+        self.conv_to_fc = nn.Linear(atom_fea_len, h_fea_len)
+        self.bn_hidden = nn.BatchNorm1d(h_fea_len)
+        self.dropout = nn.Dropout(p=dropout)
+
+        if n_h > 1:
+            self.fcs = nn.ModuleList(
+                [nn.Linear(h_fea_len, h_fea_len) for _ in range(n_h - 1)]
+            )
+            self.bns = nn.ModuleList(
+                [nn.BatchNorm1d(h_fea_len) for _ in range(n_h - 1)]
+            )
+        else:
+            self.fcs = nn.ModuleList([])
+            self.bns = nn.ModuleList([])
+
+        self.fc_out = nn.Linear(h_fea_len, n_targets)
+
+        self.n_h = n_h
+
+    def forward(self, atom_fea, edge_index, edge_dist, batch_index):
+        """
+        Args:
+            atom_fea (Tensor): [N] Atom type indices.
+            edge_index (Tensor): [2, E] Edge connectivity.
+            edge_dist (Tensor): [E] Edge distances.
+            batch_index (Tensor): [N] Batch index for each node (for pooling).
+        Returns:
+            Tensor: [B, n_targets] Predictions.
+        """
+        # 1. Node Embedding
+        x = self.embedding(atom_fea)  # [N, atom_fea_len]
+
+        # 2. Edge Embedding (RBF)
+        edge_fea = self.rbf_expansion(edge_dist)  # [E, n_rbf]
+
+        # 3. Convolution Layers
+        for conv in self.convs:
+            x = conv(x, edge_index, edge_fea)
+
+        # 4. Global Pooling
+        # Aggregate node features into graph features
+        # We use mean pooling to be invariant to crystal size in a stable way
+        crys_fea = scatter(x, batch_index, dim=0, reduce="mean")  # [B, atom_fea_len]
+
+        # 5. MLP
+        crys_fea = F.softplus(self.conv_to_fc(crys_fea))
+        crys_fea = self.bn_hidden(crys_fea)
+        crys_fea = self.dropout(crys_fea)
+
+        for i in range(self.n_h - 1):
+            crys_fea = F.softplus(self.fcs[i](crys_fea))
+            crys_fea = self.bns[i](crys_fea)
+            crys_fea = self.dropout(crys_fea)
+
+        out = self.fc_out(crys_fea)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+            # Compute loss
+            loss = self.criterion(preds, targets_norm)
+
+            # Backward pass and optimization
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            losses.update(loss.item(), targets.size(0))
+=======
+            # Compute loss
+            loss = self.criterion(preds, targets_norm)
+
+            # Backward pass and optimization
+            self.optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+
+            losses.update(loss.item(), targets.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Hyperparameters
+BATCH_SIZE = 64
+EPOCHS = 30
+LR = 2e-3
+WEIGHT_DECAY = 1e-5
+PATIENCE = 10
+RADIUS = 5.0
+NUM_WORKERS = 2
+SEED = 42
+METADATA_DIR = "./metadata"
+CHECKPOINT_DIR = "./working/checkpoints"
+SUBMISSION_DIR = "./submission"
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+=======
+# Hyperparameters
+BATCH_SIZE = 128
+EPOCHS = 80
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+PATIENCE = 15
+RADIUS = 6.0
+NUM_WORKERS = 2
+SEED = 42
+METADATA_DIR = "./metadata"
+CHECKPOINT_DIR = "./working/checkpoints"
+SUBMISSION_DIR = "./submission"
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+TARGET_METRIC_THRESHOLD = 0.05913267808931845
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Model Initialization
+    # Atoms: O(8), Al(13), Ga(31), In(49) -> Mapped to 0, 1, 2, 3 in data_loader
+    model = CGCNN(
+        orig_atom_fea_len=4,
+        atom_fea_len=64,
+        n_conv=4,
+        h_fea_len=128,
+        n_h=2,
+        n_targets=2,
+        radius=RADIUS,
+        n_rbf=50,
+    ).to(device)
+=======
+    # 4. Model Initialization
+    # Atoms: O(8), Al(13), Ga(31), In(49) -> Mapped to 0, 1, 2, 3 in data_loader
+    model = CGCNN(
+        orig_atom_fea_len=4,
+        atom_fea_len=128,
+        n_conv=4,
+        h_fea_len=128,
+        n_h=2,
+        n_targets=2,
+        radius=RADIUS,
+        n_rbf=50,
+        dropout=0.2,
+    ).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 8. Generate Submission
+    print(f"Generating submission to {SUBMISSION_PATH}...")
+    trainer.predict(test_loader, SUBMISSION_PATH)
+    print("Submission generation complete.")
+=======
+    # 8. Generate Submission
+    if final_val_rmsle < TARGET_METRIC_THRESHOLD:
+        print(f"Validation metric {final_val_rmsle:.6f} is better than threshold {TARGET_METRIC_THRESHOLD:.6f}.")
+        print(f"Generating submission to {SUBMISSION_PATH}...")
+        trainer.predict(test_loader, SUBMISSION_PATH)
+        print("Submission generation complete.")
+    else:
+        print(f"Validation metric {final_val_rmsle:.6f} did not improve upon {TARGET_METRIC_THRESHOLD:.6f}. Skipping submission.")
+>>>>>>> REPLACE
+```

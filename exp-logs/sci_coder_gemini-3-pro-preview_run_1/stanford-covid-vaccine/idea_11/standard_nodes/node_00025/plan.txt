@@ -1,0 +1,316 @@
+I will optimize the solution by reverting the architecture to the "Current Best Solution" identified in the lessons, specifically a **Distance-Aware Residual BiGRU** with **Signed Distance Encoding**.
+
+The changes are motivated by the following lessons:
+1.  **Cite solution_lesson_node_00023**: I will remove the explicit "Teleportation" (gathering paired embeddings) and the hybrid Transformer architecture, as these added complexity without benefit in low-data regimes compared to implicit structural biases.
+2.  **Cite solution_lesson_node_00024**: I will replace the absolute distance encoding with **Signed Distance Encoding** (distinguishing upstream vs. downstream pairing), which preserves critical directionality in RNA structure.
+3.  **Cite solution_lesson_node_00017**: I will maintain the **Pre-LayerNorm** configuration for the Residual BiGRU stack to facilitate training deep recurrent networks.
+4.  **Cite solution_lesson_node_00022**: I will ensure the hidden dimension remains high (384) to provide sufficient capacity for modeling long-range dependencies.
+
+I will also increase the batch size to 64 and epochs to 50 to optimize convergence, as suggested by the successful experiments in the lessons.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Model Hyperparameters
+    HIDDEN_DIM = 384
+    NUM_GRU_LAYERS = 5
+    NUM_TRANSFORMER_LAYERS = 2
+    NHEAD = 8
+    DROPOUT = 0.1
+
+    # Vocabularies
+    VOCAB_SIZE = 4  # A, G, U, C
+    LOOP_VOCAB_SIZE = 7  # S, M, I, B, H, E, X
+
+    # Training Settings
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    EPOCHS = 50
+=======
+    # Model Hyperparameters
+    HIDDEN_DIM = 384
+    NUM_GRU_LAYERS = 5
+    DROPOUT = 0.1
+
+    # Vocabularies
+    VOCAB_SIZE = 4  # A, G, U, C
+    LOOP_VOCAB_SIZE = 7  # S, M, I, B, H, E, X
+
+    # Training Settings
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-3
+    EPOCHS = 50
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class StructureAugmentedHybridNetwork(nn.Module):
+    """
+    Structure-Augmented Hybrid Recurrent-Attention Network.
+
+    Architecture:
+    1. Embeddings: Sequence + Loop + Pair Distance + Paired Base Identity (Teleportation).
+    2. Stage 1: Deep Pre-LayerNorm Residual BiGRU backbone (Sequential Bias).
+    3. Stage 2: Transformer Encoder (Global Refinement).
+    4. Head: Projection to target columns.
+    """
+
+    def __init__(self, config=Config):
+        super().__init__()
+        self.hidden_dim = config.HIDDEN_DIM
+
+        # 1. Embeddings
+        self.seq_emb = nn.Embedding(config.VOCAB_SIZE, self.hidden_dim)
+        self.loop_emb = nn.Embedding(config.LOOP_VOCAB_SIZE, self.hidden_dim)
+
+        # 2. Distance Encoding (Sinusoidal)
+        # Max distance is bounded by sequence length. Adding a buffer for safety.
+        self.dist_emb = SinusoidalPositionalEncoding(
+            self.hidden_dim, max_len=config.SEQ_LENGTH + 20
+        )
+
+        # 3. Paired-Base Identity (Teleportation)
+        # Learnable embedding for unpaired bases (where no paired neighbor exists)
+        self.unpaired_emb = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
+
+        # 4. Input Projection
+        # Concatenate: Seq(H) + Loop(H) + Dist(H) + PairedSeq(H) = 4H
+        self.input_proj = nn.Sequential(
+            nn.Linear(4 * self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Dropout(config.DROPOUT),
+        )
+
+        # 5. Stage 1: Pre-LN BiGRU Stack
+        # We use a ModuleList to manually implement the Residual + Pre-LN connection
+        self.gru_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(config.NUM_GRU_LAYERS):
+            self.norms.append(nn.LayerNorm(self.hidden_dim))
+            self.gru_layers.append(
+                nn.GRU(
+                    self.hidden_dim,
+                    self.hidden_dim // 2,  # Bidirectional output will be hidden_dim
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
+
+        # 6. Stage 2: Transformer Encoder Refinement
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=config.NHEAD,
+            dim_feedforward=self.hidden_dim * 4,
+            dropout=config.DROPOUT,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.NUM_TRANSFORMER_LAYERS
+        )
+
+        # 7. Output Head
+        # Predicts the 3 scored targets: reactivity, deg_Mg_pH10, deg_Mg_50C
+        self.head = nn.Linear(self.hidden_dim, 3)
+
+    def forward(self, seq, loop, pair_index):
+        """
+        Args:
+            seq (torch.Tensor): (B, L) Integer encoded sequence.
+            loop (torch.Tensor): (B, L) Integer encoded loop type.
+            pair_index (torch.Tensor): (B, L) Indices of paired bases, -1 if unpaired.
+        """
+        B, L = seq.shape
+        device = seq.device
+
+        # --- Feature Generation ---
+
+        # 1. Base Embeddings
+        x_seq = self.seq_emb(seq)  # (B, L, H)
+        x_loop = self.loop_emb(loop)  # (B, L, H)
+
+        # 2. Distance Embeddings
+        # Create grid of indices [0, 1, ..., L-1]
+        indices = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+
+        # Identify paired positions
+        is_paired = pair_index != -1
+
+        # Calculate distance: |i - j| where paired, else 0
+        dist = torch.zeros_like(indices)
+        dist[is_paired] = torch.abs(indices[is_paired] - pair_index[is_paired])
+
+        x_dist = self.dist_emb(dist)  # (B, L, H)
+
+        # 3. Paired-Base Identity (Teleportation)
+        # We want to gather the sequence embedding of the paired base j for position i.
+
+        # Prepare gather indices: replace -1 with 0 to avoid index out of bounds errors
+        gather_indices = pair_index.clone()
+        gather_indices[~is_paired] = 0
+
+        # Expand indices for gathering across the hidden dimension
+        gather_indices_expanded = gather_indices.unsqueeze(-1).expand(
+            -1, -1, self.hidden_dim
+        )
+
+        # Gather operation: x_paired[b, i, :] = x_seq[b, pair_index[b, i], :]
+        x_paired_raw = torch.gather(x_seq, 1, gather_indices_expanded)
+
+        # Apply mask: Use gathered embedding if paired, else use special unpaired token
+        x_paired = torch.where(
+            is_paired.unsqueeze(-1), x_paired_raw, self.unpaired_emb.expand(B, L, -1)
+        )
+
+        # --- Model Backbone ---
+
+        # Combine all features
+        x = torch.cat([x_seq, x_loop, x_dist, x_paired], dim=-1)  # (B, L, 4H)
+        x = self.input_proj(x)  # (B, L, H)
+
+        # Stage 1: Residual Pre-LN BiGRU
+        for norm, gru in zip(self.norms, self.gru_layers):
+            x_norm = norm(x)
+            x_gru, _ = gru(x_norm)
+            x = x + x_gru  # Residual connection
+
+        # Stage 2: Transformer Refinement
+        x = self.transformer(x)
+
+        # Output Projection
+        logits = self.head(x)  # (B, L, 3)
+
+        return logits
+=======
+class StructureAugmentedHybridNetwork(nn.Module):
+    """
+    Distance-Aware Residual BiGRU Network.
+    Cite solution_lesson_node_00017: Pre-LayerNorm Facilitates Scaling in Deep Residual RNNs.
+    Cite solution_lesson_node_00024: Preserve Directionality in Structural Distance Encodings.
+    Cite solution_lesson_node_00023: Implicit Structural Bias via Continuous Distance Encoding Outperforms Explicit Graph Features.
+    """
+
+    def __init__(self, config=Config):
+        super().__init__()
+        self.hidden_dim = config.HIDDEN_DIM
+        self.seq_len = config.SEQ_LENGTH
+
+        # 1. Embeddings
+        self.seq_emb = nn.Embedding(config.VOCAB_SIZE, self.hidden_dim)
+        self.loop_emb = nn.Embedding(config.LOOP_VOCAB_SIZE, self.hidden_dim)
+
+        # 2. Signed Distance Encoding (Sinusoidal)
+        # Range of signed distance is roughly [-L, +L].
+        # We shift by +L to make indices positive [0, 2L].
+        # Max index needed is 2*L + small buffer.
+        self.dist_emb = SinusoidalPositionalEncoding(
+            self.hidden_dim, max_len=2 * config.SEQ_LENGTH + 20
+        )
+
+        # 3. Input Projection
+        # Concatenate: Seq(H) + Loop(H) + Dist(H) = 3H
+        self.input_proj = nn.Sequential(
+            nn.Linear(3 * self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Dropout(config.DROPOUT),
+        )
+
+        # 4. Deep Pre-LN BiGRU Stack
+        self.gru_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(config.NUM_GRU_LAYERS):
+            self.norms.append(nn.LayerNorm(self.hidden_dim))
+            self.gru_layers.append(
+                nn.GRU(
+                    self.hidden_dim,
+                    self.hidden_dim // 2,  # Bidirectional output will be hidden_dim
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
+
+        # 5. Output Head
+        self.head = nn.Linear(self.hidden_dim, 3)
+
+    def forward(self, seq, loop, pair_index):
+        """
+        Args:
+            seq (torch.Tensor): (B, L) Integer encoded sequence.
+            loop (torch.Tensor): (B, L) Integer encoded loop type.
+            pair_index (torch.Tensor): (B, L) Indices of paired bases, -1 if unpaired.
+        """
+        B, L = seq.shape
+        device = seq.device
+
+        # --- Feature Generation ---
+
+        # 1. Base Embeddings
+        x_seq = self.seq_emb(seq)  # (B, L, H)
+        x_loop = self.loop_emb(loop)  # (B, L, H)
+
+        # 2. Signed Distance Embeddings
+        # Create grid of indices [0, 1, ..., L-1]
+        indices = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+
+        # Handle unpaired bases:
+        # If paired, target = pair_index.
+        # If unpaired (pair_index == -1), target = current_index (distance 0).
+        # This creates a "0 distance" for unpaired bases, distinct from +/- distances for paired.
+        target_indices = pair_index.clone()
+        unpaired_mask = pair_index == -1
+        target_indices[unpaired_mask] = indices[unpaired_mask]
+
+        # Calculate signed distance: target - current
+        signed_dist = target_indices - indices  # Range approx [-L, L]
+
+        # Shift to positive indices for embedding lookup
+        # Add L to center 0 at L.
+        dist_indices = signed_dist + self.seq_len
+
+        x_dist = self.dist_emb(dist_indices)  # (B, L, H)
+
+        # --- Model Backbone ---
+
+        # Combine features (Implicit structure via distance)
+        x = torch.cat([x_seq, x_loop, x_dist], dim=-1)  # (B, L, 3H)
+        x = self.input_proj(x)  # (B, L, H)
+
+        # Residual Pre-LN BiGRU
+        for norm, gru in zip(self.norms, self.gru_layers):
+            x_norm = norm(x)
+            x_gru, _ = gru(x_norm)
+            x = x + x_gru  # Residual connection
+
+        # Output Projection
+        logits = self.head(x)  # (B, L, 3)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_pipeline():
+    # 1. Setup and Configuration
+    # Override epochs for a fast baseline execution as requested
+    Config.EPOCHS = 10
+    seed_everything(Config.SEED)
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Batch Size={Config.BATCH_SIZE}, Device={Config.DEVICE}"
+    )
+=======
+def run_pipeline():
+    # 1. Setup and Configuration
+    # Use Config defaults (optimized for performance)
+    seed_everything(Config.SEED)
+
+    print(
+        f"Configuration: Epochs={Config.EPOCHS}, Batch Size={Config.BATCH_SIZE}, Device={Config.DEVICE}"
+    )
+>>>>>>> REPLACE
+```

@@ -1,0 +1,242 @@
+I will optimize the solution by simplifying the architecture and enhancing regularization, addressing the overfitting observed in the previous run.
+
+**Strategy:**
+1.  **Simplify Architecture (Cite solution_lesson_node_00019):** I will remove the `WeightedLayerPooling` and `Gated Fusion` mechanisms. These complex components introduced additional learnable parameters that led to overfitting on the small dataset (~4k samples). Instead, I will revert to using the standard `[CLS]` token from the last hidden layer, which is more robust for this data scale.
+2.  **Multi-Sample Dropout (Cite solution_lesson_node_00019):** To improve generalization and stability, I will implement Multi-Sample Dropout (MSD) in the classification head. This technique creates multiple dropout masks for the final layer and averages the predictions, acting as an efficient internal ensemble.
+3.  **Feature Fusion (Cite solution_lesson_node_00016):** I will maintain the fusion of dense structural features (SVD of TF-IDF n-grams) with the Transformer embeddings. I will ensure these auxiliary features are normalized via `LayerNorm` before simple concatenation, as this proved effective in previous iterations.
+4.  **Hyperparameters:** I will retain the differential learning rates (Cite solution_lesson_node_00015) and AWP (Cite solution_lesson_node_00016) but adjust the configuration to support MSD.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Weighted Layer Pooling Settings
+    # We use the last N layers for pooling
+    pool_layers = 4
+
+    # =========================================================================
+=======
+    # Multi-Sample Dropout Settings
+    msd_num = 5
+    msd_dropout = 0.5
+
+    # =========================================================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class WeightedLayerPooling(nn.Module):
+    """
+    Computes a weighted average of the [CLS] tokens from the last N hidden layers.
+    The weights are learnable parameters normalized via Softmax.
+    """
+
+    def __init__(self, num_pool_layers: int = 4, hidden_size: int = 768):
+        super().__init__()
+        self.num_pool_layers = num_pool_layers
+        self.hidden_size = hidden_size
+        # Initialize weights to 0, resulting in equal weighting after Softmax initially
+        self.weights = nn.Parameter(torch.zeros(num_pool_layers))
+
+    def forward(self, all_hidden_states):
+        # all_hidden_states is a tuple of tensors (embeddings + layer outputs)
+        # We take the last 'num_pool_layers'
+        selected_layers = all_hidden_states[-self.num_pool_layers :]
+
+        # Stack CLS tokens: (batch_size, num_pool_layers, hidden_size)
+        # Assuming [CLS] is at index 0
+        cls_outputs = torch.stack([layer[:, 0, :] for layer in selected_layers], dim=1)
+
+        # Compute normalized weights: (num_pool_layers)
+        norm_weights = torch.softmax(self.weights, dim=0)
+
+        # Weighted sum: (batch_size, hidden_size)
+        # Broadcasting: (batch, layers, hidden) * (1, layers, 1) -> sum over layers
+        weighted_output = torch.sum(cls_outputs * norm_weights.view(1, -1, 1), dim=1)
+
+        return weighted_output
+
+
+class InsultDetector(nn.Module):
+    """
+    Hybrid DeBERTa-v3 model with Weighted Layer Pooling and Gated Structural Injection.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Backbone Configuration
+        self.config = AutoConfig.from_pretrained(Config.model_name)
+        self.config.update(
+            {
+                "output_hidden_states": True,
+                "hidden_dropout_prob": Config.dropout,
+                "attention_probs_dropout_prob": Config.dropout,
+                "num_labels": Config.num_classes,
+            }
+        )
+
+        # 2. Semantic Backbone
+        self.backbone = AutoModel.from_pretrained(Config.model_name, config=self.config)
+
+        # 3. Weighted Layer Pooling
+        self.pooling = WeightedLayerPooling(
+            num_pool_layers=Config.pool_layers, hidden_size=Config.hidden_size
+        )
+
+        # 4. Structural Branch (SVD Projection)
+        # Projects SVD dim (256) -> Hidden dim (768)
+        self.svd_projection = nn.Sequential(
+            nn.Linear(Config.svd_components, Config.hidden_size),
+            nn.LayerNorm(Config.hidden_size),
+            nn.Dropout(Config.dropout),
+        )
+
+        # 5. Gated Fusion Mechanism
+        # Gate takes concatenated [Trans; SVD] -> produces Gate vector
+        self.gate_dense = nn.Linear(Config.hidden_size * 2, Config.hidden_size)
+
+        # 6. Classifier
+        self.classifier = nn.Linear(Config.hidden_size, Config.num_classes)
+
+        # Initialize weights for custom layers
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        """Initialize weights for the new layers (Projection, Gate, Classifier)."""
+        for module in [self.gate_dense, self.classifier]:
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+        for module in self.svd_projection:
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask, svd_features):
+        """
+        Forward pass of the hybrid model.
+
+        Args:
+            input_ids: Tensor (batch, seq_len)
+            attention_mask: Tensor (batch, seq_len)
+            svd_features: Tensor (batch, svd_components)
+
+        Returns:
+            logits: Tensor (batch, 1)
+        """
+        # 1. Get Backbone Outputs
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+        # 2. Weighted Pooling of Hidden States
+        # outputs.hidden_states is a tuple of (batch, seq_len, hidden)
+        trans_emb = self.pooling(outputs.hidden_states)
+
+        # 3. Process Structural Features
+        svd_emb = self.svd_projection(svd_features)
+
+        # 4. Gated Fusion
+        # Calculate Gate: g = sigmoid(W * [V_trans; V_svd] + b)
+        combined = torch.cat([trans_emb, svd_emb], dim=1)
+        gate = torch.sigmoid(self.gate_dense(combined))
+
+        # Apply Fusion: V_final = V_trans + (g * V_svd)
+        fused_emb = trans_emb + (gate * svd_emb)
+
+        # 5. Classification
+        logits = self.classifier(fused_emb)
+
+        return logits
+=======
+class InsultDetector(nn.Module):
+    """
+    Hybrid DeBERTa-v3 model with Multi-Sample Dropout and Structural Feature Injection.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Backbone Configuration
+        self.config = AutoConfig.from_pretrained(Config.model_name)
+        self.config.update(
+            {
+                "output_hidden_states": False,
+                "hidden_dropout_prob": Config.dropout,
+                "attention_probs_dropout_prob": Config.dropout,
+                "num_labels": Config.num_classes,
+            }
+        )
+
+        # 2. Semantic Backbone
+        self.backbone = AutoModel.from_pretrained(Config.model_name, config=self.config)
+
+        # 3. Structural Branch (SVD Projection)
+        # Projects SVD dim (256) -> Hidden dim (768)
+        self.svd_projection = nn.Sequential(
+            nn.Linear(Config.svd_components, Config.hidden_size),
+            nn.LayerNorm(Config.hidden_size),
+            nn.Dropout(Config.dropout),
+        )
+
+        # 4. Multi-Sample Dropout
+        self.dropouts = nn.ModuleList(
+            [nn.Dropout(Config.msd_dropout) for _ in range(Config.msd_num)]
+        )
+
+        # 5. Classifier
+        # Input dim is hidden_size * 2 because we concatenate [CLS] and SVD
+        self.classifier = nn.Linear(Config.hidden_size * 2, Config.num_classes)
+
+        # Initialize weights for custom layers
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        """Initialize weights for the new layers."""
+        self.classifier.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        if self.classifier.bias is not None:
+            self.classifier.bias.data.zero_()
+
+        for module in self.svd_projection:
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask, svd_features):
+        """
+        Forward pass of the hybrid model.
+
+        Args:
+            input_ids: Tensor (batch, seq_len)
+            attention_mask: Tensor (batch, seq_len)
+            svd_features: Tensor (batch, svd_components)
+
+        Returns:
+            logits: Tensor (batch, 1)
+        """
+        # 1. Get Backbone Outputs
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Use [CLS] token representation from the last hidden state
+        cls_token = outputs.last_hidden_state[:, 0, :]
+
+        # 2. Process Structural Features
+        svd_emb = self.svd_projection(svd_features)
+
+        # 3. Concatenation
+        features = torch.cat([cls_token, svd_emb], dim=1)
+
+        # 4. Multi-Sample Dropout & Classification
+        logits_list = []
+        for dropout in self.dropouts:
+            logits_list.append(self.classifier(dropout(features)))
+        
+        # Average logits
+        logits = torch.mean(torch.stack(logits_list, dim=0), dim=0)
+
+        return logits
+>>>>>>> REPLACE
+```

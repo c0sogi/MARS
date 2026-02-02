@@ -1,0 +1,368 @@
+The issue is that the GPU memory from the first training stage (Tagger) is not being fully released before the second stage (Seq2Seq) begins, causing a `torch.OutOfMemoryError`. Despite explicit calls to garbage collection, internal references (likely from `DataLoader` or pinned memory) keep the tensors alive. To fix this, I will isolate each training stage in a separate Operating System process. This ensures that when the Tagger training process terminates, the OS forcibly reclaims all its resources, providing a clean slate for the Seq2Seq process (Cite debug_lesson_5). I will move the training logic into a new importable module `library/training_tasks.py` to satisfy `multiprocessing` requirements (Cite debug_lesson_6) and wrap the subprocess code in `try...except` blocks with `sys.stderr.flush()` to ensure any errors are properly reported (Cite debug_lesson_7, debug_lesson_8).
+
+```diff
+library/training_tasks.py
+<<<<<<< SEARCH
+=======
+import torch
+import sys
+import traceback
+import pandas as pd
+from torch.utils.data import DataLoader
+from library.config import TrainingConfig, DataConfig, ProjectConfig, set_seed
+from library.data_utils import (
+    build_vocabularies,
+    load_dataset_raw,
+    TaggerDataset,
+    Seq2SeqDataset,
+    collate_fn_tagger,
+    collate_fn_seq2seq,
+)
+from library.models import MultiGranularityTagger, Seq2SeqNormalizer
+from library.engine import Trainer
+
+def run_tagger_task(config_overrides):
+    """
+    Isolated process for training the Tagger model.
+    """
+    try:
+        # Apply configuration overrides
+        for k, v in config_overrides.items():
+            setattr(TrainingConfig, k, v)
+        
+        set_seed(TrainingConfig.SEED)
+        device = torch.device(TrainingConfig.DEVICE)
+        print(f"\n[Process] Starting Tagger Training on {device}")
+
+        # Load Resources
+        vocab_words, vocab_chars, vocab_classes = build_vocabularies(load_cached_data=True)
+        
+        # Load and Subsample Data (Replicating logic from runfile.py)
+        df_train_full = load_dataset_raw("train")
+        df_val_full = load_dataset_raw("val")
+        
+        TAGGER_TRAIN_SIZE = 200000
+        VAL_SUBSET_SIZE = 10000
+        
+        df_train_tagger = df_train_full.sample(
+            n=min(TAGGER_TRAIN_SIZE, len(df_train_full)), random_state=TrainingConfig.SEED
+        )
+        df_val_subset = df_val_full.sample(
+            n=min(VAL_SUBSET_SIZE, len(df_val_full)), random_state=TrainingConfig.SEED
+        )
+        
+        # Create Datasets & Loaders
+        train_ds = TaggerDataset(df_train_tagger, vocab_words, vocab_chars, vocab_classes)
+        val_ds = TaggerDataset(df_val_subset, vocab_words, vocab_chars, vocab_classes)
+        
+        train_loader = DataLoader(
+            train_ds, batch_size=TrainingConfig.TAGGER_BATCH_SIZE, shuffle=True,
+            collate_fn=collate_fn_tagger, num_workers=DataConfig.NUM_WORKERS
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=TrainingConfig.TAGGER_BATCH_SIZE, shuffle=False,
+            collate_fn=collate_fn_tagger, num_workers=DataConfig.NUM_WORKERS
+        )
+        
+        # Initialize and Train
+        model = MultiGranularityTagger(len(vocab_words), len(vocab_chars), len(vocab_classes))
+        trainer = Trainer(device=device)
+        trainer.train_tagger(model, train_loader, val_loader, epochs=TrainingConfig.TAGGER_EPOCHS)
+        
+        print("[Process] Tagger Training Completed.")
+
+    except Exception:
+        # Cite debug_lesson_7 and debug_lesson_8: Catch and Flush
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(1)
+
+def run_seq2seq_task(config_overrides):
+    """
+    Isolated process for training the Seq2Seq model.
+    """
+    try:
+        # Apply configuration overrides
+        for k, v in config_overrides.items():
+            setattr(TrainingConfig, k, v)
+            
+        set_seed(TrainingConfig.SEED)
+        device = torch.device(TrainingConfig.DEVICE)
+        print(f"\n[Process] Starting Seq2Seq Training on {device}")
+
+        # Load Resources
+        _, vocab_chars, vocab_classes = build_vocabularies(load_cached_data=True)
+        
+        # Load and Subsample Data
+        df_train_full = load_dataset_raw("train")
+        df_val_full = load_dataset_raw("val")
+        
+        SEQ_TRAIN_SIZE = 100000
+        VAL_SUBSET_SIZE = 10000
+        
+        df_changed = df_train_full[df_train_full["before"] != df_train_full["after"]]
+        df_train_seq = df_changed.sample(
+            n=min(SEQ_TRAIN_SIZE, len(df_changed)), random_state=TrainingConfig.SEED
+        )
+        df_val_subset = df_val_full.sample(
+            n=min(VAL_SUBSET_SIZE, len(df_val_full)), random_state=TrainingConfig.SEED
+        )
+        
+        # Create Datasets & Loaders
+        train_ds = Seq2SeqDataset(df_train_seq, vocab_chars, vocab_classes)
+        val_ds = Seq2SeqDataset(df_val_subset, vocab_chars, vocab_classes)
+        
+        train_loader = DataLoader(
+            train_ds, batch_size=TrainingConfig.SEQ_BATCH_SIZE, shuffle=True,
+            collate_fn=collate_fn_seq2seq, num_workers=DataConfig.NUM_WORKERS
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=TrainingConfig.SEQ_BATCH_SIZE, shuffle=False,
+            collate_fn=collate_fn_seq2seq, num_workers=DataConfig.NUM_WORKERS
+        )
+        
+        # Initialize and Train
+        model = Seq2SeqNormalizer(len(vocab_chars), len(vocab_classes))
+        trainer = Trainer(device=device)
+        trainer.train_seq2seq(model, train_loader, val_loader, epochs=TrainingConfig.SEQ_EPOCHS)
+        
+        print("[Process] Seq2Seq Training Completed.")
+
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(1)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import os
+import sys
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+# Import from provided libraries
+from library.config import ProjectConfig, TrainingConfig, DataConfig, set_seed
+from library.data_utils import (
+    build_vocabularies,
+    build_knowledge_base,
+    load_dataset_raw,
+    TaggerDataset,
+    Seq2SeqDataset,
+    collate_fn_tagger,
+    collate_fn_seq2seq,
+)
+from library.models import MultiGranularityTagger, Seq2SeqNormalizer
+from library.engine import Trainer
+from library.inference import CascadePredictor, generate_submission_file
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Setup and Configuration Overrides for Fast Baseline
+    # ---------------------------------------------------------
+    print("Initializing Fast Baseline Run...")
+    set_seed(TrainingConfig.SEED)
+
+    # Override Config for speed
+    # We use 1 epoch and limited data to ensure completion within 2 hours
+    TrainingConfig.TAGGER_EPOCHS = 1
+    TrainingConfig.SEQ_EPOCHS = 1
+
+    # Subsampling sizes
+    TAGGER_TRAIN_SIZE = 200000
+    SEQ_TRAIN_SIZE = 100000
+    VAL_SUBSET_SIZE = 10000  # For training loop validation only
+
+    device = torch.device(TrainingConfig.DEVICE)
+    print(f"Using device: {device}")
+
+    # ---------------------------------------------------------
+    # 2. Resource Building (Vocabs & KB)
+    # ---------------------------------------------------------
+    print("\n--- Building Resources ---")
+    # Build vocabs on full data (fast enough and necessary for dimensions)
+    vocab_words, vocab_chars, vocab_classes = build_vocabularies(load_cached_data=True)
+
+    # Build Knowledge Base on full data (critical for high accuracy)
+    # This might take ~1-2 mins but is worth it as it handles >90% of cases
+    kb_dict = build_knowledge_base(load_cached_data=True)
+
+    # ---------------------------------------------------------
+    # 3. Data Loading & Subsampling
+    # ---------------------------------------------------------
+    print("\n--- Loading and Subsampling Data ---")
+    df_train_full = load_dataset_raw("train")
+    df_val_full = load_dataset_raw("val")
+
+    # Subsample for Tagger (General distribution)
+    df_train_tagger = df_train_full.sample(
+        n=min(TAGGER_TRAIN_SIZE, len(df_train_full)), random_state=TrainingConfig.SEED
+    )
+
+    # Subsample for Seq2Seq (Focus on changed tokens)
+    # Filter first, then sample
+    df_changed = df_train_full[df_train_full["before"] != df_train_full["after"]]
+    df_train_seq = df_changed.sample(
+        n=min(SEQ_TRAIN_SIZE, len(df_changed)), random_state=TrainingConfig.SEED
+    )
+
+    # Subset val for training loop speed
+    df_val_subset = df_val_full.sample(
+        n=min(VAL_SUBSET_SIZE, len(df_val_full)), random_state=TrainingConfig.SEED
+    )
+
+    print(f"Tagger Train Size: {len(df_train_tagger)}")
+    print(f"Seq2Seq Train Size: {len(df_train_seq)}")
+    print(f"Validation Full Size: {len(df_val_full)}")
+
+    # Create Datasets
+    train_tagger_ds = TaggerDataset(
+        df_train_tagger, vocab_words, vocab_chars, vocab_classes
+    )
+    val_tagger_ds = TaggerDataset(
+        df_val_subset, vocab_words, vocab_chars, vocab_classes
+    )
+
+    train_seq_ds = Seq2SeqDataset(df_train_seq, vocab_chars, vocab_classes)
+    val_seq_ds = Seq2SeqDataset(
+        df_val_subset, vocab_chars, vocab_classes
+    )  # Seq2SeqDataset internally filters for changes
+
+    # Create Loaders
+    train_tagger_loader = DataLoader(
+        train_tagger_ds,
+        batch_size=TrainingConfig.TAGGER_BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn_tagger,
+        num_workers=DataConfig.NUM_WORKERS,
+    )
+    val_tagger_loader = DataLoader(
+        val_tagger_ds,
+        batch_size=TrainingConfig.TAGGER_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn_tagger,
+        num_workers=DataConfig.NUM_WORKERS,
+    )
+
+    train_seq_loader = DataLoader(
+        train_seq_ds,
+        batch_size=TrainingConfig.SEQ_BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn_seq2seq,
+        num_workers=DataConfig.NUM_WORKERS,
+    )
+    val_seq_loader = DataLoader(
+        val_seq_ds,
+        batch_size=TrainingConfig.SEQ_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn_seq2seq,
+        num_workers=DataConfig.NUM_WORKERS,
+    )
+
+    # ---------------------------------------------------------
+    # 4. Model Training
+    # ---------------------------------------------------------
+    trainer = Trainer(device=device)
+
+    # --- Train Tagger ---
+    print("\n--- Training Tagger ---")
+    tagger_model = MultiGranularityTagger(
+        len(vocab_words), len(vocab_chars), len(vocab_classes)
+    )
+    trainer.train_tagger(
+        tagger_model,
+        train_tagger_loader,
+        val_tagger_loader,
+        epochs=TrainingConfig.TAGGER_EPOCHS,
+    )
+
+    # Free memory
+    del tagger_model, train_tagger_loader, val_tagger_loader, df_train_tagger
+    torch.cuda.empty_cache()
+
+    # --- Train Seq2Seq ---
+    print("\n--- Training Seq2Seq ---")
+    seq_model = Seq2SeqNormalizer(len(vocab_chars), len(vocab_classes))
+    trainer.train_seq2seq(
+        seq_model, train_seq_loader, val_seq_loader, epochs=TrainingConfig.SEQ_EPOCHS
+    )
+
+    # Free memory
+    del seq_model, train_seq_loader, val_seq_loader, df_train_seq
+    torch.cuda.empty_cache()
+=======
+import os
+import sys
+import pandas as pd
+import numpy as np
+import torch
+import multiprocessing
+from torch.utils.data import DataLoader
+
+# Import from provided libraries
+from library.config import ProjectConfig, TrainingConfig, DataConfig, set_seed
+from library.data_utils import (
+    build_vocabularies,
+    build_knowledge_base,
+    load_dataset_raw,
+    TaggerDataset,
+    collate_fn_tagger,
+)
+from library.inference import CascadePredictor, generate_submission_file
+# Import the isolated tasks
+from library.training_tasks import run_tagger_task, run_seq2seq_task
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Setup and Configuration
+    # ---------------------------------------------------------
+    print("Initializing Fast Baseline Run with Process Isolation...")
+    set_seed(TrainingConfig.SEED)
+    device = torch.device(TrainingConfig.DEVICE)
+
+    # Define overrides to pass to subprocesses
+    config_overrides = {
+        "TAGGER_EPOCHS": 1,
+        "SEQ_EPOCHS": 1
+    }
+
+    # ---------------------------------------------------------
+    # 2. Resource Building
+    # ---------------------------------------------------------
+    print("\n--- Building Resources (Main Process) ---")
+    # Build once here to avoid race conditions
+    vocab_words, vocab_chars, vocab_classes = build_vocabularies(load_cached_data=True)
+    build_knowledge_base(load_cached_data=True)
+
+    # ---------------------------------------------------------
+    # 3. Isolated Model Training
+    # ---------------------------------------------------------
+    # Use 'spawn' context for CUDA compatibility
+    ctx = multiprocessing.get_context('spawn')
+
+    # --- Train Tagger ---
+    print("\n--- Launching Tagger Training Process ---")
+    p_tagger = ctx.Process(target=run_tagger_task, args=(config_overrides,))
+    p_tagger.start()
+    p_tagger.join()
+
+    if p_tagger.exitcode != 0:
+        raise RuntimeError("Tagger training process failed! Check logs above.")
+
+    # --- Train Seq2Seq ---
+    print("\n--- Launching Seq2Seq Training Process ---")
+    # Previous process has exited, OS has reclaimed GPU memory.
+    p_seq = ctx.Process(target=run_seq2seq_task, args=(config_overrides,))
+    p_seq.start()
+    p_seq.join()
+
+    if p_seq.exitcode != 0:
+        raise RuntimeError("Seq2Seq training process failed! Check logs above.")
+>>>>>>> REPLACE
+```

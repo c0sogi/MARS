@@ -1,0 +1,366 @@
+My strategy focuses on stabilizing the training process and fixing the data truncation issue identified in the failure analysis.
+
+1.  **Architecture Simplification (Cite Lesson 00009, 00025)**: The 9-channel "Weight-Inflated" approach caused exploding gradients. I will revert to a standard 3-channel input (FLAIR, T1wCE, T2w) using an ImageNet-pretrained EfficientNet-B0. I will remove the custom `conv_stem` modification and the Gaussian weight initialization, which likely destabilized the optimization.
+2.  **Deterministic Centroid Selection (Cite Lesson 00002, 00015)**: Instead of a 9-slice slab, I will select a single informative slice per modality based on the tissue centroid. This preserves the "Independent Heuristic" approach (Cite Lesson 00036) while reducing dimensionality.
+3.  **Cache Integrity (Cite Lesson 00071)**: I will add a validation step in the centroid caching mechanism to ensure the loaded cache matches the current dataset size, preventing silent data truncation.
+4.  **Normalization (Cite Lesson 00023)**: I will ensure each modality is normalized independently (Min-Max) before stacking, as global normalization can suppress contrast in lower-intensity modalities.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Data Parameters
+    IMAGE_SIZE = 224
+    NUM_CHANNELS = 9  # 3 modalities (FLAIR, T1wCE, T2w) * 3 depths
+    STRIDE = 5  # Delta for volumetric packing
+    MODALITIES = [
+=======
+    # Data Parameters
+    IMAGE_SIZE = 224
+    NUM_CHANNELS = 3  # 3 modalities (FLAIR, T1wCE, T2w)
+    STRIDE = 0  # Not used for single slice
+    MODALITIES = [
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+    # 1. Try Loading from Cache
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            # If load fails, proceed to recompute
+            pass
+=======
+    # 1. Try Loading from Cache
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cached_df = pd.read_parquet(cache_path)
+            # Cite solution_lesson_node_00071: Verify Cache Integrity
+            if len(cached_df) == len(df):
+                print(f"Loaded cached centroids from {cache_path} (Size: {len(cached_df)})")
+                return cached_df
+            else:
+                print(f"Cache mismatch (Cache: {len(cached_df)}, Current: {len(df)}). Recomputing...")
+        except Exception:
+            # If load fails, proceed to recompute
+            pass
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.data_processing import load_volumetric_slab
+
+
+class BraTSDataset(Dataset):
+    """
+    Dataset class for Volumetric Glioblastoma Classification.
+    Constructs a 9-channel input tensor based on Centroid-Aligned Weight-Inflated Volumetric strategy.
+    """
+
+    def __init__(
+        self, df, centroids_df, input_dir=Config.INPUT_DIR, transform=None, mode="train"
+    ):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe containing BraTS21ID and paths.
+            centroids_df (pd.DataFrame): Dataframe containing computed centroids for each subject.
+            input_dir (str): Path to the input directory.
+            transform (albumentations.Compose): Augmentation pipeline.
+            mode (str): 'train', 'val', or 'test'.
+        """
+        self.df = df.reset_index(drop=True)
+        # Index centroids by BraTS21ID for O(1) lookup
+        if "BraTS21ID" in centroids_df.columns:
+            self.centroids_df = centroids_df.set_index("BraTS21ID")
+        else:
+            self.centroids_df = centroids_df
+
+        self.input_dir = input_dir
+        self.transform = transform
+        self.mode = mode
+        self.modalities = ["flair", "t1wce", "t2w"]
+        self.stride = Config.STRIDE
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        sid = row["BraTS21ID"]
+
+        # Retrieve centroids for this subject
+        # Handle case where subject might be missing from centroids cache (fallback to 0/middle handled later)
+        if sid in self.centroids_df.index:
+            subject_centroids = self.centroids_df.loc[sid]
+        else:
+            # Fallback dictionary if ID not found
+            subject_centroids = {f"{m}_centroid": 0 for m in self.modalities}
+
+        # Load slabs for each modality
+        # load_volumetric_slab returns (H, W, 3) corresponding to [z-delta, z, z+delta]
+        slabs = {}
+        for mod in self.modalities:
+            rel_path = row[f"{mod}_path"]
+            full_path = os.path.join(self.input_dir, rel_path)
+
+            # Glob files for this modality
+            # Note: load_volumetric_slab handles sorting, we just need to provide paths
+            if os.path.exists(full_path):
+                file_paths = glob.glob(os.path.join(full_path, "*.dcm"))
+            else:
+                file_paths = []
+
+            # Get centroid index
+            centroid_idx = int(subject_centroids.get(f"{mod}_centroid", 0))
+            if not file_paths and f"{mod}_centroid" not in subject_centroids:
+                # If no files and no centroid info, logic inside load_volumetric_slab handles empty list
+                pass
+            elif file_paths and f"{mod}_centroid" not in subject_centroids:
+                # Fallback if specific centroid missing but files exist
+                centroid_idx = len(file_paths) // 2
+
+            # Load the 3-slice slab
+            # Returns (H, W, 3) -> [z-stride, z, z+stride]
+            slabs[mod] = load_volumetric_slab(
+                file_paths,
+                centroid_idx,
+                delta=self.stride,
+                image_size=Config.IMAGE_SIZE,
+            )
+
+        # Construct 9-channel tensor
+        # Requirement:
+        # Ch 0-2: [FLAIR, T1wCE, T2w] at z-delta
+        # Ch 3-5: [FLAIR, T1wCE, T2w] at z
+        # Ch 6-8: [FLAIR, T1wCE, T2w] at z+delta
+
+        channels = []
+
+        # Iterate through depths: 0 (z-d), 1 (z), 2 (z+d)
+        for depth_idx in range(3):
+            for mod in self.modalities:
+                # Extract the specific depth slice from the modality slab
+                # slabs[mod] is (H, W, 3)
+                channels.append(slabs[mod][:, :, depth_idx])
+
+        # Stack to create (H, W, 9)
+        img_stack = np.stack(channels, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            augmented = self.transform(image=img_stack)
+            img_tensor = augmented["image"]  # (9, H, W) via ToTensorV2
+        else:
+            # Manual conversion if no transform provided
+            img_tensor = torch.tensor(img_stack.transpose(2, 0, 1), dtype=torch.float32)
+
+        # Return based on mode
+        if self.mode == "test":
+            return img_tensor, sid
+        else:
+            target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return img_tensor, target
+=======
+from library.config import Config
+from library.data_processing import read_dicom
+
+
+class BraTSDataset(Dataset):
+    """
+    Dataset class for Volumetric Glioblastoma Classification.
+    Constructs a 3-channel input tensor using Centroid-Aligned Slice Selection.
+    Cite solution_lesson_node_00009: Avoid naive channel stacking of depth.
+    Cite solution_lesson_node_00015: Deterministic geometric heuristics.
+    """
+
+    def __init__(
+        self, df, centroids_df, input_dir=Config.INPUT_DIR, transform=None, mode="train"
+    ):
+        self.df = df.reset_index(drop=True)
+        if "BraTS21ID" in centroids_df.columns:
+            self.centroids_df = centroids_df.set_index("BraTS21ID")
+        else:
+            self.centroids_df = centroids_df
+
+        self.input_dir = input_dir
+        self.transform = transform
+        self.mode = mode
+        self.modalities = ["flair", "t1wce", "t2w"]
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        sid = row["BraTS21ID"]
+
+        if sid in self.centroids_df.index:
+            subject_centroids = self.centroids_df.loc[sid]
+        else:
+            subject_centroids = {f"{m}_centroid": 0 for m in self.modalities}
+
+        channels = []
+        for mod in self.modalities:
+            rel_path = row[f"{mod}_path"]
+            full_path = os.path.join(self.input_dir, rel_path)
+            
+            if os.path.exists(full_path):
+                # We need sorted files to index correctly
+                files = sorted(
+                    glob.glob(os.path.join(full_path, "*.dcm")),
+                    key=lambda x: int(x.split("-")[-1].split(".")[0]),
+                )
+            else:
+                files = []
+
+            if not files:
+                img = np.zeros((Config.IMAGE_SIZE, Config.IMAGE_SIZE), dtype=np.float32)
+            else:
+                # Select centroid slice
+                centroid_idx = int(subject_centroids.get(f"{mod}_centroid", len(files) // 2))
+                centroid_idx = max(0, min(centroid_idx, len(files) - 1))
+                
+                img = read_dicom(files[centroid_idx], Config.IMAGE_SIZE)
+
+                # Cite solution_lesson_node_00023: Channel-Independent Normalization
+                img_min = img.min()
+                img_max = img.max()
+                if img_max > img_min:
+                    img = (img - img_min) / (img_max - img_min)
+                else:
+                    img = np.zeros_like(img)
+
+            channels.append(img)
+
+        # Stack to create (H, W, 3)
+        img_stack = np.stack(channels, axis=-1)
+
+        if self.transform:
+            augmented = self.transform(image=img_stack)
+            img_tensor = augmented["image"]
+        else:
+            img_tensor = torch.tensor(img_stack.transpose(2, 0, 1), dtype=torch.float32)
+
+        if self.mode == "test":
+            return img_tensor, sid
+        else:
+            target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return img_tensor, target
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CAWIVModel(nn.Module):
+    """
+    Centroid-Aligned Weight-Inflated Volumetric (CA-WIV) Network.
+
+    This model adapts an EfficientNet-B0 backbone to accept 9-channel volumetric inputs
+    (3 modalities x 3 depths) by inflating the weights of the first convolutional layer
+    using a Gaussian-like distribution. This preserves ImageNet priors while integrating
+    3D spatial context.
+    """
+
+    def __init__(self, model_name=Config.BACKBONE, pretrained=True):
+        """
+        Args:
+            model_name (str): Name of the timm backbone (default: efficientnet_b0).
+            pretrained (bool): Whether to load ImageNet pretrained weights.
+        """
+        super().__init__()
+
+        # Load backbone with 1 output class for binary classification
+        self.backbone = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=1
+        )
+
+        # Apply Gaussian Weight Inflation to the first layer
+        self._inflate_weights()
+
+        # Add Dropout to the classifier for regularization
+        self._modify_classifier()
+
+    def _inflate_weights(self):
+        """
+        Modifies the first convolutional layer (conv_stem) to accept 9 channels.
+        Initializes weights using a Center-Biased (Gaussian) Prior:
+        - Channels 0-2 (z-delta): 25% of original weights
+        - Channels 3-5 (z-center): 50% of original weights
+        - Channels 6-8 (z+delta): 25% of original weights
+        """
+        # EfficientNet stem is usually named 'conv_stem'
+        if not hasattr(self.backbone, "conv_stem"):
+            raise AttributeError(
+                f"Backbone {Config.BACKBONE} does not have 'conv_stem'."
+            )
+
+        old_layer = self.backbone.conv_stem
+
+        # Parameters for the new layer
+        in_channels = 9  # 3 modalities * 3 depths
+        out_channels = old_layer.out_channels
+        kernel_size = old_layer.kernel_size
+        stride = old_layer.stride
+        padding = old_layer.padding
+        bias = old_layer.bias is not None
+
+        # Create new layer
+        new_layer = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride, padding, bias=bias
+        )
+
+        # Initialize weights with Gaussian Inflation strategy
+        with torch.no_grad():
+            original_weights = old_layer.weight  # Shape: (Out, 3, K, K)
+            new_weights = torch.zeros_like(new_layer.weight)  # Shape: (Out, 9, K, K)
+
+            # Distribute energy to preserve activation magnitude statistics
+            # Channels 0-2: Peripheral (z-delta) -> 0.25
+            new_weights[:, 0:3, :, :] = original_weights * 0.25
+
+            # Channels 3-5: Center (z) -> 0.50
+            new_weights[:, 3:6, :, :] = original_weights * 0.50
+
+            # Channels 6-8: Peripheral (z+delta) -> 0.25
+            new_weights[:, 6:9, :, :] = original_weights * 0.25
+
+            new_layer.weight.copy_(new_weights)
+
+            # Copy bias if it exists
+            if bias:
+                new_layer.bias.copy_(old_layer.bias)
+
+        # Replace the layer in the backbone
+        self.backbone.conv_stem = new_layer
+
+    def _modify_classifier(self):
+=======
+class CAWIVModel(nn.Module):
+    """
+    Centroid-Aligned Volumetric Network.
+    Simplified to use standard 3-channel input to avoid optimization instability.
+    Cite solution_lesson_node_00009: Naive Channel-Stacking Destabilizes 2D CNNs.
+    Cite solution_lesson_node_00025: Avoid learnable input projections/modifications.
+    """
+
+    def __init__(self, model_name=Config.BACKBONE, pretrained=True):
+        super().__init__()
+
+        # Load backbone with 1 output class for binary classification
+        # Standard EfficientNet expects 3 channels, which matches our new input.
+        self.backbone = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=1
+        )
+
+        # Add Dropout to the classifier for regularization
+        self._modify_classifier()
+
+    def _modify_classifier(self):
+>>>>>>> REPLACE
+```

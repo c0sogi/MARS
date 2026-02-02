@@ -1,0 +1,341 @@
+The `CUDA out of memory` error occurs because the `Attention` mechanism performs a computationally expensive linear projection on the concatenated encoder outputs and decoder hidden state *inside* the decoding loop. Since the loop runs for 450 steps (`MAX_LENGTH`), PyTorch creates and stores the computation graph for this large matrix multiplication 450 times, causing memory usage to scale linearly with sequence length.
+
+To fix this, I will apply **debug_lesson_3** ("Precompute Static Tensor Operations Outside Training Loops") by refactoring the `Attention` module. I will split the single linear layer into two separate layers: one for the static `encoder_outputs` and one for the dynamic `hidden` state. This allows us to precompute the projection of `encoder_outputs` once before the decoding loop starts. Inside the loop, we simply add this precomputed tensor to the projected hidden state, significantly reducing memory consumption and computational redundancy.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class Attention(nn.Module):
+    """
+    Bahdanau (Additive) Attention.
+    """
+
+    def __init__(self, enc_hid_dim, dec_hid_dim, attn_dim):
+        super().__init__()
+        # Linear layer to transform concatenated hidden states
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, attn_dim)
+        # Linear layer to score the energy
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        # hidden: (B, dec_hid_dim) - Decoder hidden state from previous step
+        # encoder_outputs: (B, seq_len, enc_hid_dim * 2) - All encoder outputs
+
+        src_len = encoder_outputs.shape[1]
+
+        # Repeat decoder hidden state src_len times to align with encoder outputs
+        # (B, seq_len, dec_hid_dim)
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+
+        # Calculate Energy
+        # tanh(W * [hidden; encoder_outputs] + b)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        # (B, seq_len, attn_dim)
+
+        # Calculate Attention Scores
+        attention = self.v(energy).squeeze(2)
+        # (B, seq_len)
+
+        return F.softmax(attention, dim=1)
+
+
+class Decoder(nn.Module):
+    """
+    LSTM Decoder with Attention.
+    """
+
+    def __init__(
+        self, vocab_size, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.attention = attention
+
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+
+        # Input to LSTM is concatenation of Embedding and Context Vector (Weighted Encoder Outputs)
+        self.rnn = nn.LSTMCell((enc_hid_dim * 2) + emb_dim, dec_hid_dim)
+
+        # Output layer
+        self.fc_out = nn.Linear((enc_hid_dim * 2) + dec_hid_dim + emb_dim, vocab_size)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input_token, hidden, cell, encoder_outputs):
+        # input_token: (B,) - Index of previous character
+        # hidden, cell: (B, dec_hid_dim) - Previous states
+        # encoder_outputs: (B, seq_len, enc_hid_dim * 2)
+
+        input_token = input_token.unsqueeze(1)  # (B, 1)
+
+        # Embedding
+        embedded = self.dropout(self.embedding(input_token)).squeeze(1)  # (B, emb_dim)
+
+        # Calculate Attention Weights
+        a = self.attention(hidden, encoder_outputs)  # (B, seq_len)
+        a = a.unsqueeze(1)  # (B, 1, seq_len)
+
+        # Apply Attention (Context Vector)
+        # Weighted sum of encoder outputs
+        weighted = torch.bmm(a, encoder_outputs).squeeze(1)  # (B, enc_hid_dim * 2)
+
+        # LSTM Step
+        rnn_input = torch.cat((embedded, weighted), dim=1)
+        hidden, cell = self.rnn(rnn_input, (hidden, cell))
+
+        # Prediction
+        # Concatenate embedded input, context vector, and new hidden state
+        prediction = self.fc_out(torch.cat((embedded, weighted, hidden), dim=1))
+
+        return prediction, hidden, cell, a.squeeze(1)
+
+
+class Seq2Seq(nn.Module):
+    """
+    Wrapper class for Encoder-Decoder architecture.
+    Handles forward pass (Training/Teacher Forcing) and Inference (Greedy Decoding).
+    """
+
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.encoder = Encoder()
+        self.attention = Attention(
+            Config.ENCODER_HIDDEN_DIM, Config.DECODER_HIDDEN_DIM, Config.ATTENTION_DIM
+        )
+        self.decoder = Decoder(
+            vocab_size,
+            Config.EMBEDDING_DIM,
+            Config.ENCODER_HIDDEN_DIM,
+            Config.DECODER_HIDDEN_DIM,
+            Config.DROPOUT,
+            self.attention,
+        )
+        self.vocab_size = vocab_size
+
+        # SOS Token Index (Assumed to be 1 based on Tokenizer implementation)
+        self.SOS_IDX = 1
+
+    def forward(self, images, targets=None, teacher_forcing_ratio=0.5):
+        """
+        Forward pass for training or validation.
+
+        Args:
+            images: (B, C, H, W)
+            targets: (B, max_len) - Ground truth sequences (indices). If None, runs inference.
+            teacher_forcing_ratio: Probability of using ground truth as input for next step.
+
+        Returns:
+            outputs: (B, max_len, vocab_size) - Logits for each time step.
+        """
+        batch_size = images.shape[0]
+        max_len = Config.MAX_LENGTH if targets is None else targets.shape[1]
+
+        # Encode Images
+        encoder_outputs = self.encoder(images)
+        # encoder_outputs: (B, 128, 512)
+
+        # Initialize Decoder State
+        # Use mean of encoder outputs to initialize hidden state
+        mean_encoder_out = torch.mean(encoder_outputs, dim=1)
+
+        # Project if dimensions differed, but here they match (512)
+        hidden = mean_encoder_out
+        cell = torch.zeros_like(hidden)
+
+        # Tensor to store decoder outputs
+        outputs = torch.zeros(batch_size, max_len, self.vocab_size).to(Config.DEVICE)
+
+        # First input is <sos>
+        input_token = torch.tensor([self.SOS_IDX] * batch_size, dtype=torch.long).to(
+            Config.DEVICE
+        )
+
+        # Decoding Loop
+        for t in range(1, max_len):
+            output, hidden, cell, _ = self.decoder(
+                input_token, hidden, cell, encoder_outputs
+            )
+
+            # Store prediction
+            outputs[:, t] = output
+
+            # Decide next input
+            top1 = output.argmax(1)
+
+            # Teacher Forcing
+            if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                input_token = targets[:, t]
+            else:
+                input_token = top1
+
+        return outputs
+=======
+class Attention(nn.Module):
+    """
+    Bahdanau (Additive) Attention.
+    """
+
+    def __init__(self, enc_hid_dim, dec_hid_dim, attn_dim):
+        super().__init__()
+        # Split linear layers to allow precomputation (Cite debug_lesson_3)
+        self.attn_enc = nn.Linear(enc_hid_dim * 2, attn_dim, bias=False)
+        self.attn_dec = nn.Linear(dec_hid_dim, attn_dim, bias=True)
+        # Linear layer to score the energy
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_energy):
+        # hidden: (B, dec_hid_dim) - Decoder hidden state from previous step
+        # encoder_energy: (B, seq_len, attn_dim) - Precomputed energy from encoder outputs
+
+        # Project hidden state: (B, 1, attn_dim)
+        hidden_energy = self.attn_dec(hidden).unsqueeze(1)
+
+        # Calculate Energy using broadcast addition (Cite debug_lesson_3)
+        # tanh(W_h * h + W_e * e)
+        energy = torch.tanh(hidden_energy + encoder_energy)
+        # (B, seq_len, attn_dim)
+
+        # Calculate Attention Scores
+        attention = self.v(energy).squeeze(2)
+        # (B, seq_len)
+
+        return F.softmax(attention, dim=1)
+
+
+class Decoder(nn.Module):
+    """
+    LSTM Decoder with Attention.
+    """
+
+    def __init__(
+        self, vocab_size, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.attention = attention
+
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+
+        # Input to LSTM is concatenation of Embedding and Context Vector (Weighted Encoder Outputs)
+        self.rnn = nn.LSTMCell((enc_hid_dim * 2) + emb_dim, dec_hid_dim)
+
+        # Output layer
+        self.fc_out = nn.Linear((enc_hid_dim * 2) + dec_hid_dim + emb_dim, vocab_size)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input_token, hidden, cell, encoder_outputs, encoder_energy):
+        # input_token: (B,) - Index of previous character
+        # hidden, cell: (B, dec_hid_dim) - Previous states
+        # encoder_outputs: (B, seq_len, enc_hid_dim * 2)
+        # encoder_energy: (B, seq_len, attn_dim) - Precomputed attention energy
+
+        input_token = input_token.unsqueeze(1)  # (B, 1)
+
+        # Embedding
+        embedded = self.dropout(self.embedding(input_token)).squeeze(1)  # (B, emb_dim)
+
+        # Calculate Attention Weights
+        a = self.attention(hidden, encoder_energy)  # (B, seq_len)
+        a = a.unsqueeze(1)  # (B, 1, seq_len)
+
+        # Apply Attention (Context Vector)
+        # Weighted sum of encoder outputs
+        weighted = torch.bmm(a, encoder_outputs).squeeze(1)  # (B, enc_hid_dim * 2)
+
+        # LSTM Step
+        rnn_input = torch.cat((embedded, weighted), dim=1)
+        hidden, cell = self.rnn(rnn_input, (hidden, cell))
+
+        # Prediction
+        # Concatenate embedded input, context vector, and new hidden state
+        prediction = self.fc_out(torch.cat((embedded, weighted, hidden), dim=1))
+
+        return prediction, hidden, cell, a.squeeze(1)
+
+
+class Seq2Seq(nn.Module):
+    """
+    Wrapper class for Encoder-Decoder architecture.
+    Handles forward pass (Training/Teacher Forcing) and Inference (Greedy Decoding).
+    """
+
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.encoder = Encoder()
+        self.attention = Attention(
+            Config.ENCODER_HIDDEN_DIM, Config.DECODER_HIDDEN_DIM, Config.ATTENTION_DIM
+        )
+        self.decoder = Decoder(
+            vocab_size,
+            Config.EMBEDDING_DIM,
+            Config.ENCODER_HIDDEN_DIM,
+            Config.DECODER_HIDDEN_DIM,
+            Config.DROPOUT,
+            self.attention,
+        )
+        self.vocab_size = vocab_size
+
+        # SOS Token Index (Assumed to be 1 based on Tokenizer implementation)
+        self.SOS_IDX = 1
+
+    def forward(self, images, targets=None, teacher_forcing_ratio=0.5):
+        """
+        Forward pass for training or validation.
+
+        Args:
+            images: (B, C, H, W)
+            targets: (B, max_len) - Ground truth sequences (indices). If None, runs inference.
+            teacher_forcing_ratio: Probability of using ground truth as input for next step.
+
+        Returns:
+            outputs: (B, max_len, vocab_size) - Logits for each time step.
+        """
+        batch_size = images.shape[0]
+        max_len = Config.MAX_LENGTH if targets is None else targets.shape[1]
+
+        # Encode Images
+        encoder_outputs = self.encoder(images)
+        # encoder_outputs: (B, 128, 512)
+
+        # Precompute encoder attention energy (Cite debug_lesson_3)
+        # This avoids recomputing the large matrix multiplication at every decoder step
+        encoder_energy = self.attention.attn_enc(encoder_outputs)
+
+        # Initialize Decoder State
+        # Use mean of encoder outputs to initialize hidden state
+        mean_encoder_out = torch.mean(encoder_outputs, dim=1)
+
+        # Project if dimensions differed, but here they match (512)
+        hidden = mean_encoder_out
+        cell = torch.zeros_like(hidden)
+
+        # Tensor to store decoder outputs
+        outputs = torch.zeros(batch_size, max_len, self.vocab_size).to(Config.DEVICE)
+
+        # First input is <sos>
+        input_token = torch.tensor([self.SOS_IDX] * batch_size, dtype=torch.long).to(
+            Config.DEVICE
+        )
+
+        # Decoding Loop
+        for t in range(1, max_len):
+            output, hidden, cell, _ = self.decoder(
+                input_token, hidden, cell, encoder_outputs, encoder_energy
+            )
+
+            # Store prediction
+            outputs[:, t] = output
+
+            # Decide next input
+            top1 = output.argmax(1)
+
+            # Teacher Forcing
+            if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                input_token = targets[:, t]
+            else:
+                input_token = top1
+
+        return outputs
+>>>>>>> REPLACE
+```

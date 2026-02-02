@@ -1,0 +1,636 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement an optimization strategy focused on architectural simplification and efficient data utilization.
+
+**Strategy:**
+1.  **Switch to Early Fusion (Cite solution_lesson_node_00018):** The previous solution used a Siamese Late Fusion approach, which was identified in the lessons as suboptimal for spatially registered multi-modal data. I will replace the `DualStreamSiameseNet` with a single 2.5D `VolumetricEfficientNet` that accepts all slices and modalities stacked in the channel dimension. This allows the model to learn pixel-level cross-modal and inter-slice correlations immediately.
+2.  **Optimize Volumetric Sampling (Cite solution_lesson_node_00015 & solution_lesson_node_00013):** I will reduce the total number of sampled slices from 32 to 16. The lessons indicate that 32 slices can lead to overfitting and diminishing returns, while 16 slices combined with global normalization achieved the best reported AUC (~0.698). This also reduces the input dimensionality, acting as a regularizer.
+3.  **Maintain Global Normalization (Cite solution_lesson_node_00015):** I will preserve the global volumetric normalization logic to ensure inter-slice contrast is preserved.
+
+**Implementation Details:**
+- **Config:** Update `NUM_SLICES_TOTAL` to 16 and `INPUT_CHANNELS` to 64 (16 slices * 4 modalities).
+- **Data:** Simplify `BraTSDataset` and `process_patient` to return a single tensor `(64, 256, 256)` instead of splitting into Even/Odd streams.
+- **Model:** Replace the Siamese network with a standard EfficientNet-B0 instantiated with `in_chans=64`.
+- **Training/Inference:** Update loops to handle a single input tensor.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Total slices to extract from the volume (10%-90% range)
+    NUM_SLICES_TOTAL = 32
+
+    # Slices per stream (Even/Odd split means half of total)
+    NUM_SLICES_PER_STREAM = 16
+
+    # Input channels for the network
+    # Calculation: 16 slices * 4 modalities = 64 channels
+    INPUT_CHANNELS = 64
+
+    # ==========================================
+    # Training Configuration
+    # ==========================================
+    BATCH_SIZE = 16
+=======
+    # Total slices to extract from the volume (10%-90% range)
+    # Reduced to 16 to prevent overfitting and match best lesson configuration
+    NUM_SLICES_TOTAL = 16
+
+    # Input channels for the network
+    # Calculation: 16 slices * 4 modalities = 64 channels
+    INPUT_CHANNELS = 64
+
+    # ==========================================
+    # Training Configuration
+    # ==========================================
+    BATCH_SIZE = 16
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_6"
+=======
+    WORKING_DIR = "./working/idea_opt"
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+class BraTSDataset(Dataset):
+    def __init__(self, X, y=None, ids=None):
+        """
+        Args:
+            X (np.ndarray): Input data of shape (N, 2, 64, 256, 256).
+                            Dimension 1 contains [Even_Stream, Odd_Stream].
+            y (np.ndarray, optional): Labels of shape (N,).
+            ids (np.ndarray, optional): BraTS21IDs of shape (N,).
+        """
+        self.X = X
+        self.y = y
+        self.ids = ids
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        # X[idx] is (2, 64, 256, 256)
+        # 0 -> Even Stream, 1 -> Odd Stream
+        even_stream = self.X[idx, 0]
+        odd_stream = self.X[idx, 1]
+
+        # Convert to torch tensors
+        even_tensor = torch.from_numpy(even_stream).float()
+        odd_tensor = torch.from_numpy(odd_stream).float()
+
+        if self.y is not None:
+            label = torch.tensor(self.y[idx], dtype=torch.float32)
+            return even_tensor, odd_tensor, label
+        else:
+            # For inference, return the ID to map predictions
+            patient_id = self.ids[idx] if self.ids is not None else ""
+            return even_tensor, odd_tensor, patient_id
+=======
+class BraTSDataset(Dataset):
+    def __init__(self, X, y=None, ids=None):
+        """
+        Args:
+            X (np.ndarray): Input data of shape (N, 64, 256, 256).
+            y (np.ndarray, optional): Labels of shape (N,).
+            ids (np.ndarray, optional): BraTS21IDs of shape (N,).
+        """
+        self.X = X
+        self.y = y
+        self.ids = ids
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        # X[idx] is (64, 256, 256)
+        x_data = self.X[idx]
+
+        # Convert to torch tensor
+        x_tensor = torch.from_numpy(x_data).float()
+
+        if self.y is not None:
+            label = torch.tensor(self.y[idx], dtype=torch.float32)
+            return x_tensor, label
+        else:
+            # For inference, return the ID to map predictions
+            patient_id = self.ids[idx] if self.ids is not None else ""
+            return x_tensor, patient_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def process_patient(row, img_size, num_slices):
+    """
+    Processes a single patient's data:
+    1. Loads full volumes for all 4 modalities.
+    2. Normalizes each modality globally.
+    3. Samples 32 slices uniformly.
+    4. Interleaves into Even/Odd streams.
+    """
+    modalities = ["flair", "t1w", "t1wce", "t2w"]
+    patient_slices = []
+
+    for mod in modalities:
+        paths = row.get(f"{mod}_paths", [])
+
+        # Load all available slices for the modality
+        volume_imgs = []
+        if paths is not None and len(paths) > 0:
+            for p in paths:
+                img = read_dicom_file(p)
+                volume_imgs.append(img)
+
+        # Handle missing data or empty folders
+        if len(volume_imgs) == 0:
+            # Create a dummy volume with 1 slice to allow code to proceed
+            volume = np.zeros((1, img_size, img_size), dtype=np.float32)
+        else:
+            volume = np.stack(volume_imgs)  # (D, H, W)
+
+        # Global Volumetric Normalization (per modality)
+        # This preserves inter-slice contrast
+        volume = normalize_min_max(volume)
+
+        # High-Density Uniform Sampling (10%-90% depth)
+        indices = get_depth_indices(len(volume), num_slices)
+        sampled_volume = volume[indices]  # (32, H, W)
+
+        patient_slices.append(sampled_volume)
+
+    # Stack modalities: (4, 32, H, W) -> Transpose to (32, 4, H, W)
+    # We organize by slice index first to facilitate even/odd splitting
+    stack = np.stack(patient_slices, axis=1)  # (32, 4, H, W)
+
+    # Deterministic Interleaving
+    # Even Indices: 0, 2, ..., 30
+    # Odd Indices: 1, 3, ..., 31
+    even_indices = np.arange(0, num_slices, 2)
+    odd_indices = np.arange(1, num_slices, 2)
+
+    even_vol = stack[even_indices]  # (16, 4, H, W)
+    odd_vol = stack[odd_indices]  # (16, 4, H, W)
+
+    # Flatten to Channels: (16, 4, H, W) -> (64, H, W)
+    # We use reshape to merge the slice and modality dimensions
+    even_stream = even_vol.reshape(-1, img_size, img_size)
+    odd_stream = odd_vol.reshape(-1, img_size, img_size)
+
+    # Stack streams: (2, 64, H, W)
+    return np.stack([even_stream, odd_stream])
+=======
+def process_patient(row, img_size, num_slices):
+    """
+    Processes a single patient's data:
+    1. Loads full volumes for all 4 modalities.
+    2. Normalizes each modality globally.
+    3. Samples 16 slices uniformly.
+    4. Stacks into a single 2.5D volume (Early Fusion).
+    """
+    modalities = ["flair", "t1w", "t1wce", "t2w"]
+    patient_slices = []
+
+    for mod in modalities:
+        paths = row.get(f"{mod}_paths", [])
+
+        # Load all available slices for the modality
+        volume_imgs = []
+        if paths is not None and len(paths) > 0:
+            for p in paths:
+                img = read_dicom_file(p)
+                volume_imgs.append(img)
+
+        # Handle missing data or empty folders
+        if len(volume_imgs) == 0:
+            # Create a dummy volume with 1 slice to allow code to proceed
+            volume = np.zeros((1, img_size, img_size), dtype=np.float32)
+        else:
+            volume = np.stack(volume_imgs)  # (D, H, W)
+
+        # Global Volumetric Normalization (per modality)
+        volume = normalize_min_max(volume)
+
+        # Uniform Sampling (10%-90% depth)
+        indices = get_depth_indices(len(volume), num_slices)
+        sampled_volume = volume[indices]  # (16, H, W)
+
+        patient_slices.append(sampled_volume)
+
+    # Stack modalities: (4, 16, H, W) -> Transpose to (16, 4, H, W)
+    stack = np.stack(patient_slices, axis=1)  # (16, 4, H, W)
+
+    # Flatten to Channels: (16, 4, H, W) -> (64, H, W)
+    # Early Fusion: All slices and modalities are stacked in the channel dimension
+    volumetric_input = stack.reshape(-1, img_size, img_size)
+
+    return volumetric_input
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+            # Process in parallel
+            results = Parallel(n_jobs=num_workers, verbose=0)(
+                delayed(process_patient)(row, Config.IMG_SIZE, Config.NUM_SLICES_TOTAL)
+                for row in records
+            )
+
+            X = np.stack(results)  # (N, 2, 64, 256, 256)
+
+            ids = df["BraTS21ID"].values.astype(str)
+=======
+            # Process in parallel
+            results = Parallel(n_jobs=num_workers, verbose=0)(
+                delayed(process_patient)(row, Config.IMG_SIZE, Config.NUM_SLICES_TOTAL)
+                for row in records
+            )
+
+            X = np.stack(results)  # (N, 64, 256, 256)
+
+            ids = df["BraTS21ID"].values.astype(str)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DualStreamSiameseNet(nn.Module):
+    """
+    A Siamese 2.5D Convolutional Neural Network for MGMT promoter methylation prediction.
+
+    Architecture:
+    - Backbone: EfficientNet-B0 (Shared weights)
+    - Input: Two streams (Even slices, Odd slices), each with 64 channels.
+    - Fusion: Late fusion via concatenation of Global Average Pooled features.
+    - Head: Single linear layer for binary classification.
+    """
+
+    def __init__(self):
+        super(DualStreamSiameseNet, self).__init__()
+
+        # Initialize the shared backbone
+        # We use EfficientNet-B0 pre-trained on ImageNet.
+        # in_chans=64 adapts the first layer to accept our 16 slices * 4 modalities input.
+        # num_classes=0 removes the classification head, returning the pooled feature vector.
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=True,
+            in_chans=Config.INPUT_CHANNELS,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Get the number of output features from the backbone (e.g., 1280 for EfficientNet-B0)
+        num_features = self.backbone.num_features
+
+        # Fusion Head
+        # We concatenate the feature vectors from both streams, so input dim is * 2.
+        # Output is 1 logit (for BCEWithLogitsLoss).
+        self.fc = nn.Linear(num_features * 2, 1)
+
+    def forward(self, x_even, x_odd):
+        """
+        Forward pass for the Siamese Network.
+
+        Args:
+            x_even (torch.Tensor): Input tensor for Even stream. Shape (B, 64, H, W).
+            x_odd (torch.Tensor): Input tensor for Odd stream. Shape (B, 64, H, W).
+
+        Returns:
+            torch.Tensor: Logits of shape (B, 1).
+        """
+        # Pass both streams through the shared backbone
+        # Output shape: (Batch_Size, num_features)
+        feat_even = self.backbone(x_even)
+        feat_odd = self.backbone(x_odd)
+
+        # Late Fusion: Concatenate features
+        # Output shape: (Batch_Size, num_features * 2)
+        combined = torch.cat([feat_even, feat_odd], dim=1)
+
+        # Final Classification
+        # Output shape: (Batch_Size, 1)
+        logits = self.fc(combined)
+
+        return logits
+=======
+class VolumetricEfficientNet(nn.Module):
+    """
+    A 2.5D Convolutional Neural Network for MGMT promoter methylation prediction.
+    Uses Early Fusion by stacking slices and modalities in the channel dimension.
+
+    Architecture:
+    - Backbone: EfficientNet-B0
+    - Input: 64 channels (16 slices * 4 modalities)
+    - Head: Single linear layer for binary classification.
+    """
+
+    def __init__(self):
+        super(VolumetricEfficientNet, self).__init__()
+
+        # Initialize the backbone
+        # in_chans=64 adapts the first layer to accept our 16 slices * 4 modalities input.
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=True,
+            in_chans=Config.INPUT_CHANNELS,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Get the number of output features from the backbone
+        num_features = self.backbone.num_features
+
+        # Classification Head
+        self.fc = nn.Linear(num_features, 1)
+
+    def forward(self, x):
+        """
+        Forward pass.
+        Args:
+            x (torch.Tensor): Input tensor. Shape (B, 64, H, W).
+        Returns:
+            torch.Tensor: Logits of shape (B, 1).
+        """
+        # Extract features
+        features = self.backbone(x)
+
+        # Classification
+        logits = self.fc(features)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import DualStreamSiameseNet
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    """
+    Trains the model for one epoch.
+
+    Args:
+        model: The PyTorch model.
+        loader: DataLoader for training data.
+        optimizer: The optimizer.
+        criterion: The loss function.
+        device: The device to run on (cpu or cuda).
+
+    Returns:
+        float: Average training loss for the epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (x_even, x_odd, labels) in enumerate(loader):
+        x_even = x_even.to(device)
+        x_odd = x_odd.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        optimizer.zero_grad()
+
+        outputs = model(x_even, x_odd)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x_even.size(0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def validate(model, loader, criterion, device):
+    """
+    Validates the model on the validation set.
+
+    Args:
+        model: The PyTorch model.
+        loader: DataLoader for validation data.
+        criterion: The loss function.
+        device: The device to run on.
+
+    Returns:
+        tuple: (Average validation loss, ROC AUC score)
+    """
+    model.eval()
+    running_loss = 0.0
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for x_even, x_odd, labels in loader:
+            x_even = x_even.to(device)
+            x_odd = x_odd.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            outputs = model(x_even, x_odd)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * x_even.size(0)
+
+            # Apply sigmoid to get probabilities for AUC calculation
+            probs = torch.sigmoid(outputs)
+
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(probs.cpu().numpy())
+
+    avg_loss = running_loss / len(loader.dataset)
+=======
+from library.model import VolumetricEfficientNet
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (x, labels) in enumerate(loader):
+        x = x.to(device)
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        optimizer.zero_grad()
+
+        outputs = model(x)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * x.size(0)
+
+    epoch_loss = running_loss / len(loader.dataset)
+    return epoch_loss
+
+
+def validate(model, loader, criterion, device):
+    """
+    Validates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        for x, labels in loader:
+            x = x.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            outputs = model(x)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * x.size(0)
+
+            # Apply sigmoid to get probabilities for AUC calculation
+            probs = torch.sigmoid(outputs)
+
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(probs.cpu().numpy())
+
+    avg_loss = running_loss / len(loader.dataset)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = DualStreamSiameseNet()
+    model.to(device)
+=======
+    # Initialize Model
+    model = VolumetricEfficientNet()
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DualStreamSiameseNet
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 2. Train Model
+    # run_training handles data loading (with caching), model init, training loop,
+    # and returns the model with the best weights loaded.
+    model = run_training(load_cached_data=True)
+
+    # 3. Validation & Metric Calculation
+    # We reload datasets to ensure we have access to the validation set object
+    _, val_dataset, test_dataset = prepare_datasets(load_cached_data=True)
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    model.eval()
+    val_preds = []
+    val_labels = []
+
+    # Inference on Validation Set
+    with torch.no_grad():
+        for x_even, x_odd, labels in val_loader:
+            x_even = x_even.to(device)
+            x_odd = x_odd.to(device)
+
+            outputs = model(x_even, x_odd)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+
+            val_preds.extend(probs.flatten())
+            val_labels.extend(labels.numpy().flatten())
+=======
+from library.model import VolumetricEfficientNet
+
+
+def main():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+
+    # 2. Train Model
+    # run_training handles data loading (with caching), model init, training loop,
+    # and returns the model with the best weights loaded.
+    model = run_training(load_cached_data=True)
+
+    # 3. Validation & Metric Calculation
+    # We reload datasets to ensure we have access to the validation set object
+    _, val_dataset, test_dataset = prepare_datasets(load_cached_data=True)
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    model.eval()
+    val_preds = []
+    val_labels = []
+
+    # Inference on Validation Set
+    with torch.no_grad():
+        for x, labels in val_loader:
+            x = x.to(device)
+
+            outputs = model(x)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+
+            val_preds.extend(probs.flatten())
+            val_labels.extend(labels.numpy().flatten())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        test_preds = []
+        test_ids = []
+
+        with torch.no_grad():
+            for x_even, x_odd, ids in test_loader:
+                x_even = x_even.to(device)
+                x_odd = x_odd.to(device)
+
+                outputs = model(x_even, x_odd)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+
+                test_preds.extend(probs.flatten())
+                test_ids.extend(ids)
+=======
+        test_preds = []
+        test_ids = []
+
+        with torch.no_grad():
+            for x, ids in test_loader:
+                x = x.to(device)
+
+                outputs = model(x)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+
+                test_preds.extend(probs.flatten())
+                test_ids.extend(ids)
+>>>>>>> REPLACE
+```

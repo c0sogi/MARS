@@ -1,0 +1,376 @@
+To optimize the solution, I will implement the following strategy based on the provided lessons:
+
+1.  **Switch to DistilBERT**: I will replace `roberta-base` with `distilbert-base-uncased`. As detailed in **Lesson 00017 (Coverage Over Complexity)**, training a lighter model on the full dataset is superior to training a heavy model on a subsample for bias mitigation. DistilBERT is significantly faster, allowing us to process the full 1.44M training examples within the time limit.
+2.  **Train on Full Dataset**: I will remove the data subsampling logic in `runfile.py`. Access to the full dataset ensures the model encounters rare "hard negative" examples (non-toxic identity mentions), which are critical for learning to disentangle identity from toxicity (Cite **Lesson 00017**).
+3.  **Optimize Data Loading**: I will replace the Python loop in `ToxicityDataset` with vectorized PyTorch operations (`torch.isin`) for Stochastic Identity Masking. This eliminates the CPU bottleneck caused by iterating over tokens for every example, ensuring the GPU remains fed with data.
+4.  **Hyperparameter Tuning**: I will increase `TRAIN_BATCH_SIZE` to 64 and `VALID_BATCH_SIZE` to 128 to leverage DistilBERT's smaller memory footprint, and set `EPOCHS` to 2 to ensure sufficient convergence on the large dataset.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Model Architecture & Hyperparameters
+    # =========================================================================
+    MODEL_NAME = "roberta-base"
+
+    # Input processing
+    MAX_LEN = 256  # Max sequence length for tokenizer
+
+    # Architecture dimensions
+    # 1 Main Target + 6 Aux Targets = 7 Outputs
+    NUM_CLASSES = 1
+    NUM_AUX_CLASSES = len(AUX_COLUMNS)
+    TOTAL_OUTPUTS = NUM_CLASSES + NUM_AUX_CLASSES
+
+    # Training Hyperparameters
+    TRAIN_BATCH_SIZE = 32
+    VALID_BATCH_SIZE = 64
+    EPOCHS = 4
+=======
+    # Model Architecture & Hyperparameters
+    # =========================================================================
+    MODEL_NAME = "distilbert-base-uncased"
+
+    # Input processing
+    MAX_LEN = 256  # Max sequence length for tokenizer
+
+    # Architecture dimensions
+    # 1 Main Target + 6 Aux Targets = 7 Outputs
+    NUM_CLASSES = 1
+    NUM_AUX_CLASSES = len(AUX_COLUMNS)
+    TOTAL_OUTPUTS = NUM_CLASSES + NUM_AUX_CLASSES
+
+    # Training Hyperparameters
+    TRAIN_BATCH_SIZE = 64
+    VALID_BATCH_SIZE = 128
+    EPOCHS = 2
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Pre-compute identity token IDs for Stochastic Identity Masking
+        self.identity_token_ids = set()
+        if self.mode == "train":
+            keywords = get_identity_keywords()
+            for word in keywords:
+                # Encode word alone
+                ids = tokenizer.encode(word, add_special_tokens=False)
+                self.identity_token_ids.update(ids)
+                # Encode word with leading space (RoBERTa uses 'Ġ' for space)
+                # This ensures we catch " muslim" as well as "muslim" at start of sentence
+                ids_space = tokenizer.encode(" " + word, add_special_tokens=False)
+                self.identity_token_ids.update(ids_space)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        text = str(self.text[index])
+
+        # Tokenize
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        input_ids = encoding["input_ids"].flatten()
+        attention_mask = encoding["attention_mask"].flatten()
+
+        # Stochastic Identity Masking (Train only)
+        if self.mode == "train":
+            # Clone to avoid modifying shared storage if any
+            input_ids = input_ids.clone()
+
+            # Iterate through tokens to find identity terms
+            # Note: Iterating over tensor elements in Python is generally slow,
+            # but with max_len=256 it is acceptable for this task.
+            for i, token_id in enumerate(input_ids):
+                # Skip special tokens
+                if token_id.item() in [
+                    self.tokenizer.cls_token_id,
+                    self.tokenizer.sep_token_id,
+                    self.tokenizer.pad_token_id,
+                ]:
+                    continue
+
+                # Check if token is an identity term
+                if token_id.item() in self.identity_token_ids:
+                    # Randomly mask with probability MASK_PROB
+                    if torch.rand(1).item() < Config.MASK_PROB:
+                        input_ids[i] = self.tokenizer.mask_token_id
+=======
+        # Pre-compute identity token IDs for Stochastic Identity Masking
+        self.identity_token_ids = None
+        if self.mode == "train":
+            keywords = get_identity_keywords()
+            ids_set = set()
+            for word in keywords:
+                # Encode word alone
+                ids = tokenizer.encode(word, add_special_tokens=False)
+                ids_set.update(ids)
+                # Encode word with leading space (RoBERTa uses 'Ġ' for space)
+                # For DistilBERT/WordPiece this is less critical but harmless
+                ids_space = tokenizer.encode(" " + word, add_special_tokens=False)
+                ids_set.update(ids_space)
+            
+            # Convert to tensor for efficient lookup
+            self.identity_token_ids = torch.tensor(list(ids_set), dtype=torch.long)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        text = str(self.text[index])
+
+        # Tokenize
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        input_ids = encoding["input_ids"].flatten()
+        attention_mask = encoding["attention_mask"].flatten()
+
+        # Stochastic Identity Masking (Train only)
+        if self.mode == "train" and self.identity_token_ids is not None:
+            # Clone to avoid modifying shared storage
+            input_ids = input_ids.clone()
+            
+            # Efficient masking using tensor operations
+            # Find positions where input_ids match any identity token
+            matches = torch.isin(input_ids, self.identity_token_ids)
+            
+            # Get indices of matches
+            match_indices = torch.where(matches)[0]
+            
+            if len(match_indices) > 0:
+                # Generate random mask for these indices
+                # Create random probs only for matches
+                probs = torch.rand(len(match_indices))
+                mask_decision = probs < Config.MASK_PROB
+                
+                # Apply mask
+                indices_to_mask = match_indices[mask_decision]
+                input_ids[indices_to_mask] = self.tokenizer.mask_token_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MultiTaskRoBERTa(nn.Module):
+    """
+    RoBERTa-based model for Toxicity Classification with Multi-Task Learning.
+
+    Architecture:
+    1. RoBERTa Backbone (roberta-base)
+    2. Extraction of [CLS] token embedding
+    3. Multi-Sample Dropout
+    4. Single Linear Projection to 7 outputs (1 Main + 6 Aux)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        config_name = Config.MODEL_NAME
+
+        # Load configuration
+        self.config = AutoConfig.from_pretrained(config_name)
+
+        # Load backbone
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(config_name, config=self.config)
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        self.hidden_size = self.config.hidden_size
+
+        # Initialize Multi-Sample Dropout Head
+        # Projects [CLS] embedding to TOTAL_OUTPUTS (Target + Aux Tasks)
+        self.multi_sample_dropout = MultiSampleDropout(
+            dropout_rates=Config.DROPOUT_RATES,
+            input_dim=self.hidden_size,
+            output_dim=Config.TOTAL_OUTPUTS,
+        )
+
+        # Initialize weights for the classifier head
+        self._init_weights(self.multi_sample_dropout.classifier)
+
+    def _init_weights(self, module):
+        """
+        Initialize the weights of the linear layer using the backbone's initializer range.
+        """
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask=None):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
+
+        Returns:
+            torch.Tensor: Logits of shape (batch_size, TOTAL_OUTPUTS).
+                          Index 0 is the main toxicity target.
+                          Indices 1-6 are the auxiliary toxicity subtypes.
+        """
+        # Pass through RoBERTa backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Extract the [CLS] token embedding (first token of the last hidden state)
+        # Shape: (batch_size, hidden_size)
+        last_hidden_state = outputs.last_hidden_state
+        cls_embedding = last_hidden_state[:, 0, :]
+
+        # Pass through Multi-Sample Dropout and Projection Layer
+        logits = self.multi_sample_dropout(cls_embedding)
+
+        return logits
+=======
+class MultiTaskModel(nn.Module):
+    """
+    Transformer-based model for Toxicity Classification with Multi-Task Learning.
+    Supports DistilBERT and RoBERTa.
+
+    Architecture:
+    1. Transformer Backbone
+    2. Extraction of [CLS] token embedding
+    3. Multi-Sample Dropout
+    4. Single Linear Projection to 7 outputs (1 Main + 6 Aux)
+    """
+
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        config_name = Config.MODEL_NAME
+
+        # Load configuration
+        self.config = AutoConfig.from_pretrained(config_name)
+
+        # Load backbone
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(config_name, config=self.config)
+        else:
+            self.backbone = AutoModel.from_config(self.config)
+
+        self.hidden_size = self.config.hidden_size
+
+        # Initialize Multi-Sample Dropout Head
+        # Projects [CLS] embedding to TOTAL_OUTPUTS (Target + Aux Tasks)
+        self.multi_sample_dropout = MultiSampleDropout(
+            dropout_rates=Config.DROPOUT_RATES,
+            input_dim=self.hidden_size,
+            output_dim=Config.TOTAL_OUTPUTS,
+        )
+
+        # Initialize weights for the classifier head
+        self._init_weights(self.multi_sample_dropout.classifier)
+
+    def _init_weights(self, module):
+        """
+        Initialize the weights of the linear layer using the backbone's initializer range.
+        """
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, input_ids, attention_mask=None):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
+
+        Returns:
+            torch.Tensor: Logits of shape (batch_size, TOTAL_OUTPUTS).
+                          Index 0 is the main toxicity target.
+                          Indices 1-6 are the auxiliary toxicity subtypes.
+        """
+        # Pass through backbone
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Extract the [CLS] token embedding (first token of the last hidden state)
+        # Shape: (batch_size, hidden_size)
+        last_hidden_state = outputs.last_hidden_state
+        cls_embedding = last_hidden_state[:, 0, :]
+
+        # Pass through Multi-Sample Dropout and Projection Layer
+        logits = self.multi_sample_dropout(cls_embedding)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.dataset import load_processed_train_data, ToxicityDataset
+from library.model import MultiTaskRoBERTa
+from library.trainer import Trainer
+from library.metrics import compute_final_score
+=======
+from library.dataset import load_processed_train_data, ToxicityDataset
+from library.model import MultiTaskModel
+from library.trainer import Trainer
+from library.metrics import compute_final_score
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Fast Baseline: Subsample training data
+    # We use 50,000 samples to ensure execution within 2 hours
+    SAMPLE_SIZE = 50000
+    if len(train_df) > SAMPLE_SIZE:
+        print(f"Subsampling training data to {SAMPLE_SIZE} rows for fast baseline...")
+        train_df = train_df.sample(n=SAMPLE_SIZE, random_state=Config.SEED).reset_index(
+            drop=True
+        )
+
+    # Load Validation Data (Full set required for accurate metric)
+=======
+    # Load Validation Data (Full set required for accurate metric)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = MultiTaskRoBERTa(pretrained=True)
+    model.to(device)
+
+    # 4. Optimizer & Scheduler
+    # Fast Baseline: Train for 2 epochs
+    EPOCHS = 2
+=======
+    # 3. Model Initialization
+    print("Initializing model...")
+    model = MultiTaskModel(pretrained=True)
+    model.to(device)
+
+    # 4. Optimizer & Scheduler
+    EPOCHS = Config.EPOCHS
+>>>>>>> REPLACE
+```

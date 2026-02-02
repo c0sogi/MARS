@@ -1,0 +1,278 @@
+Based on the lessons learned, specifically **Lesson 00064**, I will optimize the solution by switching from `WideCoordinateResNeXt` to `WideSEResNeXt`. This involves replacing the Coordinate Attention mechanism with Squeeze-and-Excitation (SE) blocks, which have been shown to saturate the performance metric (AUC 1.0) when combined with a wide backbone and multi-scale aggregation. I will also increase the number of training epochs from 5 to 15 to ensure robust convergence.
+
+```diff
+library/coordinate_attention.py
+<<<<<<< SEARCH
+class CoordinateAttention(nn.Module):
+    """
+    Coordinate Attention Block.
+
+    This block replaces standard Squeeze-and-Excitation (SE) blocks. Instead of global average pooling,
+    it pools features along the horizontal and vertical directions separately. These direction-aware
+    features are encoded via a shared convolution and then used to generate attention maps that
+    recalibrate the input feature map, preserving spatial texture information critical for
+    identifying cactus spines.
+    """
+
+    def __init__(self, inp, reduction=32):
+        """
+        Args:
+            inp (int): Number of input channels.
+            reduction (int): Reduction ratio for the intermediate channel dimension.
+        """
+        super(CoordinateAttention, self).__init__()
+
+        # Adaptive Average Pooling for H and W directions
+        # pool_h: pools width to 1, keeping height dynamic -> (N, C, H, 1)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        # pool_w: pools height to 1, keeping width dynamic -> (N, C, 1, W)
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        # Calculate intermediate channels (mip), ensuring a minimum size (e.g., 8)
+        mip = max(8, inp // reduction)
+
+        # Shared 1x1 Convolution for encoding spatial information
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        # 1x1 Convolutions for generating attention weights for each direction
+        self.conv_h = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        """
+        Forward pass of the Coordinate Attention block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (N, C, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (N, C, H, W) recalibrated by attention.
+        """
+        identity = x
+        n, c, h, w = x.size()
+
+        # 1. Coordinate Information Embedding
+        # Pool along width -> (N, C, H, 1)
+        x_h = self.pool_h(x)
+        # Pool along height -> (N, C, 1, W) -> Permute to (N, C, W, 1) for concatenation
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        # 2. Coordinate Attention Generation
+        # Concatenate along the spatial dimension (H + W) -> (N, C, H+W, 1)
+        y = torch.cat([x_h, x_w], dim=2)
+
+        # Encode via shared convolution, BN, and activation
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # Split back into height and width features
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+
+        # Permute width features back to (N, C, 1, W)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        # Generate attention maps via 1x1 convolution and Sigmoid
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        # 3. Re-weighting
+        # Broadcast multiplication: (N, C, H, W) * (N, C, H, 1) * (N, C, 1, W)
+        out = identity * a_h * a_w
+        return out
+=======
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation (SE) Block.
+    
+    Adaptively recalibrates channel-wise feature responses by explicitly modelling interdependencies
+    between channels. Cite solution_lesson_node_00064.
+    """
+
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.coordinate_attention import CoordinateAttention
+
+
+class ResNeXtBlock(nn.Module):
+    """
+    ResNeXt Block with Coordinate Attention.
+
+    Standard ResNeXt bottleneck block (1x1 -> 3x3 Grouped -> 1x1) enhanced with
+    Coordinate Attention to preserve spatial information.
+    """
+
+    def __init__(self, in_planes, planes, stride=1, cardinality=32, reduction=16):
+        super(ResNeXtBlock, self).__init__()
+
+        # In Wide ResNeXt, the bottleneck width is typically planes // 2
+        group_width = planes // 2
+
+        self.conv1 = nn.Conv2d(in_planes, group_width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(group_width)
+
+        self.conv2 = nn.Conv2d(
+            group_width,
+            group_width,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=cardinality,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(group_width)
+
+        self.conv3 = nn.Conv2d(group_width, planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+
+        # Coordinate Attention replaces SE blocks
+        self.attn = CoordinateAttention(planes, reduction=reduction)
+
+        self.shortcut = nn.Sequential()
+=======
+from library.coordinate_attention import SEBlock
+
+
+class ResNeXtBlock(nn.Module):
+    """
+    ResNeXt Block with Squeeze-and-Excitation (SE).
+
+    Standard ResNeXt bottleneck block (1x1 -> 3x3 Grouped -> 1x1) enhanced with
+    SE blocks to recalibrate channel-wise feature responses.
+    """
+
+    def __init__(self, in_planes, planes, stride=1, cardinality=32, reduction=16):
+        super(ResNeXtBlock, self).__init__()
+
+        # In Wide ResNeXt, the bottleneck width is typically planes // 2
+        group_width = planes // 2
+
+        self.conv1 = nn.Conv2d(in_planes, group_width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(group_width)
+
+        self.conv2 = nn.Conv2d(
+            group_width,
+            group_width,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=cardinality,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(group_width)
+
+        self.conv3 = nn.Conv2d(group_width, planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+
+        # SE Block
+        self.attn = SEBlock(planes, reduction=reduction)
+
+        self.shortcut = nn.Sequential()
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class WideCoordinateResNeXt(nn.Module):
+    """
+    Wide Coordinate-ResNeXt with Multi-Scale Aggregation.
+
+    Backbone: 3-stage ResNeXt with [64, 128, 256] channels.
+    Head: Concatenates GAP features from Stage 2 (16x16) and Stage 3 (8x8).
+    """
+
+    def __init__(self, cardinality=32):
+        super(WideCoordinateResNeXt, self).__init__()
+        self.cardinality = cardinality
+=======
+class WideSEResNeXt(nn.Module):
+    """
+    Wide SE-ResNeXt with Multi-Scale Aggregation.
+
+    Backbone: 3-stage ResNeXt with [64, 128, 256] channels.
+    Head: Concatenates GAP features from Stage 2 (16x16) and Stage 3 (8x8).
+    Cite solution_lesson_node_00064.
+    """
+
+    def __init__(self, cardinality=32):
+        super(WideSEResNeXt, self).__init__()
+        self.cardinality = cardinality
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import WideCoordinateResNeXt
+=======
+from library.model import WideSEResNeXt
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Initialize Model
+        model = WideCoordinateResNeXt(cardinality=32).to(device)
+=======
+        # Initialize Model
+        model = WideSEResNeXt(cardinality=32).to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import WideCoordinateResNeXt
+=======
+from library.model import WideSEResNeXt
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# Configuration for Fast Baseline
+EPOCHS = 5
+BATCH_SIZE = 64
+SEEDS = [0, 1, 2, 3, 4]
+=======
+# Configuration for Fast Baseline
+EPOCHS = 15
+BATCH_SIZE = 64
+SEEDS = [0, 1, 2, 3, 4]
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Initialize Model
+        model = WideCoordinateResNeXt(cardinality=32).to(device)
+=======
+        # Initialize Model
+        model = WideSEResNeXt(cardinality=32).to(device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,454 @@
+Based on the empirical findings and lessons learned, I will optimize the solution by reverting to a **Standard U-Net** architecture and prioritizing **full convergence of a single model** over an ensemble of undertrained models.
+
+The strategy involves:
+1.  **Architecture Simplification**: Replacing the `AttentionUNet` with the lighter `UNet` (Standard U-Net with Bilinear Upsampling). Complex architectures like Attention U-Net and ResUNet have been shown to underperform on this small dataset (Cite `solution_lesson_node_00011`).
+2.  **Training Regime**: Training a single model (`NUM_MODELS = 1`) for a significantly longer duration (`NUM_EPOCHS = 1500`) to ensure it reaches the global minimum. Previous experiments showed that a single fully converged model outperforms an ensemble of partially trained ones (Cite `solution_lesson_node_00012`).
+3.  **Scheduler Optimization**: Using Cosine Annealing with a horizon (`T_max = 1500`) decoupled from early stopping. This ensures the learning rate remains high enough to escape local minima for longer, avoiding premature convergence (Cite `solution_lesson_node_00007`).
+4.  **Augmentation**: Retaining the effective geometric augmentations and Test-Time Augmentation (TTA) strategy (Cite `solution_lesson_node_00003`, `solution_lesson_node_00006`).
+
+Here are the code modifications:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 16  # Small batch size as per strategy
+    LEARNING_RATE = 1e-3  # High learning rate for velocity
+    NUM_EPOCHS = 1000  # High max epochs, relying on early stopping
+    EARLY_STOPPING_PATIENCE = 20
+
+    # Scheduler Settings (Cosine Annealing)
+    COSINE_T_MAX = 1000  # Decoupled horizon for scheduler
+
+    # =========================================================================
+    # Ensemble Strategy
+    # =========================================================================
+    NUM_MODELS = 5  # Number of independent models for Bagging
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 16  # Small batch size as per strategy
+    LEARNING_RATE = 1e-3  # High learning rate for velocity
+    NUM_EPOCHS = 1500  # High max epochs, relying on early stopping
+    EARLY_STOPPING_PATIENCE = 50
+
+    # Scheduler Settings (Cosine Annealing)
+    COSINE_T_MAX = 1500  # Decoupled horizon for scheduler
+
+    # =========================================================================
+    # Ensemble Strategy
+    # =========================================================================
+    NUM_MODELS = 1  # Single converged model is better than ensemble of weak models
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class AttentionGate(nn.Module):
+    """
+    Attention Gate to filter features from the skip connection (x)
+    using the gating signal (g) from the decoder.
+    """
+
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int),
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+
+        # In case of spatial mismatch due to pooling/padding in encoder
+        if g1.shape[2:] != x1.shape[2:]:
+            g1 = F.interpolate(
+                g1, size=x1.shape[2:], mode="bilinear", align_corners=True
+            )
+
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+
+        return x * psi
+
+
+class Up(nn.Module):
+    """
+    Upscaling => Attention Gate => Concatenation => DoubleConv
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+
+        # Bilinear upsampling
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Attention Gate
+        # F_g = in_channels (from decoder)
+        # F_l = skip_channels (from encoder)
+        # F_int = skip_channels // 2 (heuristic)
+        self.attn = AttentionGate(
+            F_g=in_channels, F_l=skip_channels, F_int=skip_channels // 2
+        )
+
+        # Convolution after concatenation
+        # Input channels = in_channels (upsampled) + skip_channels (gated)
+        self.conv = DoubleConv(in_channels + skip_channels, out_channels)
+
+    def forward(self, x1, x2):
+        # x1: Feature from the previous decoder layer (to be upsampled)
+        # x2: Feature from the encoder skip connection (to be gated)
+
+        x1 = self.up(x1)
+
+        # Handle padding if shapes don't match exactly (e.g. odd input dimensions)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        if diffX != 0 or diffY != 0:
+            x1 = F.pad(
+                x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2]
+            )
+
+        # Apply attention to the skip connection using the upsampled decoder feature as gate
+        x2 = self.attn(g=x1, x=x2)
+
+        # Concatenate
+        x = torch.cat([x2, x1], dim=1)
+
+        return self.conv(x)
+
+
+class AttentionUNet(nn.Module):
+    """
+    Attention U-Net architecture for image denoising.
+    """
+
+    def __init__(self, n_channels=1, n_classes=1):
+        super(AttentionUNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+
+        # Encoder
+        # Level 1: 1 -> 32
+        self.inc = DoubleConv(n_channels, 32)
+
+        # Level 2: 32 -> 64
+        self.down1 = DoubleConv(32, 64)
+
+        # Level 3: 64 -> 128
+        self.down2 = DoubleConv(64, 128)
+
+        # Level 4: 128 -> 256
+        self.down3 = DoubleConv(128, 256)
+
+        # Level 5 (Bottleneck): 256 -> 512
+        self.down4 = DoubleConv(256, 512)
+
+        self.pool = nn.MaxPool2d(2)
+
+        # Decoder with Attention
+        # Up 1: 512 + 256 -> 256
+        self.up1 = Up(512, 256, 256)
+
+        # Up 2: 256 + 128 -> 128
+        self.up2 = Up(256, 128, 128)
+
+        # Up 3: 128 + 64 -> 64
+        self.up3 = Up(128, 64, 64)
+
+        # Up 4: 64 + 32 -> 32
+        self.up4 = Up(64, 32, 32)
+
+        # Output mapping
+        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder Path
+        x1 = self.inc(x)  # 32 channels
+
+        x2 = self.pool(x1)
+        x2 = self.down1(x2)  # 64 channels
+
+        x3 = self.pool(x2)
+        x3 = self.down2(x3)  # 128 channels
+
+        x4 = self.pool(x3)
+        x4 = self.down3(x4)  # 256 channels
+
+        x5 = self.pool(x4)
+        x5 = self.down4(x5)  # 512 channels (Bottleneck)
+
+        # Decoder Path with Attention Gates
+        x = self.up1(x5, x4)  # -> 256
+        x = self.up2(x, x3)  # -> 128
+        x = self.up3(x, x2)  # -> 64
+        x = self.up4(x, x1)  # -> 32
+
+        logits = self.outc(x)
+        return logits
+=======
+class Up(nn.Module):
+    """
+    Upscaling => Concatenation => DoubleConv
+    """
+
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+
+        # Bilinear upsampling
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+
+        # Convolution after concatenation
+        # Input channels = in_channels (upsampled) + skip_channels
+        self.conv = DoubleConv(in_channels + skip_channels, out_channels)
+
+    def forward(self, x1, x2):
+        # x1: Feature from the previous decoder layer (to be upsampled)
+        # x2: Feature from the encoder skip connection
+
+        x1 = self.up(x1)
+
+        # Handle padding if shapes don't match exactly (e.g. odd input dimensions)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        if diffX != 0 or diffY != 0:
+            x1 = F.pad(
+                x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2]
+            )
+
+        # Concatenate
+        x = torch.cat([x2, x1], dim=1)
+
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    """
+    Standard U-Net architecture for image denoising.
+    """
+
+    def __init__(self, n_channels=1, n_classes=1):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+
+        # Encoder
+        # Level 1: 1 -> 32
+        self.inc = DoubleConv(n_channels, 32)
+
+        # Level 2: 32 -> 64
+        self.down1 = DoubleConv(32, 64)
+
+        # Level 3: 64 -> 128
+        self.down2 = DoubleConv(64, 128)
+
+        # Level 4: 128 -> 256
+        self.down3 = DoubleConv(128, 256)
+
+        # Level 5 (Bottleneck): 256 -> 512
+        self.down4 = DoubleConv(256, 512)
+
+        self.pool = nn.MaxPool2d(2)
+
+        # Decoder
+        # Up 1: 512 + 256 -> 256
+        self.up1 = Up(512, 256, 256)
+
+        # Up 2: 256 + 128 -> 128
+        self.up2 = Up(256, 128, 128)
+
+        # Up 3: 128 + 64 -> 64
+        self.up3 = Up(128, 64, 64)
+
+        # Up 4: 64 + 32 -> 32
+        self.up4 = Up(64, 32, 32)
+
+        # Output mapping
+        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder Path
+        x1 = self.inc(x)  # 32 channels
+
+        x2 = self.pool(x1)
+        x2 = self.down1(x2)  # 64 channels
+
+        x3 = self.pool(x2)
+        x3 = self.down2(x3)  # 128 channels
+
+        x4 = self.pool(x3)
+        x4 = self.down3(x4)  # 256 channels
+
+        x5 = self.pool(x4)
+        x5 = self.down4(x5)  # 512 channels (Bottleneck)
+
+        # Decoder Path
+        x = self.up1(x5, x4)  # -> 256
+        x = self.up2(x, x3)  # -> 128
+        x = self.up3(x, x2)  # -> 64
+        x = self.up4(x, x1)  # -> 32
+
+        logits = self.outc(x)
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import AttentionUNet
+from library.utils import calculate_rmse, print_metric, save_checkpoint
+=======
+from library.model import UNet
+from library.utils import calculate_rmse, print_metric, save_checkpoint
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Initialize Model, Loss, Optimizer, Scheduler
+    device = torch.device(Config.DEVICE)
+    model = AttentionUNet(n_channels=1, n_classes=1).to(device)
+
+    criterion = nn.MSELoss()
+=======
+    # 3. Initialize Model, Loss, Optimizer, Scheduler
+    device = torch.device(Config.DEVICE)
+    model = UNet(n_channels=1, n_classes=1).to(device)
+
+    criterion = nn.MSELoss()
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.dataset import DenoisingDataset
+from library.model import AttentionUNet
+from library.utils import create_submission_csv
+=======
+from library.config import Config
+from library.dataset import DenoisingDataset
+from library.model import UNet
+from library.utils import create_submission_csv
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        try:
+            # Initialize model architecture
+            model = AttentionUNet(n_channels=1, n_classes=1).to(device)
+
+            # Load weights
+=======
+        try:
+            # Initialize model architecture
+            model = UNet(n_channels=1, n_classes=1).to(device)
+
+            # Load weights
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.inference import generate_submission, predict_with_tta
+from library.dataset import DenoisingDataset
+from library.model import AttentionUNet
+from library.utils import calculate_rmse
+
+
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Override Config for a fast baseline execution
+    Config.NUM_EPOCHS = 50  # Reduced from 1000 for speed
+    Config.NUM_MODELS = 3  # Reduced from 5 to save time while keeping ensemble
+
+    # Set seeds for reproducibility
+=======
+from library.inference import generate_submission, predict_with_tta
+from library.dataset import DenoisingDataset
+from library.model import UNet
+from library.utils import calculate_rmse
+
+
+def main():
+    # =========================================================================
+    # 1. Configuration & Setup
+    # =========================================================================
+    # Use Config defaults for full training
+    # Config.NUM_EPOCHS is 1500
+    # Config.NUM_MODELS is 1
+
+    # Set seeds for reproducibility
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load the trained ensemble models
+    models = []
+    for i in range(Config.NUM_MODELS):
+        model_path = os.path.join(Config.WORKING_DIR, f"model_{i}.pth")
+        if os.path.exists(model_path):
+            try:
+                model = AttentionUNet(n_channels=1, n_classes=1).to(device)
+                checkpoint = torch.load(model_path, map_location=device)
+                if "model_state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                model.eval()
+                models.append(model)
+                print(f"Loaded model {i}")
+            except Exception as e:
+                print(f"Failed to load model {i}: {e}")
+=======
+    # Load the trained ensemble models
+    models = []
+    for i in range(Config.NUM_MODELS):
+        model_path = os.path.join(Config.WORKING_DIR, f"model_{i}.pth")
+        if os.path.exists(model_path):
+            try:
+                model = UNet(n_channels=1, n_classes=1).to(device)
+                checkpoint = torch.load(model_path, map_location=device)
+                if "model_state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                model.eval()
+                models.append(model)
+                print(f"Loaded model {i}")
+            except Exception as e:
+                print(f"Failed to load model {i}: {e}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,281 @@
+I will implement the following changes to optimize the model's performance:
+
+1.  **Architecture Upgrade (`library/model.py`)**: I will replace the Multi-Scale Feature Aggregation (GeM) architecture with a **U-Net style decoder** for the auxiliary segmentation task. As noted in **Cite solution_lesson_node_00020**, a dense decoder provides superior regularization for fine-grained classification by forcing the encoder to preserve spatial fidelity.
+2.  **Resolution Increase (`library/config.py`)**: I will increase the input image resolution from 512x512 to **640x640**. **Cite solution_lesson_node_00004** demonstrates that higher resolution, combined with local contrast enhancement, significantly aids in detecting thin structures like catheters.
+3.  **Training Schedule (`runfile.py`)**: I will increase the number of training epochs from 5 to **10**. The U-Net architecture acts as a strong regularizer, delaying overfitting and allowing the model to benefit from a longer training schedule to refine its features.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Image Processing
+    IMAGE_SIZE = (512, 512)  # (Height, Width)
+    IN_CHANNELS = 3
+=======
+    # Image Processing
+    IMAGE_SIZE = (640, 640)  # (Height, Width) Cite solution_lesson_node_00004
+    IN_CHANNELS = 3
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GeM(nn.Module):
+    """
+    Generalized Mean Pooling layer.
+    Computes (AvgPool(x^p))^(1/p) where p is a learnable parameter.
+    """
+
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        return self.gem(x, p=self.p, eps=self.eps)
+
+    def gem(self, x, p=3, eps=1e-6):
+        # Clamp for numerical stability before power operation
+        x = x.clamp(min=eps)
+        # Apply power p, average pool over spatial dimensions, then root p
+        return F.avg_pool2d(x.pow(p), (x.size(-2), x.size(-1))).pow(1.0 / p)
+
+
+class CatheterModel(nn.Module):
+    """
+    Multi-Scale Feature Aggregation Model for Catheter Detection.
+    Uses EfficientNetV2-S backbone with GeM pooling on strides 8, 16, and 32.
+    Includes an auxiliary segmentation head for background suppression.
+    """
+
+    def __init__(self, pretrained=True):
+        super(CatheterModel, self).__init__()
+
+        # 1. Backbone: EfficientNetV2-S
+        # Extract features at indices 2, 3, 4 corresponding to strides 8, 16, 32
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(2, 3, 4),
+        )
+
+        # Determine channel counts dynamically
+        # Create a dummy input to trace shapes
+        dummy_input = torch.randn(1, 3, 256, 256)
+        with torch.no_grad():
+            feats = self.backbone(dummy_input)
+        self.feature_channels = [f.shape[1] for f in feats]
+
+        # 2. Classification Head Components
+        # Independent GeM pooling for each feature scale
+        self.gems = nn.ModuleList([GeM(p=3.0) for _ in self.feature_channels])
+
+        # Final Linear Layer
+        # Input dimension is the sum of channels from all scales
+        total_channels = sum(self.feature_channels)
+        self.drop = nn.Dropout(Config.DROP_RATE)
+        self.fc = nn.Linear(total_channels, Config.NUM_CLASSES)
+
+        # 3. Auxiliary Segmentation Head Components
+        # Project all scales to a common dimension for fusion
+        aux_dim = 64
+        self.aux_convs = nn.ModuleList(
+            [nn.Conv2d(in_c, aux_dim, kernel_size=1) for in_c in self.feature_channels]
+        )
+
+        # Fusion and Prediction
+        # Input: 3 scales * aux_dim
+        self.aux_classifier = nn.Sequential(
+            nn.Conv2d(aux_dim * 3, aux_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(aux_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(aux_dim, 1, kernel_size=1),
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input images of shape (B, 3, H, W)
+
+        Returns:
+            logits (torch.Tensor): Classification logits (B, NumClasses)
+            mask (torch.Tensor): Auxiliary segmentation mask (B, 1, H, W)
+        """
+        input_size = x.shape[-2:]
+
+        # Extract multi-scale features
+        # feats[0]: Stride 8
+        # feats[1]: Stride 16
+        # feats[2]: Stride 32
+        feats = self.backbone(x)
+
+        # --- Classification Path ---
+        pooled_feats = []
+        for i, feat in enumerate(feats):
+            # Apply GeM -> (B, C, 1, 1)
+            pooled = self.gems[i](feat)
+            # Flatten -> (B, C)
+            pooled = pooled.flatten(1)
+            pooled_feats.append(pooled)
+
+        # Concatenate features from all scales
+        concat_feats = torch.cat(pooled_feats, dim=1)
+
+        # Dropout and Classify
+        embedding = self.drop(concat_feats)
+        logits = self.fc(embedding)
+
+        # --- Auxiliary Segmentation Path ---
+        # Target spatial resolution is that of the largest feature map (Stride 8)
+        target_h, target_w = feats[0].shape[-2:]
+
+        aux_feats = []
+        for i, feat in enumerate(feats):
+            # Project channels to aux_dim
+            proj = self.aux_convs[i](feat)
+
+            # Upsample lower resolution maps (Stride 16, 32) to Stride 8
+            if proj.shape[-2:] != (target_h, target_w):
+                proj = F.interpolate(
+                    proj,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            aux_feats.append(proj)
+
+        # Fuse features (Concatenate along channel dim)
+        aux_concat = torch.cat(aux_feats, dim=1)
+
+        # Predict mask at Stride 8
+        aux_out = self.aux_classifier(aux_concat)
+
+        # Upsample mask to original image resolution
+        mask = F.interpolate(
+            aux_out, size=input_size, mode="bilinear", align_corners=False
+        )
+
+        return logits, mask
+=======
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels + skip_channels, out_channels, 3, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x, skip=None):
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if skip is not None:
+            if x.shape[-2:] != skip.shape[-2:]:
+                x = F.interpolate(
+                    x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+                )
+            x = torch.cat([x, skip], dim=1)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class CatheterModel(nn.Module):
+    """
+    Multi-Task Learning Model for Catheter Detection.
+    Uses EfficientNetV2-S backbone with a U-Net style decoder for auxiliary segmentation.
+    Cite solution_lesson_node_00020 (Dense Decoder Superiority)
+    """
+
+    def __init__(self, pretrained=True):
+        super(CatheterModel, self).__init__()
+
+        # 1. Backbone: EfficientNetV2-S
+        # Extract features at indices 0, 1, 2, 3, 4
+        # Stride 2, 4, 8, 16, 32
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),
+        )
+
+        # Dummy input to get channel counts
+        dummy = torch.randn(1, 3, 256, 256)
+        with torch.no_grad():
+            feats = self.backbone(dummy)
+        ch = [f.shape[1] for f in feats]
+        # ch: [s2, s4, s8, s16, s32]
+
+        # 2. Classification Head
+        # Global Avg Pooling on the last feature map (Stride 32)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.drop = nn.Dropout(Config.DROP_RATE)
+        self.fc = nn.Linear(ch[-1], Config.NUM_CLASSES)
+
+        # 3. Auxiliary Segmentation Decoder (U-Net Style)
+        # Center: Stride 32 -> 256 channels
+        # Dec4: In(256), Skip(s16), Out(128)
+        self.dec4 = DecoderBlock(ch[4], ch[3], 128)
+        # Dec3: In(128), Skip(s8), Out(64)
+        self.dec3 = DecoderBlock(128, ch[2], 64)
+        # Dec2: In(64), Skip(s4), Out(32)
+        self.dec2 = DecoderBlock(64, ch[1], 32)
+        # Dec1: In(32), Skip(s2), Out(16)
+        self.dec1 = DecoderBlock(32, ch[0], 16)
+
+        # Final Segmentation Head
+        self.final_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(16, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1),
+        )
+
+    def forward(self, x):
+        input_size = x.shape[-2:]
+
+        # Encoder
+        # f0: s2, f1: s4, f2: s8, f3: s16, f4: s32
+        feats = self.backbone(x)
+
+        # Classification Path
+        x_cls = self.global_pool(feats[-1])
+        x_cls = x_cls.flatten(1)
+        x_cls = self.drop(x_cls)
+        logits = self.fc(x_cls)
+
+        # Segmentation Path (Decoder)
+        # Start from f4 (s32)
+        d4 = self.dec4(feats[4], feats[3])  # -> s16
+        d3 = self.dec3(d4, feats[2])        # -> s8
+        d2 = self.dec2(d3, feats[1])        # -> s4
+        d1 = self.dec1(d2, feats[0])        # -> s2
+
+        # Final upsample to s1
+        mask = self.final_conv(d1)
+
+        # Ensure mask matches input size exactly (in case of odd dims)
+        if mask.shape[-2:] != input_size:
+            mask = F.interpolate(
+                mask, size=input_size, mode="bilinear", align_corners=False
+            )
+
+        return logits, mask
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Limit epochs to ensure completion within the time limit while allowing convergence
+    Config.NUM_EPOCHS = 5
+=======
+    # Limit epochs to ensure completion within the time limit while allowing convergence
+    # Increased to 10 to allow U-Net regularization to take effect (Cite solution_lesson_node_00008)
+    Config.NUM_EPOCHS = 10
+>>>>>>> REPLACE
+```

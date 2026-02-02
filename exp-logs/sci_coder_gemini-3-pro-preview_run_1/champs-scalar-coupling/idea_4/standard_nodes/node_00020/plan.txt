@@ -1,0 +1,383 @@
+Based on the analysis of the previous solution and the provided lessons, I will implement the following changes:
+
+1.  **Restore Model Capacity (Cite Lesson 00018, 00008):** The previous execution used a "fast baseline" configuration (1,000 trees, 0.1 LR) which severely underfitted the data, leading to a poor LogMAE of 0.103. I will modify `library/config.py` to use 25,000 estimators and a learning rate of 0.05, and crucially, I will remove the code in `runfile.py` that overrides these settings. This ensures the model has sufficient capacity to learn complex geometric interactions.
+2.  **Implement Aggregate Directional Statistics (Cite Lesson 00019):** I will replace the explicit path-based geometric features (bond angles and dihedrals along the shortest path) with **Cosine Projection Features**. This involves calculating the cosine similarity between the coupling axis and the bond vectors of all immediate neighbors for both atoms, then aggregating them (mean, min, max). This captures the steric "field" effect and electronic crowding more effectively than single-path descriptors.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# XGBoost Parameters for Path-Contextualized Stratified Ensemble
+# Designed for high-capacity learning of geometric features (angles, dihedrals)
+XGB_PARAMS = {
+    "n_estimators": 30000,  # High ceiling, relying on early stopping
+    "learning_rate": 0.02,  # Low LR for robust convergence
+    "max_depth": 11,  # Deep trees to capture high-order geometric interactions
+    "colsample_bytree": 0.45,  # Aggressive sampling to force diversity in split features
+    "subsample": 0.8,  # Row subsampling for generalization
+=======
+# XGBoost Parameters for Path-Contextualized Stratified Ensemble
+# Designed for high-capacity learning of geometric features (angles, dihedrals)
+XGB_PARAMS = {
+    "n_estimators": 25000,  # Optimized capacity Cite solution_lesson_node_00008
+    "learning_rate": 0.05,  # Balanced LR Cite solution_lesson_node_00008
+    "max_depth": 11,  # Deep trees to capture high-order geometric interactions
+    "colsample_bytree": 0.45,  # Aggressive sampling to force diversity in split features
+    "subsample": 0.8,  # Row subsampling for generalization
+>>>>>>> REPLACE
+```
+
+```diff
+library/geometry_engine.py
+<<<<<<< SEARCH
+    def _calculate_angle(self, p0, p1, p2):
+        """
+        Calculates the angle (in degrees) at p1 formed by p0-p1-p2.
+        """
+        v1 = p0 - p1
+        v2 = p2 - p1
+
+        # Normalize
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+
+        if n1 < 1e-6 or n2 < 1e-6:
+            return np.nan
+
+        v1_u = v1 / n1
+        v2_u = v2 / n2
+
+        cosine_angle = np.dot(v1_u, v2_u)
+        # Clip to handle floating point errors slightly outside [-1, 1]
+        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+        angle = np.arccos(cosine_angle)
+        return np.degrees(angle)
+
+    def _calculate_dihedral(self, p0, p1, p2, p3):
+        """
+        Calculates the dihedral angle (in degrees) for the chain p0-p1-p2-p3.
+        """
+        b0 = -1.0 * (p1 - p0)
+        b1 = p2 - p1
+        b2 = p3 - p2
+
+        # Normalize b1
+        b1_norm = np.linalg.norm(b1)
+        if b1_norm < 1e-6:
+            return np.nan
+        b1_u = b1 / b1_norm
+
+        # Vector rejections
+        # v = projection of b0 onto plane perpendicular to b1
+        v = b0 - np.dot(b0, b1_u) * b1_u
+        w = b2 - np.dot(b2, b1_u) * b1_u
+
+        # Angle between v and w
+        x = np.dot(v, w)
+        y = np.dot(np.cross(b1_u, v), w)
+
+        return np.degrees(np.arctan2(y, x))
+
+    def get_shortest_path_features(self, df, dataset_name, load_cached_data=True):
+        """
+        Computes geometric path features for the given dataframe.
+
+        Args:
+            df (pd.DataFrame): Dataframe containing 'molecule_name', 'atom_index_0', 'atom_index_1'.
+            dataset_name (str): Name of the dataset (e.g., 'train', 'test') for caching.
+            load_cached_data (bool): Whether to load from cache if available.
+
+        Returns:
+            pd.DataFrame: Dataframe with geometric features, aligned with input df.
+        """
+        # Ensure working directory exists
+        os.makedirs(WORKING_DIR, exist_ok=True)
+        cache_file = os.path.join(
+            WORKING_DIR, f"geometry_features_{dataset_name}.parquet"
+        )
+
+        if load_cached_data and os.path.exists(cache_file):
+            print(f"Loading cached geometry features from {cache_file}")
+            return pd.read_parquet(cache_file)
+
+        print(f"Computing geometry features for {dataset_name}...")
+
+        # Prepare results container
+        n_samples = len(df)
+        path_lengths = np.full(n_samples, -1, dtype=np.int8)
+        path_angles = np.full(n_samples, np.nan, dtype=np.float32)
+        path_dihedrals = np.full(n_samples, np.nan, dtype=np.float32)
+
+        # Add a temp index to df to track order for filling arrays
+        df_temp = df.copy()
+        df_temp["temp_row_idx"] = np.arange(n_samples)
+
+        # Group by molecule to process efficiently
+        grouped = df_temp.groupby("molecule_name")
+
+        # Iterate over molecules
+        for mol_name, group in grouped:
+            if mol_name not in self.structures_map:
+                continue
+
+            mol_data = self.structures_map[mol_name]
+            coords = mol_data["coords"]
+
+            # Build Graph
+            G = self._build_graph(coords)
+
+            # Compute all pairs shortest paths (BFS)
+            # path_dict[source][target] = [list of nodes]
+            try:
+                path_dict = dict(nx.all_pairs_shortest_path(G))
+            except Exception:
+                # Fallback for empty/error graphs
+                path_dict = {}
+
+            # Process rows for this molecule
+            for row in group.itertuples():
+                idx0 = row.atom_index_0
+                idx1 = row.atom_index_1
+                row_idx = row.temp_row_idx
+
+                if idx0 in path_dict and idx1 in path_dict[idx0]:
+                    path = path_dict[idx0][idx1]
+                    plen = len(path) - 1  # Number of bonds
+
+                    path_lengths[row_idx] = plen
+
+                    if plen == 2:
+                        # 2J: Angle at path[1] (A-B-C)
+                        angle = self._calculate_angle(
+                            coords[path[0]], coords[path[1]], coords[path[2]]
+                        )
+                        path_angles[row_idx] = angle
+                    elif plen == 3:
+                        # 3J: Dihedral (A-B-C-D)
+                        dihedral = self._calculate_dihedral(
+                            coords[path[0]],
+                            coords[path[1]],
+                            coords[path[2]],
+                            coords[path[3]],
+                        )
+                        path_dihedrals[row_idx] = dihedral
+                else:
+                    # No path found (disconnected or error)
+                    path_lengths[row_idx] = -1
+
+        # Construct Result DataFrame
+        result_df = pd.DataFrame(
+            {
+                "geo_path_len": path_lengths,
+                "geo_angle": path_angles,
+                "geo_dihedral": path_dihedrals,
+            }
+        )
+
+        # Reduce memory usage
+        result_df = reduce_mem_usage(result_df, verbose=False)
+
+        # Save to cache
+        print(f"Saving geometry features to {cache_file}")
+        result_df.to_parquet(cache_file)
+
+        return result_df
+=======
+    def get_cosine_features(self, df, dataset_name, load_cached_data=True):
+        """
+        Computes cosine projection features (Aggregate Directional Statistics).
+        Cite solution_lesson_node_00019
+
+        Args:
+            df (pd.DataFrame): Dataframe containing 'molecule_name', 'atom_index_0', 'atom_index_1'.
+            dataset_name (str): Name of the dataset for caching.
+            load_cached_data (bool): Whether to load from cache.
+
+        Returns:
+            pd.DataFrame: Dataframe with cosine features.
+        """
+        os.makedirs(WORKING_DIR, exist_ok=True)
+        cache_file = os.path.join(
+            WORKING_DIR, f"cosine_features_{dataset_name}.parquet"
+        )
+
+        if load_cached_data and os.path.exists(cache_file):
+            print(f"Loading cached cosine features from {cache_file}")
+            return pd.read_parquet(cache_file)
+
+        print(f"Computing cosine features for {dataset_name}...")
+
+        n_samples = len(df)
+        # Features: mean, min, max for atom 0 and atom 1
+        # Initialize with NaNs
+        res = {
+            "cos_0_mean": np.full(n_samples, np.nan, dtype=np.float32),
+            "cos_0_min": np.full(n_samples, np.nan, dtype=np.float32),
+            "cos_0_max": np.full(n_samples, np.nan, dtype=np.float32),
+            "cos_1_mean": np.full(n_samples, np.nan, dtype=np.float32),
+            "cos_1_min": np.full(n_samples, np.nan, dtype=np.float32),
+            "cos_1_max": np.full(n_samples, np.nan, dtype=np.float32),
+        }
+
+        df_temp = df.copy()
+        df_temp["temp_row_idx"] = np.arange(n_samples)
+        grouped = df_temp.groupby("molecule_name")
+
+        for mol_name, group in grouped:
+            if mol_name not in self.structures_map:
+                continue
+
+            mol_data = self.structures_map[mol_name]
+            coords = mol_data["coords"]
+            n_atoms = len(coords)
+
+            # Build Adjacency (Neighbors)
+            dists = squareform(pdist(coords))
+            adj = (dists < BOND_LENGTH_THRESHOLD)
+            np.fill_diagonal(adj, False)
+            
+            # Pre-compute neighbors list for this molecule
+            neighbors_list = [np.where(adj[i])[0] for i in range(n_atoms)]
+
+            # Process rows
+            for row in group.itertuples():
+                idx0 = row.atom_index_0
+                idx1 = row.atom_index_1
+                row_idx = row.temp_row_idx
+                
+                p0 = coords[idx0]
+                p1 = coords[idx1]
+                
+                # Axis vectors (pointing towards the other atom)
+                axis_0 = p1 - p0
+                axis_1 = p0 - p1
+                
+                norm_axis_0 = np.linalg.norm(axis_0)
+                norm_axis_1 = np.linalg.norm(axis_1)
+                
+                # Avoid zero division
+                if norm_axis_0 < 1e-6: norm_axis_0 = 1.0
+                if norm_axis_1 < 1e-6: norm_axis_1 = 1.0
+
+                # --- Atom 0 ---
+                neighs_0 = neighbors_list[idx0]
+                if len(neighs_0) > 0:
+                    # Vectors to neighbors
+                    vecs = coords[neighs_0] - p0
+                    norms = np.linalg.norm(vecs, axis=1)
+                    norms[norms < 1e-6] = 1.0
+                    
+                    # Dot products
+                    dots = np.dot(vecs, axis_0)
+                    cosines = dots / (norms * norm_axis_0)
+                    
+                    # Clip
+                    cosines = np.clip(cosines, -1.0, 1.0)
+                    
+                    res["cos_0_mean"][row_idx] = np.mean(cosines)
+                    res["cos_0_min"][row_idx] = np.min(cosines)
+                    res["cos_0_max"][row_idx] = np.max(cosines)
+                else:
+                    res["cos_0_mean"][row_idx] = 0.0
+                    res["cos_0_min"][row_idx] = 0.0
+                    res["cos_0_max"][row_idx] = 0.0
+
+                # --- Atom 1 ---
+                neighs_1 = neighbors_list[idx1]
+                if len(neighs_1) > 0:
+                    vecs = coords[neighs_1] - p1
+                    norms = np.linalg.norm(vecs, axis=1)
+                    norms[norms < 1e-6] = 1.0
+                    
+                    dots = np.dot(vecs, axis_1)
+                    cosines = dots / (norms * norm_axis_1)
+                    
+                    cosines = np.clip(cosines, -1.0, 1.0)
+                    
+                    res["cos_1_mean"][row_idx] = np.mean(cosines)
+                    res["cos_1_min"][row_idx] = np.min(cosines)
+                    res["cos_1_max"][row_idx] = np.max(cosines)
+                else:
+                    res["cos_1_mean"][row_idx] = 0.0
+                    res["cos_1_min"][row_idx] = 0.0
+                    res["cos_1_max"][row_idx] = 0.0
+
+        result_df = pd.DataFrame(res)
+        result_df = reduce_mem_usage(result_df, verbose=False)
+
+        print(f"Saving cosine features to {cache_file}")
+        result_df.to_parquet(cache_file)
+        return result_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_pipeline.py
+<<<<<<< SEARCH
+        with Timer("Geometry Engine (Path Features)"):
+            # 4. Path-Centric Features (Angles, Dihedrals)
+            # This uses the GeometryEngine to find shortest paths
+            df_geo = self.geo_engine.get_shortest_path_features(
+                metadata_df, dataset_name, load_cached_data=load_cached_data
+            )
+
+            # Concatenate features (assuming index alignment, which is true if metadata_df hasn't been shuffled/filtered)
+            # To be safe, we reset index on both
+            df = df.reset_index(drop=True)
+            df_geo = df_geo.reset_index(drop=True)
+            df = pd.concat([df, df_geo], axis=1)
+=======
+        with Timer("Geometry Engine (Cosine Features)"):
+            # 4. Cosine Projection Features
+            # Cite solution_lesson_node_00019
+            df_geo = self.geo_engine.get_cosine_features(
+                metadata_df, dataset_name, load_cached_data=load_cached_data
+            )
+
+            # Concatenate features
+            df = df.reset_index(drop=True)
+            df_geo = df_geo.reset_index(drop=True)
+            df = pd.concat([df, df_geo], axis=1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_pipeline.py
+<<<<<<< SEARCH
+        with Timer("Cleanup & Save"):
+            # 6. Final Cleanup
+            # Fill NaNs for geometric features (e.g. no path found, or 1J coupling has no angle)
+            # Angles/Dihedrals: NaN usually implies the topology doesn't support the feature.
+            # We fill with -1 or 0. XGBoost handles NaNs, but explicit values can be safer.
+            df["geo_angle"] = df["geo_angle"].fillna(-1)
+            df["geo_dihedral"] = df["geo_dihedral"].fillna(-1)
+
+            # Drop raw coordinates (rotational variance makes them noisy)
+=======
+        with Timer("Cleanup & Save"):
+            # 6. Final Cleanup
+            # Fill NaNs for cosine features
+            cosine_cols = [c for c in df.columns if c.startswith("cos_")]
+            df[cosine_cols] = df[cosine_cols].fillna(0)
+
+            # Drop raw coordinates (rotational variance makes them noisy)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Optimize Configuration for Fast Baseline Execution
+    # We modify the configuration dictionary in-place. Since library.trainer imports this dictionary,
+    # changes here will be reflected in the trainer.
+    print("Configuring parameters for fast baseline run...")
+    config.XGB_PARAMS["n_estimators"] = 1000  # Limit trees for speed (baseline)
+    config.XGB_PARAMS["learning_rate"] = (
+        0.1  # Increase LR to compensate for fewer trees
+    )
+    config.XGB_PARAMS["verbose"] = 0  # Silent training
+=======
+    # Use Full Configuration from config.py
+    # Cite solution_lesson_node_00018: Do not use low-capacity models for feature evaluation.
+    print("Using production configuration (High Capacity)...")
+>>>>>>> REPLACE
+```

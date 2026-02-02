@@ -1,0 +1,290 @@
+To address the critical issue of context truncation identified in the failure analysis, I will implement a **Sliding Window** strategy with a **Retriever-Reader** mechanism within the data loading pipeline.
+
+### Strategy
+1.  **Context Windowing (Cite solution_lesson_node_00001)**: The previous solution truncated contexts at 1024 tokens, often discarding the answer span since contexts average ~1600 words (likely >3000 tokens). I will modify `QADataset` to split long contexts into manageable windows.
+2.  **Oracle Training**: During training (`mode='train'`), the dataset will select the specific window that contains the ground truth `answer_start`. This ensures the model always receives the relevant context to learn the answer extraction task.
+3.  **Retrieval Inference**: During validation and testing (`mode='val'`/`mode='test'`), where the answer location is unknown, the dataset will slide a window over the text and select the chunk with the highest token overlap (Jaccard similarity) with the question. This acts as a lightweight retriever to find the most relevant passage.
+4.  **Hyperparameter Tuning**: I will increase `EPOCHS` from 5 (baseline) to 20 to allow the model sufficient time to converge on this improved, high-quality input data.
+
+### Code Changes
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 15
+    BATCH_SIZE = 8
+=======
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    EPOCHS = 20
+    BATCH_SIZE = 8
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+class QADataset(Dataset):
+    """
+    Custom Dataset for Question Answering using mT5.
+    Formats input as: "question: <question> context: <context>"
+    """
+
+    def __init__(self, data, tokenizer, source_max_len, target_max_len, is_test=False):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.source_max_len = source_max_len
+        self.target_max_len = target_max_len
+        self.is_test = is_test
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data.iloc[index]
+
+        # Input formatting for T5/mT5
+        source_text = f"question: {row['question']} context: {row['context']}"
+
+        # Tokenize inputs
+        source_encoding = self.tokenizer(
+            source_text,
+            max_length=self.source_max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Base item dictionary
+        item = {
+            "ids": row["id"],
+            "input_ids": source_encoding["input_ids"].squeeze(),
+            "attention_mask": source_encoding["attention_mask"].squeeze(),
+            "context": row["context"],  # Needed for post-processing
+            "question": row["question"],  # Kept for reference
+        }
+
+        # Handle targets (Training/Validation)
+        if not self.is_test:
+            target_text = str(row["answer_text"])
+
+            # Tokenize targets
+            # Note: text_target is the standard way to tokenize labels in newer transformers
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            labels = target_encoding["input_ids"].squeeze()
+
+            # Replace padding token id with -100 so CrossEntropyLoss ignores them
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            item["labels"] = labels
+            item["answer_text"] = target_text
+
+        return item
+=======
+class QADataset(Dataset):
+    """
+    Custom Dataset for Question Answering using mT5.
+    Implements Sliding Window strategy to handle long contexts.
+    """
+
+    def __init__(self, data, tokenizer, source_max_len, target_max_len, mode='train'):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.source_max_len = source_max_len
+        self.target_max_len = target_max_len
+        self.mode = mode  # 'train', 'val', 'test'
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        row = self.data.iloc[index]
+        question = row['question']
+        context = row['context']
+        
+        # Tokenize question to determine available budget
+        q_enc = self.tokenizer(question, add_special_tokens=False)
+        q_ids = q_enc.input_ids
+        
+        # Reserve space for special tokens and formatting (approximate safety margin)
+        budget = self.source_max_len - len(q_ids) - 20
+        
+        # Tokenize full context with offsets
+        c_enc = self.tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
+        c_ids = c_enc.input_ids
+        
+        best_window_text = context  # Default to full context if it fits
+        
+        if len(c_ids) > budget:
+            # Need to select a window
+            if self.mode == 'train':
+                # Oracle Strategy: Center around answer
+                ans_start_char = int(row['answer_start'])
+                token_idx = c_enc.char_to_token(ans_start_char)
+                
+                # If exact start not found (e.g. whitespace), search nearby
+                if token_idx is None:
+                    for offset in range(1, 20):
+                        token_idx = c_enc.char_to_token(ans_start_char + offset)
+                        if token_idx is not None:
+                            break
+                
+                if token_idx is None:
+                    token_idx = 0  # Fallback
+                
+                # Center the window
+                half_window = budget // 2
+                start_idx = max(0, token_idx - half_window)
+                end_idx = min(len(c_ids), start_idx + budget)
+                
+                # Adjust if we hit the end
+                if end_idx - start_idx < budget and start_idx > 0:
+                    start_idx = max(0, end_idx - budget)
+                
+                # Extract text span using offsets
+                span_start = c_enc.offset_mapping[start_idx][0]
+                span_end = c_enc.offset_mapping[end_idx - 1][1]
+                best_window_text = context[span_start:span_end]
+                
+            else:
+                # Retrieval Strategy (Val/Test): Sliding window based on question overlap
+                stride = budget // 2
+                best_score = -1
+                best_window_text = ""
+                
+                q_set = set(q_ids)
+                
+                for i in range(0, len(c_ids), stride):
+                    end_i = min(len(c_ids), i + budget)
+                    window_ids = c_ids[i:end_i]
+                    
+                    # Simple overlap score (intersection count)
+                    score = len(set(window_ids) & q_set)
+                    
+                    if score > best_score:
+                        best_score = score
+                        span_start = c_enc.offset_mapping[i][0]
+                        span_end = c_enc.offset_mapping[end_i - 1][1]
+                        best_window_text = context[span_start:span_end]
+                    
+                    if end_i == len(c_ids):
+                        break
+                
+                if not best_window_text:
+                    best_window_text = context[:2000]  # Fallback
+
+        # Construct final input
+        source_text = f"question: {question} context: {best_window_text}"
+
+        # Tokenize final input
+        source_encoding = self.tokenizer(
+            source_text,
+            max_length=self.source_max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        item = {
+            "ids": row["id"],
+            "input_ids": source_encoding["input_ids"].squeeze(),
+            "attention_mask": source_encoding["attention_mask"].squeeze(),
+            "context": context,  # Keep full context for post-processing
+            "question": question,
+        }
+
+        # Handle targets
+        if self.mode in ['train', 'val']:
+            target_text = str(row["answer_text"])
+            target_encoding = self.tokenizer(
+                text_target=target_text,
+                max_length=self.target_max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            labels = target_encoding["input_ids"].squeeze()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            item["labels"] = labels
+            item["answer_text"] = target_text
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # Create Datasets
+    train_dataset = QADataset(
+        train_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=False,
+    )
+
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=False,
+    )
+
+    test_dataset = QADataset(
+        test_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        is_test=True,
+    )
+=======
+    # Create Datasets
+    train_dataset = QADataset(
+        train_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode='train',
+    )
+
+    val_dataset = QADataset(
+        val_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode='val',
+    )
+
+    test_dataset = QADataset(
+        test_df,
+        tokenizer,
+        Config.MAX_SOURCE_LENGTH,
+        Config.MAX_TARGET_LENGTH,
+        mode='test',
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline
+    # The dataset is small (800 samples), so 5 epochs is quick but sufficient for a baseline.
+    Config.EPOCHS = 5
+
+    print("Configuration set. Starting pipeline...")
+=======
+    print("Configuration set. Starting pipeline...")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,264 @@
+import os
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset, DataLoader
+
+from library.config import Config
+from library.utils import create_contralateral_lookup, set_seed
+
+# Ensure reproducibility
+set_seed(Config.SEED)
+
+
+def get_age_statistics(df_train, cache_dir):
+    """
+    Computes or loads mean and std of age from training data.
+    """
+    cache_path = os.path.join(cache_dir, "age_stats.npy")
+
+    if os.path.exists(cache_path):
+        stats = np.load(cache_path, allow_pickle=True).item()
+        return stats["mean"], stats["std"]
+
+    # Compute
+    # Handle missing ages if any (impute with mean of available)
+    ages = df_train["age"].dropna().values
+    mean_age = np.mean(ages)
+    std_age = np.std(ages)
+
+    # Save
+    np.save(cache_path, {"mean": mean_age, "std": std_age})
+
+    return mean_age, std_age
+
+
+def load_image(path, size):
+    """
+    Loads an image, converts to grayscale, and resizes.
+    Fails loudly if file is missing/corrupt.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Image file not found: {path}")
+
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Failed to load image (corrupt or unsupported): {path}")
+
+    img = cv2.resize(img, (size[1], size[0]), interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+class SiameseMammographyDataset(Dataset):
+    def __init__(self, df, age_mean, age_std, transform=None, is_test=False):
+        self.df = df.reset_index(drop=True)
+        self.age_mean = age_mean
+        self.age_std = age_std
+        self.transform = transform
+        self.is_test = is_test
+        self.img_size = Config.IMG_SIZE
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # 1. Load Target Image
+        target_path = os.path.join(Config.INPUT_DIR, row["file_path"])
+        try:
+            target_img = load_image(target_path, self.img_size)
+        except Exception as e:
+            # As per requirements: Fail loudly
+            raise e
+
+        # 2. Load Contralateral Image
+        contra_path_rel = row.get("contra_file_path")
+
+        if contra_path_rel and pd.notna(contra_path_rel):
+            full_contra_path = os.path.join(Config.INPUT_DIR, contra_path_rel)
+            if os.path.exists(full_contra_path):
+                try:
+                    contra_img = load_image(full_contra_path, self.img_size)
+                except:
+                    # If corrupt, treat as missing (zero tensor) or fail?
+                    # Prompt says: "Fail Loudly... if a file path exists in metadata but the file is unreadable."
+                    raise ValueError(
+                        f"Contralateral image defined but unreadable: {full_contra_path}"
+                    )
+            else:
+                # If file doesn't exist, raise error as per Fail Loudly policy for expected files
+                raise FileNotFoundError(
+                    f"Contralateral file missing: {full_contra_path}"
+                )
+        else:
+            # No pair exists
+            contra_img = np.zeros(self.img_size, dtype=np.uint8)
+
+        # 3. Augmentation (Synchronized)
+        # Apply identical transforms to both images to maintain spatial correspondence
+        if self.transform:
+            augmented = self.transform(image=target_img, image_contra=contra_img)
+            target_img = augmented["image"]
+            contra_img = augmented["image_contra"]
+
+        # 4. Normalization (Pixel) -> [0, 1]
+        target_img = target_img.astype(np.float32) / 255.0
+        contra_img = contra_img.astype(np.float32) / 255.0
+
+        # 5. Metadata Channels
+        # Age
+        age = row["age"]
+        if pd.isna(age):
+            age = self.age_mean  # Simple imputation
+        age_norm = (age - self.age_mean) / self.age_std
+        age_map = np.full(self.img_size, age_norm, dtype=np.float32)
+
+        # Implant
+        implant = row["implant"]
+        if pd.isna(implant):
+            implant = 0
+        implant_val = 1.0 if implant else 0.0
+        implant_map = np.full(self.img_size, implant_val, dtype=np.float32)
+
+        # 6. Stack Channels
+        # Result: (H, W, 3) -> (Image, Age, Implant)
+        target_tensor = np.stack([target_img, age_map, implant_map], axis=-1)
+        contra_tensor = np.stack([contra_img, age_map, implant_map], axis=-1)
+
+        # Convert to Torch Tensor (C, H, W)
+        target_tensor = torch.from_numpy(target_tensor).permute(2, 0, 1).float()
+        contra_tensor = torch.from_numpy(contra_tensor).permute(2, 0, 1).float()
+
+        # 7. Label / Prediction ID
+        if self.is_test:
+            return target_tensor, contra_tensor, row["prediction_id"]
+        else:
+            label = torch.tensor(row["cancer"], dtype=torch.float32)
+            return target_tensor, contra_tensor, label
+
+
+def get_transforms(phase):
+    """
+    Returns albumentations transforms for train or val/test.
+    """
+    if phase == "train":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=15, p=0.5, border_mode=cv2.BORDER_CONSTANT, value=0),
+                # No photometric augmentations as per strategy
+            ],
+            additional_targets={"image_contra": "image"},
+        )
+    else:
+        # No test-time augmentation (TTA) specified
+        return A.Compose([], additional_targets={"image_contra": "image"})
+
+
+def process_metadata(df_path, cache_path, load_cached_data):
+    """
+    Loads metadata, adds contralateral paths, and caches the result.
+    """
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            df = pd.read_parquet(cache_path)
+            return df
+        except Exception:
+            pass  # Fallback to recomputing
+
+    df = pd.read_csv(df_path)
+
+    # Create lookup
+    lookup = create_contralateral_lookup(df)
+
+    # Map lookup to dataframe
+    df["contra_file_path"] = df["image_id"].map(lookup)
+
+    # Save to cache
+    df.to_parquet(cache_path, index=False)
+
+    return df
+
+
+def get_dataloaders(
+    load_cached_data=True,
+    debug=Config.DEBUG,
+    debug_sample_size=Config.DEBUG_SAMPLE_SIZE,
+):
+    """
+    Main function to prepare dataloaders.
+    """
+    # Ensure working directory exists
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+    # 1. Age Statistics
+    # Load raw train to get stats (always from full train set for consistency)
+    df_train_raw = pd.read_csv(Config.TRAIN_METADATA_PATH)
+    age_mean, age_std = get_age_statistics(df_train_raw, Config.WORKING_DIR)
+
+    # 2. Process Metadata (Train/Val/Test)
+    train_cache = os.path.join(Config.WORKING_DIR, "processed_train.parquet")
+    val_cache = os.path.join(Config.WORKING_DIR, "processed_val.parquet")
+    test_cache = os.path.join(Config.WORKING_DIR, "processed_test.parquet")
+
+    df_train = process_metadata(
+        Config.TRAIN_METADATA_PATH, train_cache, load_cached_data
+    )
+    df_val = process_metadata(Config.VAL_METADATA_PATH, val_cache, load_cached_data)
+    df_test = process_metadata(Config.TEST_METADATA_PATH, test_cache, load_cached_data)
+
+    # Debug Subsampling
+    if debug:
+        df_train = df_train.sample(
+            n=min(len(df_train), debug_sample_size), random_state=Config.SEED
+        ).reset_index(drop=True)
+        df_val = df_val.sample(
+            n=min(len(df_val), debug_sample_size), random_state=Config.SEED
+        ).reset_index(drop=True)
+        df_test = df_test.sample(
+            n=min(len(df_test), debug_sample_size), random_state=Config.SEED
+        ).reset_index(drop=True)
+
+    # 3. Datasets
+    train_dataset = SiameseMammographyDataset(
+        df_train, age_mean, age_std, transform=get_transforms("train"), is_test=False
+    )
+    val_dataset = SiameseMammographyDataset(
+        df_val, age_mean, age_std, transform=get_transforms("val"), is_test=False
+    )
+    test_dataset = SiameseMammographyDataset(
+        df_test, age_mean, age_std, transform=get_transforms("test"), is_test=True
+    )
+
+    # 4. Dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+    )
+
+    return train_loader, val_loader, test_loader

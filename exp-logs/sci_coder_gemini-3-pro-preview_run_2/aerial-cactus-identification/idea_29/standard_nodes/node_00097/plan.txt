@@ -1,0 +1,379 @@
+To optimize the solution, I will replace the computationally expensive `WideAntiAliasedRes2NeXt` architecture with a streamlined `SimpleResNet` specifically designed for 32x32 input images. This decision is grounded in several key lessons:
+
+1.  **Cite solution_lesson_node_00001** and **Cite solution_lesson_node_00005**: A shallow, custom CNN that preserves spatial resolution (avoiding early aggressive downsampling) is highly effective for low-resolution tasks.
+2.  **Cite solution_lesson_node_00013**: Complex mechanisms like Squeeze-and-Excitation (SE) blocks and attention add computational overhead without improving performance when a simpler baseline already saturates the metric (AUC ~1.0).
+3.  **Cite solution_lesson_node_00063**: Standard 1x1 convolutional projections in residual shortcuts are preferred over complex 3x3 shortcuts for efficiency and performance.
+4.  **Cite solution_lesson_node_00049**: Prioritizing standard model width (scaling from 32 to 128 channels) is more robust than complex multi-scale feature aggregation heads.
+
+The new `SimpleResNet` will feature a channel progression of [32, 64, 128], use standard `BasicBlock`s with 1x1 shortcuts, and employ Global Average Pooling. This change will drastically reduce model complexity and training time while maintaining the near-perfect accuracy achieved by the previous solution.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+# --- Model Components ---
+
+
+class BlurPool(nn.Module):
+    """
+    Anti-Aliased Downsampling using a low-pass filter (Blur) before subsampling.
+    """
+
+    def __init__(self, channels, stride=2):
+        super(BlurPool, self).__init__()
+        self.stride = stride
+        # Gaussian kernel [1, 2, 1]
+        kernel = torch.tensor([1, 2, 1], dtype=torch.float32)
+        kernel = kernel[:, None] * kernel[None, :]  # 3x3
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, 3, 3)
+        # Register as buffer so it's saved with model but not updated by optimizer
+        self.register_buffer("kernel", kernel.repeat(channels, 1, 1, 1))
+        self.groups = channels
+
+    def forward(self, x):
+        if self.stride == 1:
+            return x
+        # Pad to keep size correct before subsampling
+        return F.conv2d(
+            x, self.kernel, stride=self.stride, padding=1, groups=self.groups
+        )
+
+
+class CoordinateAttention(nn.Module):
+    """
+    Coordinate Attention for efficient mobile network design.
+    Factorizes attention into two 1D feature encoding processes.
+    """
+
+    def __init__(self, inp, reduction=32):
+        super(CoordinateAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        self.conv_h = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+
+        out = identity * a_h * a_w
+        return out
+
+
+class Res2NeXtBlock(nn.Module):
+    """
+    Integrates Res2Net hierarchical connections within a ResNeXt topology.
+    Includes Coordinate Attention and Anti-Aliased Downsampling (BlurPool).
+    """
+
+    def __init__(self, in_planes, planes, stride=1, scale=4, groups=8):
+        super(Res2NeXtBlock, self).__init__()
+        self.stride = stride
+        self.scale = scale
+        self.width = planes  # Using expansion=1 for simplicity given "Wide" channels
+
+        # 1x1 Expand/Project
+        self.conv1 = nn.Conv2d(in_planes, self.width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.width)
+
+        # Res2Net Convs
+        # Split width into 'scale' groups
+        self.width_per_scale = self.width // scale
+        self.convs = nn.ModuleList()
+        for i in range(scale - 1):
+            # Grouped convolution inside the split
+            self.convs.append(
+                nn.Conv2d(
+                    self.width_per_scale,
+                    self.width_per_scale,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    groups=groups,
+                    bias=False,
+                )
+            )
+        self.bns = nn.ModuleList(
+            [nn.BatchNorm2d(self.width_per_scale) for _ in range(scale - 1)]
+        )
+
+        # 1x1 Project
+        self.conv3 = nn.Conv2d(self.width, planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Coordinate Attention
+        self.ca = CoordinateAttention(planes)
+
+        # BlurPool for downsampling (applied after convs)
+        self.downsample = None
+        if stride > 1 or in_planes != planes:
+            layers = []
+            if stride > 1:
+                layers.append(BlurPool(in_planes, stride=stride))
+            layers.append(nn.Conv2d(in_planes, planes, kernel_size=1, bias=False))
+            layers.append(nn.BatchNorm2d(planes))
+            self.downsample = nn.Sequential(*layers)
+
+        self.blur = BlurPool(planes, stride=stride) if stride > 1 else nn.Identity()
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # Res2Net Logic
+        spx = torch.split(out, self.width_per_scale, 1)
+
+        # The first group is identity (or processed if we wanted, but standard Res2Net leaves one identity-like path)
+        # We accumulate features hierarchically
+        yx = []
+        yx.append(spx[0])
+        y_prev = spx[0]
+
+        for i in range(1, self.scale):
+            # y[i] = Conv(x[i] + y[i-1])
+            y = self.convs[i - 1](spx[i] + y_prev)
+            y = self.bns[i - 1](y)
+            y = self.relu(y)
+            yx.append(y)
+            y_prev = y
+
+        out = torch.cat(yx, 1)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        out = self.ca(out)
+
+        # Apply BlurPool if stride > 1
+        if self.stride > 1:
+            out = self.blur(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class WideAntiAliasedRes2NeXt(nn.Module):
+    """
+    Custom Wide Anti-Aliased Coordinate-Res2NeXt with Multi-Scale Aggregation.
+    """
+
+    def __init__(self):
+        super(WideAntiAliasedRes2NeXt, self).__init__()
+
+        self.in_planes = 64
+
+        # Stem: 32x32 image, keep resolution high
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Stages
+        # Stage 1: 64 channels, stride 1 (32x32)
+        self.layer1 = self._make_layer(64, blocks=2, stride=1)
+        # Stage 2: 128 channels, stride 2 (16x16)
+        self.layer2 = self._make_layer(128, blocks=2, stride=2)
+        # Stage 3: 256 channels, stride 2 (8x8)
+        self.layer3 = self._make_layer(256, blocks=2, stride=2)
+
+        # Head: Multi-Scale Aggregation
+        # Concatenating GAP from Stage 2 (128) and Stage 3 (256) -> 384
+        self.fc = nn.Linear(128 + 256, 1)
+
+    def _make_layer(self, planes, blocks, stride):
+        layers = []
+        # First block handles stride and channel change
+        layers.append(Res2NeXtBlock(self.in_planes, planes, stride=stride))
+        self.in_planes = planes
+        # Subsequent blocks
+        for _ in range(1, blocks):
+            layers.append(Res2NeXtBlock(self.in_planes, planes, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        l1 = self.layer1(x)  # 32x32, 64
+        l2 = self.layer2(l1)  # 16x16, 128
+        l3 = self.layer3(l2)  # 8x8, 256
+
+        # Multi-Scale Aggregation
+        out2 = F.adaptive_avg_pool2d(l2, 1).view(l2.size(0), -1)
+        out3 = F.adaptive_avg_pool2d(l3, 1).view(l3.size(0), -1)
+
+        out = torch.cat([out2, out3], dim=1)
+        return self.fc(out)
+=======
+# --- Model Components ---
+
+
+class BasicBlock(nn.Module):
+    """
+    Standard Residual Block with 2 convolutions.
+    Cite solution_lesson_node_00063: Prefer 1x1 convolutions for projection shortcuts.
+    """
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class SimpleResNet(nn.Module):
+    """
+    Lightweight Custom ResNet tailored for 32x32 images.
+    Cite solution_lesson_node_00005: Preserve Spatial Resolution, prefer GAP.
+    Cite solution_lesson_node_00013: Avoid architectural complexity (SE/Attention).
+    """
+
+    def __init__(self):
+        super(SimpleResNet, self).__init__()
+        self.in_planes = 32
+
+        # Stem: 32x32 image, 3x3 conv, no maxpool to preserve resolution
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        # Stages
+        # Cite solution_lesson_node_00049: Prioritize model width (32->128).
+        self.layer1 = self._make_layer(32, 2, stride=1)  # 32x32
+        self.layer2 = self._make_layer(64, 2, stride=2)  # 16x16
+        self.layer3 = self._make_layer(128, 2, stride=2)  # 8x8
+
+        self.linear = nn.Linear(128, 1)
+
+    def _make_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(BasicBlock(self.in_planes, planes, stride))
+            self.in_planes = planes
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.adaptive_avg_pool2d(out, 1)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        model = WideAntiAliasedRes2NeXt().to(DEVICE)
+=======
+        model = SimpleResNet().to(DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import WideAntiAliasedRes2NeXt, train_one_epoch, validate, predict
+=======
+from library.model import SimpleResNet, train_one_epoch, validate, predict
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+        model = WideAntiAliasedRes2NeXt().to(device)
+=======
+        model = SimpleResNet().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import WideAntiAliasedRes2NeXt
+=======
+from library.model import SimpleResNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+        # Initialize Model
+        model = WideAntiAliasedRes2NeXt()
+=======
+        # Initialize Model
+        model = SimpleResNet()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import WideAntiAliasedRes2NeXt
+=======
+from library.model import SimpleResNet
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Load model
+        model = WideAntiAliasedRes2NeXt()
+=======
+        # Load model
+        model = SimpleResNet()
+>>>>>>> REPLACE
+```

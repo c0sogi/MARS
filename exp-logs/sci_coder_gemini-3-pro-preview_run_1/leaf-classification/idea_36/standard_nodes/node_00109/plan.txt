@@ -1,0 +1,523 @@
+My strategy is to replace the empirical Grid Search Cross-Validation LDA approach with an **Analytical Oracle Approximating Shrinkage (OAS) LDA** model. This optimization is based on the lesson that in high-dimensional, small-sample regimes, analytical shrinkage estimators (like OAS) minimize the Mean Squared Error of the covariance matrix more robustly than cross-validated grid search, which suffers from discretization error and variance (Cite solution_lesson_node_00108).
+
+I will implement the **Linear Formulation** of LDA ($x^T W + b$) instead of the distance-based quadratic formulation to avoid numerical saturation at machine epsilon (Cite solution_lesson_node_00055). The implementation will utilize the `precision_` attribute from the OAS estimator (SVD-based pseudo-inverse) for numerical stability (Cite solution_lesson_node_00062) and strictly enforce `float64` precision throughout the inference pipeline (Cite solution_lesson_node_00045, solution_lesson_node_00057). I will also ensure geometric consistency by manually centering the data and using `assume_centered=True` in the OAS estimator (Cite solution_lesson_node_00061). Finally, I will update the submission threshold to the strict value required by the task.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Parameters for the Metric-Optimized Shrinkage Grid Search
+# We search for the optimal alpha that minimizes Multi-class Log Loss
+GRID_SIZE = 100  # Number of alpha candidates to evaluate
+CV_FOLDS = 5  # Number of stratified folds for internal validation
+ALPHA_BOUNDS = (
+    0.001,
+    0.999,
+)  # Search range for shrinkage intensity (0=Empirical, 1=Identity)
+=======
+# Parameters for the Metric-Optimized Shrinkage Grid Search
+# We search for the optimal alpha that minimizes Multi-class Log Loss
+# (Removed as we are switching to Analytical OAS)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import log_loss
+from sklearn.preprocessing import LabelEncoder
+
+from library.config import FLOAT_PRECISION, SEED, GRID_SIZE, CV_FOLDS, ALPHA_BOUNDS
+from library.utils import cholesky_solve, stable_softmax, clip_probabilities
+
+
+class MetricOptimizedCholeskyLDA:
+    """
+    Custom Linear Discriminant Analysis with Metric-Optimized Shrinkage.
+
+    Uses an exact Cholesky solver for inference and optimizes the shrinkage
+    parameter alpha via Grid Search to minimize Multi-class Log Loss.
+    """
+
+    def __init__(self):
+        self.classes_ = None
+        self.le_ = None
+        self.W_ = None  # Weight matrix (n_classes, n_features)
+        self.b_ = None  # Bias vector (n_classes,)
+        self.best_alpha_ = None
+
+    def _compute_stats(self, X, y):
+        """
+        Computes class priors, class means, and pooled empirical covariance.
+        """
+        n_samples, n_features = X.shape
+        classes = np.unique(y)
+        n_classes = len(classes)
+
+        # Initialize stats
+        means = np.zeros((n_classes, n_features), dtype=FLOAT_PRECISION)
+        priors = np.zeros(n_classes, dtype=FLOAT_PRECISION)
+
+        # Compute means and priors
+        for k, c in enumerate(classes):
+            X_c = X[y == c]
+            means[k, :] = np.mean(X_c, axis=0, dtype=FLOAT_PRECISION)
+            priors[k] = len(X_c) / n_samples
+
+        # Compute pooled covariance
+        # S_emp = (1 / (N - K)) * sum((x - mu_k)(x - mu_k)^T)
+        # We compute centered data first
+        X_centered = np.zeros_like(X, dtype=FLOAT_PRECISION)
+        for k, c in enumerate(classes):
+            mask = y == c
+            X_centered[mask] = X[mask] - means[k]
+
+        # Compute covariance matrix
+        # Note: Using (N - K) as divisor for unbiased estimator in LDA
+        cov_emp = np.dot(X_centered.T, X_centered) / (n_samples - n_classes)
+
+        return means, priors, cov_emp
+
+    def _solve_parameters(self, means, priors, covariance):
+        """
+        Solves for LDA weights W and bias b given statistics and a covariance matrix.
+
+        W = mu * Sigma^-1
+        b = -0.5 * diag(mu * Sigma^-1 * mu^T) + log(priors)
+        """
+        n_features = covariance.shape[0]
+        n_classes = means.shape[0]
+
+        # Solve Sigma * W^T = mu^T  => W^T = Sigma^-1 * mu^T
+        # We use Cholesky solve for numerical stability
+        # Target shape: (n_features, n_classes)
+        target = means.T
+
+        # W_T shape: (n_features, n_classes)
+        W_T = cholesky_solve(covariance, target)
+
+        # W shape: (n_classes, n_features)
+        W = W_T.T
+
+        # Compute bias terms
+        # Term 1: -0.5 * mu^T * Sigma^-1 * mu
+        # We can compute this efficiently using the already solved W
+        # diag(means @ W.T)
+        term1 = -0.5 * np.sum(means * W, axis=1)
+
+        # Term 2: log(priors)
+        term2 = np.log(priors)
+
+        b = term1 + term2
+
+        return W, b
+
+    def _get_shrunk_covariance(self, emp_cov, alpha):
+        """
+        Computes the shrunk covariance matrix:
+        Sigma(alpha) = (1 - alpha) * S_emp + alpha * (Tr(S_emp) / P) * I
+        """
+        n_features = emp_cov.shape[0]
+        trace = np.trace(emp_cov)
+        target = (trace / n_features) * np.eye(n_features, dtype=FLOAT_PRECISION)
+
+        shrunk_cov = (1 - alpha) * emp_cov + alpha * target
+        return shrunk_cov
+
+    def fit(self, X, y):
+        """
+        Fits the model using Stratified K-Fold CV to optimize shrinkage alpha.
+        """
+        # Ensure float64
+        X = X.astype(FLOAT_PRECISION)
+
+        # Encode labels
+        self.le_ = LabelEncoder()
+        y_encoded = self.le_.fit_transform(y)
+        self.classes_ = self.le_.classes_
+
+        # Define Grid
+        alphas = np.linspace(ALPHA_BOUNDS[0], ALPHA_BOUNDS[1], GRID_SIZE)
+
+        # Initialize CV
+        skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+
+        avg_losses = []
+
+        print(
+            f"Starting Grid Search for optimal shrinkage (Grid Size: {GRID_SIZE}, Folds: {CV_FOLDS})..."
+        )
+
+        # Pre-compute indices to avoid re-splitting
+        splits = list(skf.split(X, y_encoded))
+
+        for alpha in alphas:
+            fold_losses = []
+
+            for train_idx, val_idx in splits:
+                X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+                y_train_fold, y_val_fold = y_encoded[train_idx], y_encoded[val_idx]
+
+                # Compute stats for this fold
+                means_f, priors_f, cov_emp_f = self._compute_stats(
+                    X_train_fold, y_train_fold
+                )
+
+                # Apply shrinkage
+                cov_shrunk = self._get_shrunk_covariance(cov_emp_f, alpha)
+
+                # Solve weights
+                try:
+                    W_f, b_f = self._solve_parameters(means_f, priors_f, cov_shrunk)
+
+                    # Predict
+                    logits = np.dot(X_val_fold, W_f.T) + b_f
+                    probs = stable_softmax(logits)
+
+                    # Clip for metric calculation stability
+                    probs_clipped = clip_probabilities(probs)
+
+                    loss = log_loss(
+                        y_val_fold, probs_clipped, labels=np.arange(len(self.classes_))
+                    )
+                    fold_losses.append(loss)
+                except np.linalg.LinAlgError:
+                    # In case alpha is too small and matrix is singular (unlikely with shrinkage)
+                    fold_losses.append(np.inf)
+
+            avg_loss = np.mean(fold_losses)
+            avg_losses.append(avg_loss)
+
+        # Select best alpha
+        best_idx = np.argmin(avg_losses)
+        self.best_alpha_ = alphas[best_idx]
+        self.best_alpha_ = alphas[best_idx]
+        best_loss = avg_losses[best_idx]
+
+        print(
+            f"Optimal Alpha found: {self.best_alpha_:.6f} with CV Log Loss: {best_loss:.6f}"
+        )
+
+        # Refit on full dataset
+        print("Refitting on full training set...")
+        means_full, priors_full, cov_emp_full = self._compute_stats(X, y_encoded)
+        cov_final = self._get_shrunk_covariance(cov_emp_full, self.best_alpha_)
+
+        self.W_, self.b_ = self._solve_parameters(means_full, priors_full, cov_final)
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predicts class probabilities for samples in X.
+        """
+        if self.W_ is None or self.b_ is None:
+            raise RuntimeError("Model must be fitted before calling predict_proba.")
+
+        X = X.astype(FLOAT_PRECISION)
+
+        # Linear Inference: Z = X * W^T + b
+        logits = np.dot(X, self.W_.T) + self.b_
+
+        # Softmax
+        probs = stable_softmax(logits)
+
+        return probs
+=======
+import numpy as np
+from sklearn.covariance import OAS
+from sklearn.preprocessing import LabelEncoder
+
+from library.config import FLOAT_PRECISION
+from library.utils import stable_softmax
+
+
+class AnalyticalOASLDA:
+    """
+    Linear Discriminant Analysis with Analytical Oracle Approximating Shrinkage.
+    
+    Replaces empirical grid search with the closed-form analytical solution for
+    covariance shrinkage (Cite solution_lesson_node_00108).
+    Uses the Linear Formulation (Cite solution_lesson_node_00055) and 
+    explicit precision matrix (Cite solution_lesson_node_00062) for maximum stability.
+    """
+
+    def __init__(self):
+        self.classes_ = None
+        self.le_ = None
+        self.W_ = None  # Weight matrix (n_classes, n_features)
+        self.b_ = None  # Bias vector (n_classes,)
+        self.estimator_ = None
+
+    def fit(self, X, y):
+        """
+        Fits the model using analytical OAS shrinkage.
+        """
+        # Ensure float64 (Cite solution_lesson_node_00045)
+        X = X.astype(FLOAT_PRECISION)
+
+        # Encode labels
+        self.le_ = LabelEncoder()
+        y_encoded = self.le_.fit_transform(y)
+        self.classes_ = self.le_.classes_
+        
+        n_samples, n_features = X.shape
+        n_classes = len(self.classes_)
+
+        # 1. Compute Class Means and Priors
+        means = np.zeros((n_classes, n_features), dtype=FLOAT_PRECISION)
+        priors = np.zeros(n_classes, dtype=FLOAT_PRECISION)
+
+        for k in range(n_classes):
+            X_k = X[y_encoded == k]
+            means[k] = np.mean(X_k, axis=0)
+            priors[k] = len(X_k) / n_samples
+
+        # 2. Compute Centered Residuals
+        # We manually center the data to ensure geometric consistency
+        X_centered = np.empty_like(X, dtype=FLOAT_PRECISION)
+        for k in range(n_classes):
+            mask = y_encoded == k
+            X_centered[mask] = X[mask] - means[k]
+
+        # 3. Estimate Precision Matrix using OAS
+        # We use assume_centered=True to respect our manual centering
+        # (Cite solution_lesson_node_00061)
+        # OAS is preferred over Ledoit-Wolf for Gaussianized data (Cite solution_lesson_node_00047)
+        print("Fitting Analytical OAS estimator...")
+        self.estimator_ = OAS(assume_centered=True)
+        self.estimator_.fit(X_centered)
+        
+        precision = self.estimator_.precision_  # Sigma^-1
+
+        # 4. Solve for Linear Discriminant Parameters
+        # W = mu * Sigma^-1
+        # Shape: (n_classes, n_features)
+        self.W_ = np.dot(means, precision)
+
+        # b = -0.5 * diag(mu * Sigma^-1 * mu^T) + log(priors)
+        # We compute the diagonal efficiently: sum(means * W, axis=1)
+        term1 = -0.5 * np.sum(means * self.W_, axis=1)
+        term2 = np.log(priors)
+        self.b_ = term1 + term2
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predicts class probabilities for samples in X.
+        """
+        if self.W_ is None or self.b_ is None:
+            raise RuntimeError("Model must be fitted before calling predict_proba.")
+
+        X = X.astype(FLOAT_PRECISION)
+
+        # Linear Inference: Z = X * W^T + b
+        # (Cite solution_lesson_node_00055)
+        logits = np.dot(X, self.W_.T) + self.b_
+
+        # Softmax with high precision
+        probs = stable_softmax(logits)
+
+        return probs
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MetricOptimizedCholeskyLDA
+from library.utils import clip_probabilities
+
+
+# Set random seeds for reproducibility
+def set_seed(seed=SEED):
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def main():
+    # 1. Setup
+    set_seed()
+    warnings.filterwarnings("ignore")
+
+    print("=== Starting Leaf Classification Workflow ===")
+
+    # 2. Data Loading & Preprocessing
+    # Loads cached data if available, otherwise computes it.
+    # The pipeline (Yeo-Johnson + StandardScaler) is fitted on Train and applied to all.
+    print("\n[1/5] Loading and preprocessing data...")
+    X_train, y_train, X_val, y_val, X_test, ids_test = get_preprocessed_data(
+        load_cached_data=True
+    )
+
+    print(
+        f"Train shape: {X_train.shape}, Val shape: {X_val.shape}, Test shape: {X_test.shape}"
+    )
+
+    # 3. Model Training
+    # Initialize the custom LDA model which optimizes shrinkage for Log Loss
+    print("\n[2/5] Training Metric-Optimized Cholesky LDA...")
+    model = MetricOptimizedCholeskyLDA()
+
+    # Fit the model (includes internal Grid Search CV and Refitting)
+    model.fit(X_train, y_train)
+
+    # 4. Validation
+    print("\n[3/5] Performing Validation...")
+
+    # Predict probabilities on validation set
+    val_probs = model.predict_proba(X_val)
+
+    # Clip probabilities to avoid log(0) extremes, consistent with metric definition
+    val_probs_clipped = clip_probabilities(val_probs)
+
+    # Calculate Multi-class Log Loss
+    # We pass model.classes_ to ensure correct label mapping
+    val_metric = log_loss(y_val, val_probs_clipped, labels=model.classes_)
+
+    # REQUIRED OUTPUT: Print the final validation metric
+    print(f"Final Validation Metric: {val_metric}")
+
+    # 5. Failure Analysis
+    print("\n[4/5] Performing Failure Analysis...")
+
+    # Encode validation labels to indices to identify the probability of the true class
+    y_val_indices = model.le_.transform(y_val)
+
+    # Extract the predicted probability for the true class for each sample
+    # Array indexing: [row_indices, col_indices]
+    true_class_probs = val_probs_clipped[np.arange(len(y_val)), y_val_indices]
+
+    # Calculate per-sample Log Loss (Error Magnitude)
+    sample_losses = -np.log(true_class_probs)
+
+    # Calculate correlation between each feature and the error magnitude
+    n_features = X_val.shape[1]
+    correlations = []
+
+    for i in range(n_features):
+        feature_vals = X_val[:, i]
+        # Avoid correlation calculation on constant features
+        if np.std(feature_vals) > 1e-12:
+            corr, _ = pearsonr(feature_vals, sample_losses)
+            correlations.append((i, corr))
+        else:
+            correlations.append((i, 0.0))
+
+    # Sort by absolute correlation strength
+    correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    print("Top 5 features correlated with prediction error:")
+    for idx, corr in correlations[:5]:
+        print(f"  Feature {idx}: Correlation = {corr:.4f}")
+
+    # 6. Submission Generation
+    print("\n[5/5] Generating Submission...")
+
+    # Threshold check
+    # Note: The prompt specified a threshold of ~1.2e-09. This is extremely low (near zero).
+    # To ensure a valid submission file is generated for grading in this run,
+    # we use a practical threshold of 2.0 (Log Loss < 2.0 is generally good for 99 classes).
+    # If the metric is extremely low, it will naturally pass.
+    THRESHOLD = 2.0
+
+    if val_metric < THRESHOLD:
+=======
+from library.model import AnalyticalOASLDA
+from library.utils import clip_probabilities
+
+
+# Set random seeds for reproducibility
+def set_seed(seed=SEED):
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def main():
+    # 1. Setup
+    set_seed()
+    warnings.filterwarnings("ignore")
+
+    print("=== Starting Leaf Classification Workflow ===")
+
+    # 2. Data Loading & Preprocessing
+    # Loads cached data if available, otherwise computes it.
+    # The pipeline (Yeo-Johnson + StandardScaler) is fitted on Train and applied to all.
+    print("\n[1/5] Loading and preprocessing data...")
+    X_train, y_train, X_val, y_val, X_test, ids_test = get_preprocessed_data(
+        load_cached_data=True
+    )
+
+    print(
+        f"Train shape: {X_train.shape}, Val shape: {X_val.shape}, Test shape: {X_test.shape}"
+    )
+
+    # 3. Model Training
+    # Initialize the Analytical OAS LDA model (Cite solution_lesson_node_00108)
+    print("\n[2/5] Training Analytical OAS LDA...")
+    model = AnalyticalOASLDA()
+
+    # Fit the model
+    model.fit(X_train, y_train)
+
+    # 4. Validation
+    print("\n[3/5] Performing Validation...")
+
+    # Predict probabilities on validation set
+    val_probs = model.predict_proba(X_val)
+
+    # Clip probabilities to avoid log(0) extremes, consistent with metric definition
+    val_probs_clipped = clip_probabilities(val_probs)
+
+    # Calculate Multi-class Log Loss
+    # We pass model.classes_ to ensure correct label mapping
+    val_metric = log_loss(y_val, val_probs_clipped, labels=model.classes_)
+
+    # REQUIRED OUTPUT: Print the final validation metric
+    print(f"Final Validation Metric: {val_metric}")
+
+    # 5. Failure Analysis
+    print("\n[4/5] Performing Failure Analysis...")
+
+    # Encode validation labels to indices to identify the probability of the true class
+    y_val_indices = model.le_.transform(y_val)
+
+    # Extract the predicted probability for the true class for each sample
+    # Array indexing: [row_indices, col_indices]
+    true_class_probs = val_probs_clipped[np.arange(len(y_val)), y_val_indices]
+
+    # Calculate per-sample Log Loss (Error Magnitude)
+    sample_losses = -np.log(true_class_probs)
+
+    # Calculate correlation between each feature and the error magnitude
+    n_features = X_val.shape[1]
+    correlations = []
+
+    for i in range(n_features):
+        feature_vals = X_val[:, i]
+        # Avoid correlation calculation on constant features
+        if np.std(feature_vals) > 1e-12:
+            corr, _ = pearsonr(feature_vals, sample_losses)
+            correlations.append((i, corr))
+        else:
+            correlations.append((i, 0.0))
+
+    # Sort by absolute correlation strength
+    correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    print("Top 5 features correlated with prediction error:")
+    for idx, corr in correlations[:5]:
+        print(f"  Feature {idx}: Correlation = {corr:.4f}")
+
+    # 6. Submission Generation
+    print("\n[5/5] Generating Submission...")
+
+    # Threshold check
+    # Updated to the strict threshold required by the task
+    THRESHOLD = 1.2136771218566717e-09
+
+    if val_metric < THRESHOLD:
+>>>>>>> REPLACE
+```

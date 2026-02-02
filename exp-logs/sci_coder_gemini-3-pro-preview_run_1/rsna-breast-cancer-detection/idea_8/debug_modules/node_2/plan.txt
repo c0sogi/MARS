@@ -1,0 +1,215 @@
+The `AssertionError` occurs because the data augmentation (specifically `TF.rotate`) is applied to the entire 3-channel tensor (Image + Age + Implant). When the tensor is rotated, the empty corners are filled with zeros. Since the Age and Implant channels contain non-zero constant values (e.g., normalized age), the zero-filled corners introduce variance, causing the "spatially constant" check (`torch.std(age_map) < 1e-6`) to fail.
+
+To fix this, I will decouple the image processing from the metadata channel construction. I will modify `_process_single_image` to return the image tensor and scalar metadata values separately. Then, in `__getitem__`, I will apply augmentation **only** to the image tensor and reconstruct the full 3-channel tensor by appending the constant metadata planes *after* the geometric transformations. This ensures the metadata channels remain perfectly uniform without rotation artifacts.
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    def _process_single_image(self, img_path, age, implant):
+        """
+        Loads image, resizes, and creates the 3-channel tensor (Img, Age, Implant).
+        Returns: Tensor of shape (3, H, W)
+        """
+        # 1. Load Image
+        if (
+            img_path
+            and isinstance(img_path, str)
+            and os.path.exists(os.path.join(Config.INPUT_DIR, img_path))
+        ):
+            full_path = os.path.join(Config.INPUT_DIR, img_path)
+            try:
+                img = load_image(full_path)
+                # If grayscale, keep as is. If RGB, convert to Gray.
+                if len(img.shape) == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                # Fallback for corrupt images (though utils.load_image fails loudly usually)
+                img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        else:
+            # Missing file (e.g. no contralateral view)
+            img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+
+        # 2. Resize
+        img = cv2.resize(
+            img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR
+        )
+
+        # 3. Normalize Image (0-1)
+        img = img.astype(np.float32) / 255.0
+
+        # 4. Normalize Age
+        # Handle NaN age by filling with mean (0 after normalization)
+        if np.isnan(age):
+            age_norm = 0.0
+        else:
+            age_norm = (age - self.age_mean) / (self.age_std + 1e-7)
+
+        # 5. Process Implant
+        implant_val = 1.0 if implant == 1 else 0.0
+
+        # 6. Construct Tensor (Channels, H, W)
+        # Channel 0: Image
+        # Channel 1: Age Map
+        # Channel 2: Implant Map
+        tensor = torch.zeros((3, self.img_size, self.img_size), dtype=torch.float32)
+        tensor[0, :, :] = torch.from_numpy(img)
+        tensor[1, :, :] = age_norm
+        tensor[2, :, :] = implant_val
+
+        return tensor
+=======
+    def _process_single_image(self, img_path, age, implant):
+        """
+        Loads image, resizes, and prepares components.
+        Returns:
+            img_tensor: Tensor of shape (1, H, W)
+            age_norm: float
+            implant_val: float
+        """
+        # 1. Load Image
+        if (
+            img_path
+            and isinstance(img_path, str)
+            and os.path.exists(os.path.join(Config.INPUT_DIR, img_path))
+        ):
+            full_path = os.path.join(Config.INPUT_DIR, img_path)
+            try:
+                img = load_image(full_path)
+                # If grayscale, keep as is. If RGB, convert to Gray.
+                if len(img.shape) == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                # Fallback for corrupt images (though utils.load_image fails loudly usually)
+                img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+        else:
+            # Missing file (e.g. no contralateral view)
+            img = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+
+        # 2. Resize
+        img = cv2.resize(
+            img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR
+        )
+
+        # 3. Normalize Image (0-1)
+        img = img.astype(np.float32) / 255.0
+
+        # 4. Normalize Age
+        # Handle NaN age by filling with mean (0 after normalization)
+        if np.isnan(age):
+            age_norm = 0.0
+        else:
+            age_norm = (age - self.age_mean) / (self.age_std + 1e-7)
+
+        # 5. Process Implant
+        implant_val = 1.0 if implant == 1 else 0.0
+
+        # 6. Prepare Image Tensor
+        img_tensor = torch.from_numpy(img).unsqueeze(0)  # (1, H, W)
+
+        return img_tensor, age_norm, implant_val
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        # Retrieve metadata
+        target_path = self.file_paths[idx]
+        contra_path = self.contra_paths[idx]
+        age = self.ages[idx]
+        implant = self.implants[idx]
+
+        # Process Inputs
+        target_tensor = self._process_single_image(target_path, age, implant)
+        contra_tensor = self._process_single_image(contra_path, age, implant)
+
+        # Synchronized Augmentation
+        if self.augment:
+            # Apply identical transforms to both tensors
+
+            # Random Horizontal Flip
+            if random.random() > 0.5:
+                target_tensor = TF.hflip(target_tensor)
+                contra_tensor = TF.hflip(contra_tensor)
+
+            # Random Vertical Flip
+            if random.random() > 0.5:
+                target_tensor = TF.vflip(target_tensor)
+                contra_tensor = TF.vflip(contra_tensor)
+
+            # Random Rotation
+            angle = random.uniform(-20, 20)
+            target_tensor = TF.rotate(target_tensor, angle)
+            contra_tensor = TF.rotate(contra_tensor, angle)
+
+        # Return format
+        # X: (target, contra)
+        # y: label (float for BCE)
+
+        if self.labels is not None:
+            label = torch.tensor(self.labels[idx], dtype=torch.float32)
+            return (target_tensor, contra_tensor), label
+        else:
+            # Test mode: return prediction_id as well for submission mapping
+            pred_id = self.prediction_ids[idx]
+            return (target_tensor, contra_tensor), pred_id
+=======
+    def __getitem__(self, idx):
+        # Retrieve metadata
+        target_path = self.file_paths[idx]
+        contra_path = self.contra_paths[idx]
+        age = self.ages[idx]
+        implant = self.implants[idx]
+
+        # Process Inputs (Image only + scalars)
+        target_img, age_norm, implant_val = self._process_single_image(target_path, age, implant)
+        contra_img, _, _ = self._process_single_image(contra_path, age, implant)
+
+        # Synchronized Augmentation (Image only)
+        if self.augment:
+            # Apply identical transforms to both images
+
+            # Random Horizontal Flip
+            if random.random() > 0.5:
+                target_img = TF.hflip(target_img)
+                contra_img = TF.hflip(contra_img)
+
+            # Random Vertical Flip
+            if random.random() > 0.5:
+                target_img = TF.vflip(target_img)
+                contra_img = TF.vflip(contra_img)
+
+            # Random Rotation
+            angle = random.uniform(-20, 20)
+            target_img = TF.rotate(target_img, angle)
+            contra_img = TF.rotate(contra_img, angle)
+
+        # Construct Final 3-Channel Tensors (Post-Augmentation)
+        # Channel 0: Image
+        # Channel 1: Age Map (Spatially Constant)
+        # Channel 2: Implant Map (Spatially Constant)
+        
+        target_tensor = torch.zeros((3, self.img_size, self.img_size), dtype=torch.float32)
+        target_tensor[0] = target_img[0]
+        target_tensor[1] = age_norm
+        target_tensor[2] = implant_val
+
+        contra_tensor = torch.zeros((3, self.img_size, self.img_size), dtype=torch.float32)
+        contra_tensor[0] = contra_img[0]
+        contra_tensor[1] = age_norm
+        contra_tensor[2] = implant_val
+
+        # Return format
+        # X: (target, contra)
+        # y: label (float for BCE)
+
+        if self.labels is not None:
+            label = torch.tensor(self.labels[idx], dtype=torch.float32)
+            return (target_tensor, contra_tensor), label
+        else:
+            # Test mode: return prediction_id as well for submission mapping
+            pred_id = self.prediction_ids[idx]
+            return (target_tensor, contra_tensor), pred_id
+>>>>>>> REPLACE
+```

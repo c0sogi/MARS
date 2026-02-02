@@ -1,0 +1,887 @@
+To improve the model's performance, I will transition from a Siamese Network (Pairwise Learning) to an **ArcFace** (Classification-based Margin Loss) approach, which is significantly more effective for high-cardinality datasets like this one (Cite Lesson 00008).
+
+Here is the optimization strategy:
+1.  **Model Architecture**: Switch to **EfficientNet-B3** with an input resolution of **256x256**. This implements the "Capacity-Resolution Swap" (Cite Lesson 00013), prioritizing model depth over pixel count to maximize feature extraction capability within the compute budget.
+2.  **Loss Function**: Implement **ArcFace** (Additive Angular Margin Loss) using `timm` for the backbone and a custom `ArcMarginProduct` head. This avoids the combinatorial explosion of pair mining in Siamese networks.
+3.  **Data Curation**:
+    *   **Training**: Explicitly exclude the `new_whale` class from the training set (Cite Lesson 00005). This prevents the model from trying to cluster visually distinct "unknown" whales into a single identity.
+    *   **Validation**: Implement an "Open-Set" validation protocol (Cite Lesson 00019). The validation gallery will contain only *known* whales, while the query set includes both known and unknown whales.
+4.  **Inference Logic**: Use a distance-based rejection strategy. If a query image is too far from any known whale in the embedding space (based on Euclidean distance), it is classified as `new_whale` (Cite Lesson 00018).
+5.  **System Stability**: Fix the "Silent Empty Dataset" bug (Cite Lesson 00001) and the stale cache bug (Cite Lesson 00003) by enforcing cache invalidation during the final evaluation.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 4. Model Hyperparameters
+    # ---------------------------------------------------------
+    BACKBONE = "resnet18"
+    PRETRAINED = True
+    EMBEDDING_DIM = 128  # Dimension of the output embedding vector
+
+    # ---------------------------------------------------------
+    # 5. Training Hyperparameters
+    # ---------------------------------------------------------
+    NUM_EPOCHS = 25
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # Contrastive Loss Margin
+    MARGIN = 1.0
+=======
+    # ---------------------------------------------------------
+    # 4. Model Hyperparameters
+    # ---------------------------------------------------------
+    BACKBONE = "efficientnet_b3"  # Cite Lesson 00013
+    PRETRAINED = True
+    EMBEDDING_DIM = 512  # Increased for larger backbone
+
+    # ArcFace Hyperparameters
+    ARCFACE_S = 30.0
+    ARCFACE_M = 0.50
+
+    # ---------------------------------------------------------
+    # 5. Training Hyperparameters
+    # ---------------------------------------------------------
+    NUM_EPOCHS = 20  # Cite Lesson 00008
+    BATCH_SIZE = 24  # Cite Lesson 00010
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+from library.config import Config
+
+
+class EmbeddingNet(nn.Module):
+    """
+    A neural network that maps images to an embedding space.
+    Uses ResNet-18 as the backbone.
+    """
+
+    def __init__(self):
+        super(EmbeddingNet, self).__init__()
+
+        # Determine weights based on configuration
+        if Config.PRETRAINED:
+            weights = models.ResNet18_Weights.DEFAULT
+        else:
+            weights = None
+
+        # Load the backbone
+        self.backbone = models.resnet18(weights=weights)
+
+        # Replace the final fully connected layer
+        # ResNet18's fc layer has 512 input features
+        num_ftrs = self.backbone.fc.in_features
+        self.backbone.fc = nn.Linear(num_ftrs, Config.EMBEDDING_DIM)
+
+    def forward(self, x):
+        """
+        Forward pass of the embedding network.
+
+        Args:
+            x (torch.Tensor): Input images of shape (B, C, H, W).
+
+        Returns:
+            torch.Tensor: L2-normalized embeddings of shape (B, EMBEDDING_DIM).
+        """
+        x = self.backbone(x)
+        # L2-normalize the output vectors
+        x = F.normalize(x, p=2, dim=1)
+        return x
+
+
+class SiameseNet(nn.Module):
+    """
+    Siamese Network wrapper that processes pairs of images using a shared EmbeddingNet.
+    """
+
+    def __init__(self, embedding_net):
+        super(SiameseNet, self).__init__()
+        self.embedding_net = embedding_net
+
+    def forward(self, x1, x2):
+        """
+        Forward pass for image pairs.
+
+        Args:
+            x1 (torch.Tensor): First batch of images.
+            x2 (torch.Tensor): Second batch of images.
+
+        Returns:
+            tuple: (output1, output2) embeddings.
+        """
+        output1 = self.embedding_net(x1)
+        output2 = self.embedding_net(x2)
+        return output1, output2
+
+
+class ContrastiveLoss(nn.Module):
+    """
+    Contrastive Loss function.
+    Minimizes distance for positive pairs (label=1) and maximizes distance
+    for negative pairs (label=0) up to a margin.
+    """
+
+    def __init__(self, margin=Config.MARGIN):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, label):
+        """
+        Args:
+            output1 (torch.Tensor): Embeddings for first images.
+            output2 (torch.Tensor): Embeddings for second images.
+            label (torch.Tensor): 1.0 for same class, 0.0 for different class.
+
+        Returns:
+            torch.Tensor: Scalar loss value.
+        """
+        # Calculate Euclidean distance
+        euclidean_distance = F.pairwise_distance(output1, output2)
+
+        # Formula: Y * D^2 + (1 - Y) * max(0, margin - D)^2
+        # Note: dataset.py yields label=1 for same, label=0 for different.
+
+        loss_contrastive = torch.mean(
+            label * torch.pow(euclidean_distance, 2)
+            + (1 - label)
+            * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2)
+        )
+
+        return loss_contrastive
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import math
+from library.config import Config
+
+
+class ArcMarginProduct(nn.Module):
+    """
+    ArcFace output layer.
+    Cite Lesson 00008: Classification-Based Margin Losses.
+    """
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input, label):
+        # --------------------------- cos(theta) & phi(theta) ---------------------------
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        
+        # --------------------------- convert label to one-hot ---------------------------
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        # -------------torch.where(out_i = {x_i if condition_i else y_i}) -------------
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        return output
+
+
+class WhaleArcFaceModel(nn.Module):
+    """
+    Model with EfficientNet Backbone and ArcFace Head.
+    Cite Lesson 00013: Capacity-Resolution Swap (EfficientNet-B3).
+    """
+    def __init__(self, num_classes, backbone_name=Config.BACKBONE, pretrained=True):
+        super(WhaleArcFaceModel, self).__init__()
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
+        self.in_features = self.backbone.num_features
+        
+        self.bn1 = nn.BatchNorm1d(self.in_features)
+        self.dropout = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(self.in_features, Config.EMBEDDING_DIM)
+        self.bn2 = nn.BatchNorm1d(Config.EMBEDDING_DIM)
+        
+        self.arcface = ArcMarginProduct(Config.EMBEDDING_DIM, num_classes, 
+                                      s=Config.ARCFACE_S, m=Config.ARCFACE_M)
+
+    def forward(self, x, labels=None, extract_embeddings=False):
+        features = self.backbone(x)
+        features = self.bn1(features)
+        features = self.dropout(features)
+        embeddings = self.fc1(features)
+        embeddings = self.bn2(embeddings)
+        
+        # L2 normalize embeddings for inference
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+        
+        if extract_embeddings:
+            return embeddings_norm
+            
+        if labels is not None:
+            return self.arcface(embeddings, labels)
+        return embeddings_norm
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+class SiameseWhaleDataset(Dataset):
+    """
+    Dataset for training a Siamese Network.
+    Yields pairs of images (anchor, other) and a binary label (same/different).
+    """
+
+    def __init__(
+        self,
+        df,
+        load_cached_data=True,
+        transform=None,
+        cache_name="train_images_cache.npy",
+    ):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe.
+            load_cached_data (bool): Whether to use cached image data.
+            transform (callable, optional): Transform to be applied on a sample.
+            cache_name (str): Unique name for the cache file.
+        """
+        self.df = df.reset_index(drop=True)
+        self.transform = transform or get_transforms("train")
+
+        # Group images by Id for fast sampling
+        self.id_to_images = self.df.groupby("Id")["Image"].apply(list).to_dict()
+        self.ids = list(self.id_to_images.keys())
+
+        # Pre-load images into RAM
+        # Cite solution_lesson_node_00001: Parameterize cache path to avoid collisions
+        self.image_cache = cache_images(
+            self.df, cache_name, load_cached_data=load_cached_data
+        )
+
+        # Filter dataframe to only include images that were successfully loaded
+        available_images = set(self.image_cache.keys())
+        self.df = self.df[self.df["Image"].isin(available_images)].reset_index(
+            drop=True
+        )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        # Anchor
+        row = self.df.iloc[index]
+        anchor_id = row["Id"]
+        anchor_filename = row["Image"]
+
+        # Determine if positive or negative pair (50/50)
+        # We use random.random() < 0.5.
+        # Note: We use numpy random for consistency if seeded externally
+        is_positive = np.random.random() < 0.5
+
+        if is_positive:
+            label = 1.0
+            # Get all images for this whale ID
+            candidates = self.id_to_images[anchor_id]
+
+            # Filter candidates to those available in cache
+            candidates = [c for c in candidates if c in self.image_cache]
+
+            if len(candidates) > 1:
+                # Pick a different image if possible, or same (rarely)
+                # To ensure robustness, we can pick any from the list
+                second_filename = np.random.choice(candidates)
+            else:
+                # Singleton: Use the same image.
+                # The transform will create a synthetic view.
+                second_filename = anchor_filename
+        else:
+            label = 0.0
+            # Pick a different class
+            while True:
+                neg_id = np.random.choice(self.ids)
+                if neg_id != anchor_id:
+                    break
+
+            # Pick a random image from that class
+            neg_candidates = self.id_to_images[neg_id]
+            # Filter
+            neg_candidates = [c for c in neg_candidates if c in self.image_cache]
+
+            if not neg_candidates:
+                # Fallback if the chosen negative class has no valid images (rare edge case)
+                # Just use anchor as negative (label 0) - creates noise but prevents crash
+                second_filename = anchor_filename
+                label = 1.0  # Revert to positive if we can't find negative
+            else:
+                second_filename = np.random.choice(neg_candidates)
+
+        # Retrieve images from cache
+        img1_array = self.image_cache[anchor_filename]
+        img2_array = self.image_cache[second_filename]
+
+        # Apply transforms
+        # Transforms expect PIL Image or Tensor. ToPILImage handles ndarray (H,W,C)
+        if self.transform:
+            img1 = self.transform(img1_array)
+            img2 = self.transform(img2_array)
+
+        return (img1, img2), torch.tensor(label, dtype=torch.float32)
+=======
+class WhaleClassificationDataset(Dataset):
+    """
+    Dataset for training ArcFace (Classification).
+    Yields (image, label_index).
+    Cite Lesson 00005: Excluding Composite Labels (new_whale is handled in runfile).
+    """
+
+    def __init__(
+        self,
+        df,
+        label_encoder,
+        load_cached_data=True,
+        transform=None,
+        cache_name="train_images_cache.npy",
+    ):
+        """
+        Args:
+            df (pd.DataFrame): Metadata dataframe (filtered).
+            label_encoder (dict): Map from Id string to int.
+            load_cached_data (bool): Whether to use cached image data.
+            transform (callable, optional): Transform to be applied on a sample.
+            cache_name (str): Unique name for the cache file.
+        """
+        self.df = df.reset_index(drop=True)
+        self.label_encoder = label_encoder
+        self.transform = transform or get_transforms("train")
+
+        # Pre-load images into RAM
+        self.image_cache = cache_images(
+            self.df, cache_name, load_cached_data=load_cached_data
+        )
+
+        # Filter dataframe to only include images that were successfully loaded
+        available_images = set(self.image_cache.keys())
+        self.df = self.df[self.df["Image"].isin(available_images)].reset_index(
+            drop=True
+        )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        row = self.df.iloc[index]
+        filename = row["Image"]
+        whale_id = row["Id"]
+        
+        label = self.label_encoder[whale_id]
+
+        img_array = self.image_cache[filename]
+
+        if self.transform:
+            img = self.transform(img_array)
+
+        return img, torch.tensor(label, dtype=torch.long)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Trains the Siamese Network for one epoch.
+
+    Args:
+        model (nn.Module): The SiameseNet model.
+        dataloader (DataLoader): DataLoader for SiameseWhaleDataset.
+        criterion (nn.Module): Loss function (ContrastiveLoss).
+        optimizer (Optimizer): Optimizer.
+        device (torch.device): Device to run training on.
+
+    Returns:
+        float: Average training loss.
+    """
+    model.train()
+    running_loss = 0.0
+    total_samples = 0
+
+    for batch_idx, ((img1, img2), labels) in enumerate(dataloader):
+        img1 = img1.to(device)
+        img2 = img2.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        # SiameseNet returns (output1, output2)
+        out1, out2 = model(img1, img2)
+
+        # Compute loss
+        loss = criterion(out1, out2, labels)
+
+        # Backward and optimize
+        loss.backward()
+        optimizer.step()
+
+        # Aggregate loss
+        # loss.item() is the average loss for the batch (default reduction='mean')
+        batch_size = labels.size(0)
+        running_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+    epoch_loss = running_loss / total_samples if total_samples > 0 else 0.0
+    return epoch_loss
+=======
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Trains the ArcFace Model for one epoch.
+    Cite Lesson 00008: Classification-based training.
+    """
+    model.train()
+    running_loss = 0.0
+    total_samples = 0
+
+    for batch_idx, (imgs, labels) in enumerate(dataloader):
+        imgs = imgs.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass (returns logits from ArcFace head)
+        outputs = model(imgs, labels)
+
+        # Compute loss (CrossEntropy)
+        loss = criterion(outputs, labels)
+
+        # Backward and optimize
+        loss.backward()
+        optimizer.step()
+
+        batch_size = labels.size(0)
+        running_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+    epoch_loss = running_loss / total_samples if total_samples > 0 else 0.0
+    return epoch_loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def extract_embeddings(model, dataloader, device):
+    """
+    Passes images through the network to generate embeddings.
+    Used for building the reference database and for inference.
+
+    Args:
+        model (nn.Module): The model (SiameseNet or EmbeddingNet).
+        dataloader (DataLoader): DataLoader yielding (image, id, filename).
+        device (torch.device): Device.
+
+    Returns:
+        dict: 'embeddings': np.array (N, D), 'ids': list of ids, 'images': list of filenames
+    """
+    model.eval()
+
+    # If model is SiameseNet, use the underlying embedding_net
+    if hasattr(model, "embedding_net"):
+        net = model.embedding_net
+    else:
+        net = model
+
+    all_embeddings = []
+    all_ids = []
+    all_filenames = []
+
+    with torch.no_grad():
+        for imgs, ids, filenames in dataloader:
+            imgs = imgs.to(device)
+
+            # Forward pass through EmbeddingNet
+            embeddings = net(imgs)
+
+            all_embeddings.append(embeddings.cpu().numpy())
+            all_ids.extend(ids)
+            all_filenames.extend(filenames)
+
+    if len(all_embeddings) > 0:
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+    else:
+        all_embeddings = np.array([])
+
+    return {"embeddings": all_embeddings, "ids": all_ids, "images": all_filenames}
+=======
+def extract_embeddings(model, dataloader, device):
+    """
+    Passes images through the network to generate embeddings.
+    """
+    model.eval()
+
+    all_embeddings = []
+    all_ids = []
+    all_filenames = []
+
+    with torch.no_grad():
+        for imgs, ids, filenames in dataloader:
+            imgs = imgs.to(device)
+
+            # Forward pass with extract_embeddings=True
+            embeddings = model(imgs, extract_embeddings=True)
+
+            all_embeddings.append(embeddings.cpu().numpy())
+            all_ids.extend(ids)
+            all_filenames.extend(filenames)
+
+    if len(all_embeddings) > 0:
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+    else:
+        all_embeddings = np.array([])
+
+    return {"embeddings": all_embeddings, "ids": all_ids, "images": all_filenames}
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        # Validate Loss (for monitoring)
+        val_loss = evaluate_loss(model, val_loader, criterion, device)
+
+        # Validate MAP@5 (for Early Stopping)
+=======
+        # Validate MAP@5 (for Early Stopping)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        print(
+            f"Epoch {epoch}/{num_epochs} - Train Loss: {train_loss:.4f} - Val Loss: {val_loss:.4f} - Val MAP@5: {val_map5:.5f}"
+        )
+=======
+        print(
+            f"Epoch {epoch}/{num_epochs} - Train Loss: {train_loss:.4f} - Val MAP@5: {val_map5:.5f}"
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.model import EmbeddingNet, SiameseNet
+=======
+from library.model import WhaleArcFaceModel
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 2. Initialize Model
+    print("Initializing model...")
+    # We need to reconstruct the model architecture to load weights
+    embedding_net = EmbeddingNet()
+    model = SiameseNet(embedding_net)
+    model.to(device)
+
+    # Load weights
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+=======
+    # 2. Initialize Model
+    print("Initializing model...")
+    
+    # Calculate num_classes from training data (excluding new_whale)
+    # This is required to initialize the ArcFace head with correct dimensions
+    df_train_filtered = df_train[df_train["Id"] != "new_whale"]
+    num_classes = df_train_filtered["Id"].nunique()
+    
+    model = WhaleArcFaceModel(num_classes=num_classes)
+    model.to(device)
+
+    # Load weights
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.dataset import SiameseWhaleDataset, WhaleInferenceDataset
+from library.model import EmbeddingNet, SiameseNet
+from library.loss import ContrastiveLoss
+from library.engine import train_model
+from library.inference import get_embeddings, run_inference
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Setup & Configuration
+    # ---------------------------------------------------------
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Device: {device}")
+
+    # ---------------------------------------------------------
+    # 2. Data Loading
+    # ---------------------------------------------------------
+    print("Loading metadata...")
+    df_train = load_metadata("train")
+    df_val = load_metadata("val")
+
+    # Initialize Datasets
+    # Cite solution_lesson_node_00001: Use unique cache names for train and val splits
+    train_dataset = SiameseWhaleDataset(
+        df_train, load_cached_data=True, cache_name="train_siamese_cache.npy"
+    )
+
+    # For validation loss monitoring, we use the Siamese dataset wrapper on val data
+    val_dataset_pairs = SiameseWhaleDataset(
+        df_val, load_cached_data=True, cache_name="val_siamese_cache.npy"
+    )
+
+    # Evaluation Datasets (for MAP@5 calculation)
+    train_eval_dataset = WhaleInferenceDataset(
+        df_train, load_cached_data=True, cache_name="train_eval_cache.npy"
+    )
+    val_eval_dataset = WhaleInferenceDataset(
+        df_val, load_cached_data=True, cache_name="val_eval_cache.npy"
+    )
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset_pairs,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_eval_loader = DataLoader(
+        val_eval_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # ---------------------------------------------------------
+    # 3. Model Initialization & Training
+    # ---------------------------------------------------------
+    print("Initializing model...")
+    embedding_net = EmbeddingNet()
+    model = SiameseNet(embedding_net).to(device)
+
+    criterion = ContrastiveLoss(margin=Config.MARGIN)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Simple scheduler to decay LR
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+    print("Starting training...")
+    # train_model saves the best model to Config.MODEL_SAVE_PATH and returns the model with best weights
+    model = train_model(
+        model,
+        train_loader,
+        val_loader,
+        train_eval_loader,
+        val_eval_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        device,
+        num_epochs=Config.NUM_EPOCHS,
+        patience=Config.PATIENCE,
+    )
+
+    # ---------------------------------------------------------
+    # 4. Validation Metric (MAP@5)
+    # ---------------------------------------------------------
+    print("\nCalculating Final Validation MAP@5...")
+
+    # Generate embeddings for Training set (Reference) and Validation set (Query)
+    # get_embeddings handles caching and returns (embeddings, ids, images)
+    train_emb, train_ids, train_imgs = get_embeddings(
+        model, df_train, device, "train_ref", load_cached_data=True
+    )
+
+    val_emb, val_ids, val_imgs = get_embeddings(
+        model, df_val, device, "val_query", load_cached_data=True
+    )
+
+    # Predict using KNN
+    val_preds = predict_knn(
+        val_emb, train_emb, train_ids, threshold=Config.NEW_WHALE_THRESHOLD
+    )
+=======
+from library.dataset import WhaleClassificationDataset, WhaleInferenceDataset
+from library.model import WhaleArcFaceModel
+from library.engine import train_model
+from library.inference import get_embeddings, run_inference
+
+
+def main():
+    # ---------------------------------------------------------
+    # 1. Setup & Configuration
+    # ---------------------------------------------------------
+    seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Device: {device}")
+
+    # ---------------------------------------------------------
+    # 2. Data Loading
+    # ---------------------------------------------------------
+    print("Loading metadata...")
+    df_train = load_metadata("train")
+    df_val = load_metadata("val")
+
+    # Filter new_whale for training (Cite Lesson 00005)
+    df_train_filtered = df_train[df_train["Id"] != "new_whale"].reset_index(drop=True)
+    
+    # Create Label Encoder
+    unique_ids = sorted(df_train_filtered["Id"].unique())
+    label_encoder = {uid: idx for idx, uid in enumerate(unique_ids)}
+    num_classes = len(unique_ids)
+    print(f"Number of classes for ArcFace: {num_classes}")
+
+    # Initialize Datasets
+    # Cite Lesson 00001: Unique cache names
+    train_dataset = WhaleClassificationDataset(
+        df_train_filtered, 
+        label_encoder, 
+        load_cached_data=True, 
+        cache_name="train_arcface_cache.npy"
+    )
+
+    # Evaluation Datasets
+    # For validation gallery, we use df_train_filtered (Known Whales Only) - Cite Lesson 00019
+    train_eval_dataset = WhaleInferenceDataset(
+        df_train_filtered, load_cached_data=True, cache_name="train_eval_cache.npy"
+    )
+    
+    # For validation query, we use df_val (Includes new_whale)
+    val_eval_dataset = WhaleInferenceDataset(
+        df_val, load_cached_data=True, cache_name="val_eval_cache.npy"
+    )
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # No validation loss loader needed for ArcFace (we use MAP@5 directly)
+    val_loader = None 
+
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_eval_loader = DataLoader(
+        val_eval_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # ---------------------------------------------------------
+    # 3. Model Initialization & Training
+    # ---------------------------------------------------------
+    print("Initializing model...")
+    model = WhaleArcFaceModel(num_classes=num_classes).to(device)
+
+    # Cite Lesson 00008: Classification-based loss
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+    print("Starting training...")
+    model = train_model(
+        model,
+        train_loader,
+        val_loader, # None
+        train_eval_loader,
+        val_eval_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        device,
+        num_epochs=Config.NUM_EPOCHS,
+        patience=Config.PATIENCE,
+    )
+
+    # ---------------------------------------------------------
+    # 4. Validation Metric (MAP@5)
+    # ---------------------------------------------------------
+    print("\nCalculating Final Validation MAP@5...")
+
+    # Cite Lesson 00003: Force re-computation of embeddings to avoid stale cache
+    # Cite Lesson 00019: Validation Gallery = Known Whales Only
+    train_emb, train_ids, train_imgs = get_embeddings(
+        model, df_train_filtered, device, "train_ref_final", load_cached_data=False
+    )
+
+    val_emb, val_ids, val_imgs = get_embeddings(
+        model, df_val, device, "val_query_final", load_cached_data=False
+    )
+
+    # Predict using KNN
+    val_preds = predict_knn(
+        val_emb, train_emb, train_ids, threshold=Config.NEW_WHALE_THRESHOLD
+    )
+>>>>>>> REPLACE
+```

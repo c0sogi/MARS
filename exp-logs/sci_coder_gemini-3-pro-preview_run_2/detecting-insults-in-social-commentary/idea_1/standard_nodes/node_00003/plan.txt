@@ -1,0 +1,512 @@
+I will optimize the solution by replacing the `NeuralBoE` (Bag of Embeddings) model with a `BiLSTM` (Bidirectional LSTM) model. This change addresses the limitation of the BoE approach, which aggregates embeddings and loses word order information. As noted in the lessons, insult detection often relies on syntax and context (e.g., negation), which sequence models like LSTMs can capture effectively (Cite solution_lesson_node_00002).
+
+To support this architectural change, I will update the data processing pipeline to produce padded sequences instead of flattened lists with offsets. Specifically:
+1.  **`library/dataset.py`**: Modify `collate_fn` to use `torch.nn.utils.rnn.pad_sequence`, returning padded text tensors and sequence lengths.
+2.  **`library/model.py`**: Replace `NeuralBoE` with `BiLSTM`. The new model will use `nn.Embedding` (with padding) and `nn.LSTM`, utilizing `pack_padded_sequence` for efficient processing of variable-length inputs. I will also update the training and evaluation loops to handle the `(text, lengths)` input format.
+3.  **`runfile.py`**: Update the script to instantiate the `BiLSTM` model and implement the conditional submission logic, ensuring predictions are saved only if the validation AUC exceeds the specified threshold of 0.861867816091954.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def collate_fn(
+    batch: List[Tuple[torch.Tensor, float]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Custom collate function for EmbeddingBag.
+
+    Args:
+        batch: List of (indices, label) tuples.
+
+    Returns:
+        text (torch.Tensor): Flat tensor of all token indices concatenated.
+        offsets (torch.Tensor): Tensor of starting indices for each sample.
+        labels (torch.Tensor): FloatTensor of labels.
+    """
+    indices_list, labels_list = zip(*batch)
+
+    # Calculate offsets
+    # offsets[i] is the starting index of the i-th sequence in the flattened 'text' tensor
+    offsets = [0]
+    for indices in indices_list:
+        offsets.append(indices.size(0))
+
+    # We only need the starting positions, so we take the cumulative sum
+    # and exclude the last element (which would be the total length)
+    offsets = torch.tensor(offsets[:-1]).cumsum(dim=0).long()
+
+    # Concatenate all indices into a single 1D tensor
+    text = torch.cat(indices_list)
+
+    # Stack labels
+    labels = torch.tensor(labels_list, dtype=torch.float)
+
+    return text, offsets, labels
+=======
+def collate_fn(
+    batch: List[Tuple[torch.Tensor, float]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Custom collate function for BiLSTM (padded sequences).
+
+    Args:
+        batch: List of (indices, label) tuples.
+
+    Returns:
+        text (torch.Tensor): Padded tensor of token indices (batch_size, max_len).
+        lengths (torch.Tensor): Tensor of sequence lengths.
+        labels (torch.Tensor): FloatTensor of labels.
+    """
+    indices_list, labels_list = zip(*batch)
+
+    # Calculate lengths
+    lengths = torch.tensor([len(x) for x in indices_list], dtype=torch.long)
+
+    # Pad sequences
+    # batch_first=True -> (batch, seq_len)
+    text = torch.nn.utils.rnn.pad_sequence(indices_list, batch_first=True, padding_value=0)
+
+    # Stack labels
+    labels = torch.tensor(labels_list, dtype=torch.float)
+
+    return text, lengths, labels
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class NeuralBoE(nn.Module):
+    """
+    Neural Bag-of-Embeddings (BoE) classifier.
+    Consists of an EmbeddingBag layer followed by an MLP.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int = EMBED_DIM,
+        hidden_dim: int = HIDDEN_DIM,
+        output_dim: int = OUTPUT_DIM,
+    ):
+        super(NeuralBoE, self).__init__()
+        # EmbeddingBag computes the mean of embeddings for a sequence
+        # This handles variable length sequences efficiently
+        self.embedding = nn.EmbeddingBag(vocab_size, embed_dim, mode="mean")
+
+        # MLP: Linear -> ReLU -> Linear
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+        # Final activation to output probability
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, text: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            text: 1D tensor containing concatenated token indices.
+            offsets: 1D tensor containing starting indices of each sequence.
+        Returns:
+            Probability score in range [0, 1].
+        """
+        # embedded shape: (batch_size, embed_dim)
+        embedded = self.embedding(text, offsets)
+
+        # MLP forward pass
+        x = self.fc1(embedded)
+        x = self.relu(x)
+        x = self.fc2(x)
+
+        # Output probability
+        return self.sigmoid(x)
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    for text, offsets, labels in dataloader:
+        text = text.to(device)
+        offsets = offsets.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(text, offsets)
+        # Flatten outputs to match labels shape (batch_size,)
+        outputs = outputs.view(-1)
+
+        loss = criterion(outputs, labels)
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * labels.size(0)
+
+        # Store predictions and labels for AUC calculation
+        all_preds.extend(outputs.detach().cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    # Calculate AUC, handling potential edge cases (e.g., only one class in batch)
+    try:
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_auc = 0.5
+
+    return epoch_loss, epoch_auc
+
+
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for text, offsets, labels in dataloader:
+            text = text.to(device)
+            offsets = offsets.to(device)
+            labels = labels.to(device)
+
+            outputs = model(text, offsets)
+            outputs = outputs.view(-1)
+
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * labels.size(0)
+            all_preds.extend(outputs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    try:
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_auc = 0.5
+
+    return epoch_loss, epoch_auc
+=======
+class BiLSTM(nn.Module):
+    """
+    Bidirectional LSTM classifier.
+    Captures sequential dependencies for insult detection.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int = EMBED_DIM,
+        hidden_dim: int = HIDDEN_DIM,
+        output_dim: int = OUTPUT_DIM,
+        pad_idx: int = 0,
+    ):
+        super(BiLSTM, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        
+        # Bidirectional LSTM
+        self.lstm = nn.LSTM(
+            embed_dim, 
+            hidden_dim, 
+            batch_first=True, 
+            bidirectional=True
+        )
+
+        # FC layer: input is hidden_dim * 2 (forward + backward)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+
+        # Final activation
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, text: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            text: (batch_size, seq_len)
+            lengths: (batch_size)
+        """
+        # embedded: (batch_size, seq_len, embed_dim)
+        embedded = self.embedding(text)
+
+        # Pack padded sequence for efficiency and ignoring padding
+        # enforce_sorted=False allows unsorted batch
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        # LSTM forward
+        # output is packed, hidden is (num_layers*num_directions, batch, hidden_dim)
+        packed_output, (hidden, cell) = self.lstm(packed_embedded)
+
+        # Concatenate the final forward and backward hidden states
+        # hidden[-2, :, :] is the last hidden state of the forward LSTM
+        # hidden[-1, :, :] is the last hidden state of the backward LSTM
+        hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
+
+        # FC and Sigmoid
+        return self.sigmoid(self.fc(hidden))
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    for text, lengths, labels in dataloader:
+        text = text.to(device)
+        lengths = lengths.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(text, lengths)
+        # Flatten outputs to match labels shape (batch_size,)
+        outputs = outputs.view(-1)
+
+        loss = criterion(outputs, labels)
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * labels.size(0)
+
+        # Store predictions and labels for AUC calculation
+        all_preds.extend(outputs.detach().cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    # Calculate AUC, handling potential edge cases (e.g., only one class in batch)
+    try:
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_auc = 0.5
+
+    return epoch_loss, epoch_auc
+
+
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for text, lengths, labels in dataloader:
+            text = text.to(device)
+            lengths = lengths.to(device)
+            labels = labels.to(device)
+
+            outputs = model(text, lengths)
+            outputs = outputs.view(-1)
+
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * labels.size(0)
+            all_preds.extend(outputs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    try:
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_auc = 0.5
+
+    return epoch_loss, epoch_auc
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def predict(
+    model: nn.Module, dataloader: torch.utils.data.DataLoader, device: str = DEVICE
+) -> np.ndarray:
+    """
+    Generates predictions for the given dataloader.
+    Returns:
+        np.ndarray: Array of probability scores.
+    """
+    model.eval()
+    model = model.to(device)
+    predictions = []
+
+    with torch.no_grad():
+        for text, offsets, _ in dataloader:
+            text = text.to(device)
+            offsets = offsets.to(device)
+
+            outputs = model(text, offsets)
+            outputs = outputs.view(-1)
+
+            predictions.extend(outputs.cpu().numpy())
+
+    return np.array(predictions)
+=======
+def predict(
+    model: nn.Module, dataloader: torch.utils.data.DataLoader, device: str = DEVICE
+) -> np.ndarray:
+    """
+    Generates predictions for the given dataloader.
+    Returns:
+        np.ndarray: Array of probability scores.
+    """
+    model.eval()
+    model = model.to(device)
+    predictions = []
+
+    with torch.no_grad():
+        for text, lengths, _ in dataloader:
+            text = text.to(device)
+            lengths = lengths.to(device)
+
+            outputs = model(text, lengths)
+            outputs = outputs.view(-1)
+
+            predictions.extend(outputs.cpu().numpy())
+
+    return np.array(predictions)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import NeuralBoE, train_model, predict
+=======
+from library.model import BiLSTM, train_model, predict
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    print("Initializing Model...")
+    model = NeuralBoE(
+        vocab_size=vocab_size,
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=output_dim,
+    )
+=======
+    print("Initializing Model...")
+    model = BiLSTM(
+        vocab_size=vocab_size,
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=output_dim,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import NeuralBoE, train_model, predict, evaluate
+=======
+from library.model import BiLSTM, train_model, predict, evaluate
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing NeuralBoE Model...")
+    model = NeuralBoE(
+        vocab_size=vocab_size,
+        embed_dim=EMBED_DIM,
+        hidden_dim=HIDDEN_DIM,
+        output_dim=OUTPUT_DIM,
+    )
+=======
+    # 3. Model Initialization
+    print("Initializing BiLSTM Model...")
+    model = BiLSTM(
+        vocab_size=vocab_size,
+        embed_dim=EMBED_DIM,
+        hidden_dim=HIDDEN_DIM,
+        output_dim=OUTPUT_DIM,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Submission Generation
+    print("Generating Submission...")
+    test_probs = predict(trained_model, test_loader, DEVICE)
+
+    # Load sample submission
+    if not os.path.exists(SAMPLE_SUBMISSION_PATH):
+        raise FileNotFoundError(
+            f"Sample submission not found at {SAMPLE_SUBMISSION_PATH}"
+        )
+
+    submission_df = pd.read_csv(SAMPLE_SUBMISSION_PATH)
+
+    # Check length
+    if len(test_probs) != len(submission_df):
+        print(
+            f"Warning: Prediction length ({len(test_probs)}) matches test set but differs from sample submission ({len(submission_df)})."
+        )
+
+    # Assign predictions
+    submission_df["Insult"] = test_probs
+
+    # Save
+    os.makedirs(os.path.dirname(SUBMISSION_PATH), exist_ok=True)
+    submission_df.to_csv(SUBMISSION_PATH, index=False)
+    print(f"Submission saved to {SUBMISSION_PATH}")
+=======
+    # 7. Submission Generation
+    if val_auc > 0.861867816091954:
+        print("Generating Submission...")
+        test_probs = predict(trained_model, test_loader, DEVICE)
+
+        # Load sample submission
+        if not os.path.exists(SAMPLE_SUBMISSION_PATH):
+            raise FileNotFoundError(
+                f"Sample submission not found at {SAMPLE_SUBMISSION_PATH}"
+            )
+
+        submission_df = pd.read_csv(SAMPLE_SUBMISSION_PATH)
+
+        # Check length
+        if len(test_probs) != len(submission_df):
+            print(
+                f"Warning: Prediction length ({len(test_probs)}) matches test set but differs from sample submission ({len(submission_df)})."
+            )
+
+        # Assign predictions
+        submission_df["Insult"] = test_probs
+
+        # Save
+        os.makedirs(os.path.dirname(SUBMISSION_PATH), exist_ok=True)
+        submission_df.to_csv(SUBMISSION_PATH, index=False)
+        print(f"Submission saved to {SUBMISSION_PATH}")
+    else:
+        print(f"Validation AUC ({val_auc}) did not meet the threshold. Skipping submission.")
+>>>>>>> REPLACE
+```

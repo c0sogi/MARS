@@ -1,0 +1,319 @@
+I will implement the following changes to optimize the model performance, guided by the lessons learned:
+
+1.  **Architecture Upgrade to CBAM (Cite solution_lesson_node_00095):** I will replace the `MaxCoordinateAttention` module with the `CBAM` (Convolutional Block Attention Module). The previous solution used Max-only pooling in its attention mechanism, which Lesson 95 identifies as inferior for noisy SAR data compared to Mixed Pooling (Max + Average) used in CBAM.
+2.  **Regularization Tuning (Cite solution_lesson_node_00095, solution_lesson_node_00077):** I will increase the `DROPOUT_RATE` from 0.2 to 0.5. Lesson 95 and 77 emphasize that for small, noisy datasets, maintaining high dropout is essential to prevent overfitting when using wider, attention-augmented architectures.
+3.  **Channel Width Adjustment (Cite solution_lesson_node_00055):** I will modify the filter progression in `Config.FILTERS` to `[64, 128, 128, 64]`. The previous solution aggressively contracted the final stage to 32 filters, which Lesson 55 warns can cause information loss. The new configuration maintains a wider bottleneck (64 filters) to preserve discriminative features before the classifier.
+4.  **Dynamic Model Implementation:** I will update the `CADPNet` class to dynamically instantiate layers based on `Config.FILTERS`, ensuring the implementation matches the configuration changes.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Convolutional filters for the 4 stages
+    # Stage 4 contracts to 32 to prevent param explosion
+    FILTERS = [64, 128, 128, 32]
+
+    # Dropout rate for the dense head
+    DROPOUT_RATE = 0.2
+=======
+    # Convolutional filters for the 4 stages
+    # Less aggressive contraction in Stage 4 to preserve features (Cite solution_lesson_node_00055)
+    FILTERS = [64, 128, 128, 64]
+
+    # Dropout rate for the dense head
+    # Increased to 0.5 to combat overfitting in wide networks (Cite solution_lesson_node_00095)
+    DROPOUT_RATE = 0.5
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class MaxCoordinateAttention(nn.Module):
+    """
+    Coordinate Attention using 1D Max Pooling to preserve peak signals.
+    Decomposes attention into vertical and horizontal directions.
+    """
+
+    def __init__(self, in_channels, reduction=16):
+        super(MaxCoordinateAttention, self).__init__()
+        # Adaptive Max Pool to get (H, 1) and (1, W)
+        self.pool_h = nn.AdaptiveMaxPool2d((None, 1))
+        self.pool_w = nn.AdaptiveMaxPool2d((1, None))
+
+        # Ensure bottleneck has reasonable capacity
+        mip = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.ReLU(inplace=True)
+
+        self.conv_h = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+
+        # Max Pooling along axes
+        x_h = self.pool_h(x)  # (N, C, H, 1)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)  # (N, C, 1, W) -> (N, C, W, 1)
+
+        # Concatenate along spatial dimension for shared processing
+        y = torch.cat([x_h, x_w], dim=2)  # (N, C, H+W, 1)
+
+        # Shared 1x1 Conv reduction
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # Split back into H and W components
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)  # (N, C, 1, W)
+
+        # Generate attention maps
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+
+        # Apply attention
+        out = identity * a_h * a_w
+        return out
+=======
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), "kernel size must be 3 or 7"
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module.
+    Uses Mixed Pooling (Max + Avg) to handle noisy SAR data better than Max-only.
+    Cite solution_lesson_node_00095.
+    """
+
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        result = out * self.sa(out)
+        return result
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class CADPNet(nn.Module):
+    """
+    Coordinate-Aware Dual-Pooling Network.
+    Integrates 4-stage CNN with channel contraction, Max-Coord Attention,
+    Dual Pooling, and Metadata fusion.
+    """
+
+    def __init__(self):
+        super(CADPNet, self).__init__()
+
+        # --- Visual Branch ---
+        # Filters: 64 -> 128 -> 128 -> 32
+
+        # Stage 1: 3 -> 64 -> Attn -> Pool -> 128
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.ca1 = MaxCoordinateAttention(64)
+        self.pool1 = DualPooling()
+
+        # Stage 2: 128 -> 128 -> Attn -> Pool -> 256
+        self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.ca2 = MaxCoordinateAttention(128)
+        self.pool2 = DualPooling()
+
+        # Stage 3: 256 -> 128 -> Attn -> Pool -> 256
+        self.conv3 = nn.Conv2d(256, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.ca3 = MaxCoordinateAttention(128)
+        self.pool3 = DualPooling()
+
+        # Stage 4: 256 -> 32 -> Attn -> Pool -> 64 (Contraction)
+        self.conv4 = nn.Conv2d(256, 32, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(32)
+        self.ca4 = MaxCoordinateAttention(32)
+        self.pool4 = DualPooling()
+
+        # --- Metadata Branch ---
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Fusion Head ---
+        # Flattened visual: 64 channels * 4 * 4 spatial = 1024
+        # Metadata: 32
+        self.fc1 = nn.Linear(1024 + 32, 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
+        self.dropout = nn.Dropout(Config.DROPOUT_RATE)
+        self.fc2 = nn.Linear(512, 1)  # Logits
+
+    def forward(self, x_img, x_angle):
+        # Visual Branch
+        x = F.relu(self.bn1(self.conv1(x_img)))
+        x = self.ca1(x)
+        x = self.pool1(x)  # (B, 128, 37, 37)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.ca2(x)
+        x = self.pool2(x)  # (B, 256, 18, 18)
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.ca3(x)
+        x = self.pool3(x)  # (B, 256, 9, 9)
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = self.ca4(x)
+        x = self.pool4(x)  # (B, 64, 4, 4)
+
+        x_flat = x.view(x.size(0), -1)  # (B, 1024)
+
+        # Metadata Branch
+        angle = x_angle.view(-1, 1)
+        x_meta = self.meta_mlp(angle)
+
+        # Fusion
+        x_concat = torch.cat([x_flat, x_meta], dim=1)
+
+        x_out = self.fc1(x_concat)
+        x_out = self.bn_fc1(x_out)
+        x_out = F.relu(x_out)
+        x_out = self.dropout(x_out)
+        logits = self.fc2(x_out)
+
+        return logits
+=======
+class CADPNet(nn.Module):
+    """
+    Coordinate-Aware Dual-Pooling Network (Updated to DPCNet-like structure).
+    Uses CBAM for mixed-pooling attention and reduced bottlenecks.
+    """
+
+    def __init__(self):
+        super(CADPNet, self).__init__()
+        filters = Config.FILTERS  # [64, 128, 128, 64]
+
+        # --- Visual Branch ---
+        # Stage 1: 3 -> 64 -> CBAM -> DualPool -> 128
+        self.conv1 = nn.Conv2d(3, filters[0], kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(filters[0])
+        self.cbam1 = CBAM(filters[0])
+        self.pool1 = DualPooling()
+
+        # Stage 2: 128 -> 128 -> CBAM -> DualPool -> 256
+        # Input channels = filters[0] * 2 (due to DualPool)
+        self.conv2 = nn.Conv2d(filters[0] * 2, filters[1], kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(filters[1])
+        self.cbam2 = CBAM(filters[1])
+        self.pool2 = DualPooling()
+
+        # Stage 3: 256 -> 128 -> CBAM -> DualPool -> 256
+        self.conv3 = nn.Conv2d(filters[1] * 2, filters[2], kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(filters[2])
+        self.cbam3 = CBAM(filters[2])
+        self.pool3 = DualPooling()
+
+        # Stage 4: 256 -> 64 -> CBAM -> DualPool -> 128
+        self.conv4 = nn.Conv2d(filters[2] * 2, filters[3], kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(filters[3])
+        self.cbam4 = CBAM(filters[3])
+        self.pool4 = DualPooling()
+
+        # --- Metadata Branch ---
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Fusion Head ---
+        # Flattened visual: filters[3] * 2 (DualPool) * 4 * 4 spatial
+        # With [64, 128, 128, 64], final is 128 * 16 = 2048
+        final_channels = filters[3] * 2
+        self.flat_dim = final_channels * 4 * 4
+        
+        self.fc1 = nn.Linear(self.flat_dim + 32, 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
+        self.dropout = nn.Dropout(Config.DROPOUT_RATE)
+        self.fc2 = nn.Linear(512, 1)  # Logits
+
+    def forward(self, x_img, x_angle):
+        # Visual Branch
+        x = F.relu(self.bn1(self.conv1(x_img)))
+        x = self.cbam1(x)
+        x = self.pool1(x)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.cbam2(x)
+        x = self.pool2(x)
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.cbam3(x)
+        x = self.pool3(x)
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = self.cbam4(x)
+        x = self.pool4(x)
+
+        x_flat = x.view(x.size(0), -1)
+
+        # Metadata Branch
+        angle = x_angle.view(-1, 1)
+        x_meta = self.meta_mlp(angle)
+
+        # Fusion
+        x_concat = torch.cat([x_flat, x_meta], dim=1)
+
+        x_out = self.fc1(x_concat)
+        x_out = self.bn_fc1(x_out)
+        x_out = F.relu(x_out)
+        x_out = self.dropout(x_out)
+        logits = self.fc2(x_out)
+
+        return logits
+>>>>>>> REPLACE
+```

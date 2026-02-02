@@ -1,0 +1,167 @@
+To improve the model's performance and address the high validation RMSE (~23.20), I will implement the following changes based on the "Dual-Hygiene" strategy and lessons learned:
+
+1.  **Relax Learner Set Filtering (Cite Lesson 00018):** The previous solution capped the training data (Learner Set) at $1,000, effectively blinding the model to the extreme outliers (up to ~$93,000) present in the dataset. Since the RMSE metric is highly sensitive to these outliers, I will relax the `LOOSE_FILTER` in `library/config.py` to include fares up to $100,000. This allows the model to learn the heavy tail of the distribution.
+2.  **Stabilize Training with `max_delta_step`:** Training on extreme outliers can destabilize Gradient Boosting. I will add `max_delta_step=10.0` to the XGBoost parameters. This caps the maximum change a single tree can make to the prediction, preventing the model from diverging when it encounters massive gradients from the outliers.
+3.  **Fix NaN Handling in Feature Engineering:** The previous execution showed `RuntimeWarning: invalid value encountered in cast`, indicating NaNs in the coordinate data were breaking the grid key generation. I will modify `library/feature_factory.py` to fill NaNs with 0.0 (effectively mapping them to a "missing" bucket) before processing.
+4.  **Correct Rate Filtering Logic:** I will update `library/data_loader.py` to correctly handle `dist_km=0` cases in the loose filter, ensuring that high-fare, zero-distance trips (which might be valid surcharges or specific error types we need to predict) are not inadvertently dropped.
+
+These changes aim to let the model "see" and predict the outliers (Learner) while still relying on robust statistical priors derived from clean data (Wisdom).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+class Config:
+    """
+    Configuration for Idea 15: Factorized Spatiotemporal Dual-Hygiene Gradient Boosting.
+    Defines global constants, file paths, filtering thresholds, and model hyperparameters.
+    """
+=======
+class Config:
+    """
+    Configuration for Idea 16: Factorized Spatiotemporal Dual-Hygiene Gradient Boosting.
+    Optimized to handle extreme outliers in the target distribution by training on the full range (Learner)
+    while maintaining robust priors from sanitized data (Wisdom).
+    """
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 2. Learner Set Filter (Loose):
+    # Used for training the model.
+    # Retains heavy tails and outliers to minimize RMSE on difficult samples.
+    LOOSE_FILTER = {
+        "min_fare": 2.5,
+        "max_fare": 1000.0,  # Allow high value trips
+        "max_fare_per_km": 500.0,
+        "min_dist_km": 0.0,  # Allow short trips if fare is valid
+        "min_passenger": 0,
+    }
+=======
+    # 2. Learner Set Filter (Loose):
+    # Used for training the model.
+    # Retains heavy tails and outliers to minimize RMSE on difficult samples.
+    # Cite solution_lesson_node_00018: "Train on the full distribution"
+    LOOSE_FILTER = {
+        "min_fare": 1.0,
+        "max_fare": 100_000.0,  # Relaxed to include extreme outliers present in validation
+        "max_fare_per_km": 100_000.0, # Relaxed to avoid filtering short-dist high-fare trips
+        "min_dist_km": 0.0,
+        "min_passenger": 0,
+    }
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Optimized for A100 GPU (device='cuda')
+    XGB_PARAMS = {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        "learning_rate": 0.05,
+        "max_depth": 9,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "min_child_weight": 10,
+        "n_estimators": 10000,  # Controlled by early stopping
+        "early_stopping_rounds": 50,
+        "n_jobs": 12,
+        "device": "cuda",  # Enable GPU acceleration
+        "tree_method": "hist",  # Efficient histogram-based training
+        "random_state": SEED,
+    }
+=======
+    # Optimized for A100 GPU (device='cuda')
+    XGB_PARAMS = {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        "learning_rate": 0.05,
+        "max_depth": 8, # Slightly reduced to prevent overfitting to noise
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "min_child_weight": 10,
+        "max_delta_step": 10.0, # Stabilize updates from extreme outliers
+        "n_estimators": 10000,  # Controlled by early stopping
+        "early_stopping_rounds": 50,
+        "n_jobs": 12,
+        "device": "cuda",  # Enable GPU acceleration
+        "tree_method": "hist",  # Efficient histogram-based training
+        "random_state": SEED,
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+        # Only apply rate filter where distance is non-zero to avoid aggressive filtering of valid 0-dist trips?
+        # Or strictly follow config. Config says max_fare_per_km=500.
+        # We will assume strictly following config.
+        # If dist=0, fare_per_km=Inf, so it is > 500, so it gets filtered.
+        # This is consistent with removing bad data.
+
+        # Check for NaN/Inf in rate
+        valid_rate = (fare_per_km <= filters["max_fare_per_km"]) | (df["dist_km"] == 0)
+        # Note: If dist=0, we bypass rate check if we want to respect min_dist_km=0.
+        # But usually dist=0 is bad data. Let's stick to the logic that if rate > 500 it's bad.
+
+        mask = mask & (fare_per_km <= filters["max_fare_per_km"])
+
+        return df[mask].copy()
+=======
+        # Check for NaN/Inf in rate
+        # Allow Inf rate (dist=0) if max_fare_per_km is high, or explicitly handle it.
+        # We want to keep dist=0 trips if they have valid fares (e.g. cancelled with fee, or data error that needs prediction)
+        
+        # Logic: If dist > 0, check rate. If dist == 0, accept (since we filter by max_fare separately).
+        is_dist_zero = df["dist_km"] == 0
+        rate_check = (fare_per_km <= filters["max_fare_per_km"])
+        
+        # Combine: (Dist > 0 AND Rate OK) OR (Dist == 0)
+        valid_rate = (rate_check & (~is_dist_zero)) | is_dist_zero
+        
+        mask = mask & valid_rate
+
+        return df[mask].copy()
+>>>>>>> REPLACE
+```
+
+```diff
+library/feature_factory.py
+<<<<<<< SEARCH
+    def _generate_features(self, df):
+        """Generates basic keys and metrics required for stats aggregation."""
+        # Ensure coordinates are clamped to NYC box to prevent grid key explosion
+        p_lat, p_lon = GridIndexer.clamp_coordinates(
+            df["pickup_latitude"].values, df["pickup_longitude"].values
+        )
+        d_lat, d_lon = GridIndexer.clamp_coordinates(
+            df["dropoff_latitude"].values, df["dropoff_longitude"].values
+        )
+
+        # Update df with clamped values for feature usage
+        df["pickup_latitude"] = p_lat
+        df["pickup_longitude"] = p_lon
+        df["dropoff_latitude"] = d_lat
+        df["dropoff_longitude"] = d_lon
+=======
+    def _generate_features(self, df):
+        """Generates basic keys and metrics required for stats aggregation."""
+        
+        # Handle NaNs in coordinates before processing
+        # Using 0.0 as a safe fallback (ocean) to ensure they are binned consistently
+        fill_val = 0.0
+        df["pickup_latitude"] = df["pickup_latitude"].fillna(fill_val)
+        df["pickup_longitude"] = df["pickup_longitude"].fillna(fill_val)
+        df["dropoff_latitude"] = df["dropoff_latitude"].fillna(fill_val)
+        df["dropoff_longitude"] = df["dropoff_longitude"].fillna(fill_val)
+
+        # Ensure coordinates are clamped to NYC box to prevent grid key explosion
+        p_lat, p_lon = GridIndexer.clamp_coordinates(
+            df["pickup_latitude"].values, df["pickup_longitude"].values
+        )
+        d_lat, d_lon = GridIndexer.clamp_coordinates(
+            df["dropoff_latitude"].values, df["dropoff_longitude"].values
+        )
+
+        # Update df with clamped values for feature usage
+        df["pickup_latitude"] = p_lat
+        df["pickup_longitude"] = p_lon
+        df["dropoff_latitude"] = d_lat
+        df["dropoff_longitude"] = d_lon
+>>>>>>> REPLACE
+```

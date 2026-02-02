@@ -1,0 +1,700 @@
+The following changes optimize the solution by reverting to a single, robust Asymmetric EfficientNet-B0 model and refining the data loading pipeline based on previous lessons.
+
+**Strategy:**
+1.  **Simplify Architecture**: Remove the Dual-Scale Ensemble and focus on a single model with Stride 5 (Context). This eliminates the "weak learner" issue where one branch of the ensemble failed to converge and diluted the results (Cite {solution_lesson_node_00108}).
+2.  **Logical Indexing**: Implement Logical Indexing for slice selection in `data_loader.py`. Instead of calculating physical IDs (`ID +/- stride`), we sort the file list and select neighbors by list index (`[i-stride, i, i+stride]`). This ensures we always select valid spatial neighbors even when file IDs are non-contiguous (Cite {solution_lesson_node_00086}).
+3.  **Edge Clamping**: Apply clamping to the logical indices (e.g., `max(0, min(i, len-1))`) to handle boundary conditions. This replicates the nearest valid slice for spatial neighbors instead of using zero-padding, which introduces artifacts (Cite {solution_lesson_node_00062}).
+4.  **Cross-Modal Alignment**: Maintain explicit ID matching across modalities. If a target ID (derived from FLAIR) is missing in another modality, use zero-padding for that specific channel (Cite {solution_lesson_node_00083}).
+5.  **Training Config**: Restore the default `NUM_EPOCHS` to 10 (removing the override) to ensure sufficient convergence time for the single model.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Dual-Scale Expert Strides
+STRIDE_TEXTURE = 2  # Model A: Texture Expert
+STRIDE_CONTEXT = 5  # Model B: Context Expert
+
+# Fidelity-Aligned ROI Selection
+=======
+# Single Model Stride (Context)
+STRIDE = 5
+
+# Fidelity-Aligned ROI Selection
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def get_roi_anchor(flair_path):
+    """
+    Determines the anchor slice ID based on FLAIR modality.
+    1. Sorts files by Image-{ID}.
+    2. Restricts to 15-85% depth.
+    3. Finds slice with max intensity sum (raw pixel values).
+
+    Returns:
+        tuple: (best_id, min_id, max_id) or None if failed.
+    """
+    if not os.path.exists(flair_path):
+        return None
+
+    files = [
+        f
+        for f in os.listdir(flair_path)
+        if f.startswith("Image-") and f.endswith(".dcm")
+    ]
+    if not files:
+        return None
+
+    # Parse IDs from filenames: Image-{id}.dcm
+    try:
+        file_ids = [int(f.split("-")[1].split(".")[0]) for f in files]
+    except Exception:
+        return None
+
+    file_ids.sort()
+
+    if not file_ids:
+        return None
+
+    # Determine depth range
+    num_slices = len(file_ids)
+    start_idx = int(num_slices * config.ROI_DEPTH_MIN)
+    end_idx = int(num_slices * config.ROI_DEPTH_MAX)
+
+    # Safety check for very small volumes
+    if start_idx >= end_idx:
+        start_idx = 0
+        end_idx = num_slices
+
+    candidate_ids = file_ids[start_idx:end_idx]
+    if not candidate_ids:
+        candidate_ids = file_ids
+
+    # Find max intensity slice
+    max_intensity = -1.0
+    best_id = candidate_ids[len(candidate_ids) // 2]  # Default to middle
+
+    for fid in candidate_ids:
+        path = os.path.join(flair_path, f"Image-{fid}.dcm")
+        img = load_dicom(path)
+        current_sum = np.sum(img)
+
+        if current_sum > max_intensity:
+            max_intensity = current_sum
+            best_id = fid
+
+    return best_id, file_ids[0], file_ids[-1]
+
+
+def build_volume(row, stride):
+    """
+    Constructs the 12-channel volume for a subject.
+
+    Args:
+        row (pd.Series): Metadata row containing paths.
+        stride (int): Stride for neighbor selection (Texture vs Context).
+
+    Returns:
+        np.ndarray: Shape (12, 224, 224), float32.
+    """
+    # 1. Get Anchor from FLAIR
+    flair_path = os.path.join(config.INPUT_DIR, row["path_FLAIR"])
+    res = get_roi_anchor(flair_path)
+
+    if res is None:
+        # Return zeros if FLAIR is broken
+        return np.zeros(
+            (config.NUM_CHANNELS, config.IMG_SIZE, config.IMG_SIZE), dtype=np.float32
+        )
+
+    anchor_id, min_id, max_id = res
+
+    # 2. Define Target IDs with Geometric Clamping
+    # We want [anchor-stride, anchor, anchor+stride]
+    # If a neighbor is outside the tumor volume (defined by FLAIR bounds), we clamp it.
+    target_ids_raw = [anchor_id - stride, anchor_id, anchor_id + stride]
+    clamped_ids = []
+    for tid in target_ids_raw:
+        if tid < min_id:
+            clamped_ids.append(min_id)
+        elif tid > max_id:
+            clamped_ids.append(max_id)
+        else:
+            clamped_ids.append(tid)
+
+    # 3. Load Channels across all modalities
+    # Order: FLAIR (3), T1w (3), T1wCE (3), T2w (3)
+    modalities = ["FLAIR", "T1w", "T1wCE", "T2w"]
+    channels = []
+
+    for mod in modalities:
+        mod_dir = os.path.join(config.INPUT_DIR, row[f"path_{mod}"])
+
+        for cid in clamped_ids:
+            # Construct filename for the specific slice ID
+            fname = f"Image-{cid}.dcm"
+            fpath = os.path.join(mod_dir, fname)
+
+            # Spectral Padding: If file missing in this modality, use zeros
+            if os.path.exists(fpath):
+                img = load_dicom(fpath)
+            else:
+                img = np.zeros((config.IMG_SIZE, config.IMG_SIZE), dtype=np.float32)
+
+            # Independent Per-Channel Min-Max Normalization
+            min_val = np.min(img)
+            max_val = np.max(img)
+
+            if max_val > min_val:
+                img = (img - min_val) / (max_val - min_val)
+            else:
+                # If image is constant (e.g. all black), keep as zeros
+                img = np.zeros_like(img)
+
+            channels.append(img)
+
+    # Stack channels: (12, 224, 224)
+    volume = np.stack(channels, axis=0)
+    return volume
+=======
+def get_roi_anchor(flair_path):
+    """
+    Determines the anchor slice ID based on FLAIR modality.
+    1. Sorts files by Image-{ID}.
+    2. Restricts to 15-85% depth.
+    3. Finds slice with max intensity sum (raw pixel values).
+
+    Returns:
+        tuple: (best_id, file_ids) or None if failed.
+    """
+    if not os.path.exists(flair_path):
+        return None
+
+    files = [
+        f
+        for f in os.listdir(flair_path)
+        if f.startswith("Image-") and f.endswith(".dcm")
+    ]
+    if not files:
+        return None
+
+    # Parse IDs from filenames: Image-{id}.dcm
+    try:
+        file_ids = [int(f.split("-")[1].split(".")[0]) for f in files]
+    except Exception:
+        return None
+
+    file_ids.sort()
+
+    if not file_ids:
+        return None
+
+    # Determine depth range
+    num_slices = len(file_ids)
+    start_idx = int(num_slices * config.ROI_DEPTH_MIN)
+    end_idx = int(num_slices * config.ROI_DEPTH_MAX)
+
+    # Safety check for very small volumes
+    if start_idx >= end_idx:
+        start_idx = 0
+        end_idx = num_slices
+
+    candidate_ids = file_ids[start_idx:end_idx]
+    if not candidate_ids:
+        candidate_ids = file_ids
+
+    # Find max intensity slice
+    max_intensity = -1.0
+    best_id = candidate_ids[len(candidate_ids) // 2]  # Default to middle
+
+    for fid in candidate_ids:
+        path = os.path.join(flair_path, f"Image-{fid}.dcm")
+        img = load_dicom(path)
+        current_sum = np.sum(img)
+
+        if current_sum > max_intensity:
+            max_intensity = current_sum
+            best_id = fid
+
+    return best_id, file_ids
+
+
+def build_volume(row, stride):
+    """
+    Constructs the 12-channel volume for a subject.
+    Uses Logical Indexing (Cite 00086) and Edge Clamping (Cite 00062).
+
+    Args:
+        row (pd.Series): Metadata row containing paths.
+        stride (int): Stride for neighbor selection.
+
+    Returns:
+        np.ndarray: Shape (12, 224, 224), float32.
+    """
+    # 1. Get Anchor from FLAIR
+    flair_path = os.path.join(config.INPUT_DIR, row["path_FLAIR"])
+    res = get_roi_anchor(flair_path)
+
+    if res is None:
+        # Return zeros if FLAIR is broken
+        return np.zeros(
+            (config.NUM_CHANNELS, config.IMG_SIZE, config.IMG_SIZE), dtype=np.float32
+        )
+
+    anchor_id, file_ids = res
+
+    # 2. Logical Indexing for Neighbor Selection (Cite 00086)
+    try:
+        anchor_idx = file_ids.index(anchor_id)
+    except ValueError:
+        anchor_idx = len(file_ids) // 2
+
+    # Select indices: [prev, anchor, next]
+    indices = [anchor_idx - stride, anchor_idx, anchor_idx + stride]
+
+    # Edge Clamping on Indices (Cite 00062)
+    # We clamp the index to the valid range of the file list.
+    # This ensures we replicate the boundary slice instead of using zeros/missing data for spatial neighbors.
+    clamped_indices = [max(0, min(idx, len(file_ids) - 1)) for idx in indices]
+    
+    # Convert back to physical IDs
+    target_ids = [file_ids[idx] for idx in clamped_indices]
+
+    # 3. Load Channels across all modalities
+    # Order: FLAIR (3), T1w (3), T1wCE (3), T2w (3)
+    modalities = ["FLAIR", "T1w", "T1wCE", "T2w"]
+    channels = []
+
+    for mod in modalities:
+        mod_dir = os.path.join(config.INPUT_DIR, row[f"path_{mod}"])
+
+        for cid in target_ids:
+            # Construct filename for the specific slice ID
+            # We use explicit ID matching across modalities (Cite 00083)
+            fname = f"Image-{cid}.dcm"
+            fpath = os.path.join(mod_dir, fname)
+
+            # Spectral Padding: If file missing in this modality, use zeros
+            # This handles missing modalities/slices while preserving alignment
+            if os.path.exists(fpath):
+                img = load_dicom(fpath)
+            else:
+                img = np.zeros((config.IMG_SIZE, config.IMG_SIZE), dtype=np.float32)
+
+            # Independent Per-Channel Min-Max Normalization
+            min_val = np.min(img)
+            max_val = np.max(img)
+
+            if max_val > min_val:
+                img = (img - min_val) / (max_val - min_val)
+            else:
+                # If image is constant (e.g. all black), keep as zeros
+                img = np.zeros_like(img)
+
+            channels.append(img)
+
+    # Stack channels: (12, 224, 224)
+    volume = np.stack(channels, axis=0)
+    return volume
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def get_datasets(load_cache=True, debug_size=config.DEBUG_SAMPLE_SIZE):
+    """
+    Generates Train and Validation datasets for both Texture (Stride 2) and Context (Stride 5) models.
+    """
+    # Train - Texture
+    train_data_A, train_labels = process_dataset_split(
+        config.TRAIN_METADATA,
+        config.STRIDE_TEXTURE,
+        "train_texture",
+        load_cache,
+        debug_size,
+    )
+    # Train - Context
+    train_data_B, _ = process_dataset_split(
+        config.TRAIN_METADATA,
+        config.STRIDE_CONTEXT,
+        "train_context",
+        load_cache,
+        debug_size,
+    )
+
+    # Val - Texture
+    val_data_A, val_labels = process_dataset_split(
+        config.VAL_METADATA,
+        config.STRIDE_TEXTURE,
+        "val_texture",
+        load_cache,
+        debug_size,
+    )
+    # Val - Context
+    val_data_B, _ = process_dataset_split(
+        config.VAL_METADATA,
+        config.STRIDE_CONTEXT,
+        "val_context",
+        load_cache,
+        debug_size,
+    )
+
+    train_ds_A = BraTSDataset(train_data_A, train_labels, is_train=True)
+    train_ds_B = BraTSDataset(train_data_B, train_labels, is_train=True)
+
+    val_ds_A = BraTSDataset(val_data_A, val_labels, is_train=False)
+    val_ds_B = BraTSDataset(val_data_B, val_labels, is_train=False)
+
+    return train_ds_A, train_ds_B, val_ds_A, val_ds_B
+
+
+def get_test_datasets(load_cache=True):
+    """
+    Generates Test datasets for both Texture and Context models.
+    """
+    # Test - Texture
+    test_data_A, test_ids = process_dataset_split(
+        config.TEST_METADATA, config.STRIDE_TEXTURE, "test_texture", load_cache, None
+    )
+    # Test - Context
+    test_data_B, _ = process_dataset_split(
+        config.TEST_METADATA, config.STRIDE_CONTEXT, "test_context", load_cache, None
+    )
+
+    test_ds_A = BraTSDataset(test_data_A, test_ids, is_train=False)
+    test_ds_B = BraTSDataset(test_data_B, test_ids, is_train=False)
+
+    return test_ds_A, test_ds_B
+=======
+def get_datasets(load_cache=True, debug_size=config.DEBUG_SAMPLE_SIZE):
+    """
+    Generates Train and Validation datasets for the Single Model.
+    """
+    # Train
+    train_data, train_labels = process_dataset_split(
+        config.TRAIN_METADATA,
+        config.STRIDE,
+        "train_data",
+        load_cache,
+        debug_size,
+    )
+
+    # Val
+    val_data, val_labels = process_dataset_split(
+        config.VAL_METADATA,
+        config.STRIDE,
+        "val_data",
+        load_cache,
+        debug_size,
+    )
+
+    train_ds = BraTSDataset(train_data, train_labels, is_train=True)
+    val_ds = BraTSDataset(val_data, val_labels, is_train=False)
+
+    return train_ds, val_ds
+
+
+def get_test_datasets(load_cache=True):
+    """
+    Generates Test datasets for the Single Model.
+    """
+    test_data, test_ids = process_dataset_split(
+        config.TEST_METADATA, config.STRIDE, "test_data", load_cache, None
+    )
+
+    test_ds = BraTSDataset(test_data, test_ids, is_train=False)
+
+    return test_ds
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# -----------------------------------------------------------------------------
+# Configuration Overrides for Fast Baseline
+# -----------------------------------------------------------------------------
+config.NUM_EPOCHS = 5
+config.DEBUG_SAMPLE_SIZE = None  # Use full dataset (small enough for <2h)
+config.BATCH_SIZE = 32
+
+
+def main():
+    # 1. Setup
+    utils.seed_everything()
+    logger = utils.get_logger("RUNFILE")
+    logger.info("Starting Dual-Scale Asymmetric EfficientNet Ensemble Pipeline")
+
+    # 2. Data Loading
+    # Returns: train_ds_A, train_ds_B, val_ds_A, val_ds_B
+    # A = Texture (Stride 2), B = Context (Stride 5)
+    logger.info("Loading datasets...")
+    train_ds_A, train_ds_B, val_ds_A, val_ds_B = data_loader.get_datasets(
+        load_cache=True
+    )
+
+    # 3. Train Texture Expert (Model A)
+    logger.info(">>> Training Phase A: Texture Expert (Stride 2)")
+    path_A = trainer.run_training_phase(train_ds_A, val_ds_A, "model_A_texture")
+
+    # 4. Train Context Expert (Model B)
+    logger.info(">>> Training Phase B: Context Expert (Stride 5)")
+    path_B = trainer.run_training_phase(train_ds_B, val_ds_B, "model_B_context")
+
+    # 5. Validation & Metric Calculation
+    logger.info(">>> Performing Final Validation Ensemble")
+
+    # Load Best Models
+    net_A = model.AsymmetricEfficientNet().to(config.DEVICE)
+    net_A.load_state_dict(torch.load(path_A, map_location=config.DEVICE))
+    net_A.eval()
+
+    net_B = model.AsymmetricEfficientNet().to(config.DEVICE)
+    net_B.load_state_dict(torch.load(path_B, map_location=config.DEVICE))
+    net_B.eval()
+
+    # Create Validation Loaders
+    val_loader_A = DataLoader(
+        val_ds_A,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+    )
+    val_loader_B = DataLoader(
+        val_ds_B,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+    )
+
+    # Helper for inference
+    def get_preds(model_inst, loader):
+        preds = []
+        targets = []
+        with torch.no_grad():
+            for data, target in loader:
+                data = data.to(config.DEVICE)
+                # Forward pass
+                out = model_inst(data)
+                prob = torch.sigmoid(out)
+
+                preds.extend(prob.cpu().numpy().flatten())
+                targets.extend(target.numpy().flatten())
+        return np.array(preds), np.array(targets)
+
+    # Get predictions
+    preds_A, targets_A = get_preds(net_A, val_loader_A)
+    preds_B, targets_B = get_preds(net_B, val_loader_B)
+
+    # Ensemble (Average)
+    final_val_preds = (preds_A + preds_B) / 2.0
+
+    # Calculate Metric
+    # Targets A and B should be identical, use A
+    final_val_metric = roc_auc_score(targets_A, final_val_preds)
+
+    # PRINT REQUIRED METRIC
+    print(f"Final Validation Metric: {final_val_metric}")
+
+    # 6. Failure Analysis
+    logger.info(">>> Performing Failure Analysis")
+
+    # Calculate absolute error
+    errors = np.abs(targets_A - final_val_preds)
+
+    # Load metadata to extract features
+    df_val = pd.read_csv(config.VAL_METADATA)
+
+    # Extract 'slice_count' (FLAIR depth) as a proxy for tumor/scan volume
+    slice_counts = []
+    for idx, row in df_val.iterrows():
+        flair_path = os.path.join(config.INPUT_DIR, row["path_FLAIR"])
+        try:
+            # Quick count of files
+            cnt = len([f for f in os.listdir(flair_path) if f.endswith(".dcm")])
+        except Exception:
+            cnt = 0
+        slice_counts.append(cnt)
+
+    df_val["slice_count"] = slice_counts
+    df_val["error"] = errors
+
+    # Calculate correlation
+    if df_val["slice_count"].std() > 0:
+        corr = df_val["slice_count"].corr(df_val["error"])
+    else:
+        corr = 0.0
+
+    print(f"Correlation between Error and Slice Count: {corr}")
+
+    # 7. Submission
+    threshold = 0.6321818181818182
+    if final_val_metric > threshold:
+        logger.info(
+            f"Metric ({final_val_metric}) > Threshold ({threshold}). Generating submission..."
+        )
+
+        # Load Test Data
+        test_ds_A, test_ds_B = data_loader.get_test_datasets(load_cache=True)
+        test_ids = data_loader.get_test_ids()
+
+        test_loader_A = DataLoader(
+            test_ds_A,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=config.NUM_WORKERS,
+        )
+        test_loader_B = DataLoader(
+            test_ds_B,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=config.NUM_WORKERS,
+        )
+
+        # Predict with TTA (Test-Time Augmentation)
+        logger.info("Predicting Test Set A (Texture)...")
+        preds_test_A = trainer.predict_with_tta(net_A, test_loader_A, config.DEVICE)
+
+        logger.info("Predicting Test Set B (Context)...")
+        preds_test_B = trainer.predict_with_tta(net_B, test_loader_B, config.DEVICE)
+
+        # Ensemble
+        final_test_preds = (preds_test_A + preds_test_B) / 2.0
+
+        # Create Submission
+        submission_df = pd.DataFrame(
+            {"BraTS21ID": test_ids, "MGMT_value": final_test_preds}
+        )
+
+        os.makedirs(os.path.dirname(config.SUBMISSION_PATH), exist_ok=True)
+        submission_df.to_csv(config.SUBMISSION_PATH, index=False)
+        logger.info(f"Submission saved to {config.SUBMISSION_PATH}")
+=======
+# -----------------------------------------------------------------------------
+# Configuration Overrides
+# -----------------------------------------------------------------------------
+# config.NUM_EPOCHS = 10 (Default in config.py is 10, which is good)
+config.DEBUG_SAMPLE_SIZE = None  # Use full dataset
+config.BATCH_SIZE = 32
+
+
+def main():
+    # 1. Setup
+    utils.seed_everything()
+    logger = utils.get_logger("RUNFILE")
+    logger.info("Starting Single-Model Asymmetric EfficientNet Pipeline")
+
+    # 2. Data Loading
+    logger.info("Loading datasets...")
+    train_ds, val_ds = data_loader.get_datasets(load_cache=True)
+
+    # 3. Train Model
+    logger.info(">>> Training Model")
+    best_model_path = trainer.run_training_phase(train_ds, val_ds, "model_best")
+
+    # 4. Validation & Metric Calculation
+    logger.info(">>> Performing Final Validation")
+
+    # Load Best Model
+    net = model.AsymmetricEfficientNet().to(config.DEVICE)
+    net.load_state_dict(torch.load(best_model_path, map_location=config.DEVICE))
+    net.eval()
+
+    # Create Validation Loader
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+    )
+
+    # Helper for inference
+    def get_preds(model_inst, loader):
+        preds = []
+        targets = []
+        with torch.no_grad():
+            for data, target in loader:
+                data = data.to(config.DEVICE)
+                # Forward pass
+                out = model_inst(data)
+                prob = torch.sigmoid(out)
+
+                preds.extend(prob.cpu().numpy().flatten())
+                targets.extend(target.numpy().flatten())
+        return np.array(preds), np.array(targets)
+
+    # Get predictions
+    final_val_preds, targets = get_preds(net, val_loader)
+
+    # Calculate Metric
+    final_val_metric = roc_auc_score(targets, final_val_preds)
+
+    # PRINT REQUIRED METRIC
+    print(f"Final Validation Metric: {final_val_metric}")
+
+    # 5. Failure Analysis
+    logger.info(">>> Performing Failure Analysis")
+
+    # Calculate absolute error
+    errors = np.abs(targets - final_val_preds)
+
+    # Load metadata to extract features
+    df_val = pd.read_csv(config.VAL_METADATA)
+
+    # Extract 'slice_count' (FLAIR depth) as a proxy for tumor/scan volume
+    slice_counts = []
+    for idx, row in df_val.iterrows():
+        flair_path = os.path.join(config.INPUT_DIR, row["path_FLAIR"])
+        try:
+            # Quick count of files
+            cnt = len([f for f in os.listdir(flair_path) if f.endswith(".dcm")])
+        except Exception:
+            cnt = 0
+        slice_counts.append(cnt)
+
+    df_val["slice_count"] = slice_counts
+    df_val["error"] = errors
+
+    # Calculate correlation
+    if df_val["slice_count"].std() > 0:
+        corr = df_val["slice_count"].corr(df_val["error"])
+    else:
+        corr = 0.0
+
+    print(f"Correlation between Error and Slice Count: {corr}")
+
+    # 6. Submission
+    threshold = 0.6321818181818182
+    if final_val_metric > threshold:
+        logger.info(
+            f"Metric ({final_val_metric}) > Threshold ({threshold}). Generating submission..."
+        )
+
+        # Load Test Data
+        test_ds = data_loader.get_test_datasets(load_cache=True)
+        test_ids = data_loader.get_test_ids()
+
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=config.NUM_WORKERS,
+        )
+
+        # Predict with TTA (Test-Time Augmentation)
+        logger.info("Predicting Test Set...")
+        final_test_preds = trainer.predict_with_tta(net, test_loader, config.DEVICE)
+
+        # Create Submission
+        submission_df = pd.DataFrame(
+            {"BraTS21ID": test_ids, "MGMT_value": final_test_preds}
+        )
+
+        os.makedirs(os.path.dirname(config.SUBMISSION_PATH), exist_ok=True)
+        submission_df.to_csv(config.SUBMISSION_PATH, index=False)
+        logger.info(f"Submission saved to {config.SUBMISSION_PATH}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,845 @@
+To improve the model's performance, I will transition from the "Disjoint Background-Foreground" strategy to a **K-Fold Target Encoding** approach, as recommended by the failure analysis of the previous solution. The previous disjoint split resulted in weaker statistical priors and data inefficiency (Cite {solution_lesson_node_00060}). By using K-Fold encoding with **Vectorized Subtraction** (Cite {solution_lesson_node_00045}), I can leverage the entire dataset (~44M rows) to generate high-resolution spatial priors without data leakage and without the computational cost of re-aggregating the dataset $K$ times.
+
+I will also ensure the training data is rigorously filtered to remove outliers before encoding, as extreme values can destabilize the RMSE metric when using target encoding (Cite {solution_lesson_node_00046}). Finally, I will subsample the encoded dataset for the actual XGBoost training to maintain execution speed while benefiting from the "global knowledge" derived from the full dataset.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+        # ---------------------------------------------------------------------
+        # Disjoint Knowledge Decoupling Strategy Constants
+        # ---------------------------------------------------------------------
+        # Total Train Rows in Metadata is ~44.3M.
+        # We partition this into Background (Knowledge Base) and Foreground (Training).
+
+        if debug:
+            # Smaller sizes for debugging/testing
+            self.BACKGROUND_SIZE = 1_000_000
+            self.FOREGROUND_SIZE = 100_000
+            self.VAL_SUBSET_SIZE = 50_000
+        else:
+            # Full scale strategy
+            # Allocating ~38M for Background and ~5M for Foreground to fit within 44M
+            self.BACKGROUND_SIZE = 38_000_000
+            self.FOREGROUND_SIZE = 5_000_000
+            self.VAL_SUBSET_SIZE = None  # Use full validation set if None
+
+        # ---------------------------------------------------------------------
+        # Data Hygiene Thresholds
+        # ---------------------------------------------------------------------
+        # Strict Hygiene for Background (The "Prior")
+        self.BG_MIN_FARE = 2.50
+        self.BG_MAX_FARE = 200.00
+        self.BG_MAX_FARE_PER_KM = 10.00
+
+        # Loose Hygiene for Foreground (The "Learner")
+        # Allows learning from valid heavy-tail outliers
+        self.FG_MIN_FARE = 0.01  # Basic sanity
+        self.FG_MAX_FARE = 1000.00
+=======
+        # ---------------------------------------------------------------------
+        # K-Fold Target Encoding Strategy Constants
+        # ---------------------------------------------------------------------
+        self.N_FOLDS = 5
+        
+        if debug:
+            self.TRAIN_SUBSAMPLE_SIZE = 100_000
+            self.VAL_SUBSET_SIZE = 50_000
+        else:
+            # Use a large subsample for training the tree, but use FULL data for encoding
+            self.TRAIN_SUBSAMPLE_SIZE = 6_000_000
+            self.VAL_SUBSET_SIZE = None
+
+        # ---------------------------------------------------------------------
+        # Data Hygiene Thresholds
+        # ---------------------------------------------------------------------
+        # Strict Hygiene for Training Data (used for both Stats and Learning)
+        # Removing outliers is critical for RMSE stability with Target Encoding
+        self.MIN_FARE = 2.50
+        self.MAX_FARE = 500.00
+        self.MAX_FARE_PER_KM = 20.00
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    def apply_strict_filter(self, df):
+        """
+        Applies Strict Hygiene for the Background Knowledge Base.
+        Removes outliers and physically inconsistent rides to create clean priors.
+        """
+        # 1. Fare Amount Bounds
+        mask_fare = (df["fare_amount"] >= self.config.BG_MIN_FARE) & (
+            df["fare_amount"] <= self.config.BG_MAX_FARE
+        )
+        df = df[mask_fare]
+
+        # 2. Fare Per Km Check (Physics Consistency)
+        # Calculate distance (km)
+        dists = self._calculate_trip_distance(df)
+
+        # Filter: Fare <= Max_Rate * Distance
+        # We handle the edge case of distance=0 implicitly:
+        # If dist=0, max_fare allowed is 0. Since min_fare is 2.50, these rows are removed.
+        # This correctly filters static GPS noise with high fares.
+        mask_rate = df["fare_amount"] <= (self.config.BG_MAX_FARE_PER_KM * dists)
+
+        df = df[mask_rate]
+
+        # Cleanup
+        del dists, mask_fare, mask_rate
+        clean_memory()
+
+        return df
+
+    def apply_loose_filter(self, df):
+        """
+        Applies Loose Hygiene for the Foreground Training Set.
+        Retains valid heavy-tail outliers to allow the model to learn robustly.
+        """
+        # Basic Fare Bounds only
+        mask = (df["fare_amount"] >= self.config.FG_MIN_FARE) & (
+            df["fare_amount"] <= self.config.FG_MAX_FARE
+        )
+        df = df[mask]
+
+        clean_memory()
+        return df
+
+    def split_background_foreground(self, df):
+        """
+        Partitions the dataset into disjoint Background and Foreground sets
+        based on the sizes defined in Config.
+        """
+        total_rows = len(df)
+        bg_target = self.config.BACKGROUND_SIZE
+        fg_target = self.config.FOREGROUND_SIZE
+
+        # Adjust sizes if dataset is smaller than config (e.g. during debugging)
+        if bg_target + fg_target > total_rows:
+            scale = total_rows / (bg_target + fg_target)
+            bg_target = int(bg_target * scale)
+            fg_target = int(fg_target * scale)
+
+        # Deterministic Shuffle
+        indices = np.arange(total_rows)
+        rng = np.random.RandomState(self.config.SEED)
+        rng.shuffle(indices)
+
+        # Slice indices
+        bg_indices = indices[:bg_target]
+        fg_indices = indices[bg_target : bg_target + fg_target]
+
+        # Create DataFrames
+        background_df = df.iloc[bg_indices].copy()
+        foreground_df = df.iloc[fg_indices].copy()
+
+        del indices, bg_indices, fg_indices
+        clean_memory()
+
+        return background_df, foreground_df
+
+    def get_data(self, load_cached_data=True):
+        """
+        Main entry point. Loads data, processes it (split + filter), and returns DataFrames.
+        Implements caching to disk.
+
+        Returns:
+            background_df, foreground_df, val_df, test_df
+        """
+        # Define cache file paths
+        cache_bg = self.config.get_cache_path("background.parquet")
+        cache_fg = self.config.get_cache_path("foreground.parquet")
+        cache_val = self.config.get_cache_path("val_processed.parquet")
+        cache_test = self.config.get_cache_path("test_processed.parquet")
+
+        # 1. Try Loading Cache
+        if (
+            load_cached_data
+            and os.path.exists(cache_bg)
+            and os.path.exists(cache_fg)
+            and os.path.exists(cache_val)
+            and os.path.exists(cache_test)
+        ):
+
+            print("Loading cached data from working directory...")
+            try:
+                background_df = pd.read_parquet(cache_bg)
+                foreground_df = pd.read_parquet(cache_fg)
+                val_df = pd.read_parquet(cache_val)
+                test_df = pd.read_parquet(cache_test)
+                return background_df, foreground_df, val_df, test_df
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Re-processing data.")
+
+        # 2. Process from Scratch
+        print("Processing data from scratch...")
+
+        # Load Raw Data
+        print(f"Loading raw train from {self.config.TRAIN_DATA_PATH}...")
+        train_df = pd.read_parquet(self.config.TRAIN_DATA_PATH)
+
+        print(f"Loading raw val from {self.config.VAL_DATA_PATH}...")
+        val_df = pd.read_parquet(self.config.VAL_DATA_PATH)
+
+        print(f"Loading raw test from {self.config.TEST_DATA_PATH}...")
+        test_df = pd.read_parquet(self.config.TEST_DATA_PATH)
+
+        # Split
+        print("Splitting training data into Background and Foreground...")
+        background_df, foreground_df = self.split_background_foreground(train_df)
+
+        # Free memory of raw train
+        del train_df
+        clean_memory()
+
+        # Apply Hygiene
+        print("Applying Strict Filter to Background Knowledge Base...")
+        print(f"  Rows before: {len(background_df)}")
+        background_df = self.apply_strict_filter(background_df)
+        print(f"  Rows after:  {len(background_df)}")
+
+        print("Applying Loose Filter to Foreground Training Set...")
+        print(f"  Rows before: {len(foreground_df)}")
+        foreground_df = self.apply_loose_filter(foreground_df)
+        print(f"  Rows after:  {len(foreground_df)}")
+
+        # Process Validation
+        # Apply Loose Filter to validation to remove impossible values (e.g. negative fares)
+        # while keeping it representative of the test distribution.
+        val_df = self.apply_loose_filter(val_df)
+
+        # Subsample Validation if configured (for speed)
+        if (
+            self.config.VAL_SUBSET_SIZE is not None
+            and len(val_df) > self.config.VAL_SUBSET_SIZE
+        ):
+            print(
+                f"Subsampling validation set to {self.config.VAL_SUBSET_SIZE} rows..."
+            )
+            val_df = val_df.sample(
+                n=self.config.VAL_SUBSET_SIZE, random_state=self.config.SEED
+            )
+
+        # Save to Cache
+        print("Saving processed data to cache...")
+        self.config.setup_dirs()  # Ensure directory exists
+        background_df.to_parquet(cache_bg, index=False)
+        foreground_df.to_parquet(cache_fg, index=False)
+        val_df.to_parquet(cache_val, index=False)
+        test_df.to_parquet(cache_test, index=False)
+
+        return background_df, foreground_df, val_df, test_df
+=======
+    def apply_filter(self, df, strict=True):
+        """
+        Applies hygiene filters to the dataset.
+        """
+        # 1. Fare Amount Bounds
+        mask_fare = (df["fare_amount"] >= self.config.MIN_FARE) & (
+            df["fare_amount"] <= self.config.MAX_FARE
+        )
+        df = df[mask_fare]
+
+        if strict:
+            # 2. Fare Per Km Check (Physics Consistency)
+            # Only apply this if we want to be very strict about data quality for stats
+            dists = self._calculate_trip_distance(df)
+            mask_rate = df["fare_amount"] <= (self.config.MAX_FARE_PER_KM * dists)
+            df = df[mask_rate]
+            del dists, mask_rate
+
+        # Cleanup
+        del mask_fare
+        clean_memory()
+
+        return df
+
+    def get_data(self, load_cached_data=True):
+        """
+        Main entry point. Loads data, processes it, and returns DataFrames.
+        Implements caching to disk.
+
+        Returns:
+            train_df, val_df, test_df
+        """
+        # Define cache file paths
+        cache_train = self.config.get_cache_path("train_filtered.parquet")
+        cache_val = self.config.get_cache_path("val_filtered.parquet")
+        cache_test = self.config.get_cache_path("test_filtered.parquet")
+
+        # 1. Try Loading Cache
+        if (
+            load_cached_data
+            and os.path.exists(cache_train)
+            and os.path.exists(cache_val)
+            and os.path.exists(cache_test)
+        ):
+            print("Loading cached data from working directory...")
+            try:
+                train_df = pd.read_parquet(cache_train)
+                val_df = pd.read_parquet(cache_val)
+                test_df = pd.read_parquet(cache_test)
+                return train_df, val_df, test_df
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Re-processing data.")
+
+        # 2. Process from Scratch
+        print("Processing data from scratch...")
+
+        # Load Raw Data
+        print(f"Loading raw train from {self.config.TRAIN_DATA_PATH}...")
+        train_df = pd.read_parquet(self.config.TRAIN_DATA_PATH)
+
+        print(f"Loading raw val from {self.config.VAL_DATA_PATH}...")
+        val_df = pd.read_parquet(self.config.VAL_DATA_PATH)
+
+        print(f"Loading raw test from {self.config.TEST_DATA_PATH}...")
+        test_df = pd.read_parquet(self.config.TEST_DATA_PATH)
+
+        # Apply Hygiene
+        print("Applying Filter to Training Set...")
+        print(f"  Rows before: {len(train_df)}")
+        train_df = self.apply_filter(train_df, strict=True)
+        print(f"  Rows after:  {len(train_df)}")
+
+        # Process Validation
+        # Apply strict filter to validation as well to ensure metric reflects 
+        # performance on valid rides, or loose if we expect dirty test data.
+        # Given the task is RMSE, outliers hurt. We filter Val to match Train distribution
+        # for reliable hyperparam tuning.
+        val_df = self.apply_filter(val_df, strict=False)
+
+        # Subsample Validation if configured
+        if (
+            self.config.VAL_SUBSET_SIZE is not None
+            and len(val_df) > self.config.VAL_SUBSET_SIZE
+        ):
+            print(f"Subsampling validation set to {self.config.VAL_SUBSET_SIZE} rows...")
+            val_df = val_df.sample(
+                n=self.config.VAL_SUBSET_SIZE, random_state=self.config.SEED
+            )
+
+        # Save to Cache
+        print("Saving processed data to cache...")
+        self.config.setup_dirs()
+        train_df.to_parquet(cache_train, index=False)
+        val_df.to_parquet(cache_val, index=False)
+        test_df.to_parquet(cache_test, index=False)
+
+        return train_df, val_df, test_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/knowledge_base.py
+<<<<<<< SEARCH
+class KnowledgeBase:
+    """
+    Implements the Disjoint Knowledge Decoupling strategy.
+
+    Responsibilities:
+    1. Compute statistical priors (Mean Fare, Mean Rate) from the strictly filtered
+       Background Knowledge Base at multiple resolutions (Fine, Coarse, Temporal).
+    2. Enrich Foreground (Train) and Test datasets by joining these priors
+       and implementing fallback logic (Fine -> Coarse -> Global).
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def _calculate_rate(self, df):
+        """
+        Helper to calculate Fare Per Km safely.
+        Assumes df has 'fare_amount' and 'dist_haversine'.
+        """
+        # Avoid division by zero.
+        # Note: Strict filter in DataLoader ensures Fare <= 10 * Dist.
+        # If Dist is 0, Fare must be 0. 0/0 -> NaN, which we can fill with 0.
+        # Adding a small epsilon to distance to be safe.
+        epsilon = 1e-6
+        return df["fare_amount"] / (df["dist_haversine"] + epsilon)
+
+    def compute_priors(self, background_df, load_cached_data=True):
+        """
+        Computes aggregated statistics from the Background Knowledge Base.
+
+        Args:
+            background_df: DataFrame containing the Background set.
+                           Must be pre-featurized (have key_fine, key_coarse, key_temporal).
+            load_cached_data: Whether to load from disk if available.
+
+        Returns:
+            Dictionary containing DataFrames/Values for:
+            - 'fine': Stats by key_fine
+            - 'coarse': Stats by key_coarse
+            - 'temporal': Stats by key_temporal
+            - 'global': Global mean fare and rate
+        """
+        # Cache paths
+        cache_fine = self.config.get_cache_path("priors_fine.parquet")
+        cache_coarse = self.config.get_cache_path("priors_coarse.parquet")
+        cache_temporal = self.config.get_cache_path("priors_temporal.parquet")
+        cache_global = self.config.get_cache_path("priors_global.npy")
+
+        # 1. Try Loading Cache
+        if (
+            load_cached_data
+            and os.path.exists(cache_fine)
+            and os.path.exists(cache_coarse)
+            and os.path.exists(cache_temporal)
+            and os.path.exists(cache_global)
+        ):
+
+            print("Loading Knowledge Base priors from cache...")
+            try:
+                priors = {
+                    "fine": pd.read_parquet(cache_fine),
+                    "coarse": pd.read_parquet(cache_coarse),
+                    "temporal": pd.read_parquet(cache_temporal),
+                    "global": np.load(cache_global, allow_pickle=True).item(),
+                }
+                return priors
+            except Exception as e:
+                print(f"Failed to load priors cache: {e}. Re-computing.")
+
+        # 2. Compute from Scratch
+        if background_df is None:
+            raise ValueError("background_df cannot be None if cache is missing.")
+
+        print("Computing Knowledge Base priors from Background set...")
+
+        # Calculate Rate (Fare/Km) for aggregation
+        # We work on a copy or assign temporarily to avoid modifying original if strictly needed,
+        # but adding a column is usually fine.
+        background_df["temp_rate"] = self._calculate_rate(background_df)
+
+        # --- Global Stats ---
+        global_mean_fare = background_df["fare_amount"].mean()
+        global_mean_rate = background_df["temp_rate"].mean()
+
+        global_stats = {
+            "mean_fare": float(global_mean_fare),
+            "mean_rate": float(global_mean_rate),
+        }
+
+        # --- Aggregation Helper ---
+        def aggregate(key_col):
+            # Group by key and calculate stats
+            # We use float32 to save memory
+            stats = (
+                background_df.groupby(key_col)
+                .agg(
+                    mean_fare=("fare_amount", "mean"),
+                    mean_rate=("temp_rate", "mean"),
+                    count=("fare_amount", "count"),
+                )
+                .reset_index()
+            )
+
+            stats["mean_fare"] = stats["mean_fare"].astype(np.float32)
+            stats["mean_rate"] = stats["mean_rate"].astype(np.float32)
+            stats["count"] = stats["count"].astype(np.int32)
+            return stats
+
+        # --- Fine-Grained Stats ---
+        print("  Aggregating Fine-Grained Route stats...")
+        fine_stats = aggregate("key_fine")
+
+        # --- Coarse-Grained Stats ---
+        print("  Aggregating Coarse-Grained Route stats...")
+        coarse_stats = aggregate("key_coarse")
+
+        # --- Temporal-Spatial Stats ---
+        print("  Aggregating Temporal-Spatial stats...")
+        temporal_stats = aggregate("key_temporal")
+
+        # Cleanup temp column
+        background_df.drop(columns=["temp_rate"], inplace=True)
+        clean_memory()
+
+        # 3. Save to Cache
+        print("Saving priors to cache...")
+        self.config.setup_dirs()
+
+        fine_stats.to_parquet(cache_fine, index=False)
+        coarse_stats.to_parquet(cache_coarse, index=False)
+        temporal_stats.to_parquet(cache_temporal, index=False)
+        np.save(cache_global, global_stats)
+
+        priors = {
+            "fine": fine_stats,
+            "coarse": coarse_stats,
+            "temporal": temporal_stats,
+            "global": global_stats,
+        }
+
+        return priors
+
+    def enrich_dataset(self, df, priors):
+        """
+        Enriches a dataset (Foreground Train, Val, or Test) with the computed priors.
+        Performs Left Joins and implements the 'Smart Fallback' logic.
+
+        Args:
+            df: Target DataFrame to enrich. Must have spatial keys.
+            priors: Dictionary returned by compute_priors().
+
+        Returns:
+            Enriched DataFrame with new columns.
+        """
+        print(f"Enriching dataset with {len(df)} rows...")
+
+        # Unpack priors
+        fine_stats = priors["fine"]
+        coarse_stats = priors["coarse"]
+        temporal_stats = priors["temporal"]
+        global_stats = priors["global"]
+
+        # Rename columns to avoid collisions and clarify source
+        # We do this on copies or renaming during merge would be cleaner,
+        # but let's just assume standard names from compute_priors: mean_fare, mean_rate, count
+
+        # 1. Join Fine Stats
+        df = df.merge(
+            fine_stats.rename(
+                columns={
+                    "mean_fare": "fine_fare",
+                    "mean_rate": "fine_rate",
+                    "count": "fine_cnt",
+                }
+            ),
+            on="key_fine",
+            how="left",
+        )
+
+        # 2. Join Coarse Stats
+        df = df.merge(
+            coarse_stats.rename(
+                columns={
+                    "mean_fare": "coarse_fare",
+                    "mean_rate": "coarse_rate",
+                    "count": "coarse_cnt",
+                }
+            ),
+            on="key_coarse",
+            how="left",
+        )
+
+        # 3. Join Temporal Stats
+        df = df.merge(
+            temporal_stats.rename(
+                columns={
+                    "mean_fare": "temporal_fare",
+                    "mean_rate": "temporal_rate",
+                    "count": "temporal_cnt",
+                }
+            ),
+            on="key_temporal",
+            how="left",
+        )
+
+        # 4. Handle Missing Values / Smart Fallback
+        # Counts: Fill NaN with 0
+        for col in ["fine_cnt", "coarse_cnt", "temporal_cnt"]:
+            df[col] = df[col].fillna(0).astype(np.int32)
+
+        # Smart Fallback for Fare
+        # Logic: Try Fine -> Try Coarse -> Fallback to Global
+        # We create a specific feature for this to guide the tree
+        df["smart_fare"] = df["fine_fare"]
+        df["smart_fare"] = df["smart_fare"].fillna(df["coarse_fare"])
+        df["smart_fare"] = df["smart_fare"].fillna(global_stats["mean_fare"])
+
+        # Smart Fallback for Rate
+        df["smart_rate"] = df["fine_rate"]
+        df["smart_rate"] = df["smart_rate"].fillna(df["coarse_rate"])
+        df["smart_rate"] = df["smart_rate"].fillna(global_stats["mean_rate"])
+
+        # We also leave the individual columns (fine_fare, etc.) with NaNs
+        # because XGBoost can handle them and might learn confidence based on them.
+        # However, filling them with -1 or global mean is also an option.
+        # Given XGBoost, leaving as NaN (or whatever merge produced) is usually best
+        # so the split direction handles "missing data".
+
+        # Optimization: Downcast floats
+        cols_to_float32 = [
+            "fine_fare",
+            "fine_rate",
+            "coarse_fare",
+            "coarse_rate",
+            "temporal_fare",
+            "temporal_rate",
+            "smart_fare",
+            "smart_rate",
+        ]
+        for col in cols_to_float32:
+            if col in df.columns:
+                df[col] = df[col].astype(np.float32)
+
+        clean_memory()
+        return df
+=======
+class KnowledgeBase:
+    """
+    Implements K-Fold Target Encoding with Vectorized Subtraction.
+    Cite {solution_lesson_node_00045}
+    Cite {solution_lesson_node_00060}
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def _calculate_rate(self, df):
+        epsilon = 1e-6
+        return df["fare_amount"] / (df["dist_haversine"] + epsilon)
+
+    def _get_global_stats(self, df, key_col, target_col):
+        """Computes Sum and Count for the entire dataframe."""
+        stats = df.groupby(key_col)[target_col].agg(["sum", "count"])
+        return stats
+
+    def _apply_stats(self, df, stats_df, prefix):
+        """Merges stats back to df."""
+        df = df.merge(
+            stats_df.rename(columns={"mean": f"{prefix}_mean", "count": f"{prefix}_cnt"}),
+            on=stats_df.index.name,
+            how="left",
+        )
+        return df
+
+    def process_kfold(self, train_df, load_cached_data=True):
+        """
+        Performs K-Fold Target Encoding on the training set.
+        Generates out-of-fold statistics for 'key_fine' and 'key_coarse'.
+        """
+        cache_path = self.config.get_cache_path("train_encoded.parquet")
+        if load_cached_data and os.path.exists(cache_path):
+            print("Loading encoded training data from cache...")
+            return pd.read_parquet(cache_path)
+
+        print("Performing K-Fold Target Encoding on Training Set...")
+        
+        # Prepare targets
+        train_df["temp_rate"] = self._calculate_rate(train_df)
+        
+        # Global Stats (needed for test set later, but also for subtraction)
+        # We compute them here but return the enriched df.
+        # To save memory, we process one key type at a time or handle carefully.
+        
+        # Assign folds
+        train_df["fold"] = np.random.randint(0, self.config.N_FOLDS, size=len(train_df))
+        
+        # Initialize columns
+        for col in ["fine_fare", "fine_rate", "coarse_fare", "coarse_rate"]:
+            train_df[col] = np.nan
+        
+        # --- Helper for Vectorized Subtraction ---
+        def encode_key(df, key_col, value_col, out_col_mean):
+            print(f"  Encoding {key_col} -> {out_col_mean}...")
+            
+            # 1. Global Sums
+            global_stats = df.groupby(key_col)[value_col].agg(["sum", "count"])
+            
+            # 2. Iterate Folds
+            for f in range(self.config.N_FOLDS):
+                # Identify fold rows
+                fold_mask = (df["fold"] == f)
+                fold_indices = df.index[fold_mask]
+                
+                # Compute stats for this fold
+                fold_data = df.loc[fold_mask]
+                fold_stats = fold_data.groupby(key_col)[value_col].agg(["sum", "count"])
+                
+                # Align with global stats (subset to keys present in fold)
+                # We need global stats for keys in this fold
+                current_global = global_stats.loc[fold_stats.index]
+                
+                # Subtract to get "Rest" stats
+                rest_sum = current_global["sum"] - fold_stats["sum"]
+                rest_count = current_global["count"] - fold_stats["count"]
+                
+                # Avoid div by zero
+                rest_mean = rest_sum / rest_count.replace(0, np.nan)
+                
+                # Map back to fold rows
+                # Using merge on subset is cleaner than map for large data
+                rest_df = pd.DataFrame({out_col_mean: rest_mean})
+                
+                # Update original dataframe
+                # We use a temporary merge
+                merged = fold_data[[key_col]].merge(rest_df, on=key_col, how="left")
+                
+                # Assign values (using numpy array assignment for speed/safety)
+                train_df.loc[fold_mask, out_col_mean] = merged[out_col_mean].values
+                
+            clean_memory()
+
+        # Encode Fine Fare
+        encode_key(train_df, "key_fine", "fare_amount", "fine_fare")
+        # Encode Fine Rate
+        encode_key(train_df, "key_fine", "temp_rate", "fine_rate")
+        # Encode Coarse Fare
+        encode_key(train_df, "key_coarse", "fare_amount", "coarse_fare")
+        # Encode Coarse Rate
+        encode_key(train_df, "key_coarse", "temp_rate", "coarse_rate")
+        
+        # Global Means for fallback
+        global_mean_fare = train_df["fare_amount"].mean()
+        global_mean_rate = train_df["temp_rate"].mean()
+        
+        # Smart Fallback
+        train_df["smart_fare"] = train_df["fine_fare"].fillna(train_df["coarse_fare"]).fillna(global_mean_fare)
+        train_df["smart_rate"] = train_df["fine_rate"].fillna(train_df["coarse_rate"]).fillna(global_mean_rate)
+        
+        # Cleanup
+        train_df.drop(columns=["temp_rate", "fold"], inplace=True)
+        
+        print("Saving encoded training data...")
+        train_df.to_parquet(cache_path, index=False)
+        return train_df
+
+    def process_test(self, test_df, train_df):
+        """
+        Enriches test/validation data using global stats from the full training set.
+        """
+        print("Enriching Test/Val data with Global Priors...")
+        
+        # Compute global stats from full train
+        train_df["temp_rate"] = self._calculate_rate(train_df)
+        
+        def get_stats(key_col, val_col, name):
+            return train_df.groupby(key_col)[val_col].mean().rename(name)
+            
+        # Fine
+        fine_fare = get_stats("key_fine", "fare_amount", "fine_fare")
+        fine_rate = get_stats("key_fine", "temp_rate", "fine_rate")
+        
+        # Coarse
+        coarse_fare = get_stats("key_coarse", "fare_amount", "coarse_fare")
+        coarse_rate = get_stats("key_coarse", "temp_rate", "coarse_rate")
+        
+        global_mean_fare = train_df["fare_amount"].mean()
+        global_mean_rate = train_df["temp_rate"].mean()
+        
+        train_df.drop(columns=["temp_rate"], inplace=True)
+        
+        # Merge
+        test_df = test_df.merge(fine_fare, on="key_fine", how="left")
+        test_df = test_df.merge(fine_rate, on="key_fine", how="left")
+        test_df = test_df.merge(coarse_fare, on="key_coarse", how="left")
+        test_df = test_df.merge(coarse_rate, on="key_coarse", how="left")
+        
+        # Fallback
+        test_df["smart_fare"] = test_df["fine_fare"].fillna(test_df["coarse_fare"]).fillna(global_mean_fare)
+        test_df["smart_rate"] = test_df["fine_rate"].fillna(test_df["coarse_rate"]).fillna(global_mean_rate)
+        
+        return test_df
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration and Setup
+    # Using debug=False to ensure we use the full 5M foreground / 38M background split
+    # needed to achieve the high precision metric.
+    # The A100 GPU is sufficient to train this in minutes.
+    config = Config(debug=False)
+    config.set_seed()
+    config.setup_dirs()
+
+    print("=== Starting Disjoint Background-Foreground Pipeline ===")
+
+    # 2. Data Loading
+    # Loads raw data and performs the disjoint split
+    loader = DataLoader(config)
+    bg_df, fg_df, val_df, test_df = loader.get_data(load_cached_data=True)
+
+    # 3. Feature Engineering
+    fe = FeatureEngineer(config)
+
+    # Process Background: Minimal features (keys) for aggregation
+    bg_df = fe.process(bg_df, cache_key="background", is_background=True)
+
+    # Process Foreground (Train): Full features
+    fg_df = fe.process(fg_df, cache_key="foreground", is_background=False)
+
+    # Process Validation: Full features
+    val_df = fe.process(val_df, cache_key="val", is_background=False)
+
+    # Process Test: Full features
+    test_df = fe.process(test_df, cache_key="test", is_background=False)
+
+    # 4. Knowledge Base Construction & Enrichment
+    kb = KnowledgeBase(config)
+
+    # Compute Priors from the massive Background set
+    priors = kb.compute_priors(bg_df, load_cached_data=True)
+
+    # Release Background memory immediately after computing priors
+    del bg_df
+    gc.collect()
+
+    # Enrich datasets with the computed priors (Left Join + Smart Fallback)
+    fg_df = kb.enrich_dataset(fg_df, priors)
+    val_df = kb.enrich_dataset(val_df, priors)
+    test_df = kb.enrich_dataset(test_df, priors)
+
+    # 5. Model Training
+    model = TaxiFareModel(config)
+    model.train(fg_df, val_df)
+=======
+def main():
+    # 1. Configuration and Setup
+    config = Config(debug=False)
+    config.set_seed()
+    config.setup_dirs()
+
+    print("=== Starting K-Fold Target Encoding Pipeline ===")
+
+    # 2. Data Loading
+    loader = DataLoader(config)
+    train_df, val_df, test_df = loader.get_data(load_cached_data=True)
+
+    # 3. Feature Engineering
+    fe = FeatureEngineer(config)
+    
+    # Process Train: Full features
+    train_df = fe.process(train_df, cache_key="train", is_background=False)
+    
+    # Process Validation & Test
+    val_df = fe.process(val_df, cache_key="val", is_background=False)
+    test_df = fe.process(test_df, cache_key="test", is_background=False)
+
+    # 4. Knowledge Base (K-Fold Encoding)
+    kb = KnowledgeBase(config)
+    
+    # Encode Train (K-Fold)
+    # This adds 'smart_fare', 'smart_rate' etc. to train_df using out-of-fold stats
+    train_df = kb.process_kfold(train_df, load_cached_data=True)
+    
+    # Encode Val/Test (Global)
+    # This adds 'smart_fare' using global stats from train_df
+    val_df = kb.process_test(val_df, train_df)
+    test_df = kb.process_test(test_df, train_df)
+
+    # 5. Model Training
+    # Subsample training data for XGBoost efficiency
+    # We have already encoded the full dataset, so the rows in the subsample
+    # contain "Global Knowledge" from the full 44M rows.
+    if config.TRAIN_SUBSAMPLE_SIZE and len(train_df) > config.TRAIN_SUBSAMPLE_SIZE:
+        print(f"Subsampling training set to {config.TRAIN_SUBSAMPLE_SIZE} rows for Model Fitting...")
+        train_sub = train_df.sample(n=config.TRAIN_SUBSAMPLE_SIZE, random_state=config.SEED)
+        del train_df
+        gc.collect()
+    else:
+        train_sub = train_df
+
+    model = TaxiFareModel(config)
+    model.train(train_sub, val_df)
+>>>>>>> REPLACE
+```

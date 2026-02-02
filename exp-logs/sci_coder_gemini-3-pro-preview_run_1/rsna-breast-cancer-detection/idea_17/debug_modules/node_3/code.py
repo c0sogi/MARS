@@ -1,0 +1,184 @@
+import os
+import sys
+import warnings
+import torch
+import pandas as pd
+import numpy as np
+
+# Append current directory to system path to ensure library imports work
+sys.path.append(os.getcwd())
+
+# Import from the provided library
+from library.config import Config
+from library.utils import seed_everything, probabilistic_f1
+from library.dataset import SiameseBreastCancerDataset
+from library.model import PyramidSiameseEfficientNet
+from library.train import train
+from library.predict import predict
+
+
+def run_demo():
+    print("==== Starting Demonstration ====")
+
+    # 1. Setup Configuration for Demo
+    # We modify the Config singleton to run a fast, lightweight demonstration.
+    print("[1/6] Configuring environment...")
+    Config.DEBUG = True
+    Config.EPOCHS = 1
+    Config.BATCH_SIZE = 2
+    Config.DEBUG_SAMPLE_SIZE = 6  # Small sample size for speed (must be >= batch_size)
+    Config.NUM_WORKERS = 0  # Disable multiprocessing for simple debug run
+    Config.CLIP_GRADIENTS = True  # Enable just to test the flag logic
+    Config.IMG_SIZE = (256, 256)  # Set correct image size for demo data
+
+    # Ensure working directories exist
+    Config.setup()
+
+    # Set seeds for reproducibility
+    seed_everything(Config.SEED)
+    print("      Configuration complete.")
+
+    # 2. Verify Utility Functions
+    print("[2/6] Verifying utility functions...")
+    # Test Probabilistic F1 with known values
+    y_true_test = [0, 1, 1, 0]
+    y_pred_test = [0.1, 0.9, 0.8, 0.2]
+    score = probabilistic_f1(y_true_test, y_pred_test)
+    # Expected pF1 should be high as predictions match labels well
+    assert 0.0 <= score <= 1.0, "pF1 score calculation is out of bounds."
+    print(f"      pF1 Score Test: {score:.4f} (Passed)")
+
+    # 3. Verify Dataset Loading
+    print("[3/6] Verifying Dataset...")
+    try:
+        # Initialize dataset in debug mode
+        ds = SiameseBreastCancerDataset(Config.TRAIN_METADATA, mode="train", debug=True)
+
+        if len(ds) > 0:
+            sample = ds[0]
+
+            # Check dictionary keys
+            required_keys = [
+                "target",
+                "contra",
+                "patient_id",
+                "view",
+                "laterality",
+                "label",
+            ]
+            for key in required_keys:
+                assert key in sample, f"Missing key in dataset sample: {key}"
+
+            # Check Tensor Shapes
+            # Expected: (3, H, W) based on Config.CHANNELS and Config.IMG_SIZE
+            expected_shape = (Config.CHANNELS, Config.IMG_SIZE[0], Config.IMG_SIZE[1])
+            assert (
+                sample["target"].shape == expected_shape
+            ), f"Target tensor shape mismatch. Got {sample['target'].shape}, expected {expected_shape}"
+            assert (
+                sample["contra"].shape == expected_shape
+            ), f"Contra tensor shape mismatch. Got {sample['contra'].shape}, expected {expected_shape}"
+
+            print(
+                f"      Dataset loaded successfully. Sample shape: {sample['target'].shape}"
+            )
+        else:
+            print(
+                "      Warning: Dataset is empty (likely due to debug sampling). Skipping shape checks."
+            )
+
+    except FileNotFoundError as e:
+        print(f"      Dataset verification skipped due to missing files: {e}")
+        # We continue, as we might be in an environment without images but want to test the rest of the code
+    except Exception as e:
+        print(f"      Dataset verification failed: {e}")
+        raise e
+
+    # 4. Verify Model Architecture
+    print("[4/6] Verifying Model Architecture...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"      Using device: {device}")
+
+    try:
+        # Instantiate model
+        # We use 'efficientnet_b0' here just for a quick architecture check to save memory/time
+        # The actual training will use the backbone defined in Config (efficientnet_b2)
+        model = PyramidSiameseEfficientNet(
+            backbone_name="efficientnet_b0", pretrained=False
+        )
+        model.to(device)
+        model.eval()
+
+        # Create dummy input batch
+        # Batch Size = 2, Channels = 3, Size = 256x256 (reduced for quick check)
+        dummy_target = torch.randn(2, 3, 256, 256).to(device)
+        dummy_contra = torch.randn(2, 3, 256, 256).to(device)
+
+        with torch.no_grad():
+            output = model(dummy_target, dummy_contra)
+
+        # Check output shape: (Batch_Size, 1)
+        assert output.shape == (
+            2,
+            1,
+        ), f"Model output shape mismatch. Got {output.shape}, expected (2, 1)"
+        print("      Model forward pass successful.")
+
+    except Exception as e:
+        print(f"      Model verification failed: {e}")
+        raise e
+
+    # 5. Execute Training Pipeline
+    print("[5/6] Executing Training Pipeline (Debug Mode)...")
+    try:
+        # Run training using the library function
+        # This uses the actual Config.BACKBONE and settings
+        best_pf1 = train(debug=True, epochs=1)
+
+        print(f"      Training completed. Best Validation pF1: {best_pf1:.4f}")
+
+        # Verify model artifact
+        if not os.path.exists(Config.MODEL_PATH):
+            raise FileNotFoundError(
+                f"Model file not found at {Config.MODEL_PATH} after training."
+            )
+        print("      Model artifact saved successfully.")
+
+    except Exception as e:
+        print(f"      Training pipeline failed: {e}")
+        raise e
+
+    # 6. Execute Inference Pipeline
+    print("[6/6] Executing Inference Pipeline (Debug Mode)...")
+    try:
+        # Run inference
+        predict(debug=True)
+
+        # Verify submission file
+        if not os.path.exists(Config.SUBMISSION_PATH):
+            raise FileNotFoundError(
+                f"Submission file not found at {Config.SUBMISSION_PATH} after inference."
+            )
+
+        # Validate submission format
+        df_sub = pd.read_csv(Config.SUBMISSION_PATH)
+        assert (
+            "prediction_id" in df_sub.columns
+        ), "Submission missing 'prediction_id' column"
+        assert "cancer" in df_sub.columns, "Submission missing 'cancer' column"
+        assert len(df_sub) > 0, "Submission file is empty"
+
+        print(f"      Inference completed. Generated {len(df_sub)} predictions.")
+        print(f"      Sample predictions:\n{df_sub.head(3)}")
+
+    except Exception as e:
+        print(f"      Inference pipeline failed: {e}")
+        raise e
+
+    print("\n==== Demonstration Completed Successfully ====")
+
+
+if __name__ == "__main__":
+    # Suppress warnings for cleaner output
+    warnings.filterwarnings("ignore")
+    run_demo()

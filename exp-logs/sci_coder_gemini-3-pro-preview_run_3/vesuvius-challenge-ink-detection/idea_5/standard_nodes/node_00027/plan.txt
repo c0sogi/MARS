@@ -1,0 +1,333 @@
+My implementation strategy focuses on addressing the stability and data throughput issues identified in the previous solution by reverting to a simpler, more robust architecture trained with a larger batch size, as supported by the lessons.
+
+1.  **Architecture Simplification (Cite Lesson 00004, 00025):** I will replace the deep `DSDN_GN` (18 blocks, GroupNorm) with a leaner `ResidualFCN` (8 blocks, BatchNorm). The previous model was too deep for the memory-constrained batch size of 8. By reducing the depth and removing GroupNorm, I can increase the batch size to 32. This aligns with Lesson 00025 ("Prioritize Batch Size Over Model Capacity") and Lesson 00004 ("Lean Spatial Backbones").
+2.  **Batch Size Increase (Cite Lesson 00025):** I will increase `BATCH_SIZE` from 8 to 32. This ensures more stable gradient estimates and better batch statistics for BatchNorm.
+3.  **Data Throughput (Cite Lesson 00003):** I will increase the `epoch_size` (patches per epoch) from ~1,600 to 12,000. Lesson 00003 demonstrated that sampling significantly more patches per epoch is crucial for capturing the variance in texture and noise.
+4.  **Hyperparameters:** I will set `PATIENCE` to 3 (Cite Lesson 00004) and use a dilation cycle of `[1, 2, 4, 8]` (Cite Lesson 00003) to ensure adequate receptive field without excessive depth.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for this specific experiment (Idea 5)
+    # Used for caching processed tensors and saving model checkpoints
+    WORKING_DIR = "./working/idea_5"
+=======
+    # Working directory for this specific experiment (Idea 6)
+    # Used for caching processed tensors and saving model checkpoints
+    WORKING_DIR = "./working/idea_6"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Model Architecture (DSDN-GN)
+    # -------------------------------------------------------------------------
+    # The model uses a learnable 2.5D projection followed by a deep 2D backbone.
+
+    NUM_CHANNELS = 32  # Lean channel width to balance parameter count with depth
+    NUM_BLOCKS = 18  # Deep backbone to resolve complex textures
+
+    # Sequential Dilation Pattern: 1, 2, 4, 8, 16, 1, 2...
+    # This hierarchy builds receptive fields from edges to shapes.
+    DILATION_CYCLE = [1, 2, 4, 8, 16]
+
+    # Group Normalization Settings
+    # Used to ensure stability with small batch sizes.
+    # 32 channels / 8 groups = 4 channels per group.
+    GN_NUM_GROUPS = 8
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Batch size is kept small to fit the deep model and large patches into GPU memory.
+    # Group Norm makes the model invariant to this small batch size.
+    BATCH_SIZE = 8
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+
+    # Training Loop
+    EPOCHS = 25
+    PATIENCE = 5  # Strict early stopping to prevent overfitting
+=======
+    # Model Architecture (Residual FCN)
+    # -------------------------------------------------------------------------
+    # The model uses a learnable 2.5D projection followed by a 2D backbone.
+    # Cite solution_lesson_node_00004: Lean Spatial Backbones improve generalization.
+
+    NUM_CHANNELS = 32  # Lean channel width
+    NUM_BLOCKS = 8  # Reduced depth to allow larger batch size
+
+    # Sequential Dilation Pattern: 1, 2, 4, 8
+    # Cite solution_lesson_node_00003: Expanding Receptive Fields via Dilated Convolutions.
+    DILATION_CYCLE = [1, 2, 4, 8]
+
+    # -------------------------------------------------------------------------
+    # Training Hyperparameters
+    # -------------------------------------------------------------------------
+    # Cite solution_lesson_node_00025: Prioritize Batch Size Over Model Capacity.
+    BATCH_SIZE = 32
+
+    # Optimization
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-2
+
+    # Training Loop
+    EPOCHS = 25
+    PATIENCE = 3  # Cite solution_lesson_node_00004: Stricter early stopping.
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DilatedResidualBlock(nn.Module):
+    """
+    A residual block with dilated convolutions and Group Normalization.
+    Designed to maintain full spatial resolution (no pooling) while increasing
+    receptive field via dilation.
+    """
+
+    def __init__(self, channels, dilation, groups):
+        super(DilatedResidualBlock, self).__init__()
+
+        # First convolution: 3x3 with specific dilation
+        # Padding is set to dilation to preserve spatial dimensions (H, W)
+        self.conv1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.gn1 = nn.GroupNorm(groups, channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Second convolution
+        self.conv2 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.gn2 = nn.GroupNorm(groups, channels)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.gn2(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class DSDN_GN(nn.Module):
+    """
+    Deep Sequential Dilated Network with Group Normalization (DSDN-GN).
+
+    This architecture is designed to handle the trade-off between model capacity
+    and training stability. It uses Group Normalization to allow for deep
+    networks even when memory constraints force small batch sizes.
+    """
+
+    def __init__(self):
+        super(DSDN_GN, self).__init__()
+
+        # 1. Learnable 2.5D Projection
+        # Compresses the Z-dimension (65 slices) into a compact feature space.
+        # Input: (B, 65, H, W) -> Output: (B, NUM_CHANNELS, H, W)
+        self.projection = nn.Sequential(
+            nn.Conv2d(Config.Z_DIM, Config.NUM_CHANNELS, kernel_size=1, bias=False),
+            nn.GroupNorm(Config.GN_NUM_GROUPS, Config.NUM_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Deep Sequential Dilated Backbone
+        # Constructs a sequence of residual blocks with increasing dilation rates.
+        layers = []
+        dilation_rates = Config.get_dilation_rates()
+
+        for dilation in dilation_rates:
+            layers.append(
+                DilatedResidualBlock(
+                    channels=Config.NUM_CHANNELS,
+                    dilation=dilation,
+                    groups=Config.GN_NUM_GROUPS,
+                )
+            )
+
+        self.backbone = nn.Sequential(*layers)
+=======
+class DilatedResidualBlock(nn.Module):
+    """
+    A residual block with dilated convolutions and Batch Normalization.
+    Designed to maintain full spatial resolution (no pooling) while increasing
+    receptive field via dilation.
+    """
+
+    def __init__(self, channels, dilation):
+        super(DilatedResidualBlock, self).__init__()
+
+        # First convolution: 3x3 with specific dilation
+        self.conv1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        # Second convolution
+        self.conv2 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class ResidualFCN(nn.Module):
+    """
+    Residual Fully Convolutional Network (ResidualFCN).
+    
+    Cite solution_lesson_node_00025: Prioritize Batch Size Over Model Capacity.
+    Replaces GroupNorm with BatchNorm and reduces depth to allow larger batches.
+    """
+
+    def __init__(self):
+        super(ResidualFCN, self).__init__()
+
+        # 1. Learnable 2.5D Projection
+        # Cite solution_lesson_node_00002: 2.5D Volumetric Projection via Learnable Bottlenecks
+        self.projection = nn.Sequential(
+            nn.Conv2d(Config.Z_DIM, Config.NUM_CHANNELS, kernel_size=1, bias=False),
+            nn.BatchNorm2d(Config.NUM_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Dilated Backbone
+        # Cite solution_lesson_node_00003: Expanding Receptive Fields via Dilated Convolutions
+        layers = []
+        dilation_rates = Config.get_dilation_rates()
+
+        for dilation in dilation_rates:
+            layers.append(
+                DilatedResidualBlock(
+                    channels=Config.NUM_CHANNELS,
+                    dilation=dilation,
+                )
+            )
+
+        self.backbone = nn.Sequential(*layers)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def _init_weights(self):
+        """
+        Applies Kaiming initialization to convolutions and constant init to GroupNorm.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+=======
+    def _init_weights(self):
+        """
+        Applies Kaiming initialization to convolutions and constant init to BatchNorm.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    # Training dataset: Random sampling
+    train_ds = InkTrainDataset(
+        df_train,
+        epoch_size=Config.BATCH_SIZE * 200,  # Define epoch size
+        load_cached_data=load_cached_data,
+    )
+=======
+    # Training dataset: Random sampling
+    # Cite solution_lesson_node_00003: Sample 12,000 patches per epoch.
+    train_ds = InkTrainDataset(
+        df_train,
+        epoch_size=12000,
+        load_cached_data=load_cached_data,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import DSDN_GN
+from library.data import get_loaders
+from library.engine import (
+    train_one_epoch,
+    evaluate,
+    reconstruct_fragments,
+    predict_and_submit,
+)
+=======
+from library.model import ResidualFCN
+from library.data import get_loaders
+from library.engine import (
+    train_one_epoch,
+    evaluate,
+    reconstruct_fragments,
+    predict_and_submit,
+)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = DSDN_GN().to(device)
+
+    optimizer = optim.AdamW(
+=======
+    # 3. Model Initialization
+    model = ResidualFCN().to(device)
+
+    optimizer = optim.AdamW(
+>>>>>>> REPLACE
+```

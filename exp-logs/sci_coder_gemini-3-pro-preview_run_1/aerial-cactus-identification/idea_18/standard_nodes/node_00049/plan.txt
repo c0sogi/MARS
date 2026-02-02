@@ -1,0 +1,454 @@
+The previous implementation suffered from **Data Leakage**, causing an invalid validation metric (~1.0). The `StackingTrainer` merged the hold-out validation set with the training set to perform Cross-Validation. Consequently, the "Out-Of-Fold" (OOF) predictions used to train the meta-learner included predictions for the validation set. Evaluating the meta-learner on this same validation set violated the independence assumption.
+
+To fix this, I will strictly isolate the validation set, treating it as a pure hold-out set.
+1.  **`library/config.py`**: Add cache keys for validation data to support separate loading.
+2.  **`library/stacking.py`**:
+    *   Modify `load_all_data` to load validation data into separate arrays (`self.val_imgs`, etc.) without merging it into the training set.
+    *   Update `get_base_model_predictions` and `_train_single_fold` to generate predictions for this hold-out validation set using the models trained on the training folds. These predictions will be saved to `val_predictions.parquet`.
+3.  **`runfile.py`**: Update the validation analysis to load predictions from `val_predictions.parquet` instead of extracting them from the OOF set.
+
+Cite **Debug Lesson 11**.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+        "test_imgs": os.path.join(CACHE_DIR, "test_imgs.npy"),
+        "test_ids": os.path.join(CACHE_DIR, "test_ids.npy"),
+        "test_fsizes": os.path.join(CACHE_DIR, "test_fsizes.npy"),
+    }
+=======
+        "test_imgs": os.path.join(CACHE_DIR, "test_imgs.npy"),
+        "test_ids": os.path.join(CACHE_DIR, "test_ids.npy"),
+        "test_fsizes": os.path.join(CACHE_DIR, "test_fsizes.npy"),
+        "val_imgs": os.path.join(CACHE_DIR, "val_imgs.npy"),
+        "val_labels": os.path.join(CACHE_DIR, "val_labels.npy"),
+        "val_fsizes": os.path.join(CACHE_DIR, "val_fsizes.npy"),
+        "val_ids": os.path.join(CACHE_DIR, "val_ids.npy"),
+    }
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+        self.oof_cache_path = os.path.join(self.working_dir, "oof_predictions.parquet")
+        self.test_preds_cache_path = os.path.join(
+            self.working_dir, "test_predictions_raw.parquet"
+        )
+
+        # Ensure working directory exists
+=======
+        self.oof_cache_path = os.path.join(self.working_dir, "oof_predictions.parquet")
+        self.test_preds_cache_path = os.path.join(
+            self.working_dir, "test_predictions_raw.parquet"
+        )
+        self.val_preds_cache_path = os.path.join(
+            self.working_dir, "val_predictions.parquet"
+        )
+
+        # Ensure working directory exists
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+        # Load Validation Data (merging for CV)
+        # Note: In this pipeline, we merge train/val metadata to perform our own 5-fold CV
+        # However, to respect the provided file structure, we load both and concatenate.
+        logger.info("Loading Validation Data (merging for CV)...")
+        val_imgs, val_labels, val_fsizes, val_ids = load_data_to_memory(
+            Config.VAL_METADATA,
+            {
+                "imgs": None,
+                "labels": None,
+                "fsizes": None,
+                "ids": None,
+            },  # Don't cache separate val files to avoid conflict
+            load_cached_data=False,
+        )
+
+        self.train_imgs = np.concatenate([self.train_imgs, val_imgs], axis=0)
+        self.train_labels = np.concatenate([self.train_labels, val_labels], axis=0)
+        self.train_fsizes = np.concatenate([self.train_fsizes, val_fsizes], axis=0)
+        self.train_ids = np.concatenate([self.train_ids, val_ids], axis=0)
+
+        logger.info(f"Total Training Samples for CV: {len(self.train_imgs)}")
+=======
+        # Load Validation Data (Hold-out) - Cite Debug Lesson 11: Strict Isolation
+        logger.info("Loading Validation Data (Hold-out)...")
+        self.val_imgs, self.val_labels, self.val_fsizes, self.val_ids = load_data_to_memory(
+            Config.VAL_METADATA,
+            {
+                "imgs": "val_imgs",
+                "labels": "val_labels",
+                "fsizes": "val_fsizes",
+                "ids": "val_ids",
+            },
+            load_cached_data=True,
+        )
+
+        # Do NOT concatenate validation data into training data.
+        logger.info(f"Total Training Samples for CV: {len(self.train_imgs)}")
+        logger.info(f"Total Validation Samples (Hold-out): {len(self.val_imgs)}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+    def get_base_model_predictions(self, load_cached_data=True):
+        """
+        Orchestrates the training of base models to generate OOF and Test predictions.
+        Uses caching to skip training if predictions already exist.
+        """
+        if (
+            load_cached_data
+            and os.path.exists(self.oof_cache_path)
+            and os.path.exists(self.test_preds_cache_path)
+        ):
+            logger.info(
+                f"Loading cached OOF and Test predictions from {self.working_dir}..."
+            )
+            oof_df = pd.read_parquet(self.oof_cache_path)
+            test_preds_df = pd.read_parquet(self.test_preds_cache_path)
+            return oof_df, test_preds_df
+
+        logger.info("Starting Base Model Training (5-Fold CV)...")
+
+        # Initialize containers
+        # OOF DataFrame: initialized with IDs and Targets
+        oof_df = pd.DataFrame({"id": self.train_ids, "target": self.train_labels})
+
+        # Test Preds DataFrame: initialized with IDs
+        test_preds_df = pd.DataFrame({"id": self.test_ids})
+
+        # Setup Cross-Validation
+        skf = StratifiedKFold(
+            n_splits=Config.NUM_FOLDS, shuffle=True, random_state=Config.SEED
+        )
+
+        # Iterate over defined model configurations
+        for model_name, config in Config.MODEL_CONFIGS.items():
+            logger.info(f"=== Training Model Configuration: {model_name} ===")
+
+            oof_preds = np.zeros(len(self.train_imgs))
+            test_preds_accum = np.zeros(len(self.test_imgs))
+
+            for fold, (train_idx, val_idx) in enumerate(
+                skf.split(self.train_imgs, self.train_labels)
+            ):
+                logger.info(f"--- Fold {fold+1}/{Config.NUM_FOLDS} ---")
+
+                # Train single fold
+                val_probs, test_probs = self._train_single_fold(
+                    model_name, config, fold, train_idx, val_idx
+                )
+
+                # Flatten predictions to match 1D storage arrays
+                val_probs = val_probs.reshape(-1)
+                test_probs = test_probs.reshape(-1)
+
+                # Store OOF predictions
+                oof_preds[val_idx] = val_probs
+
+                # Accumulate Test predictions
+                test_preds_accum += test_probs
+
+            # Average Test predictions across folds
+            test_preds_avg = test_preds_accum / Config.NUM_FOLDS
+
+            # Add to DataFrames
+            oof_df[model_name] = oof_preds
+            test_preds_df[model_name] = test_preds_avg
+
+            # Print Model Performance
+            auc = roc_auc_score(self.train_labels, oof_preds)
+            logger.info(f"Model {model_name} CV AUC: {auc:.6f}")
+
+        # Save to Cache
+        logger.info(f"Saving predictions to {self.working_dir}...")
+        oof_df.to_parquet(self.oof_cache_path)
+        test_preds_df.to_parquet(self.test_preds_cache_path)
+
+        return oof_df, test_preds_df
+=======
+    def get_base_model_predictions(self, load_cached_data=True):
+        """
+        Orchestrates the training of base models to generate OOF, Test, and Hold-out Val predictions.
+        """
+        if (
+            load_cached_data
+            and os.path.exists(self.oof_cache_path)
+            and os.path.exists(self.test_preds_cache_path)
+            and os.path.exists(self.val_preds_cache_path)
+        ):
+            logger.info(
+                f"Loading cached OOF, Test, and Val predictions from {self.working_dir}..."
+            )
+            oof_df = pd.read_parquet(self.oof_cache_path)
+            test_preds_df = pd.read_parquet(self.test_preds_cache_path)
+            val_preds_df = pd.read_parquet(self.val_preds_cache_path)
+            return oof_df, test_preds_df, val_preds_df
+
+        logger.info("Starting Base Model Training (5-Fold CV)...")
+
+        # Initialize containers
+        # OOF DataFrame: initialized with IDs and Targets (Train Only)
+        oof_df = pd.DataFrame({"id": self.train_ids, "target": self.train_labels})
+
+        # Test Preds DataFrame
+        test_preds_df = pd.DataFrame({"id": self.test_ids})
+
+        # Val Preds DataFrame (Hold-out)
+        val_preds_df = pd.DataFrame({"id": self.val_ids, "target": self.val_labels})
+
+        # Setup Cross-Validation
+        skf = StratifiedKFold(
+            n_splits=Config.NUM_FOLDS, shuffle=True, random_state=Config.SEED
+        )
+
+        # Iterate over defined model configurations
+        for model_name, config in Config.MODEL_CONFIGS.items():
+            logger.info(f"=== Training Model Configuration: {model_name} ===")
+
+            oof_preds = np.zeros(len(self.train_imgs))
+            test_preds_accum = np.zeros(len(self.test_imgs))
+            val_preds_accum = np.zeros(len(self.val_imgs))
+
+            for fold, (train_idx, val_idx) in enumerate(
+                skf.split(self.train_imgs, self.train_labels)
+            ):
+                logger.info(f"--- Fold {fold+1}/{Config.NUM_FOLDS} ---")
+
+                # Train single fold
+                # Returns: OOF Probs, Test Probs, Hold-out Val Probs
+                val_probs, test_probs, holdout_probs = self._train_single_fold(
+                    model_name, config, fold, train_idx, val_idx
+                )
+
+                # Flatten predictions
+                val_probs = val_probs.reshape(-1)
+                test_probs = test_probs.reshape(-1)
+                holdout_probs = holdout_probs.reshape(-1)
+
+                # Store OOF predictions
+                oof_preds[val_idx] = val_probs
+
+                # Accumulate Test and Hold-out Val predictions
+                test_preds_accum += test_probs
+                val_preds_accum += holdout_probs
+
+            # Average predictions across folds
+            test_preds_avg = test_preds_accum / Config.NUM_FOLDS
+            val_preds_avg = val_preds_accum / Config.NUM_FOLDS
+
+            # Add to DataFrames
+            oof_df[model_name] = oof_preds
+            test_preds_df[model_name] = test_preds_avg
+            val_preds_df[model_name] = val_preds_avg
+
+            # Print Model Performance
+            auc = roc_auc_score(self.train_labels, oof_preds)
+            logger.info(f"Model {model_name} CV AUC: {auc:.6f}")
+
+        # Save to Cache
+        logger.info(f"Saving predictions to {self.working_dir}...")
+        oof_df.to_parquet(self.oof_cache_path)
+        test_preds_df.to_parquet(self.test_preds_cache_path)
+        val_preds_df.to_parquet(self.val_preds_cache_path)
+
+        return oof_df, test_preds_df, val_preds_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+        test_dataset = CactusDataset(
+            self.test_imgs,
+            None,
+            self.test_fsizes,
+            self.test_ids,
+            transform=get_transforms("test", config["in_chans"]),
+            in_chans=config["in_chans"],
+            fs_stats=self.fs_stats,
+        )
+
+        # DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Initialize Model
+=======
+        test_dataset = CactusDataset(
+            self.test_imgs,
+            None,
+            self.test_fsizes,
+            self.test_ids,
+            transform=get_transforms("test", config["in_chans"]),
+            in_chans=config["in_chans"],
+            fs_stats=self.fs_stats,
+        )
+        # Hold-out Validation Dataset (treated as Test)
+        holdout_dataset = CactusDataset(
+            self.val_imgs,
+            self.val_labels,
+            self.val_fsizes,
+            self.val_ids,
+            transform=get_transforms("test", config["in_chans"]),
+            in_chans=config["in_chans"],
+            fs_stats=self.fs_stats,
+        )
+
+        # DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+        holdout_loader = DataLoader(
+            holdout_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Initialize Model
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+        # Inference (TTA included in evaluate)
+        _, val_auc_final, val_probs, _ = evaluate(final_model, val_loader, self.device)
+        _, _, test_probs, _ = evaluate(final_model, test_loader, self.device)
+
+        logger.info(f"Fold {fold+1} Final AUC: {val_auc_final:.6f}")
+
+        return val_probs, test_probs
+=======
+        # Inference (TTA included in evaluate)
+        _, val_auc_final, val_probs, _ = evaluate(final_model, val_loader, self.device)
+        _, _, test_probs, _ = evaluate(final_model, test_loader, self.device)
+        _, _, holdout_probs, _ = evaluate(final_model, holdout_loader, self.device)
+
+        logger.info(f"Fold {fold+1} Final AUC: {val_auc_final:.6f}")
+
+        return val_probs, test_probs, holdout_probs
+>>>>>>> REPLACE
+```
+
+```diff
+library/stacking.py
+<<<<<<< SEARCH
+        # 1. Load Data
+        self.load_all_data()
+
+        # 2. Base Models (Level 0)
+        oof_df, test_preds_df = self.get_base_model_predictions(load_cached_data=True)
+
+        # 3. Meta Learner (Level 1)
+        meta_model = self.train_meta_learner(oof_df)
+
+        # 4. Submission
+        self.generate_submission(meta_model, test_preds_df)
+=======
+        # 1. Load Data
+        self.load_all_data()
+
+        # 2. Base Models (Level 0)
+        oof_df, test_preds_df, val_preds_df = self.get_base_model_predictions(load_cached_data=True)
+
+        # 3. Meta Learner (Level 1)
+        meta_model = self.train_meta_learner(oof_df)
+
+        # 4. Submission
+        self.generate_submission(meta_model, test_preds_df)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Load necessary artifacts generated by the trainer
+    oof_path = os.path.join(Config.WORKING_DIR, "oof_predictions.parquet")
+    meta_model_path = os.path.join(Config.WORKING_DIR, "meta_model.joblib")
+
+    if not os.path.exists(oof_path) or not os.path.exists(meta_model_path):
+        logger.error(
+            "Required artifacts (OOF preds or Meta Model) not found. Pipeline may have failed."
+        )
+        return
+
+    # Load OOF Predictions (contains base model preds for all train+val images)
+    oof_df = pd.read_parquet(oof_path)
+
+    # Load Validation Metadata to identify the hold-out subset
+    # The StackingTrainer merged Train+Val for CV, so we extract the specific Val subset here
+    val_df = pd.read_csv(Config.VAL_METADATA)
+    val_ids = val_df["id"].values
+
+    # Filter OOF for Validation set
+    val_subset = oof_df[oof_df["id"].isin(val_ids)].copy()
+
+    # Align rows with validation metadata for consistency
+    val_subset = val_subset.set_index("id").loc[val_ids].reset_index()
+=======
+    # Load necessary artifacts generated by the trainer
+    meta_model_path = os.path.join(Config.WORKING_DIR, "meta_model.joblib")
+    val_preds_path = os.path.join(Config.WORKING_DIR, "val_predictions.parquet")
+
+    if not os.path.exists(val_preds_path) or not os.path.exists(meta_model_path):
+        logger.error(
+            "Required artifacts (Val preds or Meta Model) not found. Pipeline may have failed."
+        )
+        return
+
+    # Load Validation Predictions (Hold-out set, strictly isolated from Meta-Learner training)
+    # Cite Debug Lesson 11: Enforce Strict Isolation Between Training and Hold-Out Validation Sets
+    val_subset = pd.read_parquet(val_preds_path)
+
+    # Load Validation Metadata for file sizes
+    val_df = pd.read_csv(Config.VAL_METADATA)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,264 @@
+The issue is that the pipeline implements a "Union Dataset" strategy where the validation set is merged with the training set to retrain the final "stable" models. However, the `runfile.py` script subsequently attempts to evaluate these retrained models on the original validation set. Since the validation samples were explicitly included in the training data for these models, this constitutes testing on training data (data leakage), resulting in the inflated AUC of ~0.9995.
+
+To fix this, we must rely on the **Out-of-Fold (OOF)** predictions generated during the cross-validation phase as the definitive estimate of generalization performance (Cite debug_lesson_9). The fix involves:
+1.  Modifying `library/training_engine.py` to save the OOF predictions to disk so they can be used for analysis.
+2.  Modifying `runfile.py` to remove the leaky "Validation Assessment" block and instead use the OOF AUC and saved OOF predictions for decision-making and failure analysis.
+
+```diff
+library/training_engine.py
+<<<<<<< SEARCH
+            # Extract Target and IDs
+            y = train_df[Config.TARGET_COL].values.astype(int)
+            request_ids = test_df[Config.ID_COL].values
+=======
+            # Extract Target and IDs
+            y = train_df[Config.TARGET_COL].values.astype(int)
+            train_ids = train_df[Config.ID_COL].values
+            request_ids = test_df[Config.ID_COL].values
+>>>>>>> REPLACE
+```
+
+```diff
+library/training_engine.py
+<<<<<<< SEARCH
+            # Evaluate Meta-Learner on OOF (Proxy for performance)
+            meta_oof_probs = meta_learner.predict_proba(X_meta_train)[:, 1]
+            meta_auc = roc_auc_score(y, meta_oof_probs)
+            print(f"Meta-Learner OOF AUC: {meta_auc}")
+
+            # Save Meta-Learner
+=======
+            # Evaluate Meta-Learner on OOF (Proxy for performance)
+            meta_oof_probs = meta_learner.predict_proba(X_meta_train)[:, 1]
+            meta_auc = roc_auc_score(y, meta_oof_probs)
+            print(f"Meta-Learner OOF AUC: {meta_auc}")
+
+            # Save OOF Predictions for Analysis
+            oof_df = pd.DataFrame({
+                Config.ID_COL: train_ids,
+                Config.TARGET_COL: y,
+                "pred": meta_oof_probs
+            })
+            oof_df.to_csv(os.path.join(self.working_dir, "oof_predictions.csv"), index=False)
+
+            # Save Meta-Learner
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================================================
+    # 2. Training Pipeline
+    # ==========================================================================
+    print(">>> Starting Training Pipeline...")
+    trainer = CrossValidationTrainer()
+    trainer.run()
+
+    # ==========================================================================
+    # 3. Validation Assessment
+    # ==========================================================================
+    print("\n>>> Starting Validation Assessment...")
+
+    # Load Validation Data
+    if not os.path.exists(Config.VAL_PATH):
+        raise FileNotFoundError(f"Validation file not found at {Config.VAL_PATH}")
+
+    val_df = pd.read_parquet(Config.VAL_PATH)
+    y_val = val_df[Config.TARGET_COL].values
+
+    # Load Union Data (Train+Val) to use as the fitting basis for FeatureGenerator
+    # This ensures we use the same vectorizers/scalers as training
+    union_df, _ = DataFactory.load_union_dataset(load_cached_data=True)
+
+    # Preprocess Validation Data (Replicating DataFactory logic)
+    # 1. Text Concatenation
+    val_df["text_combined"] = (
+        val_df[Config.TEXT_COLS[0]].fillna("").astype(str)
+        + " "
+        + val_df[Config.TEXT_COLS[1]].fillna("").astype(str)
+    )
+
+    # 2. Behavioral Feature
+    if Config.SUBREDDIT_COL in val_df.columns:
+        val_df["subreddit_text"] = val_df[Config.SUBREDDIT_COL].apply(
+            lambda x: (
+                " ".join(x)
+                if isinstance(x, list)
+                else (str(x) if x is not None else "")
+            )
+        )
+    else:
+        val_df["subreddit_text"] = ""
+
+    # 3. Imputation (Using medians from union_df)
+    for col in Config.METADATA_COLS:
+        if col in val_df.columns:
+            val_df[col] = pd.to_numeric(val_df[col], errors="coerce")
+            if col in union_df.columns:
+                median_val = union_df[col].median()
+                val_df[col] = val_df[col].fillna(median_val)
+            else:
+                val_df[col] = val_df[col].fillna(0)
+
+    # Generate Features for Validation Set
+    # We pass union_df as train and val_df as test.
+    # load_cached_data=False forces regeneration (overwriting cache files with val features)
+    fg_val = FeatureGenerator(union_df, val_df)
+
+    print("Generating validation features...")
+    X_tr_lex, X_val_lex = fg_val.get_lexical_features(load_cached_data=False)
+    X_tr_beh, X_val_beh = fg_val.get_behavioral_features(load_cached_data=False)
+    X_tr_sem, X_val_sem = fg_val.get_semantic_features(load_cached_data=False)
+    X_tr_meta, X_val_meta = fg_val.get_metadata_features(load_cached_data=False)
+
+    # Assemble Inputs
+    inputs_val = {}
+
+    def prepare_feature_set(feature_key, X_feature, X_meta):
+        if feature_key in ["lexical", "behavioral"]:
+            if not scipy.sparse.issparse(X_meta):
+                X_meta_sparse = scipy.sparse.csr_matrix(X_meta)
+            else:
+                X_meta_sparse = X_meta
+            return scipy.sparse.hstack([X_feature, X_meta_sparse], format="csr")
+        elif feature_key == "semantic":
+            return np.hstack([X_feature, X_meta])
+        elif feature_key == "metadata":
+            return X_meta
+
+    raw_features_val = {
+        "lexical": X_val_lex,
+        "behavioral": X_val_beh,
+        "semantic": X_val_sem,
+        "metadata": X_val_meta,
+    }
+
+    for f_key, X_raw in raw_features_val.items():
+        if f_key == "metadata":
+            inputs_val[f_key] = X_raw
+        else:
+            inputs_val[f_key] = prepare_feature_set(f_key, X_raw, X_val_meta)
+
+    # Level 1 Inference on Validation
+    models_conf = ModelZoo.get_models_dict()
+    level1_preds = pd.DataFrame()
+
+    print("Running inference on validation set...")
+    for model_name, conf in models_conf.items():
+        feature_key = conf["feature_set"]
+        X_input = inputs_val[feature_key]
+
+        # We use the full models (Stable) or averaged folds (Volatile)
+        # For consistency with HybridPredictor:
+        if conf["type"] == "volatile":
+            final_pred = np.zeros(X_input.shape[0])
+            for fold in range(Config.N_FOLDS):
+                model_path = os.path.join(
+                    Config.WORKING_DIR, f"{model_name}_fold_{fold}.joblib"
+                )
+                model = joblib.load(model_path)
+                final_pred += model.predict_proba(X_input)[:, 1]
+            final_pred /= Config.N_FOLDS
+        else:
+            model_path = os.path.join(Config.WORKING_DIR, f"{model_name}_full.joblib")
+            model = joblib.load(model_path)
+            final_pred = model.predict_proba(X_input)[:, 1]
+
+        level1_preds[model_name] = final_pred
+
+    # Level 2 Meta-Learner Inference
+    meta_learner = joblib.load(os.path.join(Config.WORKING_DIR, "meta_learner.joblib"))
+    val_probs = meta_learner.predict_proba(level1_preds.values)[:, 1]
+
+    # Compute Metric
+    val_auc = roc_auc_score(y_val, val_probs)
+    print(f"Final Validation Metric: {val_auc}")
+
+    # ==========================================================================
+    # 4. Failure Analysis
+    # ==========================================================================
+    print("\n>>> Failure Analysis...")
+    val_df["pred"] = val_probs
+    val_df["error"] = np.abs(val_df[Config.TARGET_COL] - val_df["pred"])
+
+    numeric_cols = val_df.select_dtypes(include=[np.number]).columns
+    correlations = {}
+
+    for col in numeric_cols:
+        if col not in ["pred", "error", Config.TARGET_COL]:
+            # Simple imputation for correlation calc
+            series = val_df[col].fillna(0)
+            if series.std() > 0:
+                corr = series.corr(val_df["error"])
+                correlations[col] = corr
+
+    sorted_corr = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
+    print("Top Feature Correlations with Error:")
+    for name, corr in sorted_corr[:5]:
+        print(f"{name}: {corr:.4f}")
+
+    # ==========================================================================
+    # 5. Submission Generation
+    # ==========================================================================
+    # Clean up cache so HybridPredictor regenerates features for the actual Test set
+    print("\nCleaning up validation feature cache...")
+    test_cache_files = glob.glob(os.path.join(Config.WORKING_DIR, "X_test_*.np*"))
+    for f in test_cache_files:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+=======
+    # ==========================================================================
+    # 2. Training Pipeline
+    # ==========================================================================
+    print(">>> Starting Training Pipeline...")
+    trainer = CrossValidationTrainer()
+    # Capture the OOF AUC from the trainer
+    val_auc = trainer.run()
+    print(f"Final Validation Metric (OOF): {val_auc}")
+
+    # ==========================================================================
+    # 3. Failure Analysis (Using OOF Predictions)
+    # ==========================================================================
+    print("\n>>> Failure Analysis...")
+    oof_path = os.path.join(Config.WORKING_DIR, "oof_predictions.csv")
+    
+    if os.path.exists(oof_path):
+        # Load OOF predictions
+        val_df = pd.read_csv(oof_path)
+        
+        # Load original features to correlate with error
+        # We use the union dataset which matches the OOF rows
+        union_df, _ = DataFactory.load_union_dataset(load_cached_data=True)
+        
+        # Ensure alignment (assuming OOF preserved order, which it does via index)
+        # We merge on ID to be safe
+        val_df = val_df.merge(union_df, on=Config.ID_COL, suffixes=("", "_orig"))
+        
+        val_df["error"] = np.abs(val_df[Config.TARGET_COL] - val_df["pred"])
+
+        numeric_cols = val_df.select_dtypes(include=[np.number]).columns
+        correlations = {}
+
+        for col in numeric_cols:
+            if col not in ["pred", "error", Config.TARGET_COL, "requester_received_pizza_orig"]:
+                # Simple imputation for correlation calc
+                series = val_df[col].fillna(0)
+                if series.std() > 0:
+                    corr = series.corr(val_df["error"])
+                    correlations[col] = corr
+
+        sorted_corr = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
+        print("Top Feature Correlations with Error:")
+        for name, corr in sorted_corr[:5]:
+            print(f"{name}: {corr:.4f}")
+    else:
+        print("OOF predictions not found. Skipping failure analysis.")
+
+    # ==========================================================================
+    # 4. Submission Generation
+    # ==========================================================================
+>>>>>>> REPLACE
+```

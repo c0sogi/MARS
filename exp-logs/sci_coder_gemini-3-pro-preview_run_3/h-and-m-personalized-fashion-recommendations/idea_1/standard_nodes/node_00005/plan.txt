@@ -1,0 +1,312 @@
+I will optimize the solution by extending the Markov Chain from Order-1 to Order-N and adding a weighted repurchase heuristic, as suggested in the lesson (Cite `solution_lesson_node_00002`). Specifically, I will:
+1.  Modify `get_last_purchases` to retrieve the last 20 interactions per user instead of just one, capturing a richer context.
+2.  Update the `TimeAwareTransitionGraph` model to perform vectorized inference using sparse matrix multiplication ($S = U \cdot T + \lambda U$), where $U$ is the user history matrix and $T$ is the transition matrix. This efficiently aggregates transition probabilities from multiple history items and boosts scores for previously purchased items (Repurchase Heuristic).
+3.  Tune hyperparameters `HISTORY_LENGTH` and `REPURCHASE_WEIGHT` to balance trend-following with habit-based predictions.
+
+This approach addresses the sparsity and noise issues of the single-item baseline while maintaining high computational efficiency.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Model Specific (Time-Aware Sequential Transition Graph)
+WEEKS_TO_KEEP = 10  # Filter transactions to the last N weeks to capture recent trends
+DECAY_RATE = (
+    2.5  # Exponent for time decay: weight = 1 / (days_passed + 1) ** DECAY_RATE
+)
+MIN_PURCHASES = (
+    1  # Minimum purchases required to include a user/item in graph (noise reduction)
+)
+=======
+# Model Specific (Time-Aware Sequential Transition Graph)
+WEEKS_TO_KEEP = 10  # Filter transactions to the last N weeks to capture recent trends
+DECAY_RATE = (
+    2.5  # Exponent for time decay: weight = 1 / (days_passed + 1) ** DECAY_RATE
+)
+MIN_PURCHASES = (
+    1  # Minimum purchases required to include a user/item in graph (noise reduction)
+)
+REPURCHASE_WEIGHT = 4.0  # Weight for items already in user history
+HISTORY_LENGTH = 20  # Number of recent items to consider per user
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    # Group by customer and take the last transaction
+    # We only need customer_id and article_id
+    last_purchases = df_sorted.groupby("customer_id").tail(1)[
+        ["customer_id", "article_id"]
+    ]
+=======
+    # Group by customer and take the last N transactions
+    # We need customer_id, article_id, and weight for the model
+    last_purchases = df_sorted.groupby("customer_id").tail(config.HISTORY_LENGTH)[
+        ["customer_id", "article_id", "weight"]
+    ]
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def generate_predictions(self, user_history_df):
+        """
+        Generates predictions for users based on their last purchased item.
+
+        Args:
+            user_history_df (pd.DataFrame): DataFrame with 'customer_id' and 'article_id'
+                                            representing the last purchase.
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print("Generating predictions...")
+
+        # Pre-compute global top K for fallback
+        global_top_k = self.global_popularity[: config.TOP_K]
+
+        # Prepare inputs
+        customer_ids = user_history_df["customer_id"].values
+        last_article_ids = user_history_df["article_id"].values
+
+        # Map last articles to indices
+        # pd.Index.get_indexer is very fast for bulk lookups
+        # Returns -1 for items not found in the index
+        idx_map = pd.Index(self.idx_to_article)
+        source_indices = idx_map.get_indexer(last_article_ids)
+
+        predictions = []
+
+        # Iterate over each query
+        # While a loop in python is generally slow, iterating 1.3M times with efficient
+        # sparse row slicing is feasible within the time limit compared to full matrix ops.
+
+        # Optimization: Access CSR internals directly to avoid overhead
+        indptr = self.transition_matrix.indptr
+        indices = self.transition_matrix.indices
+        data = self.transition_matrix.data
+
+        for src_idx in source_indices:
+            preds = []
+
+            # If the source item exists in our graph
+            if src_idx != -1:
+                # Get the row corresponding to this article
+                start = indptr[src_idx]
+                end = indptr[src_idx + 1]
+
+                if end > start:
+                    row_indices = indices[start:end]
+                    row_data = data[start:end]
+
+                    # Get top K neighbors
+                    if len(row_data) > config.TOP_K:
+                        # argpartition puts the top K elements at the end (unsorted)
+                        top_k_arg = np.argpartition(row_data, -config.TOP_K)[
+                            -config.TOP_K :
+                        ]
+                        # Sort these top K by weight descending
+                        sorted_top_k_arg = top_k_arg[
+                            np.argsort(row_data[top_k_arg])[::-1]
+                        ]
+                        best_indices = row_indices[sorted_top_k_arg]
+                    else:
+                        # If fewer than K, just sort all of them
+                        sorted_arg = np.argsort(row_data)[::-1]
+                        best_indices = row_indices[sorted_arg]
+
+                    # Map back to article IDs
+                    preds = self.idx_to_article[best_indices].tolist()
+
+            # Fallback / Padding
+            # Fill with global popularity if we don't have 12 predictions
+            if len(preds) < config.TOP_K:
+                for p in global_top_k:
+                    if p not in preds:
+                        preds.append(p)
+                        if len(preds) == config.TOP_K:
+                            break
+
+            # Format as space-separated string
+            predictions.append(" ".join(map(str, preds)))
+
+        return pd.DataFrame({"customer_id": customer_ids, "prediction": predictions})
+=======
+    def generate_predictions(self, user_history_df):
+        """
+        Generates predictions using sparse matrix multiplication.
+        Scores = (User_History @ Transition_Matrix) + (Repurchase_Weight * User_History)
+
+        Args:
+            user_history_df (pd.DataFrame): DataFrame with 'customer_id', 'article_id', 'weight'.
+                                            Can contain multiple rows per customer.
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print("Generating predictions (Vectorized)...")
+
+        # 1. Prepare User-Item Matrix (U)
+        # Unique customers in the input order (for final mapping)
+        unique_customers = user_history_df["customer_id"].unique()
+        cust_to_idx = {cust: i for i, cust in enumerate(unique_customers)}
+        
+        # Map IDs to indices
+        user_indices = user_history_df["customer_id"].map(cust_to_idx).values
+        
+        # Map article_ids to internal indices
+        # Items not in training set will be -1
+        idx_map = pd.Index(self.idx_to_article)
+        article_indices = idx_map.get_indexer(user_history_df["article_id"].values)
+        
+        # Filter out unknown items
+        valid_mask = article_indices != -1
+        user_indices = user_indices[valid_mask]
+        article_indices = article_indices[valid_mask]
+        weights = user_history_df["weight"].values[valid_mask]
+        
+        n_users = len(unique_customers)
+        n_items = len(self.idx_to_article)
+        
+        # Build Sparse Matrix U (Users x Items)
+        U = sp.coo_matrix(
+            (weights, (user_indices, article_indices)), 
+            shape=(n_users, n_items)
+        ).tocsr()
+        
+        # 2. Compute Scores
+        # Transition Scores: U @ T
+        print("Computing transition scores...")
+        scores = U.dot(self.transition_matrix)
+        
+        # Repurchase Scores: Add U itself (weighted)
+        # Note: U contains history weights. We boost them.
+        print("Adding repurchase scores...")
+        scores = scores + (U * config.REPURCHASE_WEIGHT)
+        
+        # 3. Extract Top K
+        print("Extracting top predictions...")
+        global_top_k = self.global_popularity[: config.TOP_K]
+        
+        predictions = []
+        
+        # Access CSR internals for speed
+        indptr = scores.indptr
+        indices = scores.indices
+        data = scores.data
+        
+        for i in range(n_users):
+            preds = []
+            
+            start = indptr[i]
+            end = indptr[i+1]
+            
+            if end > start:
+                row_indices = indices[start:end]
+                row_data = data[start:end]
+                
+                # Get top K
+                if len(row_data) > config.TOP_K:
+                    # argpartition to get top K unsorted
+                    top_k_arg = np.argpartition(row_data, -config.TOP_K)[-config.TOP_K:]
+                    # Sort top K
+                    sorted_top_k_arg = top_k_arg[np.argsort(row_data[top_k_arg])[::-1]]
+                    best_indices = row_indices[sorted_top_k_arg]
+                else:
+                    # Sort all
+                    sorted_arg = np.argsort(row_data)[::-1]
+                    best_indices = row_indices[sorted_arg]
+                
+                preds = self.idx_to_article[best_indices].tolist()
+            
+            # Fallback
+            if len(preds) < config.TOP_K:
+                for p in global_top_k:
+                    if p not in preds:
+                        preds.append(p)
+                        if len(preds) == config.TOP_K:
+                            break
+            
+            predictions.append(" ".join(map(str, preds)))
+            
+        return pd.DataFrame({"customer_id": unique_customers, "prediction": predictions})
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Merge test customers with their history.
+    # Left join ensures we have a row for every customer in the test set.
+    # Customers with no history will have NaN in 'article_id'.
+    input_df = test_customers_df[["customer_id"]].merge(
+        user_history_df, on="customer_id", how="left"
+    )
+
+    # Fill NaN article_ids with a placeholder (e.g., -1) to ensure type consistency
+    # The model handles unknown/missing IDs by falling back to global popularity.
+    # We assume article_id is generally numeric (int64 in raw data), but merge might make it float.
+    input_df["article_id"] = input_df["article_id"].fillna(-1).astype(np.int64)
+=======
+    # Merge test customers with their history.
+    # Left join ensures we have a row for every customer in the test set.
+    # Customers with no history will have NaN in 'article_id'.
+    # Note: user_history_df now has multiple rows per customer.
+    # The merge will expand test_customers_df to multiple rows.
+    input_df = test_customers_df[["customer_id"]].merge(
+        user_history_df, on="customer_id", how="left"
+    )
+
+    # Fill NaN article_ids with a placeholder (e.g., -1)
+    input_df["article_id"] = input_df["article_id"].fillna(-1).astype(np.int64)
+    # Fill NaN weights (cold start users) with 0
+    if "weight" in input_df.columns:
+        input_df["weight"] = input_df["weight"].fillna(0.0)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    print(f"Splitting Validation data at {split_date}...")
+    history_df = val_df[val_df["t_dat"] <= split_date].copy()
+    ground_truth_df = val_df[val_df["t_dat"] > split_date].copy()
+
+    # 3. Train Model on Training Set ONLY
+=======
+    print(f"Splitting Validation data at {split_date}...")
+    history_df = val_df[val_df["t_dat"] <= split_date].copy()
+    ground_truth_df = val_df[val_df["t_dat"] > split_date].copy()
+
+    # Add weights to history_df for the model
+    history_df = data_loader.add_time_weights(history_df)
+
+    # 3. Train Model on Training Set ONLY
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Create input dataframe for the model
+    pred_input = pd.DataFrame({"customer_id": target_users})
+    pred_input = pred_input.merge(val_input_history, on="customer_id", how="left")
+
+    # Fill missing history with -1 (Cold Start in Validation Period)
+    pred_input["article_id"] = pred_input["article_id"].fillna(-1).astype(np.int64)
+
+    # 5. Generate Predictions
+=======
+    # Create input dataframe for the model
+    pred_input = pd.DataFrame({"customer_id": target_users})
+    pred_input = pred_input.merge(val_input_history, on="customer_id", how="left")
+
+    # Fill missing history with -1 (Cold Start in Validation Period)
+    pred_input["article_id"] = pred_input["article_id"].fillna(-1).astype(np.int64)
+    if "weight" in pred_input.columns:
+        pred_input["weight"] = pred_input["weight"].fillna(0.0)
+
+    # 5. Generate Predictions
+>>>>>>> REPLACE
+```

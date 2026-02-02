@@ -1,0 +1,251 @@
+The previous execution failed due to a `torch.OutOfMemoryError` during the MLM pre-training phase. This occurred because the `deberta-v3-base` model was being trained with a sequence length of 512 and batch size of 8 using Full Precision (FP32), which exceeded the available GPU memory (Cite debug_lesson_10).
+
+To resolve this, I will:
+1.  **Enable Automatic Mixed Precision (AMP)** in `library/engine.py`. I will introduce `torch.cuda.amp.GradScaler` and `autocast` into both `train_mlm` and `train_fn`. This reduces memory usage by storing activations in half-precision (FP16).
+2.  **Reduce Batch Size** in `runfile.py`. I will lower the debug batch sizes from 8 to 4 to ensure the model fits within the VRAM, providing a safety margin alongside AMP.
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import torch.nn as nn
+from transformers import AutoModelForMaskedLM, DataCollatorForLanguageModeling
+from library.config import Config
+from library.utils import AverageMeter, get_score
+=======
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+from transformers import AutoModelForMaskedLM, DataCollatorForLanguageModeling
+from library.config import Config
+from library.utils import AverageMeter, get_score
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # Optimizer for MLM
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.mlm_lr, weight_decay=Config.mlm_weight_decay
+    )
+
+    # Data Collator for masking
+    # We use the standard 15% masking probability
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
+    )
+
+    for epoch in range(epochs):
+        losses = AverageMeter()
+
+        for step, batch in enumerate(loader):
+            # The loader yields batches of input_ids and attention_mask (tensors)
+            # We need to convert them to a list of dicts for the DataCollator
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch_size = input_ids.size(0)
+
+            # Prepare inputs for collator
+            examples = [
+                {"input_ids": input_ids[i], "attention_mask": attention_mask[i]}
+                for i in range(batch_size)
+            ]
+
+            # Apply masking
+            # collator returns dict with keys: input_ids, attention_mask, labels
+            masked_batch = collator(examples)
+
+            # Move to device
+            b_input_ids = masked_batch["input_ids"].to(device)
+            b_attention_mask = masked_batch["attention_mask"].to(device)
+            b_labels = masked_batch["labels"].to(device)
+
+            # Forward
+            outputs = model(
+                input_ids=b_input_ids, attention_mask=b_attention_mask, labels=b_labels
+            )
+            loss = outputs.loss
+
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            losses.update(loss.item(), batch_size)
+=======
+    # Optimizer for MLM
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.mlm_lr, weight_decay=Config.mlm_weight_decay
+    )
+    scaler = GradScaler()
+
+    # Data Collator for masking
+    # We use the standard 15% masking probability
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=True, mlm_probability=0.15
+    )
+
+    for epoch in range(epochs):
+        losses = AverageMeter()
+
+        for step, batch in enumerate(loader):
+            # The loader yields batches of input_ids and attention_mask (tensors)
+            # We need to convert them to a list of dicts for the DataCollator
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch_size = input_ids.size(0)
+
+            # Prepare inputs for collator
+            examples = [
+                {"input_ids": input_ids[i], "attention_mask": attention_mask[i]}
+                for i in range(batch_size)
+            ]
+
+            # Apply masking
+            # collator returns dict with keys: input_ids, attention_mask, labels
+            masked_batch = collator(examples)
+
+            # Move to device
+            b_input_ids = masked_batch["input_ids"].to(device)
+            b_attention_mask = masked_batch["attention_mask"].to(device)
+            b_labels = masked_batch["labels"].to(device)
+
+            # Forward
+            with autocast():
+                outputs = model(
+                    input_ids=b_input_ids, attention_mask=b_attention_mask, labels=b_labels
+                )
+                loss = outputs.loss
+
+            # Backward
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            losses.update(loss.item(), batch_size)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    """
+    model.train()
+    losses = AverageMeter()
+
+    for step, batch in enumerate(loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        batch_size = input_ids.size(0)
+
+        # 1. Standard Forward Pass
+        outputs = model(input_ids, attention_mask, labels)
+        loss = outputs["loss"]
+
+        # 2. Standard Backward Pass (Compute Gradients)
+        optimizer.zero_grad()
+        loss.backward()
+
+        # 3. Adversarial Weight Perturbation
+        if awp is not None and epoch >= awp.start_epoch:
+            # Save weights and apply perturbation based on current gradients
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            outputs_adv = model(input_ids, attention_mask, labels)
+            loss_adv = outputs_adv["loss"]
+
+            # Backward pass with perturbed weights
+            # We zero grad to use only the adversarial gradient for the update
+            # This minimizes the loss at the worst-case perturbation
+            optimizer.zero_grad()
+            loss_adv.backward()
+
+            # Restore original weights (gradients remain accumulated)
+            awp._restore()
+
+        # 4. Optimization Step
+        # Clip gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        losses.update(loss.item(), batch_size)
+=======
+    """
+    model.train()
+    losses = AverageMeter()
+    scaler = GradScaler()
+
+    for step, batch in enumerate(loader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        batch_size = input_ids.size(0)
+
+        # 1. Standard Forward Pass
+        with autocast():
+            outputs = model(input_ids, attention_mask, labels)
+            loss = outputs["loss"]
+
+        # 2. Standard Backward Pass (Compute Gradients)
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+
+        # 3. Adversarial Weight Perturbation
+        if awp is not None and epoch >= awp.start_epoch:
+            # Save weights and apply perturbation based on current gradients
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            with autocast():
+                outputs_adv = model(input_ids, attention_mask, labels)
+                loss_adv = outputs_adv["loss"]
+
+            # Backward pass with perturbed weights
+            # We zero grad to use only the adversarial gradient for the update
+            # This minimizes the loss at the worst-case perturbation
+            optimizer.zero_grad()
+            scaler.scale(loss_adv).backward()
+
+            # Restore original weights (gradients remain accumulated)
+            awp._restore()
+
+        # 4. Optimization Step
+        # Clip gradients to prevent exploding gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        scaler.step(optimizer)
+        scaler.update()
+        
+        if scheduler is not None:
+            scheduler.step()
+
+        losses.update(loss.item(), batch_size)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    Config.debug = True
+    Config.debug_subset_size = 64  # Small subset for demonstration
+    Config.epochs = 1
+    Config.mlm_epochs = 1
+    Config.batch_size = 8
+    Config.mlm_batch_size = 8
+    Config.num_workers = 0  # Avoid multiprocessing overhead for small debug run
+=======
+    Config.debug = True
+    Config.debug_subset_size = 64  # Small subset for demonstration
+    Config.epochs = 1
+    Config.mlm_epochs = 1
+    Config.batch_size = 4
+    Config.mlm_batch_size = 4
+    Config.num_workers = 0  # Avoid multiprocessing overhead for small debug run
+>>>>>>> REPLACE
+```

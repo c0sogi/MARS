@@ -1,0 +1,316 @@
+I will optimize the solution by switching from a Transformer-based architecture to a Flatten-MLP architecture for the sequence features, as recommended by **Lesson 00009**. This lesson highlights that for short, fixed-length sequences where absolute position is informative, flattening the embeddings and concatenating them with numerical features is more effective and easier to optimize than using Transformers with pooling. I will also ensure the model capacity remains high (Embedding Dim 64, MLP width 1024) as per **Lesson 00008**, and increase the training epochs to 20 to allow for proper convergence.
+
+Here are the code changes:
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Architecture: Hybrid Transformer-MLP
+    # ==========================================
+    # Sequence Branch (Transformer)
+    EMBED_DIM = 64
+    N_HEADS = 4
+    N_TRANSFORMER_LAYERS = 2
+    DIM_FEEDFORWARD = 256
+    TRANSFORMER_DROPOUT = 0.1
+
+    # Numerical Branch & Fusion Head
+    # The numerical features are concatenated with the pooled transformer output
+    # and passed through this MLP.
+    MLP_HIDDEN_SIZES = [1024, 512, 256]
+=======
+    # ==========================================
+    # Model Architecture: Hybrid Flatten-MLP
+    # ==========================================
+    # Sequence Branch
+    EMBED_DIM = 64
+
+    # Numerical Branch & Fusion Head
+    # The numerical features are concatenated with the flattened embeddings
+    # and passed through this MLP.
+    MLP_HIDDEN_SIZES = [1024, 512, 256]
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 1024
+    EPOCHS = 30
+    LEARNING_RATE = 1e-3
+=======
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 1024
+    EPOCHS = 20
+    LEARNING_RATE = 1e-3
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class HybridTransformerModel(nn.Module):
+    """
+    Hybrid architecture combining a Transformer Encoder for sequence features
+    and an MLP for numerical features.
+    """
+
+    def __init__(self, num_numerical_features):
+        super().__init__()
+
+        # ==========================================
+        # Sequence Branch
+        # ==========================================
+        self.embedding = nn.Embedding(
+            num_embeddings=Config.VOCAB_SIZE,
+            embedding_dim=Config.EMBED_DIM,
+            padding_idx=0,
+        )
+
+        # Learnable positional encoding: (1, Max Len, Embed Dim)
+        self.pos_encoder = nn.Parameter(
+            torch.zeros(1, Config.MAX_SEQ_LEN, Config.EMBED_DIM)
+        )
+        nn.init.normal_(self.pos_encoder, mean=0, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=Config.EMBED_DIM,
+            nhead=Config.N_HEADS,
+            dim_feedforward=Config.DIM_FEEDFORWARD,
+            dropout=Config.TRANSFORMER_DROPOUT,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=Config.N_TRANSFORMER_LAYERS
+        )
+
+        # ==========================================
+        # Numerical Branch
+        # ==========================================
+        # Project numerical features to match embedding dimension
+        self.num_proj = nn.Sequential(
+            nn.Linear(num_numerical_features, Config.EMBED_DIM),
+            nn.ReLU(),
+            nn.Dropout(Config.MLP_DROPOUT),
+        )
+
+        # ==========================================
+        # Fusion & Classification Head
+        # ==========================================
+        # Input is concatenation of Pooled Seq (Embed Dim) + Projected Num (Embed Dim)
+        fusion_input_dim = Config.EMBED_DIM * 2
+
+        mlp_layers = []
+        in_dim = fusion_input_dim
+
+        for hidden_dim in Config.MLP_HIDDEN_SIZES:
+            mlp_layers.append(nn.Linear(in_dim, hidden_dim))
+            mlp_layers.append(nn.BatchNorm1d(hidden_dim))
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Dropout(Config.MLP_DROPOUT))
+            in_dim = hidden_dim
+
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        # Final Output Head (Linear -> Logits)
+        self.head = nn.Linear(in_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for Linear and Embedding layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, sequence, numerical):
+        """
+        Args:
+            sequence: (Batch, Seq_Len) LongTensor
+            numerical: (Batch, Num_Features) FloatTensor
+        Returns:
+            logits: (Batch, 1) FloatTensor
+        """
+        # --- Sequence Branch ---
+        # Create padding mask (True where padding/0) for Transformer
+        # src_key_padding_mask shape: (Batch, Seq_Len)
+        padding_mask = sequence == 0
+
+        # Embed and add position
+        x_seq = self.embedding(sequence)  # (Batch, Seq_Len, Embed_Dim)
+        x_seq = x_seq + self.pos_encoder  # Broadcasting
+
+        # Transformer Encoder
+        x_seq = self.transformer_encoder(x_seq, src_key_padding_mask=padding_mask)
+
+        # Global Average Pooling (ignoring padding)
+        # Create a mask that is 1.0 for valid tokens and 0.0 for padding
+        # (~padding_mask) is True for valid tokens
+        mask_expanded = (~padding_mask).unsqueeze(-1).float()  # (Batch, Seq_Len, 1)
+
+        sum_embeddings = torch.sum(x_seq * mask_expanded, dim=1)  # (Batch, Embed_Dim)
+        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)  # (Batch, 1)
+
+        seq_pooled = sum_embeddings / sum_mask  # (Batch, Embed_Dim)
+
+        # --- Numerical Branch ---
+        num_proj = self.num_proj(numerical)  # (Batch, Embed_Dim)
+
+        # --- Fusion ---
+        combined = torch.cat([seq_pooled, num_proj], dim=1)  # (Batch, 2 * Embed_Dim)
+
+        # --- MLP ---
+        features = self.mlp(combined)
+        logits = self.head(features)
+
+        return logits
+=======
+class HybridFlattenModel(nn.Module):
+    """
+    Hybrid architecture that flattens sequence embeddings and concatenates
+    them with numerical features. Optimized for short, fixed-length sequences.
+    Cite solution_lesson_node_00009.
+    """
+
+    def __init__(self, num_numerical_features):
+        super().__init__()
+
+        # ==========================================
+        # Sequence Branch
+        # ==========================================
+        self.embedding = nn.Embedding(
+            num_embeddings=Config.VOCAB_SIZE,
+            embedding_dim=Config.EMBED_DIM,
+            padding_idx=0,
+        )
+
+        # ==========================================
+        # Fusion & Classification Head
+        # ==========================================
+        # Flattened Sequence Dim: Seq_Len * Embed_Dim
+        # Input is concatenation of Flattened Seq + Numerical Features
+        flat_seq_dim = Config.MAX_SEQ_LEN * Config.EMBED_DIM
+        fusion_input_dim = flat_seq_dim + num_numerical_features
+
+        mlp_layers = []
+        in_dim = fusion_input_dim
+
+        # High capacity MLP (Cite solution_lesson_node_00008)
+        for hidden_dim in Config.MLP_HIDDEN_SIZES:
+            mlp_layers.append(nn.Linear(in_dim, hidden_dim))
+            mlp_layers.append(nn.BatchNorm1d(hidden_dim))
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Dropout(Config.MLP_DROPOUT))
+            in_dim = hidden_dim
+
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        # Final Output Head (Linear -> Logits)
+        self.head = nn.Linear(in_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for Linear and Embedding layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, sequence, numerical):
+        """
+        Args:
+            sequence: (Batch, Seq_Len) LongTensor
+            numerical: (Batch, Num_Features) FloatTensor
+        Returns:
+            logits: (Batch, 1) FloatTensor
+        """
+        # --- Sequence Branch ---
+        # Embed: (Batch, Seq_Len, Embed_Dim)
+        x_seq = self.embedding(sequence)
+        
+        # Flatten: (Batch, Seq_Len * Embed_Dim)
+        # This preserves absolute positional information (Cite solution_lesson_node_00009)
+        x_seq_flat = x_seq.view(x_seq.size(0), -1)
+
+        # --- Fusion ---
+        # Concatenate flattened embeddings with raw numerical features
+        combined = torch.cat([x_seq_flat, numerical], dim=1)
+
+        # --- MLP ---
+        features = self.mlp(combined)
+        logits = self.head(features)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = HybridTransformerModel(num_numerical_features=num_numerical_features)
+    model.to(device)
+=======
+    # 3. Model Initialization
+    model = HybridFlattenModel(num_numerical_features=num_numerical_features)
+    model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import HybridTransformerModel, train_one_epoch, validate
+
+
+def main():
+    # 1. Setup and Configuration
+    # Limit epochs for a fast baseline, but enough to reach convergence on A100
+    Config.EPOCHS = 6
+    Config.setup()
+=======
+from library.model import HybridFlattenModel, train_one_epoch, validate
+
+
+def main():
+    # 1. Setup and Configuration
+    # Increase epochs for full convergence (Cite solution_lesson_node_00009)
+    Config.EPOCHS = 20
+    Config.setup()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    model = HybridTransformerModel(num_numerical_features=num_numerical_features)
+    model.to(device)
+=======
+    # 3. Model Initialization
+    model = HybridFlattenModel(num_numerical_features=num_numerical_features)
+    model.to(device)
+>>>>>>> REPLACE
+```

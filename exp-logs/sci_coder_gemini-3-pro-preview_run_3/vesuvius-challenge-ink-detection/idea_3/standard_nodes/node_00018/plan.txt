@@ -1,0 +1,337 @@
+To optimize the solution, I will revert the architecture from the parallel multi-scale approach (PSDN) to the sequential hierarchical approach (Residual FCN) which was identified as the superior "Current Best Solution" in Lesson `solution_lesson_node_00015`. The parallel architecture was shown to cause underfitting and high error-intensity correlation (Cite `solution_lesson_node_00017`).
+
+I will also adjust the training hyperparameters in `library/config.py` to ensure robust convergence. Specifically, I will increase `STEPS_PER_EPOCH` and `VAL_SAMPLE_SIZE` to reduce metric variance (Cite `solution_lesson_node_00010`) and extend `NUM_EPOCHS` to allow the model to fully converge, fitting within the 4-hour runtime limit. Finally, I will clean up `runfile.py` to remove the "fast baseline" overrides that were artificially limiting the model's performance.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training duration
+    NUM_EPOCHS = 20
+
+    # Since we sample patches randomly, we define an epoch by a fixed number of steps
+    STEPS_PER_EPOCH = 500
+
+    # Early stopping patience
+    PATIENCE = 5
+
+    # -------------------------------------------------------------------------
+    # Validation & Evaluation
+    # -------------------------------------------------------------------------
+    # Fixed, large validation set size to reduce metric volatility
+    VAL_SAMPLE_SIZE = 4000
+=======
+    # Training duration
+    NUM_EPOCHS = 15
+
+    # Since we sample patches randomly, we define an epoch by a fixed number of steps
+    # Increased to ~16k patches per epoch to stabilize gradients (Cite solution_lesson_node_00003)
+    STEPS_PER_EPOCH = 1000
+
+    # Early stopping patience
+    PATIENCE = 5
+
+    # -------------------------------------------------------------------------
+    # Validation & Evaluation
+    # -------------------------------------------------------------------------
+    # Fixed, large validation set size to reduce metric volatility (Cite solution_lesson_node_00010)
+    VAL_SAMPLE_SIZE = 4000
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ParallelAtrousBlock(nn.Module):
+    """
+    A block containing parallel convolutional branches with different dilation rates.
+    The outputs are fused via concatenation and projection, maintaining full spatial resolution.
+    """
+
+    def __init__(self, channels, rates, dropout=0.0):
+        super().__init__()
+        self.branches = nn.ModuleList()
+
+        # Create parallel branches for each dilation rate
+        for rate in rates:
+            # To maintain spatial dimensions with kernel_size=3: padding = dilation
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        channels,
+                        channels,
+                        kernel_size=3,
+                        padding=rate,
+                        dilation=rate,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU(inplace=True),
+                )
+            )
+
+        # Fusion layer: Project concatenated features back to original channel width
+        # Input channels = channels * number of branches
+        self.project = nn.Sequential(
+            nn.Conv2d(channels * len(rates), channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+
+    def forward(self, x):
+        # Apply all branches in parallel
+        branch_outputs = [branch(x) for branch in self.branches]
+
+        # Concatenate along the channel dimension
+        concatenated = torch.cat(branch_outputs, dim=1)
+
+        # Project back to original channel size
+        out = self.project(concatenated)
+
+        # Residual connection
+        return x + out
+
+
+class PSDN(nn.Module):
+    """
+    Parallel-Scale Dilated Network (PSDN).
+
+    Architecture:
+    1. Learnable 2.5D Projection (Input Z-slices -> Model Channels)
+    2. Deep stack of ParallelAtrousBlocks to capture multi-scale context
+    3. Final classification head (Model Channels -> 1)
+    """
+
+    def __init__(self, num_blocks=6):
+        super().__init__()
+
+        # 1. Learnable 2.5D Projection
+        # Compresses the 65 input Z-slices into the compact feature space
+        self.projection = nn.Sequential(
+            nn.Conv2d(Config.Z_DIM, Config.MODEL_CHANNELS, kernel_size=1, bias=False),
+            nn.BatchNorm2d(Config.MODEL_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Backbone: Stack of Parallel Atrous Blocks
+        layers = []
+        for _ in range(num_blocks):
+            layers.append(
+                ParallelAtrousBlock(
+                    channels=Config.MODEL_CHANNELS,
+                    rates=Config.DILATION_RATES,
+                    dropout=Config.DROPOUT,
+                )
+            )
+        self.backbone = nn.Sequential(*layers)
+
+        # 3. Classification Head
+        self.classifier = nn.Conv2d(Config.MODEL_CHANNELS, 1, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, 65, H, W)
+        Returns:
+            logits: Output tensor of shape (Batch, 1, H, W)
+        """
+        # Project Z-dimension (Batch, 65, H, W) -> (Batch, C, H, W)
+        x = self.projection(x)
+
+        # Apply deep parallel dilated backbone
+        x = self.backbone(x)
+
+        # Pixel-wise classification
+        logits = self.classifier(x)
+
+        return logits
+=======
+class ResidualBlock(nn.Module):
+    """
+    Standard Residual Block with dilated convolutions.
+    """
+    def __init__(self, channels, dilation):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation, dilation=dilation, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=dilation, dilation=dilation, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class InkDetectorFCN(nn.Module):
+    """
+    Residual FCN with Sequential Dilated Backbone.
+    Reverts to the sequential hierarchical context aggregation (Cite solution_lesson_node_00015).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # 1. Learnable 2.5D Projection (Cite solution_lesson_node_00002)
+        self.projection = nn.Sequential(
+            nn.Conv2d(Config.Z_DIM, Config.MODEL_CHANNELS, kernel_size=1, bias=False),
+            nn.BatchNorm2d(Config.MODEL_CHANNELS),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Sequential Backbone with increasing dilation (Cite solution_lesson_node_00003)
+        layers = []
+        # Hierarchical context: 1 -> 2 -> 4 -> 8
+        dilations = [1, 2, 4, 8]
+        for d in dilations:
+            layers.append(ResidualBlock(Config.MODEL_CHANNELS, dilation=d))
+            
+        self.backbone = nn.Sequential(*layers)
+
+        # 3. Classification Head
+        self.classifier = nn.Conv2d(Config.MODEL_CHANNELS, 1, kernel_size=1)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.backbone(x)
+        return self.classifier(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import PSDN
+from library.utils import find_best_threshold
+=======
+from library.model import InkDetectorFCN
+from library.utils import find_best_threshold
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model & Optimizer
+    print("Initializing Model...")
+    model = PSDN().to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+=======
+    # 3. Model & Optimizer
+    print("Initializing Model...")
+    model = InkDetectorFCN().to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.model import PSDN
+from library.dataset import InkDataset
+=======
+from library.config import Config
+from library.model import InkDetectorFCN
+from library.dataset import InkDataset
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    print(f"Loading model from {model_path}...")
+    model = PSDN().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+=======
+    print(f"Loading model from {model_path}...")
+    model = InkDetectorFCN().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config
+from library.dataset import InkDataset
+from library.model import PSDN
+from library.train import train_model
+from library.inference import generate_submission
+=======
+from library.config import Config
+from library.dataset import InkDataset
+from library.model import InkDetectorFCN
+from library.train import train_model
+from library.inference import generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Failure Analysis
+    device = torch.device(Config.DEVICE)
+    model = PSDN().to(device)
+
+    # Load best model weights
+=======
+    # 4. Failure Analysis
+    device = torch.device(Config.DEVICE)
+    model = InkDetectorFCN().to(device)
+
+    # Load best model weights
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Configuration for Fast Baseline
+    Config.set_seed(Config.SEED)
+
+    # Adjust hyperparameters for a fast run within time limits
+    Config.NUM_EPOCHS = 5
+    Config.STEPS_PER_EPOCH = 200
+    Config.VAL_SAMPLE_SIZE = 2000
+
+    # Configure submission path
+    submission_dir = "./submission"
+    os.makedirs(submission_dir, exist_ok=True)
+    Config.SUBMISSION_FILE = os.path.join(submission_dir, "submission.csv")
+
+    print("Configuration set for fast baseline.")
+    print(f"Epochs: {Config.NUM_EPOCHS}, Steps: {Config.STEPS_PER_EPOCH}")
+
+    # 2. Train Model
+=======
+def main():
+    # 1. Configuration
+    Config.set_seed(Config.SEED)
+
+    # Configure submission path
+    submission_dir = "./submission"
+    os.makedirs(submission_dir, exist_ok=True)
+    Config.SUBMISSION_FILE = os.path.join(submission_dir, "submission.csv")
+
+    # Removed "Fast Baseline" overrides to prevent underfitting (Cite solution_lesson_node_00017)
+    print("Configuration set for robust training.")
+    print(f"Epochs: {Config.NUM_EPOCHS}, Steps: {Config.STEPS_PER_EPOCH}")
+
+    # 2. Train Model
+>>>>>>> REPLACE
+```

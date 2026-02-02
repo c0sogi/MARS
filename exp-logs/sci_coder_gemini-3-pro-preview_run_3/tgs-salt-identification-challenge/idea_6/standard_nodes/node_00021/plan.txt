@@ -1,0 +1,185 @@
+To optimize the model's performance, I will implement a strategy focused on extending the fine-tuning phase and improving training efficiency, leveraging the provided lessons and the A100 GPU's capabilities.
+
+**Strategy:**
+1.  **Enable Automatic Mixed Precision (AMP):** I will integrate `torch.cuda.amp` into the training loop. This allows the model to use the A100's Tensor Cores, significantly reducing memory usage and speeding up computation. This enables larger batch sizes without exceeding memory limits.
+2.  **Increase Batch Size:** With AMP enabled, I will double the `BATCH_SIZE` from 32 to 64. Larger batches provide more stable Batch Normalization statistics and smoother gradient estimates, which is beneficial for the optimization of the non-convex Lovasz-Hinge loss.
+3.  **Extend Training Duration:** I will increase `EPOCHS` from 50 to 80 and `EARLY_STOPPING_PATIENCE` from 12 to 20. This directly addresses **Lesson 00020**, which highlights that surrogate metric losses like Lovasz-Hinge require a significantly longer "runway" to fine-tune decision boundaries effectively. The previous solution stopped early; this change ensures the model has sufficient time to converge in the high-precision regime.
+4.  **Adjust Loss Curriculum:** I will shift the `LOVASZ_SWITCH_EPOCH` from 15 to 20. This gives the model a slightly longer warm-up with BCE+Dice (beneficial with the larger batch size) while leaving a substantial 60 epochs for the critical fine-tuning phase (Cite **Lesson 00020**).
+5.  **Refine Scheduler:** I will increase `SCHEDULER_PATIENCE` from 5 to 7 to prevent premature learning rate decay, ensuring the optimizer has enough time to navigate the loss landscape before reducing the step size.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BATCH_SIZE = 32
+    EPOCHS = 50
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Loss Curriculum
+    # Epoch < LOVASZ_SWITCH_EPOCH: BCE + Dice Loss (Warmup)
+    # Epoch >= LOVASZ_SWITCH_EPOCH: Lovasz-Hinge Loss (Fine-tuning)
+    LOVASZ_SWITCH_EPOCH = 15
+
+    # Scheduler (ReduceLROnPlateau)
+    SCHEDULER_PATIENCE = 5
+    SCHEDULER_FACTOR = 0.5
+    MIN_LR = 1e-6
+
+    # Early Stopping
+    EARLY_STOPPING_PATIENCE = 12
+=======
+    BATCH_SIZE = 64
+    EPOCHS = 80
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Loss Curriculum
+    # Epoch < LOVASZ_SWITCH_EPOCH: BCE + Dice Loss (Warmup)
+    # Epoch >= LOVASZ_SWITCH_EPOCH: Lovasz-Hinge Loss (Fine-tuning)
+    LOVASZ_SWITCH_EPOCH = 20
+
+    # Scheduler (ReduceLROnPlateau)
+    SCHEDULER_PATIENCE = 7
+    SCHEDULER_FACTOR = 0.5
+    MIN_LR = 1e-6
+
+    # Early Stopping
+    EARLY_STOPPING_PATIENCE = 20
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Losses
+        self.criterion_bce_dice = BCEDiceLoss()
+        self.criterion_lovasz = LovaszHingeLoss()
+
+        # Training State
+        self.best_map = 0.0
+=======
+        # Losses
+        self.criterion_bce_dice = BCEDiceLoss()
+        self.criterion_lovasz = LovaszHingeLoss()
+
+        # AMP Scaler
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        # Training State
+        self.best_map = 0.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        for batch_idx, (images, masks, _) in enumerate(pbar):
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Forward pass
+            # Model returns list of tensors if deep_supervision=True and training=True
+            outputs = self.model(images)
+
+            # Calculate Loss
+            if epoch < Config.LOVASZ_SWITCH_EPOCH:
+                # Deep Supervision: Loss averages over all outputs
+                loss = criterion(outputs, masks)
+            else:
+                # Fine-tuning: Apply Lovasz only to the final output
+                # outputs is a list [out1, out2, out3, out4], we want out4
+                final_output = outputs[-1]
+                loss = criterion(final_output, masks)
+
+            loss.backward()
+            self.optimizer.step()
+
+            running_loss += loss.item()
+            pbar.set_postfix({"loss": running_loss / (batch_idx + 1)})
+=======
+        for batch_idx, (images, masks, _) in enumerate(pbar):
+            images = images.to(self.device)
+            masks = masks.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # AMP Forward pass
+            with torch.cuda.amp.autocast():
+                # Model returns list of tensors if deep_supervision=True and training=True
+                outputs = self.model(images)
+
+                # Calculate Loss
+                if epoch < Config.LOVASZ_SWITCH_EPOCH:
+                    # Deep Supervision: Loss averages over all outputs
+                    loss = criterion(outputs, masks)
+                else:
+                    # Fine-tuning: Apply Lovasz only to the final output
+                    # outputs is a list [out1, out2, out3, out4], we want out4
+                    final_output = outputs[-1]
+                    loss = criterion(final_output, masks)
+
+            # AMP Backward pass
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            running_loss += loss.item()
+            pbar.set_postfix({"loss": running_loss / (batch_idx + 1)})
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        with torch.no_grad():
+            for images, masks, _ in tqdm(
+                self.val_loader, desc="Validating", leave=False
+            ):
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+
+                # Forward pass (Inference returns only final output if training=False)
+                preds = self.model(images)
+
+                # Test-Time Augmentation (Horizontal Flip)
+                if Config.TTA_FLIP:
+                    images_flipped = torch.flip(images, dims=[3])
+                    preds_flipped = self.model(images_flipped)
+                    preds_flipped = torch.flip(preds_flipped, dims=[3])
+                    preds = (preds + preds_flipped) / 2.0
+
+                loss = criterion(preds, masks)
+                running_loss += loss.item()
+
+                # Move to CPU for metric calculation
+                preds_np = preds.sigmoid().cpu().numpy()  # Convert logits to probs
+=======
+        with torch.no_grad():
+            for images, masks, _ in tqdm(
+                self.val_loader, desc="Validating", leave=False
+            ):
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+
+                # AMP Inference
+                with torch.cuda.amp.autocast():
+                    # Forward pass (Inference returns only final output if training=False)
+                    preds = self.model(images)
+
+                    # Test-Time Augmentation (Horizontal Flip)
+                    if Config.TTA_FLIP:
+                        images_flipped = torch.flip(images, dims=[3])
+                        preds_flipped = self.model(images_flipped)
+                        preds_flipped = torch.flip(preds_flipped, dims=[3])
+                        preds = (preds + preds_flipped) / 2.0
+
+                    loss = criterion(preds, masks)
+                
+                running_loss += loss.item()
+
+                # Move to CPU for metric calculation
+                preds_np = preds.float().sigmoid().cpu().numpy()  # Convert logits to probs
+>>>>>>> REPLACE
+```

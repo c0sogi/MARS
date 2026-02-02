@@ -1,0 +1,819 @@
+Based on the empirical findings and lessons learned, I will optimize the solution by transitioning from a **Stratified 5-Fold Cross-Validation** strategy to a **Seed Averaging Ensemble** on a fixed validation split.
+
+**Reasoning:**
+1.  **Metric Stability (Cite solution_lesson_node_00058):** On small datasets (<2000 images), K-Fold CV can produce unstable validation signals due to small fold sizes (~260 images), leading to suboptimal early stopping. A fixed validation set (20%, ~328 images) provides a more robust signal for monitoring convergence.
+2.  **Ensemble Benefit (Cite solution_lesson_node_00059):** The previous best score (0.9902) was achieved using an ensemble metric on a hold-out set, whereas the current score (0.9778) is an Out-Of-Fold (OOF) metric. OOF metrics inherently underestimate the performance of the final ensemble. By switching to Seed Averaging, we can directly optimize and measure the ensemble performance.
+3.  **Seed Diversity (Cite solution_lesson_node_00067):** I will use disparate random seeds (`[42, 2021, 2022, 2023, 2024]`) rather than sequential integers to maximize the initialization diversity of the ensemble members.
+
+**Implementation Plan:**
+1.  **Config:** Update `Config` to replace `n_folds` with `n_runs` and define the list of disparate seeds.
+2.  **Trainer:**
+    -   Replace `get_folds` (which generates CV folds) with `get_fixed_split` (which loads the pre-defined stratified train/val metadata).
+    -   Refactor `run_fold` to `run_training`, which takes a run index, sets the specific seed, and trains on the fixed split.
+3.  **Runfile:**
+    -   Modify the main loop to iterate through the seeds.
+    -   Accumulate predictions on the fixed validation set from each trained model.
+    -   Compute the final validation metric on the **averaged ensemble predictions** rather than OOF predictions.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Cross-Validation Settings
+    # ==========================================
+    n_folds = 5
+
+    # ==========================================
+=======
+    # ==========================================
+    # Ensemble Settings (Seed Averaging)
+    # ==========================================
+    n_runs = 5
+    # Disparate seeds for diversity (Cite solution_lesson_node_00067)
+    seeds = [42, 2021, 2022, 2023, 2024]
+
+    # ==========================================
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def get_folds(
+    df: pd.DataFrame, n_folds: int = 5, seed: int = 42, load_cached_data: bool = True
+):
+    """
+    Assigns fold indices to the dataframe using StratifiedKFold.
+    Implements caching to parquet.
+    """
+    cache_path = os.path.join(Config.working_dir, "folds.parquet")
+
+    if load_cached_data and os.path.exists(cache_path):
+        print(f"Loading cached folds from {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    print("Generating new folds...")
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+    # Initialize fold column
+    df["fold"] = -1
+
+    # We use stratify_label for stratification
+    if "stratify_label" not in df.columns:
+        # Fallback if stratify_label is missing (reconstruct from targets)
+        df["stratify_label"] = df[Config.target_cols].idxmax(axis=1)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["stratify_label"])):
+        df.loc[val_idx, "fold"] = fold
+
+    # Save to cache
+    os.makedirs(Config.working_dir, exist_ok=True)
+    df.to_parquet(cache_path)
+
+    return df
+=======
+def get_fixed_split():
+    """
+    Loads train and validation metadata and combines them with a split indicator.
+    Cite solution_lesson_node_00058: Preference for fixed split seed averaging on small datasets.
+    """
+    if not os.path.exists(Config.train_metadata_path) or not os.path.exists(
+        Config.val_metadata_path
+    ):
+        raise FileNotFoundError("Metadata files not found.")
+
+    df_train = pd.read_csv(Config.train_metadata_path)
+    df_val = pd.read_csv(Config.val_metadata_path)
+
+    df_train["split"] = "train"
+    df_val["split"] = "valid"
+
+    # Merge to create full dataset
+    df_full = pd.concat([df_train, df_val], axis=0).reset_index(drop=True)
+    
+    # Ensure stratify_label exists for weight calculation
+    if "stratify_label" not in df_full.columns:
+        df_full["stratify_label"] = df_full[Config.target_cols].idxmax(axis=1)
+
+    return df_full
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def run_fold(fold_idx, df_folds, class_weights):
+    """
+    Runs training for a single fold.
+    """
+    print(f"\n{'='*20} Running Fold {fold_idx} {'='*20}")
+
+    # Split data
+    df_train = df_folds[df_folds["fold"] != fold_idx].reset_index(drop=True)
+    df_val = df_folds[df_folds["fold"] == fold_idx].reset_index(drop=True)
+
+    # Datasets
+    train_dataset = AppleDataset(df_train, transform=get_transforms("train"))
+    val_dataset = AppleDataset(df_val, transform=get_transforms("valid"))
+
+    # Dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.batch_size,
+        shuffle=True,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Model, Optimizer, Scheduler, Criterion
+    model = get_model(Config.model_name, Config.pretrained, Config.num_classes)
+    model.to(Config.device)
+
+    optimizer = optim.Adam(
+        model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay
+    )
+
+    # Synced with total epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=Config.epochs, T_mult=Config.T_mult, eta_min=Config.min_lr
+    )
+
+    criterion = WeightedSoftTargetCrossEntropy(weight=class_weights)
+
+    # Verify Initial Loss
+    print("Verifying initial loss...")
+    verify_initial_loss(model, train_loader, criterion, Config.device)
+
+    # Training Loop
+    best_auc = 0.0
+    best_model_path = os.path.join(
+        Config.checkpoint_dir, f"{Config.model_name}_fold_{fold_idx}.pth"
+    )
+
+    for epoch in range(Config.epochs):
+        start_time = time.time()
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, Config.device
+        )
+        val_loss, val_auc = validate(model, val_loader, criterion, Config.device)
+
+        # Step scheduler
+        scheduler.step()
+
+        elapsed = time.time() - start_time
+
+        # Print metrics (Full precision as requested)
+        print(f"Epoch {epoch+1}/{Config.epochs} - Time: {elapsed:.2f}s")
+        print(f"  Train Loss: {train_loss}")
+        print(f"  Val Loss: {val_loss}")
+        print(f"  Val AUC: {val_auc}")
+
+        # Checkpointing
+        if val_auc > best_auc:
+            print(
+                f"  [Improvement] AUC increased from {best_auc} to {val_auc}. Saving model..."
+            )
+            best_auc = val_auc
+            torch.save(model.state_dict(), best_model_path)
+
+    print(f"Fold {fold_idx} finished. Best AUC: {best_auc}")
+    return best_auc
+=======
+def run_training(run_idx, df, class_weights):
+    """
+    Runs training for a single seed (Seed Averaging).
+    Cite solution_lesson_node_00055: Seed Averaging Ensembles for Robustness.
+    """
+    current_seed = Config.seeds[run_idx]
+    seed_everything(current_seed)
+    print(f"\n{'='*20} Running Seed {run_idx} (Seed: {current_seed}) {'='*20}")
+
+    # Split data using fixed split
+    df_train = df[df["split"] == "train"].reset_index(drop=True)
+    df_val = df[df["split"] == "valid"].reset_index(drop=True)
+
+    # Datasets
+    train_dataset = AppleDataset(df_train, transform=get_transforms("train"))
+    val_dataset = AppleDataset(df_val, transform=get_transforms("valid"))
+
+    # Dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.batch_size,
+        shuffle=True,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Model, Optimizer, Scheduler, Criterion
+    model = get_model(Config.model_name, Config.pretrained, Config.num_classes)
+    model.to(Config.device)
+
+    optimizer = optim.Adam(
+        model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay
+    )
+
+    # Synced with total epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=Config.epochs, T_mult=Config.T_mult, eta_min=Config.min_lr
+    )
+
+    criterion = WeightedSoftTargetCrossEntropy(weight=class_weights)
+
+    # Verify Initial Loss
+    print("Verifying initial loss...")
+    verify_initial_loss(model, train_loader, criterion, Config.device)
+
+    # Training Loop
+    best_auc = 0.0
+    best_model_path = os.path.join(
+        Config.checkpoint_dir, f"{Config.model_name}_run_{run_idx}.pth"
+    )
+
+    for epoch in range(Config.epochs):
+        start_time = time.time()
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, Config.device
+        )
+        val_loss, val_auc = validate(model, val_loader, criterion, Config.device)
+
+        # Step scheduler
+        scheduler.step()
+
+        elapsed = time.time() - start_time
+
+        # Print metrics (Full precision as requested)
+        print(f"Epoch {epoch+1}/{Config.epochs} - Time: {elapsed:.2f}s")
+        print(f"  Train Loss: {train_loss}")
+        print(f"  Val Loss: {val_loss}")
+        print(f"  Val AUC: {val_auc}")
+
+        # Checkpointing
+        if val_auc > best_auc:
+            print(
+                f"  [Improvement] AUC increased from {best_auc} to {val_auc}. Saving model..."
+            )
+            best_auc = val_auc
+            torch.save(model.state_dict(), best_model_path)
+
+    print(f"Run {run_idx} finished. Best AUC: {best_auc}")
+    return best_auc
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def generate_submission(df_test, fold_models):
+    """
+    Generates predictions using an ensemble of fold models.
+    """
+    print("\nGenerating submission...")
+
+    test_dataset = AppleDataset(
+        df_test, transform=get_transforms("test"), test_mode=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Array to store sum of probabilities
+    avg_preds = np.zeros((len(df_test), Config.num_classes))
+
+    for fold_idx, model_path in enumerate(fold_models):
+        print(f"Inference with Fold {fold_idx} model...")
+
+        model = get_model(
+            Config.model_name, pretrained=False, num_classes=Config.num_classes
+        )
+        model.load_state_dict(torch.load(model_path, map_location=Config.device))
+        model.to(Config.device)
+        model.eval()
+=======
+def generate_submission(df_test, run_models):
+    """
+    Generates predictions using an ensemble of seed models.
+    """
+    print("\nGenerating submission...")
+
+    test_dataset = AppleDataset(
+        df_test, transform=get_transforms("test"), test_mode=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.batch_size,
+        shuffle=False,
+        num_workers=Config.num_workers,
+        pin_memory=True,
+    )
+
+    # Array to store sum of probabilities
+    avg_preds = np.zeros((len(df_test), Config.num_classes))
+
+    for run_idx, model_path in enumerate(run_models):
+        print(f"Inference with Run {run_idx} model...")
+
+        model = get_model(
+            Config.model_name, pretrained=False, num_classes=Config.num_classes
+        )
+        model.load_state_dict(torch.load(model_path, map_location=Config.device))
+        model.to(Config.device)
+        model.eval()
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # Average predictions
+    avg_preds /= len(fold_models)
+=======
+    # Average predictions
+    avg_preds /= len(run_models)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+def train_and_predict():
+    """
+    Main pipeline function.
+    """
+    seed_everything(Config.seed)
+
+    # 1. Prepare Data
+    df_full = get_all_data()
+    df_folds = get_folds(df_full, n_folds=Config.n_folds, seed=Config.seed)
+
+    # 2. Calculate Weights
+    class_weights = calculate_class_weights(df_folds, Config.device)
+
+    # 3. Train Folds
+    fold_model_paths = []
+    fold_scores = []
+
+    for fold in range(Config.n_folds):
+        score = run_fold(fold, df_folds, class_weights)
+        fold_scores.append(score)
+        fold_model_paths.append(
+            os.path.join(Config.checkpoint_dir, f"{Config.model_name}_fold_{fold}.pth")
+        )
+
+    print("\nCV Scores:", fold_scores)
+    print("Mean CV AUC:", np.mean(fold_scores))
+
+    # 4. Generate Submission
+    if os.path.exists(Config.test_metadata_path):
+        df_test = pd.read_csv(Config.test_metadata_path)
+        generate_submission(df_test, fold_model_paths)
+    else:
+        print("Test metadata not found. Skipping submission.")
+=======
+def train_and_predict():
+    """
+    Main pipeline function.
+    """
+    seed_everything(Config.seed)
+
+    # 1. Prepare Data
+    df_full = get_fixed_split()
+
+    # 2. Calculate Weights
+    class_weights = calculate_class_weights(df_full, Config.device)
+
+    # 3. Train Runs
+    run_model_paths = []
+    run_scores = []
+
+    for run_idx in range(Config.n_runs):
+        score = run_training(run_idx, df_full, class_weights)
+        run_scores.append(score)
+        run_model_paths.append(
+            os.path.join(Config.checkpoint_dir, f"{Config.model_name}_run_{run_idx}.pth")
+        )
+
+    print("\nRun Scores:", run_scores)
+    print("Mean Run AUC:", np.mean(run_scores))
+
+    # 4. Generate Submission
+    if os.path.exists(Config.test_metadata_path):
+        df_test = pd.read_csv(Config.test_metadata_path)
+        generate_submission(df_test, run_model_paths)
+    else:
+        print("Test metadata not found. Skipping submission.")
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    n_folds: int = Config.n_folds,
+    num_classes: int = Config.num_classes,
+    target_cols: list = Config.target_cols,
+    img_size: int = Config.img_size,
+    batch_size: int = Config.batch_size,
+    num_workers: int = Config.num_workers,
+    device: torch.device = Config.device,
+    seed: int = Config.seed,
+):
+    """
+    Generates the submission file by ensembling predictions from trained fold models.
+
+    Args:
+        test_metadata_path (str): Path to the test metadata CSV.
+        submission_path (str): Path where the submission CSV will be saved.
+        checkpoint_dir (str): Directory containing saved model checkpoints.
+        model_name (str): Name of the model architecture.
+        n_folds (int): Number of folds in the ensemble.
+        num_classes (int): Number of target classes.
+        target_cols (list): List of target column names.
+        img_size (int): Input image size.
+        batch_size (int): Batch size for inference.
+        num_workers (int): Number of dataloader workers.
+        device (torch.device): Device to run inference on.
+        seed (int): Random seed for reproducibility.
+    """
+    # 1. Setup
+    seed_everything(seed)
+
+    if not os.path.exists(test_metadata_path):
+        raise FileNotFoundError(f"Test metadata not found at {test_metadata_path}")
+
+    print(f"Loading test metadata from {test_metadata_path}...")
+    df_test = pd.read_csv(test_metadata_path)
+
+    # 2. Prepare Data
+    # Use test transforms (Resize + Normalize) and test_mode=True (returns image only)
+    test_dataset = AppleDataset(
+        df_test, transform=get_transforms("test"), test_mode=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # 3. Ensemble Inference
+    # Initialize accumulator for probabilities: Shape (N_samples, N_classes)
+    avg_preds = np.zeros((len(df_test), num_classes))
+
+    print(f"Starting inference with {n_folds} fold models...")
+
+    for fold_idx in range(n_folds):
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"{model_name}_fold_{fold_idx}.pth"
+        )
+
+        if not os.path.exists(checkpoint_path):
+            print(
+                f"Warning: Checkpoint for fold {fold_idx} not found at {checkpoint_path}. Skipping."
+            )
+            continue
+
+        print(f"Processing Fold {fold_idx} ({checkpoint_path})...")
+=======
+    n_runs: int = Config.n_runs,
+    num_classes: int = Config.num_classes,
+    target_cols: list = Config.target_cols,
+    img_size: int = Config.img_size,
+    batch_size: int = Config.batch_size,
+    num_workers: int = Config.num_workers,
+    device: torch.device = Config.device,
+    seed: int = Config.seed,
+):
+    """
+    Generates the submission file by ensembling predictions from trained seed models.
+
+    Args:
+        test_metadata_path (str): Path to the test metadata CSV.
+        submission_path (str): Path where the submission CSV will be saved.
+        checkpoint_dir (str): Directory containing saved model checkpoints.
+        model_name (str): Name of the model architecture.
+        n_runs (int): Number of runs in the ensemble.
+        num_classes (int): Number of target classes.
+        target_cols (list): List of target column names.
+        img_size (int): Input image size.
+        batch_size (int): Batch size for inference.
+        num_workers (int): Number of dataloader workers.
+        device (torch.device): Device to run inference on.
+        seed (int): Random seed for reproducibility.
+    """
+    # 1. Setup
+    seed_everything(seed)
+
+    if not os.path.exists(test_metadata_path):
+        raise FileNotFoundError(f"Test metadata not found at {test_metadata_path}")
+
+    print(f"Loading test metadata from {test_metadata_path}...")
+    df_test = pd.read_csv(test_metadata_path)
+
+    # 2. Prepare Data
+    # Use test transforms (Resize + Normalize) and test_mode=True (returns image only)
+    test_dataset = AppleDataset(
+        df_test, transform=get_transforms("test"), test_mode=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # 3. Ensemble Inference
+    # Initialize accumulator for probabilities: Shape (N_samples, N_classes)
+    avg_preds = np.zeros((len(df_test), num_classes))
+
+    print(f"Starting inference with {n_runs} seed models...")
+
+    for run_idx in range(n_runs):
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"{model_name}_run_{run_idx}.pth"
+        )
+
+        if not os.path.exists(checkpoint_path):
+            print(
+                f"Warning: Checkpoint for run {run_idx} not found at {checkpoint_path}. Skipping."
+            )
+            continue
+
+        print(f"Processing Run {run_idx} ({checkpoint_path})...")
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 4. Aggregation
+    # Divide by the number of folds to get the arithmetic mean
+    # Note: If some folds were skipped, this should ideally be divided by the count of active models
+    # but strictly following the plan, we assume all 5 exist.
+    avg_preds /= n_folds
+=======
+    # 4. Aggregation
+    # Divide by the number of runs to get the arithmetic mean
+    avg_preds /= n_runs
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Data Loading & Preparation
+    print("Loading and preparing data...")
+    # Merge train and validation metadata for full cross-validation
+    df_full = trainer.get_all_data()
+
+    # Generate Stratified Folds
+    df_folds = trainer.get_folds(df_full, n_folds=Config.n_folds, seed=Config.seed)
+
+    # Calculate Class Weights
+    class_weights = trainer.calculate_class_weights(df_folds, device)
+
+    # Initialize array to store Out-Of-Fold (OOF) predictions
+    # Shape: (N_samples, N_classes)
+    oof_preds = np.zeros((len(df_full), Config.num_classes))
+
+    # Store fold scores
+    fold_scores = []
+
+    # 3. Training Loop (5 Folds)
+    for fold_idx in range(Config.n_folds):
+        # Train the fold using the provided trainer module
+        # This handles training, validation, and saving the best checkpoint
+        best_auc = trainer.run_fold(fold_idx, df_folds, class_weights)
+        fold_scores.append(best_auc)
+
+        # ---------------------------------------------------------
+        # Generate OOF Predictions for this fold
+        # ---------------------------------------------------------
+        print(f"Generating OOF predictions for Fold {fold_idx}...")
+
+        # Load the best model checkpoint for this fold
+        model_path = os.path.join(
+            Config.checkpoint_dir, f"{Config.model_name}_fold_{fold_idx}.pth"
+        )
+        model = get_model(
+            Config.model_name, pretrained=False, num_classes=Config.num_classes
+        )
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        # Get validation data for this fold
+        val_df = df_folds[df_folds["fold"] == fold_idx].reset_index(drop=True)
+        val_indices = df_folds[df_folds["fold"] == fold_idx].index
+
+        # Create validation dataset and loader
+        val_ds = AppleDataset(val_df, transform=get_transforms("valid"))
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=Config.batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+
+        # Inference loop
+        fold_probs = []
+        with torch.no_grad():
+            for images, _ in val_loader:
+                images = images.to(device)
+                outputs = model(images)
+                # Apply Softmax to get probabilities
+                probs = torch.softmax(outputs, dim=1)
+                fold_probs.append(probs.cpu().numpy())
+
+        # Concatenate and store predictions
+        fold_probs = np.concatenate(fold_probs, axis=0)
+        oof_preds[val_indices] = fold_probs
+
+    # 4. Global Evaluation
+    print("\nEvaluating Global Performance...")
+    # Extract ground truth targets
+    oof_targets = df_folds[Config.target_cols].values
+
+    # Calculate Mean Column-wise ROC AUC
+    final_metric = roc_auc_score(oof_targets, oof_preds, average="macro")
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\nPerforming Failure Analysis...")
+    # Calculate error: 1 - sum(target * prediction)
+    # This represents the deviation from the true class probability
+    correctness = np.sum(oof_targets * oof_preds, axis=1)
+    errors = 1.0 - correctness
+
+    # Extract meta-features for correlation analysis
+    widths, heights, intensities = [], [], []
+
+    # Iterate through all images to extract stats
+    # Using cv2 to quickly read dimensions and mean intensity
+    for idx, row in df_folds.iterrows():
+        full_path = os.path.join(Config.input_dir, row["file_path"])
+        img = cv2.imread(full_path)
+=======
+    # 2. Data Loading & Preparation
+    print("Loading and preparing data...")
+    # Load fixed split metadata
+    df_full = trainer.get_fixed_split()
+
+    # Calculate Class Weights
+    class_weights = trainer.calculate_class_weights(df_full, device)
+
+    # Prepare Validation Data for Ensemble Evaluation
+    df_val = df_full[df_full["split"] == "valid"].reset_index(drop=True)
+    val_targets = df_val[Config.target_cols].values
+    
+    # Initialize array to store Ensemble predictions
+    # Shape: (N_val_samples, N_classes)
+    val_preds_ensemble = np.zeros((len(df_val), Config.num_classes))
+
+    # Store run scores
+    run_scores = []
+
+    # 3. Training Loop (Seed Averaging)
+    for run_idx in range(Config.n_runs):
+        # Train using the provided trainer module
+        # This handles training on fixed train set, validation on fixed val set
+        best_auc = trainer.run_training(run_idx, df_full, class_weights)
+        run_scores.append(best_auc)
+
+        # ---------------------------------------------------------
+        # Generate Predictions on Validation Set for Ensemble
+        # ---------------------------------------------------------
+        print(f"Generating Validation predictions for Run {run_idx}...")
+
+        # Load the best model checkpoint for this run
+        model_path = os.path.join(
+            Config.checkpoint_dir, f"{Config.model_name}_run_{run_idx}.pth"
+        )
+        model = get_model(
+            Config.model_name, pretrained=False, num_classes=Config.num_classes
+        )
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+
+        # Create validation dataset and loader
+        val_ds = AppleDataset(df_val, transform=get_transforms("valid"))
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=Config.batch_size,
+            shuffle=False,
+            num_workers=Config.num_workers,
+            pin_memory=True,
+        )
+
+        # Inference loop
+        run_probs = []
+        with torch.no_grad():
+            for images, _ in val_loader:
+                images = images.to(device)
+                outputs = model(images)
+                # Apply Softmax to get probabilities
+                probs = torch.softmax(outputs, dim=1)
+                run_probs.append(probs.cpu().numpy())
+
+        # Concatenate and add to ensemble accumulator
+        run_probs = np.concatenate(run_probs, axis=0)
+        val_preds_ensemble += run_probs
+
+    # Average predictions
+    val_preds_ensemble /= Config.n_runs
+
+    # 4. Global Evaluation
+    print("\nEvaluating Global Performance (Seed Averaging Ensemble)...")
+    
+    # Calculate Mean Column-wise ROC AUC
+    final_metric = roc_auc_score(val_targets, val_preds_ensemble, average="macro")
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    print("\nPerforming Failure Analysis...")
+    # Calculate error: 1 - sum(target * prediction)
+    # This represents the deviation from the true class probability
+    correctness = np.sum(val_targets * val_preds_ensemble, axis=1)
+    errors = 1.0 - correctness
+
+    # Extract meta-features for correlation analysis
+    widths, heights, intensities = [], [], []
+
+    # Iterate through validation images to extract stats
+    for idx, row in df_val.iterrows():
+        full_path = os.path.join(Config.input_dir, row["file_path"])
+        img = cv2.imread(full_path)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 6. Submission
+    threshold = 0.9901680711448418
+    if final_metric > threshold:
+        print(
+            f"\nMetric ({final_metric}) exceeds threshold ({threshold}). Generating submission..."
+        )
+        inference.generate_submission(
+            test_metadata_path=Config.test_metadata_path,
+            submission_path=Config.submission_path,
+            checkpoint_dir=Config.checkpoint_dir,
+            model_name=Config.model_name,
+            n_folds=Config.n_folds,
+            num_classes=Config.num_classes,
+            target_cols=Config.target_cols,
+            img_size=Config.img_size,
+            batch_size=Config.batch_size,
+            num_workers=Config.num_workers,
+            device=device,
+            seed=Config.seed,
+        )
+=======
+    # 6. Submission
+    threshold = 0.9901680711448418
+    if final_metric > threshold:
+        print(
+            f"\nMetric ({final_metric}) exceeds threshold ({threshold}). Generating submission..."
+        )
+        inference.generate_submission(
+            test_metadata_path=Config.test_metadata_path,
+            submission_path=Config.submission_path,
+            checkpoint_dir=Config.checkpoint_dir,
+            model_name=Config.model_name,
+            n_runs=Config.n_runs,
+            num_classes=Config.num_classes,
+            target_cols=Config.target_cols,
+            img_size=Config.img_size,
+            batch_size=Config.batch_size,
+            num_workers=Config.num_workers,
+            device=device,
+            seed=Config.seed,
+        )
+>>>>>>> REPLACE
+```

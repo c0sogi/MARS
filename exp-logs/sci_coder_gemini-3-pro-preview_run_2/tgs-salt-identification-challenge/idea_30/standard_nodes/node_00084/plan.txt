@@ -1,0 +1,458 @@
+I will implement the following optimizations based on the lessons learned:
+
+1.  **Training Configuration**: Increase `EPOCHS` to 50 and reduce `BATCH_SIZE` to 32. This addresses the "cold start" issue and ensures sufficient gradient updates, preventing underfitting (Cite solution_lesson_node_00035, solution_lesson_node_00063).
+2.  **Model Architecture**: Modify the `DecoderBlock` to enforce a minimum internal channel width of 32. This prevents excessive information bottlenecks in the final decoder stages where `in_channels` is small (Cite solution_lesson_node_00023).
+3.  **Data Augmentation**: Reduce the probability of `ShiftScaleRotate` from 0.2 to 0.1. While elastic deformation is crucial, excessive rigid affine transformations can degrade boundary precision required for high IoU thresholds (Cite solution_lesson_node_00054).
+4.  **Checkpointing Strategy**: Move the `calculate_map_vectorized` function to `utils.py` and integrate it into the training loop. Modify the `fit` function to save the model based on the best validation mAP (found via dynamic threshold search) rather than the lowest validation loss. This decouples the training objective from the evaluation metric (Cite solution_lesson_node_00033).
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    # Reshape column-wise
+    return img.reshape(shape, order="F")
+
+
+class MetricMonitor:
+=======
+    # Reshape column-wise
+    return img.reshape(shape, order="F")
+
+
+def calculate_map_vectorized(preds_bool, targets_bool):
+    """
+    Calculates the Mean Average Precision at IoU thresholds 0.5:0.95:0.05
+    using vectorized operations.
+
+    Args:
+        preds_bool (np.ndarray): Binary predictions (N, H, W).
+        targets_bool (np.ndarray): Binary targets (N, H, W).
+
+    Returns:
+        float: The mAP score.
+    """
+    N = preds_bool.shape[0]
+
+    # Flatten spatial dimensions for IoU calculation
+    p_flat = preds_bool.reshape(N, -1)
+    t_flat = targets_bool.reshape(N, -1)
+
+    # Check for empty masks
+    pred_empty = p_flat.sum(axis=1) == 0
+    gt_empty = t_flat.sum(axis=1) == 0
+
+    # Calculate IoU for non-empty pairs
+    # We only need to compute IoU where both are non-empty
+    # But for vectorization, we compute all and mask later
+    intersection = (p_flat & t_flat).sum(axis=1)
+    union = (p_flat | t_flat).sum(axis=1)
+
+    # Avoid division by zero
+    iou = np.zeros(N, dtype=np.float32)
+    valid_union = union > 0
+    iou[valid_union] = intersection[valid_union] / union[valid_union]
+
+    # Define thresholds
+    thresholds = np.arange(0.5, 0.95 + 1e-6, 0.05)
+
+    # Calculate score per image
+    # Case 1: Both empty -> Score 1.0
+    score_both_empty = (pred_empty & gt_empty).astype(np.float32)
+
+    # Case 2: One empty, one not -> Score 0.0 (handled by default init of scores)
+
+    # Case 3: Both non-empty -> Score based on IoU matches
+    # (N, 1) > (1, n_thresh) -> (N, n_thresh)
+    matches = iou[:, None] > thresholds[None, :]
+    # Mean over thresholds -> (N,)
+    score_iou = matches.mean(axis=1)
+
+    # Combine scores
+    # We use a mask for where both are non-empty
+    both_non_empty = (~pred_empty) & (~gt_empty)
+
+    final_scores = np.zeros(N, dtype=np.float32)
+    final_scores[pred_empty & gt_empty] = 1.0
+    final_scores[both_non_empty] = score_iou[both_non_empty]
+
+    return final_scores.mean()
+
+
+class MetricMonitor:
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+import torch.nn.functional as F
+from library.utils import rle_encode
+from library.dataset import get_depth_stats, ORIG_SIZE, TARGET_SIZE
+from library.engine import validate_one_epoch
+
+
+def calculate_map_vectorized(preds_bool, targets_bool):
+    """
+    Calculates the Mean Average Precision at IoU thresholds 0.5:0.95:0.05
+    using vectorized operations.
+
+    Args:
+        preds_bool (np.ndarray): Binary predictions (N, H, W).
+        targets_bool (np.ndarray): Binary targets (N, H, W).
+
+    Returns:
+        float: The mAP score.
+    """
+    N = preds_bool.shape[0]
+
+    # Flatten spatial dimensions for IoU calculation
+    p_flat = preds_bool.reshape(N, -1)
+    t_flat = targets_bool.reshape(N, -1)
+
+    # Check for empty masks
+    pred_empty = p_flat.sum(axis=1) == 0
+    gt_empty = t_flat.sum(axis=1) == 0
+
+    # Calculate IoU for non-empty pairs
+    # We only need to compute IoU where both are non-empty
+    # But for vectorization, we compute all and mask later
+    intersection = (p_flat & t_flat).sum(axis=1)
+    union = (p_flat | t_flat).sum(axis=1)
+
+    # Avoid division by zero
+    iou = np.zeros(N, dtype=np.float32)
+    valid_union = union > 0
+    iou[valid_union] = intersection[valid_union] / union[valid_union]
+
+    # Define thresholds
+    thresholds = np.arange(0.5, 0.95 + 1e-6, 0.05)
+
+    # Calculate score per image
+    # Case 1: Both empty -> Score 1.0
+    score_both_empty = (pred_empty & gt_empty).astype(np.float32)
+
+    # Case 2: One empty, one not -> Score 0.0 (handled by default init of scores)
+
+    # Case 3: Both non-empty -> Score based on IoU matches
+    # (N, 1) > (1, n_thresh) -> (N, n_thresh)
+    matches = iou[:, None] > thresholds[None, :]
+    # Mean over thresholds -> (N,)
+    score_iou = matches.mean(axis=1)
+
+    # Combine scores
+    # We use a mask for where both are non-empty
+    both_non_empty = (~pred_empty) & (~gt_empty)
+
+    final_scores = np.zeros(N, dtype=np.float32)
+    final_scores[pred_empty & gt_empty] = 1.0
+    final_scores[both_non_empty] = score_iou[both_non_empty]
+
+    return final_scores.mean()
+
+
+def optimize_threshold(model, val_loader, device):
+=======
+import torch.nn.functional as F
+from library.utils import rle_encode, calculate_map_vectorized
+from library.dataset import get_depth_stats, ORIG_SIZE, TARGET_SIZE
+from library.engine import validate_one_epoch
+
+
+def optimize_threshold(model, val_loader, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                # Rigid Augmentation
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.2
+                ),
+                A.HorizontalFlip(p=0.5),
+=======
+                # Rigid Augmentation
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.1
+                ),
+                A.HorizontalFlip(p=0.5),
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # Wide-LinkNet strategy: internal dim based on input, not output
+        internal_dim = in_channels // 4
+
+        self.block = nn.Sequential(
+=======
+        # Wide-LinkNet strategy: internal dim based on input, not output
+        # Ensure minimum width of 32 to avoid excessive compression
+        internal_dim = max(in_channels // 4, 32)
+
+        self.block = nn.Sequential(
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import os
+import torch
+import numpy as np
+from library.utils import MetricMonitor
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch):
+=======
+import os
+import torch
+import numpy as np
+from library.utils import MetricMonitor, calculate_map_vectorized
+from library.dataset import ORIG_SIZE, TARGET_SIZE
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch):
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    print(f"Epoch: {epoch} | Val | {metric_monitor}")
+
+    # Concatenate collected data
+    if len(predictions) > 0:
+        predictions = np.concatenate(predictions, axis=0)
+        targets = np.concatenate(targets, axis=0)
+    else:
+        predictions = np.array([])
+        targets = np.array([])
+
+    return metric_monitor.avg["Loss"], predictions, targets, ids_list
+
+
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    patience,
+    save_dir,
+):
+    """
+    Runs the full training pipeline with Early Stopping.
+
+    Args:
+        model: The PyTorch model.
+        train_loader: Training DataLoader.
+        val_loader: Validation DataLoader.
+        criterion: Loss function.
+        optimizer: Optimizer.
+        scheduler: Learning rate scheduler.
+        device: Device.
+        epochs: Maximum number of epochs.
+        patience: Early stopping patience.
+        save_dir: Directory to save the best model.
+
+    Returns:
+        float: Best validation loss achieved.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    best_model_path = os.path.join(save_dir, "best_model.pth")
+
+    best_loss = float("inf")
+    patience_counter = 0
+
+    for epoch in range(1, epochs + 1):
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+
+        # Validate
+        val_loss, val_preds, val_targets, val_ids = validate_one_epoch(
+            model, val_loader, criterion, device, epoch
+        )
+
+        # Step Scheduler
+        if scheduler is not None:
+            scheduler.step()
+
+        # Print full precision loss
+        print(f"Epoch {epoch} Validation Loss: {val_loss}")
+
+        # Early Stopping Logic
+        if val_loss < best_loss:
+            best_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved to {best_model_path} with loss: {best_loss}")
+        else:
+            patience_counter += 1
+            print(f"Early stopping counter: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    return best_loss
+=======
+    print(f"Epoch: {epoch} | Val | {metric_monitor}")
+
+    # Concatenate collected data
+    if len(predictions) > 0:
+        predictions = np.concatenate(predictions, axis=0)
+        targets = np.concatenate(targets, axis=0)
+    else:
+        predictions = np.array([])
+        targets = np.array([])
+
+    # --- Calculate mAP with Dynamic Thresholding ---
+    # Squeeze channel dim: (N, 1, H, W) -> (N, H, W)
+    if predictions.ndim == 4:
+        predictions = predictions.squeeze(1)
+    if targets.ndim == 4:
+        targets = targets.squeeze(1)
+
+    # Crop to original size (101x101)
+    pad_t = (TARGET_SIZE - ORIG_SIZE) // 2
+    pad_l = (TARGET_SIZE - ORIG_SIZE) // 2
+    
+    preds_cropped = predictions[:, pad_t : pad_t + ORIG_SIZE, pad_l : pad_l + ORIG_SIZE]
+    targets_cropped = targets[:, pad_t : pad_t + ORIG_SIZE, pad_l : pad_l + ORIG_SIZE]
+
+    # Sigmoid
+    probs = 1.0 / (1.0 + np.exp(-preds_cropped))
+    targets_bool = targets_cropped > 0.5
+
+    # Search for best threshold
+    best_map = 0.0
+    thresholds = np.linspace(0.1, 0.9, 17)
+    
+    for th in thresholds:
+        p_bool = probs > th
+        score = calculate_map_vectorized(p_bool, targets_bool)
+        if score > best_map:
+            best_map = score
+            
+    print(f"Epoch {epoch} Best mAP: {best_map:.4f}")
+
+    return metric_monitor.avg["Loss"], predictions, targets, ids_list, best_map
+
+
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    patience,
+    save_dir,
+):
+    """
+    Runs the full training pipeline with Early Stopping based on mAP.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    best_model_path = os.path.join(save_dir, "best_model.pth")
+
+    best_map = 0.0
+    patience_counter = 0
+
+    for epoch in range(1, epochs + 1):
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+
+        # Validate
+        val_loss, val_preds, val_targets, val_ids, val_map = validate_one_epoch(
+            model, val_loader, criterion, device, epoch
+        )
+
+        # Step Scheduler
+        if scheduler is not None:
+            scheduler.step()
+
+        # Early Stopping Logic (Maximize mAP)
+        if val_map > best_map:
+            best_map = val_map
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved to {best_model_path} with mAP: {best_map:.4f}")
+        else:
+            patience_counter += 1
+            print(f"Early stopping counter: {patience_counter}/{patience} (Best mAP: {best_map:.4f})")
+
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+    return best_map
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.inference import (
+    optimize_threshold,
+    generate_submission,
+    calculate_map_vectorized,
+)
+
+# --- Configuration ---
+SEED = 42
+BATCH_SIZE = 64
+EPOCHS = 30
+LR = 1e-4
+WEIGHT_DECAY = 1e-2
+=======
+from library.inference import (
+    optimize_threshold,
+    generate_submission,
+)
+from library.utils import calculate_map_vectorized
+
+# --- Configuration ---
+SEED = 42
+BATCH_SIZE = 32
+EPOCHS = 50
+LR = 1e-4
+WEIGHT_DECAY = 1e-2
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Final Metric Calculation & Failure Analysis
+    print("\n--- Failure Analysis ---")
+
+    # Run validation inference to get raw logits for analysis
+    dummy_criterion = torch.nn.BCEWithLogitsLoss()
+    _, val_logits, val_targets, val_ids = validate_one_epoch(
+        model, val_loader, dummy_criterion, DEVICE, epoch=999
+    )
+
+    # Squeeze channels if necessary
+=======
+    # 7. Final Metric Calculation & Failure Analysis
+    print("\n--- Failure Analysis ---")
+
+    # Run validation inference to get raw logits for analysis
+    dummy_criterion = torch.nn.BCEWithLogitsLoss()
+    _, val_logits, val_targets, val_ids, _ = validate_one_epoch(
+        model, val_loader, dummy_criterion, DEVICE, epoch=999
+    )
+
+    # Squeeze channels if necessary
+>>>>>>> REPLACE
+```

@@ -1,0 +1,450 @@
+I will optimize the solution by removing the Layer-Wise Learning Rate Decay (LLRD) and Lookahead optimizer, reverting to a standard AdamW optimizer with a uniform learning rate of `1e-3`. This decision is based on **Lesson ID: solution_lesson_node_00073**, which indicates that LLRD and advanced optimizers can hinder performance in cross-domain transfer learning (ImageNet to Spectrograms) on small datasets by restricting the plasticity of the backbone. Additionally, I will simplify the checkpointing strategy from Top-K Snapshot Ensembling to saving strictly the single best checkpoint based on validation AUC, adhering to **Lesson ID: solution_lesson_node_00055** and **Lesson ID: solution_lesson_node_00073** to ensure we rely on the most generalizable model state.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Layer-Wise Learning Rate Decay (LLRD)
+    LLRD_DECAY_RATE = 0.9
+
+    # Optimization
+    OPTIMIZER = "AdamW"
+    USE_LOOKAHEAD = True  # Wrap optimizer with Lookahead
+
+    # Scheduler
+    SCHEDULER = "CosineAnnealingLR"
+    MIN_LR = 1e-6
+
+    # -------------------------------------------------------------------------
+    # Evaluation & Inference
+    # -------------------------------------------------------------------------
+    TOP_K_CHECKPOINTS = 3  # Snapshot Ensemble: Average top 3 checkpoints per fold
+=======
+    # Optimization
+    OPTIMIZER = "AdamW"
+    USE_LOOKAHEAD = False
+
+    # Scheduler
+    SCHEDULER = "CosineAnnealingLR"
+    MIN_LR = 1e-6
+
+    # -------------------------------------------------------------------------
+    # Evaluation & Inference
+    # -------------------------------------------------------------------------
+    TOP_K_CHECKPOINTS = 1  # Single Best Checkpoint Cite {solution_lesson_node_00055}
+>>>>>>> REPLACE
+```
+
+```diff
+library/models.py
+<<<<<<< SEARCH
+def get_llrd_params(
+    model: BirdModel, base_lr: float, weight_decay: float, decay_rate: float
+):
+    """
+    Groups model parameters for Layer-Wise Learning Rate Decay (LLRD).
+
+    The learning rate for a parameter group is calculated as:
+    LR = base_lr * (decay_rate ^ depth_from_head)
+
+    Args:
+        model (BirdModel): The model instance.
+        base_lr (float): The base learning rate for the head (classifier).
+        weight_decay (float): Weight decay for regularization.
+        decay_rate (float): The multiplicative decay factor per layer/block.
+
+    Returns:
+        list: A list of dictionaries suitable for the optimizer.
+    """
+    backbone_name = model.backbone_name
+    timm_model = model.model
+
+    # We will collect groups of parameters starting from the stem (input) to the head (output).
+    # Later, we will reverse this list to assign decay rates (Head gets base_lr).
+    groups = []
+
+    if "resnet" in backbone_name:
+        # ResNet Structure (timm):
+        # conv1, bn1 -> layer1 -> layer2 -> layer3 -> layer4 -> fc
+
+        # Group 0: Stem
+        stem_params = []
+        if hasattr(timm_model, "conv1"):
+            stem_params.extend(list(timm_model.conv1.parameters()))
+        if hasattr(timm_model, "bn1"):
+            stem_params.extend(list(timm_model.bn1.parameters()))
+        groups.append(stem_params)
+
+        # Groups 1-4: Stages
+        groups.append(list(timm_model.layer1.parameters()))
+        groups.append(list(timm_model.layer2.parameters()))
+        groups.append(list(timm_model.layer3.parameters()))
+        groups.append(list(timm_model.layer4.parameters()))
+
+        # Group 5: Head
+        head_params = []
+        if hasattr(timm_model, "fc"):
+            head_params.extend(list(timm_model.fc.parameters()))
+        if hasattr(timm_model, "global_pool"):
+            head_params.extend(list(timm_model.global_pool.parameters()))
+        groups.append(head_params)
+
+    elif "densenet" in backbone_name:
+        # DenseNet Structure (timm):
+        # features (conv0, norm0, denseblock1...4, transition1...3) -> classifier
+        features = timm_model.features
+
+        # Group 0: Stem
+        stem_params = []
+        stem_params.extend(list(features.conv0.parameters()))
+        stem_params.extend(list(features.norm0.parameters()))
+        groups.append(stem_params)
+
+        # Groups 1-4: DenseBlocks + Transitions
+        # Block 1
+        g1 = list(features.denseblock1.parameters()) + list(
+            features.transition1.parameters()
+        )
+        groups.append(g1)
+
+        # Block 2
+        g2 = list(features.denseblock2.parameters()) + list(
+            features.transition2.parameters()
+        )
+        groups.append(g2)
+
+        # Block 3
+        g3 = list(features.denseblock3.parameters()) + list(
+            features.transition3.parameters()
+        )
+        groups.append(g3)
+
+        # Block 4 + Final Norm
+        g4 = list(features.denseblock4.parameters()) + list(features.norm5.parameters())
+        groups.append(g4)
+
+        # Group 5: Head
+        groups.append(list(timm_model.classifier.parameters()))
+
+    elif "efficientnet" in backbone_name:
+        # EfficientNet Structure (timm):
+        # conv_stem, bn1 -> blocks (0..6) -> conv_head, bn2 -> classifier
+
+        # Group 0: Stem + Block 0
+        g0 = (
+            list(timm_model.conv_stem.parameters())
+            + list(timm_model.bn1.parameters())
+            + list(timm_model.blocks[0].parameters())
+        )
+        groups.append(g0)
+
+        # Groups 1-5: Blocks 1-5
+        groups.append(list(timm_model.blocks[1].parameters()))
+        groups.append(list(timm_model.blocks[2].parameters()))
+        groups.append(list(timm_model.blocks[3].parameters()))
+        groups.append(list(timm_model.blocks[4].parameters()))
+        groups.append(list(timm_model.blocks[5].parameters()))
+
+        # Group 6: Block 6 + Top Conv/BN
+        g6 = (
+            list(timm_model.blocks[6].parameters())
+            + list(timm_model.conv_head.parameters())
+            + list(timm_model.bn2.parameters())
+        )
+        groups.append(g6)
+
+        # Group 7: Head
+        groups.append(list(timm_model.classifier.parameters()))
+
+    else:
+        # Fallback for generic models: Split into Backbone and Head
+        head_names = ["fc", "classifier", "head"]
+        head_params = []
+        backbone_params = []
+
+        head_found = False
+        for name, param in model.named_parameters():
+            is_head = False
+            for hname in head_names:
+                if hname in name:
+                    is_head = True
+                    break
+
+            if is_head:
+                head_params.append(param)
+                head_found = True
+            else:
+                backbone_params.append(param)
+
+        if not head_found:
+            groups.append(list(model.parameters()))
+        else:
+            groups.append(backbone_params)
+            groups.append(head_params)
+
+    # Reverse groups to assign Learning Rates from Head (max) to Stem (min)
+    # groups[0] is now the Head
+    groups_reversed = groups[::-1]
+
+    optimizer_params = []
+
+    for i, group_params in enumerate(groups_reversed):
+        if len(group_params) == 0:
+            continue
+
+        # LR = base_lr * (decay_rate ^ depth)
+        lr = base_lr * (decay_rate**i)
+
+        optimizer_params.append(
+            {"params": group_params, "lr": lr, "weight_decay": weight_decay}
+        )
+
+    return optimizer_params
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/optimization.py
+<<<<<<< SEARCH
+from library.models import get_llrd_params
+
+
+class Lookahead(optim.Optimizer):
+    """
+    Implements Lookahead Optimizer.
+    It wraps an inner optimizer (e.g., AdamW) and updates the "slow weights"
+    in the direction of the "fast weights" every k steps.
+
+    Reference: "Lookahead Optimizer: k steps forward, 1 step back"
+    """
+
+    def __init__(self, optimizer, k=5, alpha=0.5):
+        """
+        Args:
+            optimizer (torch.optim.Optimizer): The inner optimizer.
+            k (int): The number of steps to look ahead before synchronizing.
+            alpha (float): The interpolation coefficient (step size) for the slow weights.
+        """
+        self.optimizer = optimizer
+        self.k = k
+        self.alpha = alpha
+        self.defaults = dict(k=k, alpha=alpha, **optimizer.defaults)
+        super().__init__(self.optimizer.param_groups, self.defaults)
+        self.param_groups = self.optimizer.param_groups
+
+        # Initialize slow weights
+        for group in self.param_groups:
+            group["counter"] = 0
+
+    def update(self, group):
+        for fast in group["params"]:
+            param_state = self.state[fast]
+            if "slow_param" not in param_state:
+                param_state["slow_param"] = torch.clone(fast.data).detach()
+
+            slow = param_state["slow_param"]
+            fast.data.mul_(self.alpha).add_(slow, alpha=1.0 - self.alpha)
+            slow.data.copy_(fast.data)
+
+    def update_lookahead(self):
+        for group in self.param_groups:
+            self.update(group)
+
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
+
+        for group in self.param_groups:
+            if "counter" not in group:
+                group["counter"] = 0
+
+            group["counter"] += 1
+            if group["counter"] >= self.k:
+                group["counter"] = 0
+                self.update(group)
+
+        return loss
+
+    def state_dict(self):
+        fast_state_dict = self.optimizer.state_dict()
+        slow_state = {
+            (id(k) if isinstance(k, torch.Tensor) else k): v
+            for k, v in self.state.items()
+        }
+        fast_state = fast_state_dict["state"]
+        param_groups = fast_state_dict["param_groups"]
+        return {
+            "fast_state": fast_state,
+            "slow_state": slow_state,
+            "param_groups": param_groups,
+        }
+
+    def load_state_dict(self, state_dict):
+        slow_state_dict = state_dict["slow_state"]
+        fast_state_dict = {
+            "state": state_dict["fast_state"],
+            "param_groups": state_dict["param_groups"],
+        }
+        self.optimizer.load_state_dict(fast_state_dict)
+
+        # Restore slow state
+        # Mapping needs to be handled carefully if params are recreated,
+        # but standard PyTorch usage usually preserves object identity in memory during a session.
+        # For strict checkpointing, we rely on the inner optimizer's restoration logic
+        # and re-initialize slow params on the first step if missing, or manually map them here.
+        # A simple re-init approach is often sufficient for resumption unless exact state is critical.
+
+        # Here we manually restore the slow params to self.state
+        self.state = defaultdict(dict)
+        # Re-map based on current model parameters is complex without param_id mapping.
+        # However, since Lookahead state is just the slow weights, we can often
+        # just let them re-initialize from the loaded weights on the first step
+        # if we accept a minor discontinuity, or implement complex id mapping.
+        # For this competition context, we will rely on re-initialization from current weights
+        # if the mapping isn't trivial, but let's try to restore if keys match.
+        for k, v in slow_state_dict.items():
+            self.state[k] = v
+
+
+def get_optimizer(model):
+    """
+    Constructs the optimizer for the given model.
+    Applies Layer-Wise Learning Rate Decay (LLRD) and wraps with Lookahead if configured.
+
+    Args:
+        model (BirdModel): The model to optimize.
+
+    Returns:
+        torch.optim.Optimizer: The configured optimizer.
+    """
+    # 1. Get Parameter Groups with LLRD
+    # This assigns lower learning rates to earlier layers
+    optimizer_grouped_parameters = get_llrd_params(
+        model,
+        base_lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+        decay_rate=Config.LLRD_DECAY_RATE,
+    )
+
+    # 2. Create Inner Optimizer (AdamW)
+    if Config.OPTIMIZER == "AdamW":
+        optimizer = optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+    else:
+        # Fallback to standard Adam
+        optimizer = optim.Adam(
+            optimizer_grouped_parameters,
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+    # 3. Wrap with Lookahead if enabled
+    if Config.USE_LOOKAHEAD:
+        optimizer = Lookahead(optimizer, k=5, alpha=0.5)
+
+    return optimizer
+=======
+def get_optimizer(model):
+    """
+    Constructs the optimizer for the given model.
+    Uses uniform learning rate (no LLRD) and standard AdamW. Cite {solution_lesson_node_00073}
+    """
+    if Config.OPTIMIZER == "AdamW":
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+    else:
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+    return optimizer
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Tracking Top K Checkpoints
+            # List of tuples: (auc, epoch, state_dict)
+            top_k_checkpoints = []
+
+            best_auc = 0.0
+            patience_counter = 0
+
+            for epoch in range(1, Config.EPOCHS + 1):
+                train_loss = train_one_epoch(
+                    model, optimizer, train_loader, device, epoch
+                )
+                val_loss, val_auc = validate(model, val_loader, device)
+
+                scheduler.step()
+
+                # Manage Top K Checkpoints
+                # Save state_dict in memory temporarily
+                current_state = deepcopy(model.state_dict())
+
+                if len(top_k_checkpoints) < Config.TOP_K_CHECKPOINTS:
+                    top_k_checkpoints.append((val_auc, epoch, current_state))
+                    top_k_checkpoints.sort(key=lambda x: x[0], reverse=True)
+                else:
+                    if val_auc > top_k_checkpoints[-1][0]:
+                        top_k_checkpoints.pop()  # Remove worst
+                        top_k_checkpoints.append((val_auc, epoch, current_state))
+                        top_k_checkpoints.sort(key=lambda x: x[0], reverse=True)
+
+                # Early Stopping
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= Config.PATIENCE:
+                    break
+
+            # Save Top K Checkpoints to disk
+            for rank, (auc, ep, state) in enumerate(top_k_checkpoints):
+                ckpt_name = f"{backbone}_fold{fold_idx}_rank{rank}.pth"
+                ckpt_path = os.path.join(Config.CHECKPOINT_DIR, ckpt_name)
+                torch.save(state, ckpt_path)
+                saved_checkpoints.append(ckpt_path)
+=======
+            # Tracking Best Checkpoint
+            best_auc = 0.0
+            best_state = None
+            patience_counter = 0
+
+            for epoch in range(1, Config.EPOCHS + 1):
+                train_loss = train_one_epoch(
+                    model, optimizer, train_loader, device, epoch
+                )
+                val_loss, val_auc = validate(model, val_loader, device)
+
+                scheduler.step()
+
+                # Save Best Checkpoint in memory. Cite {solution_lesson_node_00055}
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                    best_state = deepcopy(model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= Config.PATIENCE:
+                    break
+
+            # Save Best Checkpoint to disk
+            if best_state is not None:
+                ckpt_name = f"{backbone}_fold{fold_idx}.pth"
+                ckpt_path = os.path.join(Config.CHECKPOINT_DIR, ckpt_name)
+                torch.save(best_state, ckpt_path)
+                saved_checkpoints.append(ckpt_path)
+>>>>>>> REPLACE
+```

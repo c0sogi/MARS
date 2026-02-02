@@ -1,0 +1,336 @@
+My optimization strategy focuses on reverting to the architectural principles of the "Current Best Solution" (Idea 4) as identified in the lessons, specifically addressing the regressions introduced in Idea 5.
+
+1.  **Backbone & Resolution**: I will replace the `EfficientNet-B0` backbone with `ResNet18`, initialized with ImageNet weights (Cite `solution_lesson_node_00020`, `solution_lesson_node_00025`). I will also revert the spectrogram parameters to a "Coarse Resolution" (Hop Length 64, ~32ms) to prevent signal dilution and excessive sequence lengths that hindered the RNN in Idea 5 (Cite `solution_lesson_node_00025`).
+2.  **Temporal Preservation**: I will modify the ResNet18 strides to preserve temporal resolution. Standard ResNet downsamples time by 32x; I will adjust the MaxPool and deeper layer strides to `(2, 1)` to achieve only ~2x temporal downsampling, ensuring the BiGRU receives a sequence of sufficient length (~30 frames) to model the whale call evolution (Cite `solution_lesson_node_00012`).
+3.  **Loss Function**: I will re-introduce `pos_weight` to the `BCEWithLogitsLoss` to handle the significant class imbalance (1:9), which was neglected in Idea 5 (Cite `solution_lesson_node_00025`).
+4.  **Augmentation**: I will adjust `TIME_MASK_PARAM` in SpecAugment to ~7 frames to correspond to 200ms given the new hop length, maintaining the successful masking strategy from `solution_lesson_node_00011`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    IDEA_NAME = "idea_5"
+    SEED = 42
+=======
+    IDEA_NAME = "idea_6"
+    SEED = 42
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Spectrogram Generation
+    N_FFT = 512  # Gives 257 frequency bins (0-1000Hz)
+    # Window size: 25ms * 2000Hz = 50 samples
+    WIN_LENGTH = 50
+    # Hop length: 10ms * 2000Hz = 20 samples
+    HOP_LENGTH = 20
+    N_MELS = 128
+=======
+    # Spectrogram Generation
+    N_FFT = 512  # Gives 257 frequency bins (0-1000Hz)
+    # Window size: 64ms * 2000Hz = 128 samples
+    WIN_LENGTH = 128
+    # Hop length: 32ms * 2000Hz = 64 samples
+    HOP_LENGTH = 64
+    N_MELS = 128
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Parameters
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b0"
+    PRETRAINED = True
+=======
+    # ==========================================
+    # Model Parameters
+    # ==========================================
+    BACKBONE_NAME = "resnet18"
+    PRETRAINED = True
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # SpecAugment
+    # Time mask: Max 200ms.
+    # 200ms / 10ms hop = 20 frames.
+    TIME_MASK_PARAM = 20
+    FREQ_MASK_PARAM = 16  # Approx 1/8th of n_mels
+=======
+    # SpecAugment
+    # Time mask: Max 200ms.
+    # 200ms / 32ms hop = ~6.25 frames. Round to 7.
+    TIME_MASK_PARAM = 7
+    FREQ_MASK_PARAM = 16  # Approx 1/8th of n_mels
+    
+    # Class Imbalance
+    POS_WEIGHT_VAL = 9.0
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class TimePreservingEfficientNet(nn.Module):
+    """
+    EfficientNet-B0 backbone with modified strides to preserve temporal resolution,
+    followed by BiGRU and Attention Pooling.
+    """
+
+    def __init__(self):
+        super(TimePreservingEfficientNet, self).__init__()
+
+        # 1. Load Backbone
+        # Use features_only=False but remove classifier/pooling to access raw features via forward_features
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="",
+        )
+
+        # 2. Modify First Convolution (3 channels -> 1 channel)
+        # EfficientNet uses 'conv_stem' as the first layer
+        if hasattr(self.backbone, "conv_stem"):
+            old_conv = self.backbone.conv_stem
+            new_conv = nn.Conv2d(
+                in_channels=1,
+                out_channels=old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+            # Initialize with average of original weights to preserve pretrained features
+            with torch.no_grad():
+                new_conv.weight[:] = torch.mean(old_conv.weight, dim=1, keepdim=True)
+            self.backbone.conv_stem = new_conv
+
+        # 3. Modify Strides for Time Preservation
+        # Standard EfficientNet-B0 downsamples at blocks indices: 1, 2, 3, 5.
+        # We want to maintain a temporal length of ~50 (4x downsampling total).
+        # Stem provides 2x. Block 1 provides 2x. Total 4x.
+        # We modify Block 2, 3, and 5 to have stride (2, 1) instead of (2, 2).
+        target_indices = [2, 3, 5]
+
+        for idx in target_indices:
+            if idx < len(self.backbone.blocks):
+                block = self.backbone.blocks[idx]
+                # Recursively find Conv2d layers with stride (2, 2) and change to (2, 1)
+                for m in block.modules():
+                    if isinstance(m, nn.Conv2d) and m.stride == (2, 2):
+                        m.stride = (2, 1)
+
+        # 4. Determine Feature Dimension
+        # Run a dummy forward pass to get the channel count of the final feature map
+        dummy_input = torch.zeros(1, 1, Config.N_MELS, Config.WIN_LENGTH)
+        with torch.no_grad():
+            features = self.backbone.forward_features(dummy_input)
+            # features shape: [Batch, Channels, Freq, Time]
+            self.feature_dim = features.shape[1]
+
+        # 5. Temporal Modeling (Bi-directional GRU)
+        self.rnn = nn.GRU(
+            input_size=self.feature_dim,
+            hidden_size=Config.RNN_HIDDEN_SIZE,
+            num_layers=Config.RNN_LAYERS,
+            batch_first=True,
+            bidirectional=Config.BIDIRECTIONAL,
+        )
+
+        rnn_out_dim = (
+            Config.RNN_HIDDEN_SIZE * 2
+            if Config.BIDIRECTIONAL
+            else Config.RNN_HIDDEN_SIZE
+        )
+
+        # 6. Aggregation (Attention Pooling)
+        self.attn_pool = AttentionPooling(rnn_out_dim)
+
+        # 7. Classifier
+        self.fc = nn.Linear(rnn_out_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input spectrogram [Batch, 1, Freq, Time]
+        Returns:
+            torch.Tensor: Logits [Batch, 1]
+        """
+        # Backbone Feature Extraction
+        # Returns [Batch, Channels, Freq_down, Time_down]
+        x = self.backbone.forward_features(x)
+
+        # Frequency Pooling
+        # Average over the frequency dimension to get a sequence of feature vectors
+        # [Batch, Channels, Time_down]
+        x = torch.mean(x, dim=2)
+
+        # Permute for RNN
+        # [Batch, Time_down, Channels]
+        x = x.permute(0, 2, 1)
+
+        # RNN Processing
+        self.rnn.flatten_parameters()
+        x, _ = self.rnn(x)  # [Batch, Time_down, RNN_Dim]
+
+        # Attention Pooling
+        # [Batch, RNN_Dim]
+        x = self.attn_pool(x)
+
+        # Classification
+        # [Batch, 1]
+        logits = self.fc(x)
+
+        return logits
+=======
+class TimePreservingResNet(nn.Module):
+    """
+    ResNet18 backbone with modified strides to preserve temporal resolution,
+    followed by BiGRU and Attention Pooling.
+    """
+
+    def __init__(self):
+        super(TimePreservingResNet, self).__init__()
+
+        # 1. Load Backbone
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="",
+            features_only=False,
+        )
+
+        # 2. Modify First Convolution (3 channels -> 1 channel)
+        if hasattr(self.backbone, "conv1"):
+            old_conv = self.backbone.conv1
+            new_conv = nn.Conv2d(
+                in_channels=1,
+                out_channels=old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+            # Initialize with average of original weights
+            with torch.no_grad():
+                new_conv.weight[:] = torch.mean(old_conv.weight, dim=1, keepdim=True)
+            self.backbone.conv1 = new_conv
+
+        # 3. Modify MaxPool Stride (2, 2) -> (2, 1) to preserve time
+        if hasattr(self.backbone, "maxpool"):
+            self.backbone.maxpool.stride = (2, 1)
+
+        # 4. Modify Layer Strides
+        # Layers 2, 3, 4 usually have stride 2. Change to (2, 1) to preserve time.
+        # This keeps time downsampling to just 2x (from conv1) or 4x (if maxpool was 2x time)
+        # With MaxPool stride (2, 1), total time downsampling is 2x.
+        for layer_name in ["layer2", "layer3", "layer4"]:
+            if hasattr(self.backbone, layer_name):
+                layer = getattr(self.backbone, layer_name)
+                for m in layer.modules():
+                    if isinstance(m, nn.Conv2d) and m.stride == (2, 2):
+                        m.stride = (2, 1)
+
+        # 5. Determine Feature Dimension
+        dummy_input = torch.zeros(1, 1, Config.N_MELS, 100)
+        with torch.no_grad():
+            features = self.backbone.forward_features(dummy_input)
+            self.feature_dim = features.shape[1]
+
+        # 6. Temporal Modeling (Bi-directional GRU)
+        self.rnn = nn.GRU(
+            input_size=self.feature_dim,
+            hidden_size=Config.RNN_HIDDEN_SIZE,
+            num_layers=Config.RNN_LAYERS,
+            batch_first=True,
+            bidirectional=Config.BIDIRECTIONAL,
+        )
+
+        rnn_out_dim = (
+            Config.RNN_HIDDEN_SIZE * 2
+            if Config.BIDIRECTIONAL
+            else Config.RNN_HIDDEN_SIZE
+        )
+
+        # 7. Aggregation (Attention Pooling)
+        self.attn_pool = AttentionPooling(rnn_out_dim)
+
+        # 8. Classifier
+        self.fc = nn.Linear(rnn_out_dim, Config.NUM_CLASSES)
+
+    def forward(self, x):
+        # Backbone Feature Extraction
+        # Returns [Batch, Channels, Freq_down, Time_down]
+        x = self.backbone.forward_features(x)
+
+        # Frequency Pooling
+        # [Batch, Channels, Time_down]
+        x = torch.mean(x, dim=2)
+
+        # Permute for RNN
+        # [Batch, Time_down, Channels]
+        x = x.permute(0, 2, 1)
+
+        # RNN Processing
+        self.rnn.flatten_parameters()
+        x, _ = self.rnn(x)
+
+        # Attention Pooling
+        x = self.attn_pool(x)
+
+        # Classification
+        logits = self.fc(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from library.model import TimePreservingEfficientNet
+=======
+from library.model import TimePreservingResNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Model
+    print("Initializing model...")
+    model = TimePreservingEfficientNet()
+    model = model.to(device)
+
+    # 4. Optimization
+    criterion = nn.BCEWithLogitsLoss()
+=======
+    # 3. Model
+    print("Initializing model...")
+    model = TimePreservingResNet()
+    model = model.to(device)
+
+    # 4. Optimization
+    pos_weight = torch.tensor([Config.POS_WEIGHT_VAL]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import TimePreservingEfficientNet
+=======
+from library.model import TimePreservingResNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = TimePreservingEfficientNet()
+    model = model.to(device)
+
+    # 4. Optimization
+    criterion = nn.BCEWithLogitsLoss()
+=======
+    # 3. Model Initialization
+    print("Initializing Model...")
+    model = TimePreservingResNet()
+    model = model.to(device)
+
+    # 4. Optimization
+    pos_weight = torch.tensor([Config.POS_WEIGHT_VAL]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+>>>>>>> REPLACE
+```

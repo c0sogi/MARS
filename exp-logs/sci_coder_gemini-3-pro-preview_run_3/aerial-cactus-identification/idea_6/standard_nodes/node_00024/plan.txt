@@ -1,0 +1,227 @@
+To improve the performance and stability of the cactus classifier, I will implement the following targeted optimizations based on the provided lessons:
+
+1.  **Remove the Compact Convolutional Transformer (CCT)**: The previous execution showed that the CCT model was highly unstable and contributed negatively to the ensemble (negative meta-learner coefficient). As noted in **Lesson 22 (Cite solution_lesson_node_00022)**, Transformers lack the strong inductive biases (translation invariance, locality) required for small, low-resolution datasets like this one, making CNNs the superior choice.
+2.  **Fix EfficientNet Stem Initialization**: The previous implementation copied weights from a stride-2 stem to a stride-1 stem. This caused distribution shifts that destabilized training. I will modify `ModifiedEfficientNet` to use random initialization for the new stem, as recommended in **Lesson 23 (Cite solution_lesson_node_00023)**.
+3.  **Clean up Architecture Registry**: I will remove the CCT code and its configuration to streamline the solution and focus resources on the robust CNN ensemble.
+
+These changes are expected to improve the ensemble's overall stability and performance while reducing computational overhead.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # The four orthogonal architectures for the stack
+    MODELS = [
+        "wide_se_resnet",
+        "densenet_bc",
+        "efficientnet",
+        "cct",  # Compact Convolutional Transformer
+    ]
+
+    # Specific settings for Compact Convolutional Transformer (CCT)
+    # Tailored for small data (CIFAR-like 32x32)
+    CCT_PARAMS = {
+        "embedding_dim": 256,
+        "n_conv_layers": 1,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": 1,
+        "pooling_kernel": 3,
+        "pooling_stride": 2,
+        "pooling_padding": 1,
+        "num_layers": 7,
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "dropout": 0.1,
+        "attention_dropout": 0.1,
+        "stochastic_depth": 0.1,
+    }
+=======
+    # The three orthogonal architectures for the stack
+    # Removed CCT due to poor performance on small data (Cite solution_lesson_node_00022)
+    MODELS = [
+        "wide_se_resnet",
+        "densenet_bc",
+        "efficientnet",
+    ]
+>>>>>>> REPLACE
+```
+
+```diff
+library/architectures.py
+<<<<<<< SEARCH
+        # Attempt to copy weights if shapes match (kernel size is usually 3x3 for both)
+        if original_stem.weight.shape == self.model.conv_stem.weight.shape:
+            with torch.no_grad():
+                self.model.conv_stem.weight.copy_(original_stem.weight)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# -----------------------------------------------------------------------------
+# 4. Compact Convolutional Transformer (CCT)
+# -----------------------------------------------------------------------------
+
+
+class Tokenizer(nn.Module):
+    def __init__(
+        self,
+        kernel_size,
+        stride,
+        padding,
+        pooling_kernel,
+        pooling_stride,
+        pooling_padding,
+        n_conv_layers,
+        n_input_channels,
+        n_output_channels,
+    ):
+        super(Tokenizer, self).__init__()
+        n_filter_list = [n_input_channels] + [
+            n_output_channels for _ in range(n_conv_layers)
+        ]
+
+        self.conv_layers = nn.Sequential()
+        for n in range(n_conv_layers):
+            self.conv_layers.add_module(
+                f"conv_{n}",
+                nn.Conv2d(
+                    n_filter_list[n],
+                    n_filter_list[n + 1],
+                    kernel_size=(kernel_size, kernel_size),
+                    stride=(stride, stride),
+                    padding=(padding, padding),
+                    bias=False,
+                ),
+            )
+            self.conv_layers.add_module(f"relu_{n}", nn.ReLU(inplace=True))
+            self.conv_layers.add_module(
+                f"pool_{n}",
+                nn.MaxPool2d(
+                    kernel_size=pooling_kernel,
+                    stride=pooling_stride,
+                    padding=pooling_padding,
+                ),
+            )
+
+    def forward(self, x):
+        return self.conv_layers(x)
+
+
+class SequencePooling(nn.Module):
+    def __init__(self, embedding_dim):
+        super(SequencePooling, self).__init__()
+        self.attention_pool = nn.Linear(embedding_dim, 1)
+
+    def forward(self, x):
+        # x: (B, N, D)
+        w = self.attention_pool(x)  # (B, N, 1)
+        w = F.softmax(w, dim=1)  # (B, N, 1)
+        out = torch.matmul(x.transpose(1, 2), w)  # (B, D, N) * (B, N, 1) -> (B, D, 1)
+        out = out.squeeze(-1)  # (B, D)
+        return out
+
+
+class CCT(nn.Module):
+    def __init__(self, num_classes=1):
+        super(CCT, self).__init__()
+        params = Config.CCT_PARAMS
+
+        self.tokenizer = Tokenizer(
+            kernel_size=params["kernel_size"],
+            stride=params["stride"],
+            padding=params["padding"],
+            pooling_kernel=params["pooling_kernel"],
+            pooling_stride=params["pooling_stride"],
+            pooling_padding=params["pooling_padding"],
+            n_conv_layers=params["n_conv_layers"],
+            n_input_channels=3,
+            n_output_channels=params["embedding_dim"],
+        )
+
+        self.embedding_dim = params["embedding_dim"]
+        self.num_layers = params["num_layers"]
+        self.num_heads = params["num_heads"]
+        self.mlp_ratio = params["mlp_ratio"]
+        self.dropout = params["dropout"]
+        self.attention_dropout = params["attention_dropout"]
+        self.stochastic_depth = params["stochastic_depth"]
+
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embedding_dim,
+            nhead=self.num_heads,
+            dim_feedforward=int(self.embedding_dim * self.mlp_ratio),
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=self.num_layers
+        )
+
+        # Sequence Pooling
+        self.seq_pool = SequencePooling(self.embedding_dim)
+
+        # Classifier
+        self.fc = nn.Linear(self.embedding_dim, num_classes)
+
+        # Positional Embedding (Learnable)
+        # Calculate sequence length based on 32x32 input and tokenizer params
+        # Conv: 32x32 (s=1, p=1) -> 32x32
+        # Pool: 32x32 (k=3, s=2, p=1) -> 16x16
+        # Seq Len = 16 * 16 = 256
+        self.seq_len = 256
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, self.embedding_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x):
+        # Tokenizer
+        x = self.tokenizer(x)  # (B, D, H, W)
+
+        # Flatten
+        b, c, h, w = x.shape
+        x = x.reshape(b, c, h * w).permute(0, 2, 1)  # (B, N, D)
+
+        # Add Positional Embedding
+        if x.shape[1] == self.pos_embed.shape[1]:
+            x = x + self.pos_embed
+        else:
+            # Handle potential size mismatches if input size changes
+            x = x + self.pos_embed[:, : x.shape[1], :]
+
+        # Transformer
+        x = self.transformer(x)
+
+        # Sequence Pooling
+        x = self.seq_pool(x)
+
+        # Classifier
+        x = self.fc(x)
+        return x
+=======
+        # Do not copy weights when changing stride from 2 to 1 for low-res inputs.
+        # Random initialization allows the stem to learn appropriate low-level filters 
+        # for the new resolution (Cite solution_lesson_node_00023).
+
+    def forward(self, x):
+        return self.model(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/architectures.py
+<<<<<<< SEARCH
+    elif model_name == "efficientnet":
+        return ModifiedEfficientNet(num_classes=num_classes)
+    elif model_name == "cct":
+        return CCT(num_classes=num_classes)
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+=======
+    elif model_name == "efficientnet":
+        return ModifiedEfficientNet(num_classes=num_classes)
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+>>>>>>> REPLACE
+```

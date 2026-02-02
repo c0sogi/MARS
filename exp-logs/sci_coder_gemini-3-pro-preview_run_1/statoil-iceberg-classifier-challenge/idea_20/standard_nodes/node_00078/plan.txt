@@ -1,0 +1,377 @@
+I will optimize the solution by reverting the architectural symmetrization and implementing robust Test-Time Augmentation (TTA) and domain-specific training adjustments, as supported by the lessons.
+
+1.  **Architecture**: Replace `SymmetrizedResNet18` with a standard `IcebergResNet18`. Enforcing invariance in the forward pass constrains optimization and causes instability (Cite solution_lesson_node_00076).
+2.  **Inference**: Implement 4-view TTA (Original, Horizontal Flip, Vertical Flip, Rotate 180) in the prediction loop. This ensures group closure and robust invariance without burdening the training loop (Cite solution_lesson_node_00074).
+3.  **Hyperparameters**: Reduce the learning rate from `1e-3` to `2e-4` to stabilize fine-tuning on this small dataset (Cite solution_lesson_node_00077).
+4.  **Augmentation**: Replace continuous rotations with discrete `HorizontalFlip`, `VerticalFlip`, and `RandomRotate90` to better match the top-down radar imagery characteristics and improve regularization (Cite solution_lesson_node_00077, solution_lesson_node_00028).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Hyperparameters
+    # =========================================================================
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.01
+=======
+    # Training Hyperparameters
+    # =========================================================================
+    BATCH_SIZE = 32
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 0.01
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_transforms(mode="train"):
+    """
+    Returns albumentations transforms for train or val/test.
+    """
+    if mode == "train":
+        return A.Compose(
+            [
+                # Continuous Rotation +/- 20 degrees
+                A.Rotate(limit=20, p=0.5),
+                # Random Shift/Scale
+                A.ShiftScaleRotate(
+                    rotate_limit=0, shift_limit=0.1, scale_limit=0.1, p=0.5
+                ),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose([ToTensorV2()])
+=======
+def get_transforms(mode="train"):
+    """
+    Returns albumentations transforms for train or val/test.
+    """
+    if mode == "train":
+        return A.Compose(
+            [
+                # Discrete geometric transformations for top-down imagery
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose([ToTensorV2()])
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SymmetrizedResNet18(nn.Module):
+    """
+    A ResNet-18 based architecture that implements a Symmetrized Forward Pass.
+    It enforces geometric invariance by averaging predictions over the Klein Four-Group
+    (Original, FlipLR, FlipUD, Rotate180) directly within the forward method.
+    """
+
+    def __init__(self):
+        super(SymmetrizedResNet18, self).__init__()
+
+        # Load pretrained ResNet18
+        # Using V1 weights as standard for ImageNet pretraining
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        original_model = models.resnet18(weights=weights)
+
+        # Extract backbone: keep everything up to the Average Pooling layer
+        # ResNet structure: conv1 -> bn1 -> relu -> maxpool -> layer1-4 -> avgpool -> fc
+        # list(children)[:-1] removes the final 'fc' layer
+        self.backbone = nn.Sequential(*list(original_model.children())[:-1])
+
+        # Feature dimension from ResNet18 GAP is 512
+        self.feature_dim = 512
+
+        # Angle normalization statistics (derived from dataset analysis)
+        # Mean: 39.2829, Std: 3.8362
+        self.angle_mean = 39.2829
+        self.angle_std = 3.8362
+
+        # Minimalist Head for Late Fusion
+        # Input: 512 (Image Features) + 1 (Normalized Angle)
+        self.head = nn.Sequential(
+            nn.BatchNorm1d(self.feature_dim + 1),
+            nn.Dropout(p=Config.DROPOUT_RATE),
+            nn.Linear(self.feature_dim + 1, 1),
+        )
+
+    def forward(self, x, angle):
+        """
+        Forward pass with internal symmetry expansion and averaging.
+
+        Args:
+            x (torch.Tensor): Input images of shape (B, 3, 224, 224)
+            angle (torch.Tensor): Incidence angles of shape (B,) or (B, 1)
+
+        Returns:
+            torch.Tensor: Averaged logits of shape (B, 1)
+        """
+        batch_size = x.size(0)
+
+        # ---------------------------------------------------------------------
+        # 1. Symmetrized Input Generation (Klein Four-Group)
+        # ---------------------------------------------------------------------
+        # View 1: Original
+        x0 = x
+        # View 2: Flip Left-Right (Horizontal) - Flip on Width (dim 3)
+        x1 = torch.flip(x, dims=[3])
+        # View 3: Flip Up-Down (Vertical) - Flip on Height (dim 2)
+        x2 = torch.flip(x, dims=[2])
+        # View 4: Rotate 180 (Equivalent to Flip UD + Flip LR)
+        x3 = torch.flip(x, dims=[2, 3])
+
+        # Stack all views to process in parallel: (4*B, 3, H, W)
+        x_sym = torch.cat([x0, x1, x2, x3], dim=0)
+
+        # ---------------------------------------------------------------------
+        # 2. Backbone Feature Extraction
+        # ---------------------------------------------------------------------
+        # Pass through ResNet backbone
+        # Output shape: (4*B, 512, 1, 1)
+        features = self.backbone(x_sym)
+
+        # Flatten to (4*B, 512)
+        features = features.view(features.size(0), -1)
+
+        # ---------------------------------------------------------------------
+        # 3. Angle Processing & Late Fusion
+        # ---------------------------------------------------------------------
+        # Ensure angle is (B, 1)
+        if angle.dim() == 1:
+            angle = angle.view(-1, 1)
+
+        # Normalize angle using global stats
+        angle_norm = (angle - self.angle_mean) / self.angle_std
+
+        # Repeat angle for each symmetry view to match the features batch size
+        # We constructed x_sym as [batch, batch_flip_lr, batch_flip_ud, batch_rot180]
+        # So we repeat the angle batch 4 times
+        angle_sym = angle_norm.repeat(4, 1)  # (4*B, 1)
+
+        # Concatenate image features and angle
+        fused_features = torch.cat([features, angle_sym], dim=1)  # (4*B, 513)
+
+        # ---------------------------------------------------------------------
+        # 4. Classification Head
+        # ---------------------------------------------------------------------
+        # Pass through BN -> Dropout -> Linear
+        logits_sym = self.head(fused_features)  # (4*B, 1)
+
+        # ---------------------------------------------------------------------
+        # 5. Logit Averaging (Ensemble Aggregation)
+        # ---------------------------------------------------------------------
+        # Reshape to separate views: (4, B, 1)
+        logits_reshaped = logits_sym.view(4, batch_size, 1)
+
+        # Average across the 4 views
+        final_logits = torch.mean(logits_reshaped, dim=0)  # (B, 1)
+
+        return final_logits
+=======
+class IcebergResNet18(nn.Module):
+    """
+    Standard ResNet-18 based architecture with Late Fusion for incidence angle.
+    Geometric invariance is handled via Test-Time Augmentation (TTA), not in the forward pass.
+    """
+
+    def __init__(self):
+        super(IcebergResNet18, self).__init__()
+
+        # Load pretrained ResNet18
+        # Using V1 weights as standard for ImageNet pretraining
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        original_model = models.resnet18(weights=weights)
+
+        # Extract backbone: keep everything up to the Average Pooling layer
+        self.backbone = nn.Sequential(*list(original_model.children())[:-1])
+
+        # Feature dimension from ResNet18 GAP is 512
+        self.feature_dim = 512
+
+        # Angle normalization statistics (derived from dataset analysis)
+        # Mean: 39.2829, Std: 3.8362
+        self.angle_mean = 39.2829
+        self.angle_std = 3.8362
+
+        # Minimalist Head for Late Fusion
+        # Input: 512 (Image Features) + 1 (Normalized Angle)
+        self.head = nn.Sequential(
+            nn.BatchNorm1d(self.feature_dim + 1),
+            nn.Dropout(p=Config.DROPOUT_RATE),
+            nn.Linear(self.feature_dim + 1, 1),
+        )
+
+    def forward(self, x, angle):
+        """
+        Standard forward pass.
+
+        Args:
+            x (torch.Tensor): Input images of shape (B, 3, 224, 224)
+            angle (torch.Tensor): Incidence angles of shape (B,) or (B, 1)
+
+        Returns:
+            torch.Tensor: Logits of shape (B, 1)
+        """
+        # 1. Backbone Feature Extraction
+        features = self.backbone(x)
+        features = features.view(features.size(0), -1)  # (B, 512)
+
+        # 2. Angle Processing & Late Fusion
+        if angle.dim() == 1:
+            angle = angle.view(-1, 1)
+
+        # Normalize angle using global stats
+        angle_norm = (angle - self.angle_mean) / self.angle_std
+
+        # Concatenate image features and angle
+        fused_features = torch.cat([features, angle_norm], dim=1)  # (B, 513)
+
+        # 3. Classification Head
+        logits = self.head(fused_features)  # (B, 1)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        optimizer.zero_grad()
+
+        # Forward pass (model handles symmetry averaging internally)
+        logits = model(images, angles)
+
+        # Compute loss
+=======
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(images, angles)
+
+        # Compute loss
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def predict(model, test_loader, device):
+    """
+    Generates predictions for the test set.
+
+    Args:
+        model: The PyTorch model.
+        test_loader: DataLoader for test data.
+        device: The device to run on.
+
+    Returns:
+        np.array: Flattened array of probabilities.
+    """
+    model.eval()
+    predictions = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch[0].to(device, non_blocking=True)
+            angles = batch[1].to(device, non_blocking=True)
+
+            logits = model(images, angles)
+            probs = torch.sigmoid(logits)
+
+            predictions.append(probs.cpu().numpy())
+
+    # Concatenate all batches: (N, 1) -> (N,)
+    return np.concatenate(predictions).flatten()
+=======
+def predict(model, test_loader, device):
+    """
+    Generates predictions for the test set using 4-view Test-Time Augmentation (TTA).
+    Views: Original, Horizontal Flip, Vertical Flip, Rotate 180.
+
+    Args:
+        model: The PyTorch model.
+        test_loader: DataLoader for test data.
+        device: The device to run on.
+
+    Returns:
+        np.array: Flattened array of probabilities.
+    """
+    model.eval()
+    predictions = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch[0].to(device, non_blocking=True)
+            angles = batch[1].to(device, non_blocking=True)
+
+            # 1. Original
+            logits1 = model(images, angles)
+            probs1 = torch.sigmoid(logits1)
+
+            # 2. Horizontal Flip (Flip Width - dim 3)
+            images_lr = torch.flip(images, [3])
+            logits2 = model(images_lr, angles)
+            probs2 = torch.sigmoid(logits2)
+
+            # 3. Vertical Flip (Flip Height - dim 2)
+            images_ud = torch.flip(images, [2])
+            logits3 = model(images_ud, angles)
+            probs3 = torch.sigmoid(logits3)
+
+            # 4. Rotate 180 (Flip Width + Flip Height)
+            images_180 = torch.flip(images, [2, 3])
+            logits4 = model(images_180, angles)
+            probs4 = torch.sigmoid(logits4)
+
+            # Average probabilities
+            avg_probs = (probs1 + probs2 + probs3 + probs4) / 4.0
+
+            predictions.append(avg_probs.cpu().numpy())
+
+    # Concatenate all batches: (N, 1) -> (N,)
+    return np.concatenate(predictions).flatten()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SymmetrizedResNet18
+from library.engine import train_one_epoch, evaluate, predict
+
+
+# Custom update_bn to handle model(x, angle) signature
+=======
+from library.model import IcebergResNet18
+from library.engine import train_one_epoch, evaluate, predict
+
+
+# Custom update_bn to handle model(x, angle) signature
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_training(train_loader, val_loader, device, epochs, swa_epochs, seed):
+    set_seed(seed)
+
+    model = SymmetrizedResNet18().to(device)
+
+    # Optimizer
+=======
+def run_training(train_loader, val_loader, device, epochs, swa_epochs, seed):
+    set_seed(seed)
+
+    model = IcebergResNet18().to(device)
+
+    # Optimizer
+>>>>>>> REPLACE
+```

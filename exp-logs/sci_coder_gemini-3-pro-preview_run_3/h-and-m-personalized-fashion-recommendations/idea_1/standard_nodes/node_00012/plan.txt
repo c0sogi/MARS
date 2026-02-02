@@ -1,0 +1,468 @@
+My implementation strategy focuses on transitioning from a single-step Markov Chain to a **Vectorized Sparse Propagation** model, as suggested by the provided lessons. This involves three key changes:
+
+1.  **Hyperparameter Optimization (Cite Lesson 11)**: I will update `DECAY_RATE` to 2.0, `REPURCHASE_WEIGHT` to 1.5, and `HISTORY_LENGTH` to 30. This configuration balances the influence of recent trends versus historical preferences.
+2.  **Vectorized Inference (Cite Lesson 5)**: I will rewrite the `generate_predictions` method to represent user history as a sparse matrix ($U$) and compute recommendations via matrix multiplication ($S = U \cdot T + \alpha \cdot U$). This aggregates signals from the user's entire recent history rather than just the last item.
+3.  **Efficient Sparse Processing (Cite Lesson 7)**: To avoid memory exhaustion, I will implement batch processing for the inference step and extract top-K candidates directly from the sparse result matrix without converting it to a dense array.
+
+I will also update the data loading pipeline to provide the necessary transaction history for constructing the user vectors and enforce the validation threshold in the execution script.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# Model Specific (Time-Aware Sequential Transition Graph)
+WEEKS_TO_KEEP = 10  # Filter transactions to the last N weeks to capture recent trends
+DECAY_RATE = (
+    2.5  # Exponent for time decay: weight = 1 / (days_passed + 1) ** DECAY_RATE
+)
+MIN_PURCHASES = (
+    1  # Minimum purchases required to include a user/item in graph (noise reduction)
+)
+=======
+# Model Specific (Time-Aware Sequential Transition Graph)
+WEEKS_TO_KEEP = 10  # Filter transactions to the last N weeks to capture recent trends
+DECAY_RATE = (
+    2.0  # Exponent for time decay: weight = 1 / (days_passed + 1) ** DECAY_RATE
+)  # Cite solution_lesson_node_00011
+MIN_PURCHASES = (
+    1  # Minimum purchases required to include a user/item in graph (noise reduction)
+)
+REPURCHASE_WEIGHT = 1.5  # Cite solution_lesson_node_00011
+HISTORY_LENGTH = 30  # Cite solution_lesson_node_00011
+BATCH_SIZE = 5000  # Cite solution_lesson_node_00007
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def get_user_top_items(transactions_df, load_cached_data=True):
+    """
+    Aggregates transactions by user and item, summing the time weights,
+    and retrieves the top K items per user.
+
+    Args:
+        transactions_df (pd.DataFrame): Weighted transactions.
+        load_cached_data (bool): Whether to use cache.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'customer_id' and 'history_items' (list of article_ids).
+    """
+    cache_path = config.WORKING_DIR / "user_top_items.parquet"
+
+    if load_cached_data and cache_path.exists():
+        print(f"Loading user top items from cache: {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    print("Extracting user top items from scratch...")
+
+    # Group by customer and article, sum the time-decay weights
+    # This ranks items by a combination of frequency and recency
+    grouped = (
+        transactions_df.groupby(["customer_id", "article_id"])["weight"]
+        .sum()
+        .reset_index()
+    )
+
+    # Sort by customer and weight (descending)
+    grouped = grouped.sort_values(["customer_id", "weight"], ascending=[True, False])
+
+    # Take top K items per customer
+    top_k = grouped.groupby("customer_id").head(config.TOP_K)
+
+    # Aggregate into lists
+    result = (
+        top_k.groupby("customer_id")["article_id"]
+        .apply(list)
+        .reset_index()
+        .rename(columns={"article_id": "history_items"})
+    )
+
+    print(f"Saving user top items to cache: {cache_path}")
+    result.to_parquet(cache_path, index=False)
+
+    return result
+=======
+def get_user_history_records(transactions_df, load_cached_data=True):
+    """
+    Retrieves the recent transaction history for users to build the sparse user vector.
+    
+    Args:
+        transactions_df (pd.DataFrame): Weighted transactions.
+        load_cached_data (bool): Whether to use cache.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'customer_id', 'article_id', 'weight'.
+    """
+    cache_path = config.WORKING_DIR / "user_history_records.parquet"
+
+    if load_cached_data and cache_path.exists():
+        print(f"Loading user history records from cache: {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    print("Extracting user history records from scratch...")
+
+    # Ensure sorted by date (recent first)
+    df_sorted = transactions_df.sort_values(["customer_id", "t_dat"], ascending=[True, False])
+    
+    # Aggregate weights first (handling multiple purchases of same item)
+    grouped = (
+        df_sorted.groupby(["customer_id", "article_id"])["weight"]
+        .sum()
+        .reset_index()
+    )
+    
+    # Sort by weight descending
+    grouped = grouped.sort_values(["customer_id", "weight"], ascending=[True, False])
+    
+    # Keep top HISTORY_LENGTH items (Cite solution_lesson_node_00011)
+    result = grouped.groupby("customer_id").head(config.HISTORY_LENGTH)
+
+    print(f"Saving user history records to cache: {cache_path}")
+    result.to_parquet(cache_path, index=False)
+
+    return result
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def generate_predictions(self, user_history_df):
+        """
+        Generates predictions using a hybrid approach:
+        1. Markov Chain candidates (based on last item)
+        2. User History candidates (based on frequent/recent purchases)
+        3. Global Popularity (fallback)
+
+        Args:
+            user_history_df (pd.DataFrame): DataFrame with columns:
+                - 'customer_id'
+                - 'article_id' (last purchased item)
+                - 'history_items' (list of top items from history, optional)
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print("Generating predictions...")
+
+        # Pre-compute global top K for fallback
+        global_top_k = self.global_popularity[: config.TOP_K]
+
+        # Prepare inputs
+        customer_ids = user_history_df["customer_id"].values
+        last_article_ids = user_history_df["article_id"].values
+
+        # Handle history_items if present, otherwise use empty lists
+        if "history_items" in user_history_df.columns:
+            history_items_array = user_history_df["history_items"].values
+        else:
+            history_items_array = np.empty(len(user_history_df), dtype=object)
+
+        # Map last articles to indices
+        idx_map = pd.Index(self.idx_to_article)
+        source_indices = idx_map.get_indexer(last_article_ids)
+
+        predictions = []
+
+        # Optimization: Access CSR internals directly
+        indptr = self.transition_matrix.indptr
+        indices = self.transition_matrix.indices
+        data = self.transition_matrix.data
+
+        for i, src_idx in enumerate(source_indices):
+            preds = []
+            seen = set()
+
+            # 1. Markov Chain Candidates
+            if src_idx != -1:
+                start = indptr[src_idx]
+                end = indptr[src_idx + 1]
+
+                if end > start:
+                    row_indices = indices[start:end]
+                    row_data = data[start:end]
+
+                    # Get top K neighbors
+                    if len(row_data) > config.TOP_K:
+                        top_k_arg = np.argpartition(row_data, -config.TOP_K)[
+                            -config.TOP_K :
+                        ]
+                        sorted_top_k_arg = top_k_arg[
+                            np.argsort(row_data[top_k_arg])[::-1]
+                        ]
+                        best_indices = row_indices[sorted_top_k_arg]
+                    else:
+                        sorted_arg = np.argsort(row_data)[::-1]
+                        best_indices = row_indices[sorted_arg]
+
+                    markov_candidates = self.idx_to_article[best_indices]
+
+                    for cand in markov_candidates:
+                        if cand not in seen:
+                            preds.append(cand)
+                            seen.add(cand)
+
+            # 2. User History Candidates (Repurchase)
+            # Cite solution_lesson_node_00002: Hybridizing with Repeat Purchase heuristic
+            hist_list = history_items_array[i]
+            if isinstance(hist_list, (list, np.ndarray)):
+                for cand in hist_list:
+                    if cand not in seen:
+                        preds.append(cand)
+                        seen.add(cand)
+                        if len(preds) >= config.TOP_K:
+                            break
+
+            # 3. Global Popularity Fallback
+            if len(preds) < config.TOP_K:
+                for cand in global_top_k:
+                    if cand not in seen:
+                        preds.append(cand)
+                        seen.add(cand)
+                        if len(preds) >= config.TOP_K:
+                            break
+
+            # Truncate and format
+            final_preds = preds[: config.TOP_K]
+            predictions.append(" ".join(map(str, final_preds)))
+
+        return pd.DataFrame({"customer_id": customer_ids, "prediction": predictions})
+=======
+    def generate_predictions(self, target_customers, user_history_df):
+        """
+        Generates predictions using Vectorized Sparse Propagation (Cite solution_lesson_node_00005).
+        
+        S = U * T + alpha * U
+        
+        Args:
+            target_customers (array-like): List of customer_ids to predict for.
+            user_history_df (pd.DataFrame): DataFrame with 'customer_id', 'article_id', 'weight'.
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print(f"Generating predictions for {len(target_customers)} users...")
+
+        # Pre-compute global top K for fallback
+        global_top_k = self.global_popularity[: config.TOP_K]
+        
+        # 1. Build Sparse User Matrix U (N_users x N_items)
+        print("Building sparse user history matrix...")
+        
+        # Map customers to row indices
+        cust_to_idx = {cust: i for i, cust in enumerate(target_customers)}
+        
+        # Filter history for target customers only
+        history_subset = user_history_df[user_history_df["customer_id"].isin(cust_to_idx)].copy()
+        
+        if len(history_subset) == 0:
+            print("Warning: No history found for target customers. Using global popularity.")
+            default_pred = " ".join(map(str, global_top_k))
+            return pd.DataFrame({
+                "customer_id": target_customers,
+                "prediction": [default_pred] * len(target_customers)
+            })
+
+        # Map IDs to indices
+        history_subset["row_idx"] = history_subset["customer_id"].map(cust_to_idx)
+        history_subset["col_idx"] = history_subset["article_id"].map(self.article_to_idx)
+        
+        # Drop invalid items (items not in training set)
+        history_subset = history_subset.dropna(subset=["col_idx"])
+        
+        # Construct CSR Matrix
+        rows = history_subset["row_idx"].values
+        cols = history_subset["col_idx"].astype(int).values
+        data = history_subset["weight"].values
+        
+        n_users = len(target_customers)
+        n_items = len(self.idx_to_article)
+        
+        user_matrix = sp.csr_matrix((data, (rows, cols)), shape=(n_users, n_items))
+        
+        # 2. Batch Inference (Cite solution_lesson_node_00007)
+        predictions = []
+        batch_size = config.BATCH_SIZE
+        
+        print(f"Processing in batches of {batch_size}...")
+        
+        for start_idx in range(0, n_users, batch_size):
+            end_idx = min(start_idx + batch_size, n_users)
+            
+            # Slice user matrix
+            U_batch = user_matrix[start_idx:end_idx]
+            
+            # Compute Scores: S = U * T + alpha * U
+            # Cite solution_lesson_node_00005 (Vectorized Propagation)
+            # Cite solution_lesson_node_00011 (Repurchase Weight)
+            scores = U_batch.dot(self.transition_matrix) 
+            scores += config.REPURCHASE_WEIGHT * U_batch
+            
+            # Extract Top K (Cite solution_lesson_node_00007 - Avoid dense materialization)
+            batch_preds = []
+            
+            for i in range(scores.shape[0]):
+                row = scores[i] 
+                
+                if row.nnz == 0:
+                    batch_preds.append(" ".join(map(str, global_top_k)))
+                    continue
+                
+                r_indices = row.indices
+                r_data = row.data
+                
+                if len(r_data) > config.TOP_K:
+                    top_k_idx = np.argpartition(r_data, -config.TOP_K)[-config.TOP_K:]
+                    sorted_top_k_idx = top_k_idx[np.argsort(r_data[top_k_idx])[::-1]]
+                    best_item_indices = r_indices[sorted_top_k_idx]
+                else:
+                    sorted_idx = np.argsort(r_data)[::-1]
+                    best_item_indices = r_indices[sorted_idx]
+                
+                candidates = self.idx_to_article[best_item_indices].tolist()
+                
+                # Fill with popularity if needed
+                if len(candidates) < config.TOP_K:
+                    seen = set(candidates)
+                    for pop_item in global_top_k:
+                        if pop_item not in seen:
+                            candidates.append(pop_item)
+                            seen.add(pop_item)
+                            if len(candidates) >= config.TOP_K:
+                                break
+                
+                batch_preds.append(" ".join(map(str, candidates)))
+            
+            predictions.extend(batch_preds)
+            
+        return pd.DataFrame({"customer_id": target_customers, "prediction": predictions})
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 4. Prepare Test Data
+    print("Preparing test customers...")
+    # Load the list of customers we need to predict for
+    test_customers_df = pd.read_parquet(config.TEST_PATH)
+
+    # Get the last purchase history for all users (for Markov source)
+    user_last_purchase_df = data_loader.get_last_purchases(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # Get top items from history (for Repurchase candidates)
+    user_top_items_df = data_loader.get_user_top_items(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # Merge test customers with their history.
+    input_df = test_customers_df[["customer_id"]].merge(
+        user_last_purchase_df, on="customer_id", how="left"
+    )
+
+    # Merge with top items history
+    input_df = input_df.merge(user_top_items_df, on="customer_id", how="left")
+
+    # Fill NaN article_ids with a placeholder (e.g., -1)
+    input_df["article_id"] = input_df["article_id"].fillna(-1).astype(np.int64)
+
+    # Note: 'history_items' will be NaN for users with no history.
+    # The model handles this check.
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(input_df)} customers...")
+    predictions_df = graph_model.generate_predictions(input_df)
+=======
+    # 4. Prepare Test Data
+    print("Preparing test customers...")
+    # Load the list of customers we need to predict for
+    test_customers_df = pd.read_parquet(config.TEST_PATH)
+    target_customers = test_customers_df["customer_id"].values
+
+    # Get full history records for constructing user vectors
+    user_history_df = data_loader.get_user_history_records(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # 5. Generate Predictions
+    predictions_df = graph_model.generate_predictions(target_customers, user_history_df)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Prepare Inputs for Validation Users
+    print("Preparing Validation Inputs...")
+    # Extract last purchase from the history part of validation
+    # We use the helper but must be careful about caching.
+    # We pass load_cached_data=False to avoid reading/writing the main cache file with partial data
+    val_last_purchase = data_loader.get_last_purchases(
+        history_df, load_cached_data=False
+    )
+
+    # Extract top history items for Repurchase heuristic
+    val_top_items = data_loader.get_user_top_items(history_df, load_cached_data=False)
+
+    # Identify users to predict for (those who actually bought something in the test window)
+    target_users = ground_truth_df["customer_id"].unique()
+
+    # Create input dataframe for the model
+    pred_input = pd.DataFrame({"customer_id": target_users})
+    pred_input = pred_input.merge(val_last_purchase, on="customer_id", how="left")
+    pred_input = pred_input.merge(val_top_items, on="customer_id", how="left")
+
+    # Fill missing history with -1 (Cold Start in Validation Period)
+    pred_input["article_id"] = pred_input["article_id"].fillna(-1).astype(np.int64)
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(pred_input)} validation users...")
+    preds_df = graph_model.generate_predictions(pred_input)
+=======
+    # 4. Prepare Inputs for Validation Users
+    print("Preparing Validation Inputs...")
+    
+    # Get history records for validation users
+    val_history_records = data_loader.get_user_history_records(
+        history_df, load_cached_data=False
+    )
+
+    # Identify users to predict for (those who actually bought something in the test window)
+    target_users = ground_truth_df["customer_id"].unique()
+
+    # 5. Generate Predictions
+    preds_df = graph_model.generate_predictions(target_users, val_history_records)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Final Inference
+    print("\n" + "=" * 30)
+    print("FINAL INFERENCE")
+    print("=" * 30)
+    # Retrain on ALL data (Train + Val) for the submission
+    # We disable cache loading to force a fresh fit on the combined dataset
+    inference.run_inference(load_cached_data=False)
+=======
+    # 3. Final Inference
+    print("\n" + "=" * 30)
+    print("FINAL INFERENCE")
+    print("=" * 30)
+    
+    # Check threshold
+    val_map = ap_df["ap"].mean()
+    threshold = 0.0260267759
+    
+    if val_map > threshold:
+        print(f"Validation MAP ({val_map:.6f}) > Threshold ({threshold}). Generating submission...")
+        # Retrain on ALL data (Train + Val) for the submission
+        # We disable cache loading to force a fresh fit on the combined dataset
+        inference.run_inference(load_cached_data=False)
+    else:
+        print(f"Validation MAP ({val_map:.6f}) <= Threshold ({threshold}). Skipping submission.")
+>>>>>>> REPLACE
+```

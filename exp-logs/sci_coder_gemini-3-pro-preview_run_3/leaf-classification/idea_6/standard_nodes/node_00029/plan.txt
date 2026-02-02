@@ -1,0 +1,362 @@
+Based on the lessons learned, specifically **Lesson ID: solution_lesson_node_00028**, bagging stable classifiers like LDA on small, high-cardinality datasets degrades performance compared to a single model trained on the full dataset. The previous best solution achieved near-perfect results using a single LDA model. Therefore, I will revert the ensemble strategy from a Bagged Ensemble back to a **Single Linear Discriminant Analysis (LDA) Pipeline**. I will also ensure that the feature extraction utilizes the **Multi-View Averaging** (Cite **solution_lesson_node_00017**) and **PCA with 99% variance retention** (Cite **solution_lesson_node_00019**) which were identified as optimal. The implementation will be streamlined to remove the bagging overhead, and the submission logic will be updated to strictly adhere to the performance threshold requirement.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_6")
+    SUBMISSION_DIR = "./submission"
+=======
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_optimized")
+    SUBMISSION_DIR = "./submission"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Ensemble Strategy (Bagging LDA)
+    N_ESTIMATORS = 20
+
+    # Probability Clipping (as per metric requirements)
+=======
+    # Probability Clipping (as per metric requirements)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        print(f"PCA Variance:   {cls.PCA_VARIANCE}")
+        print(f"Ensemble Size:  {cls.N_ESTIMATORS}")
+        print(f"Cache Dir:      {cls.CACHE_DIR}")
+=======
+        print(f"PCA Variance:   {cls.PCA_VARIANCE}")
+        print(f"Cache Dir:      {cls.CACHE_DIR}")
+>>>>>>> REPLACE
+```
+
+```diff
+library/ensemble.py
+<<<<<<< SEARCH
+from sklearn.utils import resample
+
+from library.config import Config
+from library.utils import seed_everything, save_submission
+from library.data import get_dataloaders
+from library.feature_extraction import process_split
+
+
+class BaggedLDAPipeline(BaseEstimator, ClassifierMixin):
+    """
+    Homogeneous Bagged Ensemble of Linear Discriminant Analysis.
+
+    Architecture:
+    - Ensemble of N_ESTIMATORS independent pipelines.
+    - Each pipeline is trained on a bootstrap sample of the training data.
+    - Pipeline components:
+        1. PCA for DINOv2 features (Global Geometry).
+        2. PCA for ConvNeXt features (Local Texture).
+        3. QuantileTransformer for Tabular features.
+        4. Linear Discriminant Analysis (LDA) with Ledoit-Wolf shrinkage.
+    """
+
+    def __init__(self):
+        self.n_estimators = Config.N_ESTIMATORS
+        self.pca_variance = Config.PCA_VARIANCE
+        self.estimators = []
+        self.classes_ = None
+
+    def fit(self, X_dino, X_conv, X_tab, y):
+        """
+        Fits the ensemble on the provided data.
+
+        Args:
+            X_dino (np.ndarray): DINOv2 embeddings.
+            X_conv (np.ndarray): ConvNeXt embeddings.
+            X_tab (np.ndarray): Tabular features.
+            y (np.ndarray): Target labels.
+        """
+        seed_everything()
+        self.classes_ = np.unique(y)
+        n_samples = X_dino.shape[0]
+
+        # Reset estimators
+        self.estimators = []
+
+        print(f"Fitting BaggedLDAPipeline with {self.n_estimators} estimators...")
+
+        for i in range(self.n_estimators):
+            # Ensure reproducibility for each estimator
+            iter_seed = Config.SEED + i
+
+            # Bootstrap sampling
+            indices = resample(
+                np.arange(n_samples), replace=True, random_state=iter_seed
+            )
+
+            X_dino_boot = X_dino[indices]
+            X_conv_boot = X_conv[indices]
+            X_tab_boot = X_tab[indices]
+            y_boot = y[indices]
+
+            # --- Transformers ---
+
+            # 1. PCA for DINOv2
+            # Retain 99% variance
+            pca_dino = PCA(
+                n_components=self.pca_variance,
+                svd_solver="full",
+                random_state=iter_seed,
+            )
+            feat_dino = pca_dino.fit_transform(X_dino_boot)
+
+            # 2. PCA for ConvNeXt
+            # Retain 99% variance
+            pca_conv = PCA(
+                n_components=self.pca_variance,
+                svd_solver="full",
+                random_state=iter_seed,
+            )
+            feat_conv = pca_conv.fit_transform(X_conv_boot)
+
+            # 3. Quantile Transformer for Tabular
+            # Output normal distribution for LDA compatibility
+            # n_quantiles must be <= n_samples
+            n_quantiles = min(len(indices), 1000)
+            qt_tab = QuantileTransformer(
+                output_distribution="normal",
+                n_quantiles=n_quantiles,
+                random_state=iter_seed,
+            )
+            feat_tab = qt_tab.fit_transform(X_tab_boot)
+
+            # --- Concatenation ---
+            X_final = np.hstack([feat_dino, feat_conv, feat_tab])
+
+            # --- Classifier ---
+            # LDA with Ledoit-Wolf shrinkage for high-dimensional data
+            lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+            lda.fit(X_final, y_boot)
+
+            # Store pipeline components
+            self.estimators.append(
+                {
+                    "pca_dino": pca_dino,
+                    "pca_conv": pca_conv,
+                    "qt_tab": qt_tab,
+                    "lda": lda,
+                    "classes": lda.classes_,
+                }
+            )
+
+        print(f"Fitting complete. Total estimators: {len(self.estimators)}")
+        return self
+
+    def predict_proba(self, X_dino, X_conv, X_tab):
+        """
+        Predicts class probabilities for new data.
+
+        Args:
+            X_dino (np.ndarray): DINOv2 embeddings.
+            X_conv (np.ndarray): ConvNeXt embeddings.
+            X_tab (np.ndarray): Tabular features.
+
+        Returns:
+            np.ndarray: Averaged probability matrix (n_samples, n_classes).
+        """
+        if not self.estimators:
+            raise RuntimeError("Model not fitted yet.")
+
+        n_samples = X_dino.shape[0]
+        n_classes = len(self.classes_)
+
+        # Map class label to column index in the final output
+        # This ensures alignment if bootstrap samples missed some classes
+        class_to_idx = {cls: idx for idx, cls in enumerate(self.classes_)}
+
+        total_probs = np.zeros((n_samples, n_classes), dtype=np.float64)
+
+        for est in self.estimators:
+            # --- Transform ---
+            feat_dino = est["pca_dino"].transform(X_dino)
+            feat_conv = est["pca_conv"].transform(X_conv)
+            feat_tab = est["qt_tab"].transform(X_tab)
+
+            X_final = np.hstack([feat_dino, feat_conv, feat_tab])
+
+            # --- Predict ---
+            # probs shape: (n_samples, n_classes_in_estimator)
+            probs = est["lda"].predict_proba(X_final)
+
+            # --- Map to Global Class Space ---
+            est_classes = est["classes"]
+            full_probs = np.zeros((n_samples, n_classes), dtype=np.float64)
+
+            # Identify which columns in global space correspond to the estimator's classes
+            col_indices = [class_to_idx[c] for c in est_classes]
+            full_probs[:, col_indices] = probs
+
+            total_probs += full_probs
+
+        # --- Aggregate ---
+        avg_probs = total_probs / self.n_estimators
+
+        # --- Clip ---
+        # As per metric requirements: max(min(p, 1-10^-15), 10^-15)
+        epsilon = Config.PROB_EPSILON
+        avg_probs = np.clip(avg_probs, epsilon, 1.0 - epsilon)
+
+        return avg_probs
+=======
+from library.config import Config
+from library.utils import seed_everything, save_submission
+from library.data import get_dataloaders
+from library.feature_extraction import process_split
+
+
+class SingleLDAPipeline(BaseEstimator, ClassifierMixin):
+    """
+    Single Linear Discriminant Analysis Pipeline.
+
+    Architecture:
+    1. PCA for DINOv2 features (Global Geometry).
+    2. PCA for ConvNeXt features (Local Texture).
+    3. QuantileTransformer for Tabular features.
+    4. Linear Discriminant Analysis (LDA) with Ledoit-Wolf shrinkage.
+    """
+
+    def __init__(self):
+        self.pca_variance = Config.PCA_VARIANCE
+        self.pca_dino = None
+        self.pca_conv = None
+        self.qt_tab = None
+        self.lda = None
+        self.classes_ = None
+
+    def fit(self, X_dino, X_conv, X_tab, y):
+        """
+        Fits the pipeline on the provided data.
+        """
+        seed_everything()
+        self.classes_ = np.unique(y)
+        
+        print("Fitting SingleLDAPipeline...")
+
+        # 1. PCA for DINOv2
+        self.pca_dino = PCA(
+            n_components=self.pca_variance,
+            svd_solver="full",
+            random_state=Config.SEED,
+        )
+        feat_dino = self.pca_dino.fit_transform(X_dino)
+
+        # 2. PCA for ConvNeXt
+        self.pca_conv = PCA(
+            n_components=self.pca_variance,
+            svd_solver="full",
+            random_state=Config.SEED,
+        )
+        feat_conv = self.pca_conv.fit_transform(X_conv)
+
+        # 3. Quantile Transformer for Tabular
+        n_quantiles = min(len(X_tab), 1000)
+        self.qt_tab = QuantileTransformer(
+            output_distribution="normal",
+            n_quantiles=n_quantiles,
+            random_state=Config.SEED,
+        )
+        feat_tab = self.qt_tab.fit_transform(X_tab)
+
+        # --- Concatenation ---
+        X_final = np.hstack([feat_dino, feat_conv, feat_tab])
+
+        # --- Classifier ---
+        # LDA with Ledoit-Wolf shrinkage for high-dimensional data
+        self.lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+        self.lda.fit(X_final, y)
+
+        print("Fitting complete.")
+        return self
+
+    def predict_proba(self, X_dino, X_conv, X_tab):
+        """
+        Predicts class probabilities for new data.
+        """
+        if self.lda is None:
+            raise RuntimeError("Model not fitted yet.")
+
+        # --- Transform ---
+        feat_dino = self.pca_dino.transform(X_dino)
+        feat_conv = self.pca_conv.transform(X_conv)
+        feat_tab = self.qt_tab.transform(X_tab)
+
+        X_final = np.hstack([feat_dino, feat_conv, feat_tab])
+
+        # --- Predict ---
+        probs = self.lda.predict_proba(X_final)
+
+        # --- Clip ---
+        epsilon = Config.PROB_EPSILON
+        probs = np.clip(probs, epsilon, 1.0 - epsilon)
+
+        return probs
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.ensemble import BaggedLDAPipeline
+=======
+from library.ensemble import SingleLDAPipeline
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 4. Model Training
+    # Initialize the Homogeneous Bagged Ensemble of LDA
+    model = BaggedLDAPipeline()
+    model.fit(X_train_dino, X_train_conv, X_train_tab, y_train)
+
+    # 5. Validation Inference & Metric
+    # Predict probabilities on validation set
+    val_probs = model.predict_proba(X_val_dino, X_val_conv, X_val_tab)
+
+    # Calculate Multi-class Log Loss
+    # We provide labels=range(len(classes)) to ensure correct handling if a class is missing in val
+    metric = log_loss(y_val, val_probs, labels=range(len(classes)))
+
+    # Print the required metric string
+    print(f"Final Validation Metric: {metric}")
+
+    # 6. Failure Analysis
+    # Calculate per-sample loss: -log(p_true)
+=======
+    # 4. Model Training
+    # Initialize the Single LDA Pipeline
+    model = SingleLDAPipeline()
+    model.fit(X_train_dino, X_train_conv, X_train_tab, y_train)
+
+    # 5. Validation Inference & Metric
+    # Predict probabilities on validation set
+    val_probs = model.predict_proba(X_val_dino, X_val_conv, X_val_tab)
+
+    # Calculate Multi-class Log Loss
+    # We provide labels=range(len(classes)) to ensure correct handling if a class is missing in val
+    metric = log_loss(y_val, val_probs, labels=range(len(classes)))
+
+    # Print the required metric string
+    print(f"Final Validation Metric: {metric}")
+
+    # 6. Failure Analysis
+    # Calculate per-sample loss: -log(p_true)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 7. Submission
+    # Generate predictions for test set
+    test_probs = model.predict_proba(X_test_dino, X_test_conv, X_test_tab)
+
+    # Save submission file
+    save_submission(test_probs, test_ids, classes)
+=======
+    # 7. Submission
+    # Generate predictions for test set and create the submission file 
+    # If and only if the final validation metric is lower than 2.2204460492503136e-16
+    threshold = 2.2204460492503136e-16
+    if metric < threshold:
+        test_probs = model.predict_proba(X_test_dino, X_test_conv, X_test_tab)
+        save_submission(test_probs, test_ids, classes)
+    else:
+        print(f"Validation metric {metric} is not lower than threshold {threshold}. Submission skipped.")
+>>>>>>> REPLACE
+```

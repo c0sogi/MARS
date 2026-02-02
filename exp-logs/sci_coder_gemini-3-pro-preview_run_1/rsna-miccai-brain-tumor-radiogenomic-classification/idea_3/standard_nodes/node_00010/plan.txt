@@ -1,0 +1,582 @@
+Based on the lessons learned, specifically `solution_lesson_node_00008` and `solution_lesson_node_00002`, I will optimize the solution by reverting from the complex Volumetric Transformer to a robust 2.5D CNN baseline. The lessons indicate that for this small dataset (~500 subjects), sophisticated sequence modeling leads to overfitting and instability, while a simple heuristic (selecting the middle slice) allows for stable training and better generalization.
+
+Here is the implementation strategy:
+1.  **Configuration (`library/config.py`)**: Switch to 2D settings. Increase `BATCH_SIZE` to 32 (from 4/16) to improve gradient stability. Remove Transformer-specific hyperparameters.
+2.  **Dataset (`library/dataset.py`)**: Modify `_prepare_data` to implement the "Middle Slice" heuristic (Cite `solution_lesson_node_00002`), selecting the single median file from each modality. Update `__getitem__` to return a standard `(3, 224, 224)` tensor. Change the cache filename to avoid loading the previous volumetric data.
+3.  **Model (`library/model.py`)**: Replace `VolumetricTransformer` with `BraTS2DCNN`, a simple wrapper around `efficientnet_b0` initialized with ImageNet weights.
+4.  **Trainer (`library/trainer.py`)** & **Runfile (`runfile.py`)**: Update imports and class references to use the new 2D model.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Data Preprocessing & Loading
+    # ==========================================
+    # Input Dimensions
+    IMG_SIZE = 224
+    NUM_SLICES = 24  # Sequence length (N) for the transformer
+
+    # Modalities to use (forming the 3 channels of the input)
+    # As per idea: FLAIR, T1wCE, T2w
+    SELECTED_MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+    NUM_CHANNELS = len(SELECTED_MODALITIES)
+
+    # Geometric Sampling
+    # Percentage of top/bottom slices to discard before sampling
+    SLICE_DISCARD_PCT = 0.15
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b0"
+    PRETRAINED_BACKBONE = True
+
+    # Transformer Encoder settings
+    HIDDEN_DIM = 256  # Projection dimension after backbone
+    TRANSFORMER_LAYERS = 2
+    TRANSFORMER_HEADS = 4
+    DROPOUT_RATE = 0.3  # Heavy dropout as per idea
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 16  # Adjusted for A100 40GB (Sequence data is memory intensive)
+    NUM_EPOCHS = 15
+    LEARNING_RATE = 1e-4
+=======
+    # ==========================================
+    # Data Preprocessing & Loading
+    # ==========================================
+    # Input Dimensions
+    IMG_SIZE = 224
+    
+    # Modalities to use (forming the 3 channels of the input)
+    # As per idea: FLAIR, T1wCE, T2w
+    SELECTED_MODALITIES = ["FLAIR", "T1wCE", "T2w"]
+    NUM_CHANNELS = len(SELECTED_MODALITIES)
+
+    # ==========================================
+    # Model Architecture
+    # ==========================================
+    BACKBONE_NAME = "efficientnet_b0"
+    PRETRAINED_BACKBONE = True
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    BATCH_SIZE = 32  # Increased for 2D model stability
+    NUM_EPOCHS = 15
+    LEARNING_RATE = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Cache setup
+        self.cache_dir = Config.WORKING_DIR
+        os.makedirs(self.cache_dir, exist_ok=True)
+        # Unique cache name based on split to avoid collisions
+        self.cache_path = os.path.join(
+            self.cache_dir, f"cached_file_lists_{split}.parquet"
+        )
+
+        # Load or generate file lists (Geometric Volumetric Sampling)
+        self.data = self._prepare_data(load_cached_data)
+=======
+        # Cache setup
+        self.cache_dir = Config.WORKING_DIR
+        os.makedirs(self.cache_dir, exist_ok=True)
+        # Unique cache name based on split to avoid collisions
+        # Changed name to avoid conflict with volumetric cache
+        self.cache_path = os.path.join(
+            self.cache_dir, f"cached_file_lists_2d_{split}.parquet"
+        )
+
+        # Load or generate file lists (Geometric Sampling: Middle Slice)
+        self.data = self._prepare_data(load_cached_data)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def _prepare_data(self, load_cached_data):
+        """
+        Generates or loads the list of specific file paths for each subject.
+        Implements Geometric Volumetric Sampling:
+        1. Sort files by instance number.
+        2. Discard top/bottom 15%.
+        3. Uniformly sample N slices.
+        """
+        if load_cached_data and os.path.exists(self.cache_path):
+            try:
+                # Load cached dataframe
+                cached_df = pd.read_parquet(self.cache_path)
+
+                # Cite debug_lesson_1: Verify Cache Consistency Before Loading
+                if len(cached_df) == len(self.metadata_df):
+                    return cached_df
+                else:
+                    print(
+                        f"Cache mismatch for {self.split}: Expected {len(self.metadata_df)} samples, found {len(cached_df)}. Regenerating..."
+                    )
+            except Exception:
+                pass  # Regenerate if load fails
+
+        records = []
+
+        for _, row in self.metadata_df.iterrows():
+            sid = row["BraTS21ID"]
+            record = {
+                "BraTS21ID": sid,
+                "MGMT_value": row.get("MGMT_value", -1),  # Default to -1 for test set
+            }
+
+            # Process each modality
+            for mod in Config.SELECTED_MODALITIES:
+                # Metadata columns are like 'flair_path', 't1wce_path'
+                col_name = f"{mod.lower()}_path"
+                rel_path = row[col_name]
+                full_dir_path = os.path.join(Config.INPUT_DIR, rel_path)
+
+                selected_files = []
+                if os.path.exists(full_dir_path):
+                    # List all DICOMs
+                    files = [f for f in os.listdir(full_dir_path) if f.endswith(".dcm")]
+
+                    if files:
+                        # Sort by instance number (Image-X.dcm)
+                        # Extract number: Image-123.dcm -> 123
+                        try:
+                            files.sort(key=lambda x: int(x.split("-")[1].split(".")[0]))
+                        except:
+                            files.sort()  # Fallback lexical sort
+
+                        # Geometric Sampling Logic
+                        n_files = len(files)
+                        start_idx = int(n_files * Config.SLICE_DISCARD_PCT)
+                        end_idx = int(n_files * (1 - Config.SLICE_DISCARD_PCT))
+
+                        # Safety check for very small volumes
+                        if end_idx <= start_idx:
+                            start_idx = 0
+                            end_idx = n_files
+
+                        # Uniform sampling of N indices
+                        # linspace returns evenly spaced numbers over a specified interval
+                        indices = np.linspace(
+                            start_idx, end_idx - 1, Config.NUM_SLICES
+                        ).astype(int)
+                        selected_files = [
+                            os.path.join(full_dir_path, files[i]) for i in indices
+                        ]
+
+                # Handle missing/empty directories by filling with None
+                if len(selected_files) < Config.NUM_SLICES:
+                    # Pad with None
+                    selected_files = selected_files + [None] * (
+                        Config.NUM_SLICES - len(selected_files)
+                    )
+
+                record[f"{mod}_files"] = selected_files
+
+            records.append(record)
+
+        df_processed = pd.DataFrame(records)
+
+        # Save to cache for future runs
+        # Parquet supports columns containing lists
+        try:
+            df_processed.to_parquet(self.cache_path)
+        except Exception as e:
+            print(f"Warning: Failed to save cache to {self.cache_path}: {e}")
+
+        return df_processed
+=======
+    def _prepare_data(self, load_cached_data):
+        """
+        Generates or loads the list of specific file paths for each subject.
+        Implements Geometric Sampling (Cite solution_lesson_node_00002):
+        Selects the middle slice of the volume.
+        """
+        if load_cached_data and os.path.exists(self.cache_path):
+            try:
+                cached_df = pd.read_parquet(self.cache_path)
+                if len(cached_df) == len(self.metadata_df):
+                    return cached_df
+                else:
+                    print(f"Cache mismatch for {self.split}. Regenerating...")
+            except Exception:
+                pass
+
+        records = []
+
+        for _, row in self.metadata_df.iterrows():
+            sid = row["BraTS21ID"]
+            record = {
+                "BraTS21ID": sid,
+                "MGMT_value": row.get("MGMT_value", -1),
+            }
+
+            for mod in Config.SELECTED_MODALITIES:
+                col_name = f"{mod.lower()}_path"
+                rel_path = row[col_name]
+                full_dir_path = os.path.join(Config.INPUT_DIR, rel_path)
+
+                selected_file = None
+                if os.path.exists(full_dir_path):
+                    files = [f for f in os.listdir(full_dir_path) if f.endswith(".dcm")]
+                    if files:
+                        try:
+                            files.sort(key=lambda x: int(x.split("-")[1].split(".")[0]))
+                        except:
+                            files.sort()
+
+                        # Cite solution_lesson_node_00002: Middle Slice Heuristic
+                        mid_idx = len(files) // 2
+                        selected_file = os.path.join(full_dir_path, files[mid_idx])
+
+                # Store as a list for consistency with parquet format, though only 1 item
+                record[f"{mod}_files"] = [selected_file]
+
+            records.append(record)
+
+        df_processed = pd.DataFrame(records)
+        try:
+            df_processed.to_parquet(self.cache_path)
+        except Exception as e:
+            print(f"Warning: Failed to save cache to {self.cache_path}: {e}")
+
+        return df_processed
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+
+        slices = []
+
+        # Iterate over sequence step (0 to N-1)
+        for seq_idx in range(Config.NUM_SLICES):
+            # For each time step, we have C channels (FLAIR, T1wCE, T2w)
+            channel_imgs = []
+            for mod in Config.SELECTED_MODALITIES:
+                file_path = row[f"{mod}_files"][seq_idx]
+
+                if file_path is not None and os.path.exists(file_path):
+                    img = read_dicom(file_path)
+
+                    # Ensure correct size if reading raw
+                    if (
+                        img.shape[0] != Config.IMG_SIZE
+                        or img.shape[1] != Config.IMG_SIZE
+                    ):
+                        try:
+                            img = cv2.resize(img, (Config.IMG_SIZE, Config.IMG_SIZE))
+                        except:
+                            img = np.zeros(
+                                (Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8
+                            )
+                else:
+                    img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+
+                # Normalize to [0, 1] per slice
+                img = img.astype(np.float32)
+                if img.max() > 0:
+                    img = (img - img.min()) / (img.max() - img.min())
+
+                channel_imgs.append(img)
+
+            # Stack channels for this time step: (H, W, C)
+            slice_vol = np.stack(channel_imgs, axis=-1)
+            slices.append(slice_vol)
+
+        # Stack all slices along channel dimension for spatial augmentation
+        # Result: (H, W, Sequence * Channels)
+        # This ensures that if we rotate the image, the entire 3D volume rotates coherently
+        combined_vol = np.concatenate(slices, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            transformed = self.transform(image=combined_vol)
+            combined_vol = transformed["image"]
+
+        # Reshape back to (Sequence, Channels, Height, Width) for PyTorch
+        # Current shape: (H, W, S*C)
+        # Transpose to (S*C, H, W)
+        combined_vol = np.transpose(combined_vol, (2, 0, 1))
+
+        # Reshape to (S, C, H, W)
+        # Since we concatenated [Slice1_C123, Slice2_C123...], the first dim is ordered by sequence then channel
+        final_tensor = combined_vol.reshape(
+            Config.NUM_SLICES, Config.NUM_CHANNELS, Config.IMG_SIZE, Config.IMG_SIZE
+        )
+
+        # Convert to torch tensor
+        final_tensor = torch.from_numpy(final_tensor).float()
+
+        target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+
+        return final_tensor, target
+=======
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+
+        channel_imgs = []
+        # Load 3 channels: FLAIR, T1wCE, T2w
+        for mod in Config.SELECTED_MODALITIES:
+            # We only have 1 file per modality now
+            file_path = row[f"{mod}_files"][0]
+
+            if file_path is not None and os.path.exists(file_path):
+                img = read_dicom(file_path)
+                if img.shape[0] != Config.IMG_SIZE or img.shape[1] != Config.IMG_SIZE:
+                    try:
+                        img = cv2.resize(img, (Config.IMG_SIZE, Config.IMG_SIZE))
+                    except:
+                        img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+            else:
+                img = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.uint8)
+
+            img = img.astype(np.float32)
+            if img.max() > 0:
+                img = (img - img.min()) / (img.max() - img.min())
+            
+            channel_imgs.append(img)
+
+        # Stack channels: (H, W, 3)
+        img_vol = np.stack(channel_imgs, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            transformed = self.transform(image=img_vol)
+            img_vol = transformed["image"]
+
+        # Transpose to (3, H, W) for PyTorch
+        img_vol = np.transpose(img_vol, (2, 0, 1))
+
+        final_tensor = torch.from_numpy(img_vol).float()
+        target = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+
+        return final_tensor, target
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class VolumetricTransformer(nn.Module):
+    """
+    2.5D Volumetric Sequence Transformer.
+
+    Architecture:
+    1. Time-Distributed CNN (EfficientNet-B0) to extract features from each slice.
+    2. Linear Projection to reduce feature dimension.
+    3. Positional Encoding + CLS Token injection.
+    4. Transformer Encoder to aggregate information across the Z-axis (slices).
+    5. Classification Head on the CLS token output.
+    """
+
+    def __init__(self):
+        super(VolumetricTransformer, self).__init__()
+
+        # 1. Backbone: EfficientNet-B0
+        # num_classes=0 removes the classifier, returning the pooled features
+        # in_chans=3 matches our input (FLAIR, T1wCE, T2w)
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED_BACKBONE,
+            num_classes=0,
+            in_chans=Config.NUM_CHANNELS,
+        )
+
+        # Get the feature dimension of the backbone (1280 for EfficientNet-B0)
+        self.backbone_dim = self.backbone.num_features
+
+        # 2. Projection Layer
+        self.projector = nn.Sequential(
+            nn.Linear(self.backbone_dim, Config.HIDDEN_DIM),
+            nn.LayerNorm(Config.HIDDEN_DIM),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.ReLU(),
+        )
+
+        # 3. Sequence Components
+        # Learnable CLS token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, Config.HIDDEN_DIM))
+
+        # Learnable Positional Embeddings
+        # Sequence length + 1 for the CLS token
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, Config.NUM_SLICES + 1, Config.HIDDEN_DIM)
+        )
+
+        # 4. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=Config.HIDDEN_DIM,
+            nhead=Config.TRANSFORMER_HEADS,
+            dim_feedforward=Config.HIDDEN_DIM * 4,
+            dropout=Config.DROPOUT_RATE,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # Pre-Norm usually stabilizes training
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=Config.TRANSFORMER_LAYERS
+        )
+
+        # 5. Classification Head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(Config.HIDDEN_DIM), nn.Linear(Config.HIDDEN_DIM, 1)
+        )
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize CLS token and Positional Embeddings
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+        # Initialize Linear layers in projector and classifier
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Sequence, Channels, Height, Width)
+        Returns:
+            logits: Output tensor of shape (Batch, 1)
+        """
+        b, s, c, h, w = x.shape
+
+        # --- 1. Time-Distributed Backbone ---
+        # Reshape to (Batch * Sequence, C, H, W) to process all slices at once
+        x = x.view(b * s, c, h, w)
+
+        # Extract features: (B*S, Backbone_Dim)
+        features = self.backbone(x)
+
+        # --- 2. Projection & Reshaping ---
+        # Reshape back to (Batch, Sequence, Backbone_Dim)
+        features = features.view(b, s, self.backbone_dim)
+
+        # Project to hidden dim: (Batch, Sequence, Hidden_Dim)
+        features = self.projector(features)
+
+        # --- 3. Sequence Preparation ---
+        # Expand CLS token to match batch size: (Batch, 1, Hidden_Dim)
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+
+        # Concatenate CLS token to the front: (Batch, Sequence + 1, Hidden_Dim)
+        x = torch.cat((cls_tokens, features), dim=1)
+
+        # Add Positional Embeddings
+        x = x + self.pos_embedding
+
+        # --- 4. Transformer ---
+        # Pass through Transformer Encoder
+        x = self.transformer(x)
+
+        # --- 5. Classification ---
+        # Extract the output of the CLS token (index 0)
+        cls_output = x[:, 0, :]
+
+        # Predict logits
+        logits = self.classifier(cls_output)
+
+        return logits
+=======
+class BraTS2DCNN(nn.Module):
+    """
+    Simple 2.5D CNN (Cite solution_lesson_node_00008).
+    Takes a 3-channel input (FLAIR, T1wCE, T2w) and predicts the target.
+    """
+    def __init__(self):
+        super(BraTS2DCNN, self).__init__()
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED_BACKBONE,
+            num_classes=1,
+            in_chans=Config.NUM_CHANNELS,
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, 3, H, W)
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import VolumetricTransformer
+=======
+from library.model import BraTS2DCNN
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Initialize Model, Optimizer, Loss
+    model = VolumetricTransformer().to(Config.DEVICE)
+=======
+    # 3. Initialize Model, Optimizer, Loss
+    model = BraTS2DCNN().to(Config.DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    # 3. Load Model
+    model = VolumetricTransformer().to(Config.DEVICE)
+=======
+    # 3. Load Model
+    model = BraTS2DCNN().to(Config.DEVICE)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import VolumetricTransformer
+=======
+from library.model import BraTS2DCNN
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline Execution
+    Config.NUM_EPOCHS = 5
+    Config.BATCH_SIZE = 4  # Reduced from 8 to 4 to prevent OOM
+=======
+    # Override Config for Fast Baseline Execution
+    Config.NUM_EPOCHS = 15
+    Config.BATCH_SIZE = 32  # Increased for 2D model stability
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # We reload the best model to perform specific analysis and get the exact metric
+    device = Config.DEVICE
+    model = VolumetricTransformer().to(device)
+=======
+    # We reload the best model to perform specific analysis and get the exact metric
+    device = Config.DEVICE
+    model = BraTS2DCNN().to(device)
+>>>>>>> REPLACE
+```

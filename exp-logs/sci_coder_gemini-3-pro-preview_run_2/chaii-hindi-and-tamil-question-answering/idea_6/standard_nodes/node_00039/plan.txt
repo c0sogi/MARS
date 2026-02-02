@@ -1,0 +1,531 @@
+The following implementation optimizes the solution by upgrading the model architecture to `xlm-roberta-large` and introducing an "Answerability Gating" mechanism (Cite solution_lesson_node_00032). This auxiliary head predicts whether a sliding window contains the answer, allowing the inference process to suppress false positives from irrelevant context chunks. To support the larger model on the available hardware, I implement Gradient Accumulation and Differential Learning Rates (Cite solution_lesson_node_00034), assigning a lower learning rate to the backbone and a higher one to the task-specific heads. Additionally, I refine the optimizer configuration to exclude bias and LayerNorm parameters from weight decay (Cite solution_lesson_node_00035) to improve generalization.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    # Using XLM-RoBERTa-Base for robust multilingual performance
+    MODEL_CHECKPOINT = "xlm-roberta-base"
+
+    # =========================================================================
+    # Tokenizer & Data Processing (Sliding Window)
+=======
+    # =========================================================================
+    # Model Architecture
+    # =========================================================================
+    # Using XLM-RoBERTa-Large for robust multilingual performance (Cite solution_lesson_node_00028, solution_lesson_node_00032)
+    MODEL_CHECKPOINT = "xlm-roberta-large"
+
+    # =========================================================================
+    # Tokenizer & Data Processing (Sliding Window)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Optimization
+    LEARNING_RATE = 2e-5
+    WEIGHT_DECAY = 0.01
+    WARMUP_RATIO = 0.1
+
+    # Batch sizes (Adjusted for A100 40GB)
+    TRAIN_BATCH_SIZE = 16
+    VALID_BATCH_SIZE = 32
+
+    # Gradient Accumulation (1 = no accumulation)
+    GRAD_ACCUM_STEPS = 1
+=======
+    # Optimization
+    # Differential Learning Rates (Cite solution_lesson_node_00034)
+    LR_BACKBONE = 1e-5
+    LR_HEAD = 3e-5
+    
+    WEIGHT_DECAY = 0.01
+    WARMUP_RATIO = 0.1
+
+    # Batch sizes (Adjusted for A100 40GB with Large Model)
+    TRAIN_BATCH_SIZE = 4
+    VALID_BATCH_SIZE = 32
+
+    # Gradient Accumulation (Cite solution_lesson_node_00034)
+    GRAD_ACCUM_STEPS = 4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # QA Head: Projects hidden size to 2 (start_logits, end_logits)
+        self.qa_outputs = nn.Linear(self.config.hidden_size, 2)
+
+        # Initialize weights for the head
+        self._init_weights(self.qa_outputs)
+
+    def _init_weights(self, module):
+=======
+        # QA Head: Projects hidden size to 2 (start_logits, end_logits)
+        self.qa_outputs = nn.Linear(self.config.hidden_size, 2)
+        
+        # Answerability Head: Projects hidden size to 1 (answerable_logit) (Cite solution_lesson_node_00032)
+        self.qa_classifier = nn.Linear(self.config.hidden_size, 1)
+
+        # Initialize weights for the head
+        self._init_weights(self.qa_outputs)
+        self._init_weights(self.qa_classifier)
+
+    def _init_weights(self, module):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Project to logits
+        # logits shape: (batch_size, sequence_length, 2)
+        logits = self.qa_outputs(sequence_output)
+
+        # Split into start and end logits
+        # start_logits shape: (batch_size, sequence_length)
+        # end_logits shape: (batch_size, sequence_length)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        return start_logits, end_logits
+=======
+        # Project to logits
+        # logits shape: (batch_size, sequence_length, 2)
+        logits = self.qa_outputs(sequence_output)
+
+        # Split into start and end logits
+        # start_logits shape: (batch_size, sequence_length)
+        # end_logits shape: (batch_size, sequence_length)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+        
+        # Answerability classification using CLS token (index 0)
+        # cls_logits shape: (batch_size, 1)
+        cls_logits = self.qa_classifier(sequence_output[:, 0, :])
+        cls_logits = cls_logits.squeeze(-1)
+
+        return start_logits, end_logits, cls_logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+        if self.mode == "train":
+            self.start_positions = features_df["start_positions"].tolist()
+            self.end_positions = features_df["end_positions"].tolist()
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        item = {
+            "input_ids": torch.tensor(self.input_ids[idx], dtype=torch.long),
+            "attention_mask": torch.tensor(self.attention_mask[idx], dtype=torch.long),
+            "offset_mapping": torch.tensor(self.offset_mapping[idx], dtype=torch.long),
+            "example_id": self.example_id[idx],
+        }
+
+        if self.mode == "train":
+            item["start_positions"] = torch.tensor(
+                self.start_positions[idx], dtype=torch.long
+            )
+            item["end_positions"] = torch.tensor(
+                self.end_positions[idx], dtype=torch.long
+            )
+
+        return item
+=======
+        if self.mode == "train":
+            self.start_positions = features_df["start_positions"].tolist()
+            self.end_positions = features_df["end_positions"].tolist()
+            # Derive answerable label: 1 if answer is in window (start > 0), 0 otherwise
+            self.answerable_label = [1 if s > 0 else 0 for s in self.start_positions]
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        item = {
+            "input_ids": torch.tensor(self.input_ids[idx], dtype=torch.long),
+            "attention_mask": torch.tensor(self.attention_mask[idx], dtype=torch.long),
+            "offset_mapping": torch.tensor(self.offset_mapping[idx], dtype=torch.long),
+            "example_id": self.example_id[idx],
+        }
+
+        if self.mode == "train":
+            item["start_positions"] = torch.tensor(
+                self.start_positions[idx], dtype=torch.long
+            )
+            item["end_positions"] = torch.tensor(
+                self.end_positions[idx], dtype=torch.long
+            )
+            item["answerable_label"] = torch.tensor(
+                self.answerable_label[idx], dtype=torch.float
+            )
+
+        return item
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+        start_positions = data["start_positions"].to(device, dtype=torch.long)
+        end_positions = data["end_positions"].to(device, dtype=torch.long)
+
+        # Forward pass with mixed precision
+        with torch.cuda.amp.autocast():
+            start_logits, end_logits = model(input_ids, attention_mask=attention_mask)
+
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            loss = (start_loss + end_loss) / 2.0
+
+            # Normalize loss for gradient accumulation
+            if Config.GRAD_ACCUM_STEPS > 1:
+                loss = loss / Config.GRAD_ACCUM_STEPS
+=======
+        start_positions = data["start_positions"].to(device, dtype=torch.long)
+        end_positions = data["end_positions"].to(device, dtype=torch.long)
+        answerable_label = data["answerable_label"].to(device, dtype=torch.float)
+
+        # Forward pass with mixed precision
+        with torch.cuda.amp.autocast():
+            start_logits, end_logits, cls_logits = model(input_ids, attention_mask=attention_mask)
+
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            
+            # Answerability Loss (Cite solution_lesson_node_00032)
+            cls_loss_fct = nn.BCEWithLogitsLoss()
+            cls_loss = cls_loss_fct(cls_logits, answerable_label)
+            
+            loss = (start_loss + end_loss) / 2.0 + cls_loss
+
+            # Normalize loss for gradient accumulation
+            if Config.GRAD_ACCUM_STEPS > 1:
+                loss = loss / Config.GRAD_ACCUM_STEPS
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    all_start_logits = []
+    all_end_logits = []
+
+    loss_fct = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for data in data_loader:
+            input_ids = data["input_ids"].to(device, dtype=torch.long)
+            attention_mask = data["attention_mask"].to(device, dtype=torch.long)
+
+            # Use autocast for consistency and performance optimization
+            with torch.cuda.amp.autocast():
+                start_logits, end_logits = model(
+                    input_ids, attention_mask=attention_mask
+                )
+
+            # Compute loss if targets are available (Validation mode)
+            if "start_positions" in data and "end_positions" in data:
+                start_positions = data["start_positions"].to(device, dtype=torch.long)
+                end_positions = data["end_positions"].to(device, dtype=torch.long)
+
+                start_loss = loss_fct(start_logits, start_positions)
+                end_loss = loss_fct(end_logits, end_positions)
+                loss = (start_loss + end_loss) / 2.0
+
+                total_loss += loss.item()
+                count += 1
+
+            # Collect logits (move to CPU, convert to float32 then numpy)
+            all_start_logits.append(start_logits.float().detach().cpu().numpy())
+            all_end_logits.append(end_logits.float().detach().cpu().numpy())
+
+    # Concatenate all logits
+    if len(all_start_logits) > 0:
+        all_start_logits = np.concatenate(all_start_logits, axis=0)
+        all_end_logits = np.concatenate(all_end_logits, axis=0)
+    else:
+        all_start_logits = np.array([])
+        all_end_logits = np.array([])
+
+    avg_loss = total_loss / count if count > 0 else 0.0
+
+    return avg_loss, (all_start_logits, all_end_logits)
+=======
+    all_start_logits = []
+    all_end_logits = []
+    all_cls_logits = []
+
+    loss_fct = nn.CrossEntropyLoss()
+    cls_loss_fct = nn.BCEWithLogitsLoss()
+
+    with torch.no_grad():
+        for data in data_loader:
+            input_ids = data["input_ids"].to(device, dtype=torch.long)
+            attention_mask = data["attention_mask"].to(device, dtype=torch.long)
+
+            # Use autocast for consistency and performance optimization
+            with torch.cuda.amp.autocast():
+                start_logits, end_logits, cls_logits = model(
+                    input_ids, attention_mask=attention_mask
+                )
+
+            # Compute loss if targets are available (Validation mode)
+            if "start_positions" in data and "end_positions" in data:
+                start_positions = data["start_positions"].to(device, dtype=torch.long)
+                end_positions = data["end_positions"].to(device, dtype=torch.long)
+                answerable_label = data["answerable_label"].to(device, dtype=torch.float)
+
+                start_loss = loss_fct(start_logits, start_positions)
+                end_loss = loss_fct(end_logits, end_positions)
+                cls_loss = cls_loss_fct(cls_logits, answerable_label)
+                
+                loss = (start_loss + end_loss) / 2.0 + cls_loss
+
+                total_loss += loss.item()
+                count += 1
+
+            # Collect logits (move to CPU, convert to float32 then numpy)
+            all_start_logits.append(start_logits.float().detach().cpu().numpy())
+            all_end_logits.append(end_logits.float().detach().cpu().numpy())
+            all_cls_logits.append(cls_logits.float().detach().cpu().numpy())
+
+    # Concatenate all logits
+    if len(all_start_logits) > 0:
+        all_start_logits = np.concatenate(all_start_logits, axis=0)
+        all_end_logits = np.concatenate(all_end_logits, axis=0)
+        all_cls_logits = np.concatenate(all_cls_logits, axis=0)
+    else:
+        all_start_logits = np.array([])
+        all_end_logits = np.array([])
+        all_cls_logits = np.array([])
+
+    avg_loss = total_loss / count if count > 0 else 0.0
+
+    return avg_loss, (all_start_logits, all_end_logits, all_cls_logits)
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    """
+    all_start_logits, all_end_logits = predictions
+
+    # Build a map from example_id to list of feature indices
+=======
+    """
+    all_start_logits, all_end_logits, all_cls_logits = predictions
+
+    # Build a map from example_id to list of feature indices
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for feature_index in feature_indices:
+            start_logits = all_start_logits[feature_index]
+            end_logits = all_end_logits[feature_index]
+            feature = features[feature_index]
+            offset_mapping = feature["offset_mapping"]
+            input_ids = feature["input_ids"]
+
+            # Determine context bounds within the input_ids
+=======
+        for feature_index in feature_indices:
+            start_logits = all_start_logits[feature_index]
+            end_logits = all_end_logits[feature_index]
+            cls_logit = all_cls_logits[feature_index]
+            
+            # Calculate answerability probability (Cite solution_lesson_node_00032)
+            # Sigmoid(logit)
+            answerability_score = 1.0 / (1.0 + np.exp(-cls_logit))
+            
+            feature = features[feature_index]
+            offset_mapping = feature["offset_mapping"]
+            input_ids = feature["input_ids"]
+
+            # Determine context bounds within the input_ids
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                    text = context[start_char:end_char]
+                    score = start_logits[start_index] + end_logits[end_index]
+
+                    valid_answers.append({"score": score, "text": text})
+=======
+                    text = context[start_char:end_char]
+                    
+                    # Weight span score by answerability score (Cite solution_lesson_node_00032)
+                    span_score = start_logits[start_index] + end_logits[end_index]
+                    final_score = span_score * answerability_score
+
+                    valid_answers.append({"score": final_score, "text": text})
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Initialize Model
+        net = model.XLMROBERTAForQA(pretrained=True)
+        net.to(Config.DEVICE)
+
+        # Optimizer and Scheduler
+        optimizer = AdamW(
+            net.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+        )
+
+        num_train_steps = int(len(train_loader) * Config.EPOCHS)
+=======
+        # Initialize Model
+        net = model.XLMROBERTAForQA(pretrained=True)
+        net.to(Config.DEVICE)
+
+        # Optimizer with differential learning rates and weight decay exclusion (Cite solution_lesson_node_00034, solution_lesson_node_00035)
+        param_optimizer = list(net.named_parameters())
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in param_optimizer if "roberta" in n and not any(nd in n for nd in no_decay)],
+                "weight_decay": Config.WEIGHT_DECAY,
+                "lr": Config.LR_BACKBONE,
+            },
+            {
+                "params": [p for n, p in param_optimizer if "roberta" in n and any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+                "lr": Config.LR_BACKBONE,
+            },
+            {
+                "params": [p for n, p in param_optimizer if "roberta" not in n and not any(nd in n for nd in no_decay)],
+                "weight_decay": Config.WEIGHT_DECAY,
+                "lr": Config.LR_HEAD,
+            },
+            {
+                "params": [p for n, p in param_optimizer if "roberta" not in n and any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+                "lr": Config.LR_HEAD,
+            },
+        ]
+
+        optimizer = AdamW(optimizer_grouped_parameters)
+
+        num_train_steps = int(len(train_loader) * Config.EPOCHS / Config.GRAD_ACCUM_STEPS)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for epoch in range(Config.EPOCHS):
+            train_loss = engine.train_fn(
+                train_loader, net, optimizer, Config.DEVICE, scheduler
+            )
+            val_loss, (start_logits, end_logits) = engine.eval_fn(
+                val_loader, net, Config.DEVICE
+            )
+
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_logits = (start_logits, end_logits)
+                torch.save(
+                    net.state_dict(),
+                    os.path.join(Config.OUTPUT_DIR, f"model_fold_{fold}.pth"),
+                )
+
+        # Generate OOF Predictions for this fold using the best logits
+=======
+        for epoch in range(Config.EPOCHS):
+            train_loss = engine.train_fn(
+                train_loader, net, optimizer, Config.DEVICE, scheduler
+            )
+            val_loss, (start_logits, end_logits, cls_logits) = engine.eval_fn(
+                val_loader, net, Config.DEVICE
+            )
+
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_logits = (start_logits, end_logits, cls_logits)
+                torch.save(
+                    net.state_dict(),
+                    os.path.join(Config.OUTPUT_DIR, f"model_fold_{fold}.pth"),
+                )
+
+        # Generate OOF Predictions for this fold using the best logits
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        avg_start_logits = None
+        avg_end_logits = None
+
+        # Ensemble Inference
+        for fold in range(Config.N_FOLDS):
+            model_path = os.path.join(Config.OUTPUT_DIR, f"model_fold_{fold}.pth")
+            net = model.XLMROBERTAForQA(pretrained=False)
+            net.load_state_dict(torch.load(model_path))
+            net.to(Config.DEVICE)
+
+            _, (start_logits, end_logits) = engine.eval_fn(
+                test_loader, net, Config.DEVICE
+            )
+
+            if avg_start_logits is None:
+                avg_start_logits = start_logits
+                avg_end_logits = end_logits
+            else:
+                avg_start_logits += start_logits
+                avg_end_logits += end_logits
+
+            del net
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Average logits
+        avg_start_logits /= Config.N_FOLDS
+        avg_end_logits /= Config.N_FOLDS
+
+        # Post-process
+        test_preds = utils.postprocess_qa_predictions(
+            examples=df_test_raw.to_dict("records"),
+            features=test_features_list,
+            predictions=(avg_start_logits, avg_end_logits),
+            n_best_size=Config.N_BEST_SIZE,
+            max_answer_length=Config.MAX_ANSWER_LENGTH,
+        )
+=======
+        avg_start_logits = None
+        avg_end_logits = None
+        avg_cls_logits = None
+
+        # Ensemble Inference
+        for fold in range(Config.N_FOLDS):
+            model_path = os.path.join(Config.OUTPUT_DIR, f"model_fold_{fold}.pth")
+            net = model.XLMROBERTAForQA(pretrained=False)
+            net.load_state_dict(torch.load(model_path))
+            net.to(Config.DEVICE)
+
+            _, (start_logits, end_logits, cls_logits) = engine.eval_fn(
+                test_loader, net, Config.DEVICE
+            )
+
+            if avg_start_logits is None:
+                avg_start_logits = start_logits
+                avg_end_logits = end_logits
+                avg_cls_logits = cls_logits
+            else:
+                avg_start_logits += start_logits
+                avg_end_logits += end_logits
+                avg_cls_logits += cls_logits
+
+            del net
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Average logits
+        avg_start_logits /= Config.N_FOLDS
+        avg_end_logits /= Config.N_FOLDS
+        avg_cls_logits /= Config.N_FOLDS
+
+        # Post-process
+        test_preds = utils.postprocess_qa_predictions(
+            examples=df_test_raw.to_dict("records"),
+            features=test_features_list,
+            predictions=(avg_start_logits, avg_end_logits, avg_cls_logits),
+            n_best_size=Config.N_BEST_SIZE,
+            max_answer_length=Config.MAX_ANSWER_LENGTH,
+        )
+>>>>>>> REPLACE
+```

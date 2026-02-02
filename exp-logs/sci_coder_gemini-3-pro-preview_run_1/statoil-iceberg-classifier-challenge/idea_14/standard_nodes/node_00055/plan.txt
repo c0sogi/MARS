@@ -1,0 +1,802 @@
+To optimize the solution, I will implement a **Stochastic Weight Averaging (SWA) Ensemble with Global Epoch Selection**, reverting the unstable semi-supervised approach.
+
+**Strategy:**
+1.  **Remove Semi-Supervised Logic**: I will strip out the Teacher-Student pipeline and pseudo-labeling logic, which was identified as the cause of performance degradation due to noise propagation (Cite solution_lesson_node_00053).
+2.  **Global Epoch Selection via Cross-Validation**: Instead of relying on a single validation split or local early stopping, I will perform a 5-Fold Cross-Validation on the training subset. I will record the validation loss curves for all folds and calculate the average loss per epoch. The epoch that minimizes this global average curve will be selected as the `optimal_epochs` (Cite solution_lesson_node_00040, solution_lesson_node_00049).
+3.  **Train Final SWA Ensemble**: Using the calibrated `optimal_epochs`, I will train an ensemble of 5 independent ResNet-18 models on the full training subset. These models will utilize SWA in the final phase of training to find flatter, more robust minima (Cite solution_lesson_node_00049).
+4.  **Evaluation**: The ensemble will be evaluated on the fixed hold-out validation set to ensure comparable metrics with previous solutions.
+
+This approach leverages the "Global Epoch Selection" lesson to maximize the utility of the small dataset while avoiding the pitfalls of noisy self-training.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # --------------------------------------------------------------------------
+    # Semi-Supervised Learning (Cycle 2)
+    # --------------------------------------------------------------------------
+    # Thresholds for selecting pseudo-labels from the Teacher Ensemble
+    CONFIDENCE_THRESHOLD_HIGH = 0.95  # Confident Iceberg
+    CONFIDENCE_THRESHOLD_LOW = 0.05  # Confident Ship
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def get_pseudo_label_loader(pseudo_preds, load_cached_data=True):
+    """
+    Creates a combined DataLoader for Cycle 2 (Semi-Supervised).
+    Merges original training data with high-confidence test samples.
+
+    Args:
+        pseudo_preds (dict): Dictionary mapping id -> probability (float).
+        load_cached_data (bool): Whether to use cached data.
+    """
+    # 1. Load Original Training Data
+    all_images, all_angles, all_labels = load_and_process_data(
+        mode="train", load_cached_data=load_cached_data
+    )
+
+    # Filter to keep only the training split (exclude validation set)
+    df_train = pd.read_csv(Config.TRAIN_META)
+    train_indices = df_train["sample_index"].values
+
+    train_images = all_images[train_indices]
+    train_angles = all_angles[train_indices]
+    train_labels = all_labels[train_indices]
+
+    # 2. Load Test Data
+    test_images, test_angles, test_ids = load_and_process_data(
+        mode="test", load_cached_data=load_cached_data
+    )
+
+    # 3. Filter Test Data based on Confidence
+    selected_images = []
+    selected_angles = []
+    selected_labels = []
+
+    # Map test_ids to indices for fast access
+    # We iterate through test data and check predictions
+    count_pseudo = 0
+
+    for i, tid in enumerate(test_ids):
+        if tid in pseudo_preds:
+            prob = pseudo_preds[tid]
+
+            # Check thresholds
+            if prob >= Config.CONFIDENCE_THRESHOLD_HIGH:
+                # High confidence Iceberg (1)
+                selected_images.append(test_images[i])
+                selected_angles.append(test_angles[i])
+                selected_labels.append(1.0)
+                count_pseudo += 1
+            elif prob <= Config.CONFIDENCE_THRESHOLD_LOW:
+                # High confidence Ship (0)
+                selected_images.append(test_images[i])
+                selected_angles.append(test_angles[i])
+                selected_labels.append(0.0)
+                count_pseudo += 1
+
+    log_message(f"Pseudo-Labeling: Added {count_pseudo} samples from test set.")
+
+    # 4. Concatenate
+    if count_pseudo > 0:
+        combined_images = np.concatenate(
+            [train_images, np.array(selected_images)], axis=0
+        )
+        combined_angles = np.concatenate(
+            [train_angles, np.array(selected_angles)], axis=0
+        )
+        combined_labels = np.concatenate(
+            [train_labels, np.array(selected_labels)], axis=0
+        )
+    else:
+        combined_images = train_images
+        combined_angles = train_angles
+        combined_labels = train_labels
+
+    # 5. Create Dataset & Loader
+    dataset = IcebergDataset(
+        combined_images,
+        combined_angles,
+        combined_labels,
+        transform=get_transforms("train"),
+        mode="train",
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return loader
+=======
+def get_training_data_arrays(load_cached_data=True):
+    """
+    Returns the arrays for the training set defined in TRAIN_META.
+    Used for Cross-Validation splitting.
+    """
+    # Load all training data (raw train.json)
+    images_all, angles_all, labels_all = load_and_process_data(
+        mode="train", load_cached_data=load_cached_data
+    )
+
+    # Load metadata to get indices for the training split
+    df_train = pd.read_csv(Config.TRAIN_META)
+    indices = df_train["sample_index"].values
+
+    return images_all[indices], angles_all[indices], labels_all[indices]
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    save_path_best=None,
+    save_path_swa=None,
+):
+    """
+    Orchestrates the Two-Phase training:
+    1. Standard Training with CosineAnnealingLR (Epochs 1 to swa_start_epoch).
+    2. SWA Training (Epochs swa_start_epoch+1 to total_epochs).
+
+    Handles Early Stopping during Phase 1.
+    """
+    if save_path_best is None:
+        save_path_best = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+    if save_path_swa is None:
+        save_path_swa = os.path.join(Config.CHECKPOINT_DIR, "swa_model.pth")
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Scheduler for Phase 1
+    # We want it to anneal down to a small value by the time SWA starts
+    scheduler = CosineAnnealingLR(optimizer, T_max=swa_start_epoch, eta_min=1e-5)
+
+    # SWA Components (Initialized later)
+    swa_model = None
+    swa_scheduler = None
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    log_message(f"Starting training on device: {device}")
+    log_message(f"Phase 1: Standard Training (Epochs 1-{swa_start_epoch})")
+
+    model.to(device)
+
+    for epoch in range(1, total_epochs + 1):
+        # -----------------------------------------------------------
+        # Phase 1: Standard Training
+        # -----------------------------------------------------------
+        if epoch <= swa_start_epoch:
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                label_smoothing=Config.LABEL_SMOOTHING,
+            )
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            log_metrics(
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "lr": current_lr,
+                    "phase": "Standard",
+                },
+            )
+
+            # Checkpoint & Early Stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_model(model, save_path_best)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                log_message(
+                    f"Early stopping triggered at epoch {epoch}. Best Val Loss: {best_val_loss}"
+                )
+                # If we stop early in Phase 1, we likely shouldn't proceed to SWA blindly.
+                # However, for this pipeline, we will load the best model and return.
+                # SWA requires a trajectory.
+                log_message("Skipping SWA phase due to early stopping.")
+                return
+
+        # -----------------------------------------------------------
+        # Phase 2: SWA Training
+        # -----------------------------------------------------------
+        else:
+            # Initialize SWA on first epoch of Phase 2
+            if swa_model is None:
+                log_message(f"Phase 2: SWA Training (Epochs {epoch}-{total_epochs})")
+
+                # Load best model from Phase 1 to ensure good starting point
+                # (Optional, but recommended if Phase 1 diverged at the end)
+                if os.path.exists(save_path_best):
+                    state_dict = torch.load(save_path_best, map_location=device)
+                    model.load_state_dict(state_dict)
+
+                swa_model = AveragedModel(model).to(device)
+
+                # SWA Scheduler: Constant high LR or cyclic
+                # Using the base LR from config is a common strategy for SWA exploration
+                swa_scheduler = SWALR(optimizer, swa_lr=Config.LEARNING_RATE / 2.0)
+
+            # Train standard model (SGD trajectory)
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                label_smoothing=Config.LABEL_SMOOTHING,
+            )
+
+            # Update SWA Model
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+
+            # We can validate the current model to monitor progress,
+            # but the SWA model itself is usually evaluated at the end.
+            # Here we validate the underlying model.
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            log_metrics(
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,  # Loss of the current stochastic model
+                    "val_acc": val_acc,
+                    "lr": current_lr,
+                    "phase": "SWA",
+                },
+            )
+
+    # -----------------------------------------------------------
+    # Finalize SWA
+    # -----------------------------------------------------------
+    if swa_model is not None:
+        log_message("Updating SWA Batch Normalization statistics...")
+        custom_update_bn(train_loader, swa_model, device=device)
+
+        # Validate SWA Model
+        swa_val_loss, swa_val_acc = validate(swa_model, val_loader, criterion, device)
+        log_message(
+            f"Final SWA Results | Val Loss: {swa_val_loss} | Val Acc: {swa_val_acc}"
+        )
+
+        save_model(swa_model.module, save_path_swa)
+        log_message(f"SWA model saved to {save_path_swa}")
+    else:
+        # Fallback if SWA didn't run (e.g. total_epochs <= swa_start_epoch)
+        log_message("SWA phase did not run. Best standard model was saved.")
+=======
+    save_path_best=None,
+    save_path_swa=None,
+    early_stopping=True,
+):
+    """
+    Orchestrates the Two-Phase training:
+    1. Standard Training with CosineAnnealingLR (Epochs 1 to swa_start_epoch).
+    2. SWA Training (Epochs swa_start_epoch+1 to total_epochs).
+
+    Returns:
+        dict: History of metrics {'val_loss': [], 'train_loss': []}
+    """
+    if save_path_best is None:
+        save_path_best = os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")
+    if save_path_swa is None:
+        save_path_swa = os.path.join(Config.CHECKPOINT_DIR, "swa_model.pth")
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Scheduler for Phase 1
+    scheduler = CosineAnnealingLR(optimizer, T_max=swa_start_epoch, eta_min=1e-5)
+
+    # SWA Components
+    swa_model = None
+    swa_scheduler = None
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    history = {"val_loss": [], "train_loss": []}
+
+    log_message(f"Starting training on device: {device}")
+    log_message(f"Phase 1: Standard Training (Epochs 1-{swa_start_epoch})")
+
+    model.to(device)
+
+    for epoch in range(1, total_epochs + 1):
+        # -----------------------------------------------------------
+        # Phase 1: Standard Training
+        # -----------------------------------------------------------
+        if epoch <= swa_start_epoch:
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                label_smoothing=Config.LABEL_SMOOTHING,
+            )
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            log_metrics(
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "lr": current_lr,
+                    "phase": "Standard",
+                },
+            )
+            
+            history["val_loss"].append(val_loss)
+            history["train_loss"].append(train_loss)
+
+            # Checkpoint & Early Stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_model(model, save_path_best)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if early_stopping and patience_counter >= patience:
+                log_message(f"Early stopping triggered at epoch {epoch}.")
+                log_message("Skipping SWA phase due to early stopping.")
+                return history
+
+        # -----------------------------------------------------------
+        # Phase 2: SWA Training
+        # -----------------------------------------------------------
+        else:
+            # Initialize SWA on first epoch of Phase 2
+            if swa_model is None:
+                log_message(f"Phase 2: SWA Training (Epochs {epoch}-{total_epochs})")
+                if os.path.exists(save_path_best):
+                    state_dict = torch.load(save_path_best, map_location=device)
+                    model.load_state_dict(state_dict)
+
+                swa_model = AveragedModel(model).to(device)
+                swa_scheduler = SWALR(optimizer, swa_lr=Config.LEARNING_RATE / 2.0)
+
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                label_smoothing=Config.LABEL_SMOOTHING,
+            )
+
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+
+            # Validate underlying model for tracking
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            log_metrics(
+                epoch,
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "lr": current_lr,
+                    "phase": "SWA",
+                },
+            )
+            
+            history["val_loss"].append(val_loss)
+            history["train_loss"].append(train_loss)
+
+    # -----------------------------------------------------------
+    # Finalize SWA
+    # -----------------------------------------------------------
+    if swa_model is not None:
+        log_message("Updating SWA Batch Normalization statistics...")
+        custom_update_bn(train_loader, swa_model, device=device)
+        swa_val_loss, swa_val_acc = validate(swa_model, val_loader, criterion, device)
+        log_message(f"Final SWA Results | Val Loss: {swa_val_loss} | Val Acc: {swa_val_acc}")
+        save_model(swa_model.module, save_path_swa)
+    else:
+        log_message("SWA phase did not run. Best standard model was saved.")
+        
+    return history
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.pseudo_labeling import create_combined_loader
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    log_message("Initializing Semi-Supervised ResNet-18 SWA Ensemble Pipeline...")
+
+    # Ensure directories exist
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # 2. Load Data (Cycle 1)
+    # Using the fixed validation split defined in metadata
+    train_loader, val_loader = get_train_val_loaders(load_cached_data=True)
+
+    # 3. Cycle 1: Teacher Ensemble Training
+    # We train 5 independent models on the labeled training set
+    teacher_models = []
+    n_teachers = 5
+
+    log_message(f"\n=== Cycle 1: Training {n_teachers} Teacher Models ===")
+
+    for i in range(n_teachers):
+        log_message(f"\nTraining Teacher Model {i+1}/{n_teachers}")
+
+        # Initialize fresh model
+        model = IcebergResNet18()
+
+        # Define checkpoint paths
+        save_path_best = os.path.join(Config.CHECKPOINT_DIR, f"teacher_{i}_best.pth")
+        save_path_swa = os.path.join(Config.CHECKPOINT_DIR, f"teacher_{i}_swa.pth")
+
+        # Run SWA Training
+        # We use the config epochs (30 + 15 = 45) which is fast enough for this dataset size
+        run_swa_training(
+            model,
+            train_loader,
+            val_loader,
+            device=Config.DEVICE,
+            save_path_best=save_path_best,
+            save_path_swa=save_path_swa,
+        )
+
+        # Load the best available weights (SWA if available, else Best Standard)
+        if os.path.exists(save_path_swa):
+            model = load_model(model, save_path_swa, device=Config.DEVICE)
+            log_message(f"Loaded SWA weights for Teacher {i+1}")
+        else:
+            model = load_model(model, save_path_best, device=Config.DEVICE)
+            log_message(f"Loaded Best Standard weights for Teacher {i+1}")
+
+        teacher_models.append(model)
+
+    # 4. Pseudo-Labeling
+    log_message("\n=== Generating Pseudo-Labels ===")
+    # Create a combined loader (Train + High Confidence Test)
+    combined_loader = create_combined_loader(
+        teacher_models, device=Config.DEVICE, load_cached_data=True
+    )
+
+    # 5. Cycle 2: Student Ensemble Training
+    # We train 5 independent models on the combined dataset
+    student_models = []
+    n_students = 5
+
+    log_message(f"\n=== Cycle 2: Training {n_students} Student Models ===")
+
+    for i in range(n_students):
+        log_message(f"\nTraining Student Model {i+1}/{n_students}")
+
+        # Initialize fresh model
+        model = IcebergResNet18()
+
+        # Define checkpoint paths
+        save_path_best = os.path.join(Config.CHECKPOINT_DIR, f"student_{i}_best.pth")
+        save_path_swa = os.path.join(Config.CHECKPOINT_DIR, f"student_{i}_swa.pth")
+
+        # Run SWA Training on Combined Loader
+        # We still validate on the original validation set to track performance
+        run_swa_training(
+            model,
+            combined_loader,
+            val_loader,
+            device=Config.DEVICE,
+            save_path_best=save_path_best,
+            save_path_swa=save_path_swa,
+        )
+
+        # Load weights
+        if os.path.exists(save_path_swa):
+            model = load_model(model, save_path_swa, device=Config.DEVICE)
+        else:
+            model = load_model(model, save_path_best, device=Config.DEVICE)
+
+        student_models.append(model)
+
+    # 6. Final Validation & Metrics
+    log_message("\n=== Final Validation ===")
+
+    # Aggregate predictions on validation set
+    # We need to manually iterate to get labels and features for failure analysis
+    all_preds = []
+    all_labels = []
+    all_angles = []
+    all_img_means = []
+
+    # Set models to eval
+    for m in student_models:
+        m.eval()
+        m.to(Config.DEVICE)
+
+    with torch.no_grad():
+        for images, angles, labels in val_loader:
+            images = images.to(Config.DEVICE)
+            angles_gpu = angles.to(Config.DEVICE)
+
+            # Ensemble Prediction (with TTA inside predict_ensemble logic manually applied here)
+            # Since predict_ensemble expects a test loader with IDs, we implement a simple ensemble loop here
+            batch_preds = []
+
+            # TTA Views
+            images_h = torch.flip(images, dims=[3])
+            images_v = torch.flip(images, dims=[2])
+
+            for model in student_models:
+                l_orig = model(images, angles_gpu)
+                l_h = model(images_h, angles_gpu)
+                l_v = model(images_v, angles_gpu)
+
+                p_avg = (
+                    torch.sigmoid(l_orig) + torch.sigmoid(l_h) + torch.sigmoid(l_v)
+                ) / 3.0
+                batch_preds.append(p_avg)
+
+            # Average across models
+            batch_preds = torch.stack(batch_preds).mean(dim=0)
+
+            all_preds.extend(batch_preds.cpu().numpy().flatten())
+            all_labels.extend(labels.numpy().flatten())
+            all_angles.extend(angles.numpy().flatten())
+
+            # Calculate image mean for failure analysis (using channel 0 - HH)
+            # images is (B, 3, 224, 224), channel 0 is HH
+            img_means = images[:, 0, :, :].mean(dim=(1, 2)).cpu().numpy()
+            all_img_means.extend(img_means)
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    # Calculate Log Loss
+    # Clip predictions to avoid log(0) - sklearn does this but good to be explicit
+    all_preds = np.clip(all_preds, 1e-15, 1 - 1e-15)
+    final_metric = log_loss(all_labels, all_preds)
+
+    # PRINT REQUIRED METRIC
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 7. Failure Analysis
+    log_message("\n=== Failure Analysis ===")
+    errors = np.abs(all_labels - all_preds)
+
+    # Correlation with Incidence Angle
+    corr_angle, _ = pearsonr(errors, all_angles)
+    print(f"Correlation (Error vs Inc Angle): {corr_angle:.4f}")
+
+    # Correlation with Image Mean (Signal Strength)
+    corr_signal, _ = pearsonr(errors, all_img_means)
+    print(f"Correlation (Error vs Signal Strength): {corr_signal:.4f}")
+
+    # 8. Submission
+    threshold = 0.16918645240183008
+    if final_metric < threshold:
+        log_message(
+            f"\nMetric ({final_metric}) is better than threshold ({threshold}). Generating submission..."
+        )
+
+        # Generate predictions on test set using the Student Ensemble
+        # We pass the list of models to predict_ensemble which handles TTA
+        from library.dataset import get_test_loader
+
+        test_loader = get_test_loader(load_cached_data=True)
+
+        test_predictions = predict_ensemble(
+            student_models, test_loader, device=Config.DEVICE
+        )
+
+        create_submission(test_predictions)
+    else:
+        log_message(
+            f"\nMetric ({final_metric}) did not meet threshold ({threshold}). Skipping submission."
+        )
+=======
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader
+from library.dataset import get_training_data_arrays, IcebergDataset, get_transforms, get_train_val_loaders
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    log_message("Initializing ResNet-18 SWA Ensemble with Global Epoch Selection...")
+
+    # Ensure directories exist
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # 2. Phase 1: Global Epoch Selection via 5-Fold CV
+    # We use the training subset defined in metadata for CV
+    log_message("\n=== Phase 1: Global Epoch Selection (5-Fold CV) ===")
+    
+    images_train, angles_train, labels_train = get_training_data_arrays(load_cached_data=True)
+    
+    kf = KFold(n_splits=5, shuffle=True, random_state=Config.SEED)
+    fold_histories = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(images_train)):
+        log_message(f"\nRunning CV Fold {fold+1}/5")
+        
+        # Create DataLoaders for this fold
+        ds_train = IcebergDataset(
+            images_train[train_idx], angles_train[train_idx], labels_train[train_idx],
+            transform=get_transforms("train"), mode="train"
+        )
+        ds_val = IcebergDataset(
+            images_train[val_idx], angles_train[val_idx], labels_train[val_idx],
+            transform=get_transforms("val"), mode="val"
+        )
+        
+        dl_train = DataLoader(ds_train, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=Config.NUM_WORKERS)
+        dl_val = DataLoader(ds_val, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=Config.NUM_WORKERS)
+        
+        model = IcebergResNet18()
+        
+        # Run training without early stopping to get full curve
+        history = run_swa_training(
+            model, dl_train, dl_val, device=Config.DEVICE,
+            save_path_best=None, save_path_swa=None, early_stopping=False
+        )
+        fold_histories.append(history["val_loss"])
+
+    # Calculate optimal epoch
+    # Average validation loss across folds for each epoch
+    # Note: history lists are 0-indexed (epoch 1 is index 0)
+    avg_val_losses = np.mean(fold_histories, axis=0)
+    optimal_epoch_idx = np.argmin(avg_val_losses)
+    optimal_epochs = optimal_epoch_idx + 1
+    min_avg_loss = avg_val_losses[optimal_epoch_idx]
+    
+    log_message(f"\nGlobal Epoch Selection Results:")
+    log_message(f"Optimal Epochs: {optimal_epochs}")
+    log_message(f"Minimum Average CV Loss: {min_avg_loss:.4f}")
+    
+    # 3. Phase 2: Train Final Ensemble on Full Training Subset
+    # We train 5 models on the full training data for the calibrated duration
+    log_message(f"\n=== Phase 2: Training Final Ensemble ({optimal_epochs} epochs) ===")
+    
+    # Full training loader (no split)
+    ds_full_train = IcebergDataset(
+        images_train, angles_train, labels_train,
+        transform=get_transforms("train"), mode="train"
+    )
+    dl_full_train = DataLoader(ds_full_train, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=Config.NUM_WORKERS)
+    
+    # We still need a validation loader for run_swa_training, but we won't use it for stopping.
+    # We can use the hold-out validation set just for logging.
+    _, dl_holdout_val = get_train_val_loaders(load_cached_data=True)
+    
+    ensemble_models = []
+    n_models = 5
+    
+    # Adjust SWA schedule if optimal_epochs is small
+    # If optimal_epochs <= Config.SWA_START_EPOCH, we effectively just train standard models
+    # But usually we expect optimal to be around 30-40.
+    # We pass the calculated optimal_epochs as total_epochs.
+    # We keep SWA_START_EPOCH from config, but if optimal < start, SWA won't trigger (handled in engine).
+    
+    for i in range(n_models):
+        log_message(f"\nTraining Ensemble Model {i+1}/{n_models}")
+        model = IcebergResNet18()
+        
+        save_path_swa = os.path.join(Config.CHECKPOINT_DIR, f"ensemble_{i}_swa.pth")
+        
+        run_swa_training(
+            model, dl_full_train, dl_holdout_val, device=Config.DEVICE,
+            total_epochs=optimal_epochs,
+            save_path_best=None, # Don't need best model, we want the final SWA/Standard state
+            save_path_swa=save_path_swa,
+            early_stopping=False
+        )
+        
+        # Load the saved SWA model (or the final state if SWA didn't run)
+        if os.path.exists(save_path_swa):
+            model = load_model(model, save_path_swa, device=Config.DEVICE)
+            log_message("Loaded SWA weights.")
+        else:
+            # If SWA didn't run, the model in memory is the final epoch model
+            log_message("SWA did not run (optimal epochs < start). Using final model state.")
+            
+        ensemble_models.append(model)
+
+    # 4. Final Evaluation on Hold-Out Validation Set
+    log_message("\n=== Final Validation on Hold-Out Set ===")
+    
+    all_preds = []
+    all_labels = []
+    all_angles = []
+    all_img_means = []
+
+    for m in ensemble_models:
+        m.eval()
+        m.to(Config.DEVICE)
+
+    with torch.no_grad():
+        for images, angles, labels in dl_holdout_val:
+            images = images.to(Config.DEVICE)
+            angles_gpu = angles.to(Config.DEVICE)
+            
+            # Manual Ensemble TTA Prediction
+            batch_preds = []
+            images_h = torch.flip(images, dims=[3])
+            images_v = torch.flip(images, dims=[2])
+
+            for model in ensemble_models:
+                l_orig = model(images, angles_gpu)
+                l_h = model(images_h, angles_gpu)
+                l_v = model(images_v, angles_gpu)
+                p_avg = (torch.sigmoid(l_orig) + torch.sigmoid(l_h) + torch.sigmoid(l_v)) / 3.0
+                batch_preds.append(p_avg)
+
+            batch_preds = torch.stack(batch_preds).mean(dim=0)
+            
+            all_preds.extend(batch_preds.cpu().numpy().flatten())
+            all_labels.extend(labels.numpy().flatten())
+            all_angles.extend(angles.numpy().flatten())
+            img_means = images[:, 0, :, :].mean(dim=(1, 2)).cpu().numpy()
+            all_img_means.extend(img_means)
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_preds = np.clip(all_preds, 1e-15, 1 - 1e-15)
+    
+    final_metric = log_loss(all_labels, all_preds)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    log_message("\n=== Failure Analysis ===")
+    errors = np.abs(all_labels - all_preds)
+    corr_angle, _ = pearsonr(errors, all_angles)
+    print(f"Correlation (Error vs Inc Angle): {corr_angle:.4f}")
+    corr_signal, _ = pearsonr(errors, all_img_means)
+    print(f"Correlation (Error vs Signal Strength): {corr_signal:.4f}")
+
+    # 6. Submission
+    threshold = 0.16918645240183008
+    if final_metric < threshold:
+        log_message(f"\nMetric ({final_metric}) is better than threshold ({threshold}). Generating submission...")
+        from library.dataset import get_test_loader
+        test_loader = get_test_loader(load_cached_data=True)
+        test_predictions = predict_ensemble(ensemble_models, test_loader, device=Config.DEVICE)
+        create_submission(test_predictions)
+    else:
+        log_message(f"\nMetric ({final_metric}) did not meet threshold ({threshold}). Skipping submission.")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,396 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import pandas as pd
+import numpy as np
+import os
+from library.config import Config
+from library.utils import set_seed, mcrmse_loss
+from library.data import get_loader
+
+# ==================================================================================
+# Model Components
+# ==================================================================================
+
+
+class SinusoidalEncoding(nn.Module):
+    """
+    Generates fixed sinusoidal encodings for signed scalar distances.
+    """
+
+    def __init__(self, dim, max_len=500):
+        super().__init__()
+        self.dim = dim
+        # Precompute denominators: 10000^(2i/dim)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+        )
+        self.register_buffer("div_term", div_term)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (Batch, Seq_Len) containing signed distances (float).
+        Returns:
+            (Batch, Seq_Len, Dim)
+        """
+        # Unsqueeze for broadcasting: (B, L, 1) * (D/2)
+        x_expanded = x.unsqueeze(-1)
+        phase = x_expanded * self.div_term
+
+        # Sin and Cos
+        pe = torch.zeros(x.shape[0], x.shape[1], self.dim, device=x.device)
+        pe[:, :, 0::2] = torch.sin(phase)
+        pe[:, :, 1::2] = torch.cos(phase)
+        return pe
+
+
+class WideBiGRUBlock(nn.Module):
+    """
+    Wide-Stream Residual Block with Pre-LayerNorm and BiGRU.
+    Maintains full residual stream width (W=384).
+    """
+
+    def __init__(self, hidden_dim, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        # BiGRU doubles the hidden size, so we use hidden_dim // 2
+        self.gru = nn.GRU(
+            hidden_dim, hidden_dim // 2, bidirectional=True, batch_first=True
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        res = x
+        x = self.norm(x)
+        x, _ = self.gru(x)
+        x = self.dropout(x)
+        return res + x
+
+
+class StructureBiasedAttention(nn.Module):
+    """
+    Multi-Head Self-Attention with Structural Bias injection.
+    Uses a learnable projection of the Sinusoidal Pairing Distance matrix as a bias.
+    """
+
+    def __init__(self, hidden_dim, num_heads, pair_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        assert self.head_dim * num_heads == hidden_dim
+
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Bias generator: Projects the pair distance encoding to a scalar per head
+        self.bias_proj = nn.Linear(pair_dim, num_heads)
+        self.pair_encoder = SinusoidalEncoding(pair_dim)
+
+    def forward(self, x, pair_offset):
+        """
+        Args:
+            x: (Batch, Seq_Len, Hidden_Dim)
+            pair_offset: (Batch, Seq_Len) - values are j-i for paired bases
+        """
+        B, L, H = x.shape
+
+        # QKV Calculation
+        qkv = (
+            self.qkv(x)
+            .reshape(B, L, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, Heads, L, Head_Dim)
+
+        # Standard Attention Logits
+        attn = (q @ k.transpose(-2, -1)) * (
+            1.0 / math.sqrt(self.head_dim)
+        )  # (B, Heads, L, L)
+
+        # --- Structural Bias Injection ---
+        # We construct a sparse bias. We only add bias to (i, j) if i and j are paired.
+        # pair_offset[b, i] = d implies i is paired with j = i + d.
+
+        # 1. Identify paired indices (b, i, j)
+        idx = torch.arange(L, device=x.device).unsqueeze(0)  # (1, L)
+        pair_offset_long = pair_offset.long()
+        target_idx = idx + pair_offset_long  # (B, L)
+
+        # Broadcast to create a mask (B, L, L)
+        # target_idx_exp: (B, L, 1) -> Target J for each I
+        # col_idx: (1, 1, L) -> Grid J
+        target_idx_exp = target_idx.unsqueeze(2)
+        col_idx = torch.arange(L, device=x.device).view(1, 1, L)
+
+        # Valid pairs are those where offset is not 0
+        valid_pair = (pair_offset_long != 0).unsqueeze(2)  # (B, L, 1)
+
+        # is_paired[b, i, j] is True if i is paired with j
+        is_paired = (target_idx_exp == col_idx) & valid_pair  # (B, L, L)
+
+        # 2. Compute Bias Value based on distance (pair_offset)
+        # We encode the scalar distance d = pair_offset[b, i]
+        dist_encoding = self.pair_encoder(pair_offset)  # (B, L, pair_dim)
+        bias_val = self.bias_proj(dist_encoding)  # (B, L, num_heads)
+        bias_val = bias_val.permute(0, 2, 1).unsqueeze(-1)  # (B, Heads, L, 1)
+
+        # 3. Add Bias
+        # We add bias_val to attn only where is_paired is True.
+        # is_paired: (B, 1, L, L) broadcasted
+        # bias_val: (B, Heads, L, 1) broadcasted
+        attn = attn + (bias_val * is_paired.unsqueeze(1).float())
+
+        # Softmax and Output
+        attn = F.softmax(attn, dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, L, H)
+        x = self.proj(x)
+        return x
+
+
+class RNAModel(nn.Module):
+    """
+    Structure-Biased Attention-Augmented Wide-Stream BiGRU.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Proportional Feature Embeddings
+        self.seq_emb = nn.Embedding(Config.vocab_size, Config.embedding_dim)
+        self.loop_emb = nn.Embedding(Config.loop_vocab_size, Config.loop_dim)
+        self.pair_enc = SinusoidalEncoding(Config.pair_dim)
+
+        # Stem: Projects concatenated inputs to residual stream width
+        self.stem_gru = nn.GRU(
+            Config.input_dim,
+            Config.hidden_dim // 2,
+            bidirectional=True,
+            batch_first=True,
+        )
+
+        # Backbone: 6 Wide-Stream Residual Blocks
+        self.blocks = nn.ModuleList(
+            [
+                WideBiGRUBlock(Config.hidden_dim, Config.dropout)
+                for _ in range(Config.num_layers)
+            ]
+        )
+
+        # Aggregation: Scalar Mixture of Stem + 6 Blocks
+        self.mix_weights = nn.Parameter(torch.zeros(Config.num_layers + 1))
+
+        # Structure-Biased Attention
+        self.attn = StructureBiasedAttention(
+            Config.hidden_dim, Config.nhead, Config.pair_dim
+        )
+
+        # Output Head
+        self.head = nn.Linear(Config.hidden_dim, Config.num_targets)
+
+    def forward(self, sequence, loop_type, pair_offset):
+        # 1. Embeddings
+        emb_seq = self.seq_emb(sequence)
+        emb_loop = self.loop_emb(loop_type)
+        emb_pair = self.pair_enc(pair_offset)
+
+        # Concatenate: (B, L, 256)
+        x = torch.cat([emb_seq, emb_loop, emb_pair], dim=-1)
+
+        # 2. Stem
+        x, _ = self.stem_gru(x)
+
+        # 3. Backbone (Collect states)
+        states = [x]
+        for block in self.blocks:
+            x = block(x)
+            states.append(x)
+
+        # 4. Scalar Mixture Aggregation
+        # Stack: (B, L, H, Layers+1)
+        stacked = torch.stack(states, dim=-1)
+        weights = F.softmax(self.mix_weights, dim=0)
+        x_agg = torch.sum(stacked * weights, dim=-1)
+
+        # 5. Structure-Biased Attention
+        x_attn = self.attn(x_agg, pair_offset)
+
+        # 6. Output Head
+        out = self.head(x_attn)
+        return out
+
+
+# ==================================================================================
+# Training and Inference Logic
+# ==================================================================================
+
+
+def train_step(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+
+    for batch in loader:
+        seq = batch["sequence"].to(device)
+        loop = batch["loop_type"].to(device)
+        pair = batch["pair_offset"].to(device)
+        targets = batch["targets"].to(device)
+
+        optimizer.zero_grad()
+        preds = model(seq, loop, pair)
+
+        # Masked MSE: Only calculate loss for the first 68 positions
+        preds_scored = preds[:, : Config.pred_len, :]
+        targets_scored = targets[:, : Config.pred_len, :]
+
+        loss = criterion(preds_scored, targets_scored)
+        loss.backward()
+
+        # Gradient Clipping
+        nn.utils.clip_grad_norm_(model.parameters(), Config.clip_grad)
+
+        optimizer.step()
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate(model, loader, device):
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(device)
+            loop = batch["loop_type"].to(device)
+            pair = batch["pair_offset"].to(device)
+            targets = batch["targets"].to(device)
+
+            preds = model(seq, loop, pair)
+
+            all_preds.append(preds.cpu())
+            all_targets.append(targets.cpu())
+
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    # MCRMSE handles slicing to pred_len internally
+    score = mcrmse_loss(all_targets, all_preds).item()
+    return score
+
+
+def inference(model, loader, device):
+    model.eval()
+    ids_list = []
+    preds_list = []
+
+    with torch.no_grad():
+        for batch in loader:
+            seq = batch["sequence"].to(device)
+            loop = batch["loop_type"].to(device)
+            pair = batch["pair_offset"].to(device)
+            ids = batch["id"]
+
+            preds = model(seq, loop, pair)
+
+            ids_list.extend(ids)
+            preds_list.append(preds.cpu().numpy())
+
+    return ids_list, np.concatenate(preds_list, axis=0)
+
+
+def run_pipeline():
+    set_seed()
+    device = Config.device
+    print(f"Device: {device}")
+
+    # 1. Data Loading
+    print("Loading data...")
+    train_loader = get_loader("train", shuffle=True)
+    val_loader = get_loader("val", shuffle=False)
+    test_loader = get_loader("test", shuffle=False)
+
+    # 2. Model Initialization
+    model = RNAModel().to(device)
+    print("Model initialized.")
+
+    # 3. Optimization
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.epochs, eta_min=Config.min_lr
+    )
+    criterion = nn.MSELoss()
+
+    # 4. Training Loop
+    best_score = float("inf")
+    print(f"Starting training for {Config.epochs} epochs...")
+
+    for epoch in range(Config.epochs):
+        train_loss = train_step(model, train_loader, optimizer, criterion, device)
+        val_score = validate(model, val_loader, device)
+
+        # Step scheduler per epoch
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{Config.epochs} | Train Loss: {train_loss:.6f} | Val MCRMSE: {val_score:.6f}"
+        )
+
+        if val_score < best_score:
+            best_score = val_score
+            torch.save(model.state_dict(), Config.model_save_path)
+
+    # 5. Inference
+    print("Loading best model for inference...")
+    model.load_state_dict(torch.load(Config.model_save_path, map_location=device))
+
+    ids, preds = inference(model, test_loader, device)
+
+    # 6. Submission Generation
+    print("Generating submission...")
+    submission_data = []
+    # preds shape: (N_samples, 107, 3)
+    # Output columns: reactivity, deg_Mg_pH10, deg_Mg_50C
+    # Submission requires: reactivity, deg_Mg_pH10, deg_pH10, deg_Mg_50C, deg_50C
+
+    for i, sample_id in enumerate(ids):
+        sample_preds = preds[i]  # (107, 3)
+
+        for j in range(Config.seq_len):
+            row_id = f"{sample_id}_{j}"
+
+            # Extract predicted values
+            reactivity = float(sample_preds[j, 0])
+            deg_Mg_pH10 = float(sample_preds[j, 1])
+            deg_Mg_50C = float(sample_preds[j, 2])
+
+            # Fill unscored columns with 0
+            deg_pH10 = 0.0
+            deg_50C = 0.0
+
+            submission_data.append(
+                [row_id, reactivity, deg_Mg_pH10, deg_pH10, deg_Mg_50C, deg_50C]
+            )
+
+    df_sub = pd.DataFrame(
+        submission_data,
+        columns=[
+            "id_seqpos",
+            "reactivity",
+            "deg_Mg_pH10",
+            "deg_pH10",
+            "deg_Mg_50C",
+            "deg_50C",
+        ],
+    )
+    df_sub.to_csv(Config.submission_path, index=False)
+    print(f"Submission saved to {Config.submission_path}")
+
+
+if __name__ == "__main__":
+    # Execute pipeline
+    run_pipeline()

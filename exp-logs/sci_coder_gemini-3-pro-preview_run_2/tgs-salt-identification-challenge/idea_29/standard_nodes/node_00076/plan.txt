@@ -1,0 +1,1627 @@
+The previous solution implemented a complex multi-stage pipeline involving knowledge distillation to an image-only student model. However, analysis of the dataset metadata reveals that depth information is available for the test set (`test_df` merges with `depths.csv`). Therefore, distilling depth knowledge into an image-only model is unnecessary and suboptimal (violating **Lesson 00032**). The "Teacher" model, which explicitly injects depth, is significantly stronger and should be used for inference.
+
+We will optimize the solution by:
+1.  **Simplifying the Architecture**: Reverting to the `ResNet34` + `Depth Injection` + `LinkNet` architecture (renamed `SaltModel`) as the primary model. This leverages explicit feature injection (**Lesson 00024**, **Lesson 00037**).
+2.  **Robust Training Strategy**: Implementing a 5-Fold Cross-Validation loop instead of a single train/val split. This ensures the model sees all available training data and provides a more robust estimate of performance (**Lesson 00067**).
+3.  **Hyperparameter Tuning**: Increasing training to 50 epochs per fold to ensure full convergence (**Lesson 00035**), while maintaining the effective Lovasz-Hinge loss (**Lesson 00021**).
+4.  **Ensemble Inference**: Generating the submission by averaging predictions from the 5 fold models and applying a globally optimized threshold derived from Out-Of-Fold (OOF) predictions (**Lesson 00018**, **Lesson 00033**).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_29")
+
+    # Submission directory
+    SUBMISSION_DIR = "./submission"
+    SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # Ensure necessary writeable directories exist
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    # =========================================================================
+    # Data Parameters
+    # =========================================================================
+    ORIG_SIZE = 101
+    IMG_SIZE = 128  # Padded size for U-Net divisibility (32)
+    CHANNELS = 1  # Input channels (Grayscale)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+
+    # Epochs for different stages of the pipeline
+    NUM_EPOCHS_TEACHER = 50  # Stage 1: Privileged Teacher
+    NUM_EPOCHS_STUDENT = 30  # Stage 2: Distillation
+    NUM_EPOCHS_FINAL = 30  # Stage 3: Self-training
+
+    # Optimization
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 10
+
+    # Loss Weights for Multi-Task Student (Stage 2 & 3)
+    LOSS_WEIGHT_SEG = 1.0  # Segmentation Loss (Lovasz + BCE)
+    LOSS_WEIGHT_MSE = 0.1  # Depth Regression Auxiliary Loss
+    LOSS_WEIGHT_BCE_DISTILL = 0.5  # Distillation Loss (Teacher Soft Targets)
+=======
+    CACHE_DIR = os.path.join(WORKING_DIR, "idea_opt")
+
+    # Submission directory
+    SUBMISSION_DIR = "./submission"
+    SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # Ensure necessary writeable directories exist
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(SUBMISSION_DIR, exist_ok=True)
+
+    # =========================================================================
+    # Data Parameters
+    # =========================================================================
+    ORIG_SIZE = 101
+    IMG_SIZE = 128  # Padded size for U-Net divisibility (32)
+    CHANNELS = 1  # Input channels (Grayscale)
+
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+
+    # Epochs
+    NUM_EPOCHS = 50
+
+    # Optimization
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 15
+>>>>>>> REPLACE
+```
+
+```diff
+library/models.py
+<<<<<<< SEARCH
+class TeacherLinkNet(nn.Module):
+    """
+    Privileged Teacher Model.
+    - Input: Image (1 channel) AND Depth (scalar).
+    - Architecture: ResNet34 Encoder + Depth Injection + Wide-LinkNet Decoder.
+    - Depth Injection: Projects scalar depth to feature map and concatenates at bottleneck.
+    """
+
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Depth Injection Module
+        # Projects scalar depth to 64 channels
+        self.depth_mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 64),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder
+        # Bottleneck input channels: 512 (ResNet) + 64 (Depth) = 576
+
+        # Block 4: 576 -> 256 (Matches x3 channels for skip)
+        self.decoder4 = DecoderBlock(512 + 64, 256)
+
+        # Block 3: 256 -> 128 (Matches x2 channels for skip)
+        self.decoder3 = DecoderBlock(256, 128)
+
+        # Block 2: 128 -> 64 (Matches x1 channels for skip)
+        self.decoder2 = DecoderBlock(128, 64)
+
+        # Block 1: 64 -> 64 (Matches x0 channels for skip)
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # Final Head: Upsample from H/2 to H
+        self.final_head = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1),
+        )
+
+    def forward(self, x, depth):
+        # x: (B, 1, H, W)
+        # depth: (B, 1)
+
+        # Encoder
+        x0, x1, x2, x3, x4 = self.encoder(x)
+
+        # Depth Injection
+        # Project depth: (B, 1) -> (B, 64)
+        d = self.depth_mlp(depth)
+        # Reshape to (B, 64, 1, 1) and expand to bottleneck spatial dimensions
+        d = d.unsqueeze(-1).unsqueeze(-1)
+        d = d.expand(-1, -1, x4.size(2), x4.size(3))
+
+        # Concatenate: (B, 512, H/32, W/32) + (B, 64, H/32, W/32) -> (B, 576, H/32, W/32)
+        bottleneck = torch.cat([x4, d], dim=1)
+
+        # Decoder with Additive Skip Connections
+        d4 = self.decoder4(bottleneck)  # -> (B, 256, H/16, W/16)
+        d4 = d4 + x3
+
+        d3 = self.decoder3(d4)  # -> (B, 128, H/8, W/8)
+        d3 = d3 + x2
+
+        d2 = self.decoder2(d3)  # -> (B, 64, H/4, W/4)
+        d2 = d2 + x1
+
+        d1 = self.decoder1(d2)  # -> (B, 64, H/2, W/2)
+        d1 = d1 + x0
+
+        # Final Prediction
+        logits = self.final_head(d1)  # -> (B, num_classes, H, W)
+
+        return logits
+
+
+class StudentLinkNet(nn.Module):
+    """
+    Multi-Task Student Model.
+    - Input: Image (1 channel) only.
+    - Architecture: ResNet34 Encoder + Depth Regression Head + Wide-LinkNet Decoder.
+    - Auxiliary Head: Predicts depth from bottleneck features to force depth-aware feature learning.
+    """
+
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Auxiliary Depth Regression Head
+        # Takes bottleneck (512 channels) -> Scalar depth
+        self.aux_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+        )
+
+        # Decoder
+        # Standard channels (no depth injection)
+
+        # Block 4: 512 -> 256
+        self.decoder4 = DecoderBlock(512, 256)
+
+        # Block 3: 256 -> 128
+        self.decoder3 = DecoderBlock(256, 128)
+
+        # Block 2: 128 -> 64
+        self.decoder2 = DecoderBlock(128, 64)
+
+        # Block 1: 64 -> 64
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # Final Head
+        self.final_head = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1),
+        )
+
+    def forward(self, x):
+        # x: (B, 1, H, W)
+
+        # Encoder
+        x0, x1, x2, x3, x4 = self.encoder(x)
+
+        # Auxiliary Depth Prediction
+        pred_depth = self.aux_head(x4)
+
+        # Decoder with Additive Skip Connections
+        d4 = self.decoder4(x4)
+        d4 = d4 + x3
+
+        d3 = self.decoder3(d4)
+        d3 = d3 + x2
+
+        d2 = self.decoder2(d3)
+        d2 = d2 + x1
+
+        d1 = self.decoder1(d2)
+        d1 = d1 + x0
+
+        # Final Prediction
+        logits = self.final_head(d1)
+
+        # Return dictionary for Multi-Task Loss
+        return {"logits": logits, "depth": pred_depth}
+=======
+class SaltModel(nn.Module):
+    """
+    Salt Segmentation Model (ResNet34 + Depth Injection + LinkNet).
+    Cite Lesson 00032: Explicit Feature Injection is superior to distillation for orthogonal metadata.
+    Cite Lesson 00037: Concatenation is superior to FiLM/Multiplication for weak signals.
+    """
+
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Depth Injection Module
+        # Projects scalar depth to 64 channels
+        # Cite Lesson 00029: Non-linear MLP embeddings outperform linear projections.
+        self.depth_mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 64),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder
+        # Bottleneck input channels: 512 (ResNet) + 64 (Depth) = 576
+
+        # Block 4: 576 -> 256 (Matches x3 channels for skip)
+        self.decoder4 = DecoderBlock(512 + 64, 256)
+
+        # Block 3: 256 -> 128 (Matches x2 channels for skip)
+        self.decoder3 = DecoderBlock(256, 128)
+
+        # Block 2: 128 -> 64 (Matches x1 channels for skip)
+        self.decoder2 = DecoderBlock(128, 64)
+
+        # Block 1: 64 -> 64 (Matches x0 channels for skip)
+        self.decoder1 = DecoderBlock(64, 64)
+
+        # Final Head: Upsample from H/2 to H
+        self.final_head = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1),
+        )
+
+    def forward(self, x, depth):
+        # x: (B, 1, H, W)
+        # depth: (B, 1)
+
+        # Encoder
+        x0, x1, x2, x3, x4 = self.encoder(x)
+
+        # Depth Injection
+        # Project depth: (B, 1) -> (B, 64)
+        d = self.depth_mlp(depth)
+        # Reshape to (B, 64, 1, 1) and expand to bottleneck spatial dimensions
+        d = d.unsqueeze(-1).unsqueeze(-1)
+        d = d.expand(-1, -1, x4.size(2), x4.size(3))
+
+        # Concatenate: (B, 512, H/32, W/32) + (B, 64, H/32, W/32) -> (B, 576, H/32, W/32)
+        bottleneck = torch.cat([x4, d], dim=1)
+
+        # Decoder with Additive Skip Connections
+        d4 = self.decoder4(bottleneck)  # -> (B, 256, H/16, W/16)
+        d4 = d4 + x3
+
+        d3 = self.decoder3(d4)  # -> (B, 128, H/8, W/8)
+        d3 = d3 + x2
+
+        d2 = self.decoder2(d3)  # -> (B, 64, H/4, W/4)
+        d2 = d2 + x1
+
+        d1 = self.decoder1(d2)  # -> (B, 64, H/2, W/2)
+        d1 = d1 + x0
+
+        # Final Prediction
+        logits = self.final_head(d1)  # -> (B, num_classes, H, W)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+# -------------------------------------------------------------------------
+# Multi-Task Student Loss Implementation
+# -------------------------------------------------------------------------
+
+
+class StudentLoss(nn.Module):
+    """
+    Composite loss function for the Multi-Task Student model.
+    Combines:
+    1. Segmentation Loss: Lovasz Hinge + BCE
+    2. Depth Regression Loss: MSE (Auxiliary Task)
+    3. Distillation Loss: BCE (Student Logits vs Teacher Soft Targets)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.lovasz = LovaszHingeLoss()
+        self.bce_seg = nn.BCEWithLogitsLoss()
+        self.mse_depth = nn.MSELoss()
+        self.bce_distill = nn.BCEWithLogitsLoss()
+
+        # Weights from Config
+        self.w_seg = Config.LOSS_WEIGHT_SEG
+        self.w_mse = Config.LOSS_WEIGHT_MSE
+        self.w_distill = Config.LOSS_WEIGHT_BCE_DISTILL
+
+    def forward(self, student_outputs, masks, depths, teacher_logits=None):
+        """
+        Args:
+            student_outputs (dict): Dictionary containing:
+                - 'logits': (N, 1, H, W) Segmentation logits
+                - 'depth': (N, 1) Predicted depth scalars
+            masks (torch.Tensor): (N, 1, H, W) Ground truth binary masks.
+            depths (torch.Tensor): (N, 1) Ground truth depth values (normalized).
+            teacher_logits (torch.Tensor, optional): (N, 1, H, W) Logits from the teacher model.
+                                                     If None, distillation loss is skipped.
+
+        Returns:
+            total_loss (torch.Tensor): Weighted sum of all losses.
+            metrics (dict): Dictionary of individual loss components for logging.
+        """
+        pred_logits = student_outputs["logits"]
+        pred_depth = student_outputs["depth"]
+
+        # 1. Segmentation Loss (Lovasz + BCE)
+        # Ensure masks are float for BCE and Lovasz
+        masks = masks.float()
+
+        loss_lovasz = self.lovasz(pred_logits, masks)
+        loss_bce_seg = self.bce_seg(pred_logits, masks)
+        loss_seg = loss_lovasz + loss_bce_seg
+
+        # 2. Depth Regression Loss (MSE)
+        # Ensure depths are float
+        depths = depths.float().view_as(pred_depth)
+        loss_depth = self.mse_depth(pred_depth, depths)
+
+        # 3. Distillation Loss (BCE with Soft Targets)
+        loss_distill = torch.tensor(0.0, device=pred_logits.device)
+        if teacher_logits is not None:
+            # Teacher logits -> Probabilities (Soft Targets)
+            teacher_probs = torch.sigmoid(teacher_logits)
+            # BCEWithLogitsLoss accepts soft targets (probabilities) as the target argument
+            loss_distill = self.bce_distill(pred_logits, teacher_probs)
+
+        # Combine Losses
+        # L = L_Seg + 0.1 * L_MSE + 0.5 * L_Distill
+        total_loss = (
+            (self.w_seg * loss_seg)
+            + (self.w_mse * loss_depth)
+            + (self.w_distill * loss_distill)
+        )
+
+        # Metrics for logging
+        metrics = {
+            "loss_total": total_loss.item(),
+            "loss_seg": loss_seg.item(),
+            "loss_lovasz": loss_lovasz.item(),
+            "loss_bce_seg": loss_bce_seg.item(),
+            "loss_depth": loss_depth.item(),
+            "loss_distill": loss_distill.item(),
+        }
+
+        return total_loss, metrics
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/training.py
+<<<<<<< SEARCH
+from library.losses import LovaszHingeLoss, StudentLoss
+
+
+class Trainer:
+    """
+    Handles training and validation logic for both Teacher and Student models.
+    """
+
+    def __init__(
+        self, model, device, optimizer=None, scheduler=None, teacher_model=None
+    ):
+        self.model = model
+        self.device = device
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.teacher_model = teacher_model
+
+        # Determine if model needs depth input by inspecting forward method
+        sig = inspect.signature(model.forward)
+        self.needs_depth = "depth" in sig.parameters
+
+        # Loss functions
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+        self.student_loss_fn = StudentLoss()
+
+    def train_epoch(self, loader, is_student=False):
+        """
+        Runs one epoch of training.
+        """
+        self.model.train()
+        if self.teacher_model:
+            self.teacher_model.eval()
+
+        total_loss = 0.0
+        num_batches = len(loader)
+
+        for batch in loader:
+            images = batch["image"].to(self.device).float()
+            depths = batch["depth"].to(self.device).float()
+            masks = batch["mask"].to(self.device).float()  # (B, 1, H, W)
+
+            self.optimizer.zero_grad()
+
+            if is_student:
+                # Student Forward: Input is Image only
+                outputs = self.model(images)  # Returns dict {'logits', 'depth'}
+
+                # Teacher Forward (Distillation)
+                teacher_logits = None
+                if self.teacher_model:
+                    with torch.no_grad():
+                        # Teacher needs depth
+                        teacher_logits = self.teacher_model(images, depths)
+
+                # Multi-task Loss
+                loss, _ = self.student_loss_fn(outputs, masks, depths, teacher_logits)
+
+            else:
+                # Teacher Forward: Input is Image + Depth
+                logits = self.model(images, depths)
+
+                # Teacher Loss: Lovasz + BCE
+                l_lovasz = self.lovasz(logits, masks)
+                l_bce = self.bce(logits, masks)
+                loss = l_lovasz + l_bce
+
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item()
+
+        return total_loss / num_batches
+
+    def validate(self, loader):
+        """
+        Evaluates the model on the validation set.
+        Performs threshold optimization to maximize mAP.
+        """
+        self.model.eval()
+        all_preds = []
+        all_masks = []
+
+        with torch.no_grad():
+            for batch in loader:
+                images = batch["image"].to(self.device).float()
+                depths = batch["depth"].to(self.device).float()
+                masks = batch["mask"].numpy()  # Keep as numpy for post-processing
+
+                # Forward pass
+                if self.needs_depth:
+                    logits = self.model(images, depths)
+                else:
+                    outputs = self.model(images)
+                    logits = outputs["logits"]
+
+                # Convert to probabilities
+                probs = torch.sigmoid(logits).cpu().numpy()
+
+                # Unpad predictions and masks to original size (101x101)
+                for i in range(len(probs)):
+                    # Squeeze channel dim: (1, 128, 128) -> (128, 128)
+                    p = probs[i].squeeze(0)
+                    m = masks[i].squeeze(0)
+
+                    p_un = unpad_image(p)
+                    m_un = unpad_image(m)
+
+                    all_preds.append(p_un)
+                    all_masks.append(m_un)
+
+        all_preds = np.array(all_preds)
+        all_masks = np.array(all_masks)
+
+        # Threshold Optimization
+        # We search for the best threshold that maximizes mAP
+        best_map = 0.0
+        best_thresh = 0.5
+
+        # Search range: 0.30 to 0.70 with step 0.02
+        thresholds = np.arange(0.3, 0.72, 0.02)
+
+        for t in thresholds:
+            # Binarize predictions
+            binary_preds = (all_preds > t).astype(np.uint8)
+            # Calculate mAP
+            score = calc_map(binary_preds, all_masks)
+
+            if score > best_map:
+                best_map = score
+                best_thresh = t
+
+        return best_map, best_thresh
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    config,
+    teacher_model=None,
+    is_student=False,
+):
+    """
+    Main training loop with Early Stopping and Checkpointing.
+    """
+    # Setup Optimizer and Scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
+    )
+
+    num_epochs = config.NUM_EPOCHS_STUDENT if is_student else config.NUM_EPOCHS_TEACHER
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    trainer = Trainer(model, device, optimizer, scheduler, teacher_model)
+
+    best_map = 0.0
+    patience_counter = 0
+    best_model_path = os.path.join(config.CACHE_DIR, "best_model.pth")
+    thresh_path = os.path.join(config.CACHE_DIR, "best_threshold.txt")
+
+    print(f"Starting training (Student Mode: {is_student})...")
+
+    for epoch in range(num_epochs):
+        train_loss = trainer.train_epoch(train_loader, is_student)
+        val_map, val_thresh = trainer.validate(val_loader)
+
+        scheduler.step()
+
+        # Print metrics with full precision
+        print(
+            f"Epoch {epoch+1}/{num_epochs} | Loss: {train_loss:.8f} | Val mAP: {val_map:.10f} | Best Thresh: {val_thresh:.4f}"
+        )
+
+        # Checkpointing
+        if val_map > best_map:
+            best_map = val_map
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            # Save the best threshold for inference
+            with open(thresh_path, "w") as f:
+                f.write(str(val_thresh))
+        else:
+            patience_counter += 1
+
+        # Early Stopping
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            print("Early stopping triggered.")
+            break
+
+    # Load best model state before returning
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path))
+
+    return model
+=======
+from library.losses import LovaszHingeLoss
+
+
+class Trainer:
+    """
+    Handles training and validation logic.
+    """
+
+    def __init__(self, model, device, optimizer=None, scheduler=None):
+        self.model = model
+        self.device = device
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+        # Loss functions
+        self.bce = nn.BCEWithLogitsLoss()
+        self.lovasz = LovaszHingeLoss()
+
+    def train_epoch(self, loader):
+        """
+        Runs one epoch of training.
+        """
+        self.model.train()
+
+        total_loss = 0.0
+        num_batches = len(loader)
+
+        for batch in loader:
+            images = batch["image"].to(self.device).float()
+            depths = batch["depth"].to(self.device).float()
+            masks = batch["mask"].to(self.device).float()  # (B, 1, H, W)
+
+            self.optimizer.zero_grad()
+
+            # Forward: Input is Image + Depth
+            logits = self.model(images, depths)
+
+            # Loss: Lovasz + BCE
+            # Cite Lesson 00021: Lovasz-Hinge Loss optimizes IoU directly.
+            l_lovasz = self.lovasz(logits, masks)
+            l_bce = self.bce(logits, masks)
+            loss = l_lovasz + l_bce
+
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item()
+
+        return total_loss / num_batches
+
+    def validate(self, loader):
+        """
+        Evaluates the model on the validation set.
+        Performs threshold optimization to maximize mAP.
+        """
+        self.model.eval()
+        all_preds = []
+        all_masks = []
+
+        with torch.no_grad():
+            for batch in loader:
+                images = batch["image"].to(self.device).float()
+                depths = batch["depth"].to(self.device).float()
+                masks = batch["mask"].numpy()
+
+                # Forward pass
+                logits = self.model(images, depths)
+
+                # Convert to probabilities
+                probs = torch.sigmoid(logits).cpu().numpy()
+
+                # Unpad predictions and masks to original size (101x101)
+                for i in range(len(probs)):
+                    p = probs[i].squeeze(0)
+                    m = masks[i].squeeze(0)
+
+                    p_un = unpad_image(p)
+                    m_un = unpad_image(m)
+
+                    all_preds.append(p_un)
+                    all_masks.append(m_un)
+
+        all_preds = np.array(all_preds)
+        all_masks = np.array(all_masks)
+
+        # Threshold Optimization
+        # Cite Lesson 00018: Always tune binarization threshold for mAP metrics.
+        best_map = 0.0
+        best_thresh = 0.5
+        thresholds = np.arange(0.3, 0.72, 0.02)
+
+        for t in thresholds:
+            binary_preds = (all_preds > t).astype(np.uint8)
+            score = calc_map(binary_preds, all_masks)
+            if score > best_map:
+                best_map = score
+                best_thresh = t
+
+        return best_map, best_thresh, all_preds, all_masks
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    config,
+    fold_idx=0
+):
+    """
+    Main training loop with Early Stopping and Checkpointing.
+    """
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.NUM_EPOCHS)
+
+    trainer = Trainer(model, device, optimizer, scheduler)
+
+    best_map = 0.0
+    patience_counter = 0
+    best_model_path = os.path.join(config.CACHE_DIR, f"best_model_fold{fold_idx}.pth")
+    
+    # Store best OOF predictions for ensemble thresholding
+    best_oof_preds = None
+    best_oof_masks = None
+
+    print(f"Starting training Fold {fold_idx}...")
+
+    for epoch in range(config.NUM_EPOCHS):
+        train_loss = trainer.train_epoch(train_loader)
+        val_map, val_thresh, val_preds, val_masks = trainer.validate(val_loader)
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch+1}/{config.NUM_EPOCHS} | Loss: {train_loss:.8f} | Val mAP: {val_map:.10f} | Best Thresh: {val_thresh:.4f}"
+        )
+
+        # Checkpointing
+        # Cite Lesson 00033: Decouple prediction probability from decision boundaries. Save based on max score at optimal threshold.
+        if val_map > best_map:
+            best_map = val_map
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            best_oof_preds = val_preds
+            best_oof_masks = val_masks
+        else:
+            patience_counter += 1
+
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            print("Early stopping triggered.")
+            break
+
+    # Load best model state
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path))
+
+    return model, best_oof_preds, best_oof_masks
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+def run_stage1_teacher(debug=False):
+    """
+    Stage 1: Train the Privileged Teacher Model using Image + Depth.
+    """
+    print("=" * 50)
+    print("STAGE 1: Training Privileged Teacher")
+    print("=" * 50)
+
+    # Use provided data loader helper which handles splitting and normalization
+    # Note: get_loaders handles caching internally
+    train_loader, val_loader, _ = get_loaders(load_cached_data=True)
+
+    if debug:
+        print("DEBUG Mode: Reducing epochs for Teacher")
+        Config.NUM_EPOCHS_TEACHER = 2
+
+    # Initialize Teacher Model
+    model = TeacherLinkNet(num_classes=1).to(Config.DEVICE)
+
+    # Train Model
+    # Teacher uses standard Lovasz+BCE loss (handled inside train_model when is_student=False)
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=Config.DEVICE,
+        config=Config,
+        teacher_model=None,
+        is_student=False,
+    )
+
+    # Save final stage 1 model
+    save_path = os.path.join(Config.CACHE_DIR, "stage1_teacher.pth")
+    torch.save(model.state_dict(), save_path)
+    print(f"Stage 1 complete. Teacher model saved to {save_path}")
+
+    return save_path
+
+
+def run_stage2_student_ensemble(teacher_path, debug=False):
+    """
+    Stage 2: Train Multi-Task Student Ensemble (5-Fold) with Distillation.
+    """
+    print("=" * 50)
+    print("STAGE 2: Training Student Ensemble (Distillation)")
+    print("=" * 50)
+
+    if debug:
+        print("DEBUG Mode: Reducing epochs for Student")
+        Config.NUM_EPOCHS_STUDENT = 2
+
+    # 1. Load Teacher Model
+    teacher_model = TeacherLinkNet(num_classes=1).to(Config.DEVICE)
+    teacher_model.load_state_dict(torch.load(teacher_path, map_location=Config.DEVICE))
+    teacher_model.eval()
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+
+    # 2. Prepare Data for K-Fold (Combine Train + Val from metadata)
+    # We need to manually load and combine to perform our own K-Fold split
+    train_df = pd.read_csv(Config.TRAIN_CSV)
+    val_df = pd.read_csv(Config.VAL_CSV)
+
+    # Process data (loads from cache if available)
+    t_imgs, t_masks, t_depths, t_ids = process_data(train_df, "train", Config.CACHE_DIR)
+    v_imgs, v_masks, v_depths, v_ids = process_data(val_df, "val", Config.CACHE_DIR)
+
+    # Combine
+    all_images = np.concatenate([t_imgs, v_imgs], axis=0)
+    all_masks = np.concatenate([t_masks, v_masks], axis=0)
+    all_depths = np.concatenate([t_depths, v_depths], axis=0)
+    all_ids = np.concatenate([t_ids, v_ids], axis=0)
+
+    # Normalize Depths (Global Stats)
+    d_mean = np.mean(all_depths)
+    d_std = np.std(all_depths) + 1e-8
+    all_depths_norm = (all_depths - d_mean) / d_std
+
+    # K-Fold Cross Validation
+    kf = KFold(n_splits=5, shuffle=True, random_state=Config.SEED)
+
+    fold_model_paths = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(all_images)):
+        print(f"\n--- Fold {fold + 1}/5 ---")
+
+        # Create Datasets
+        train_ds = SaltDataset(
+            all_images[train_idx],
+            all_depths_norm[train_idx],
+            all_ids[train_idx],
+            all_masks[train_idx],
+            transform=get_transforms("train"),
+        )
+        val_ds = SaltDataset(
+            all_images[val_idx],
+            all_depths_norm[val_idx],
+            all_ids[val_idx],
+            all_masks[val_idx],
+            transform=get_transforms("val"),
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        # Initialize Student
+        student_model = StudentLinkNet(num_classes=1).to(Config.DEVICE)
+
+        # Train with Distillation
+        # We pass the teacher_model to train_model, which triggers the distillation loss in StudentLoss
+        student_model = train_model(
+            model=student_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=Config.DEVICE,
+            config=Config,
+            teacher_model=teacher_model,
+            is_student=True,
+        )
+
+        # Validate and Check Gating (mAP > 0.70)
+        # We re-run validation to get the exact metric
+        trainer_temp = from_model_trainer(
+            student_model
+        )  # Helper to reuse validation logic
+        val_map, _ = trainer_temp.validate(val_loader)
+
+        print(f"Fold {fold+1} Final mAP: {val_map:.6f}")
+
+        if val_map >= 0.70 or debug:
+            save_name = f"stage2_fold{fold}.pth"
+            save_path = os.path.join(Config.CACHE_DIR, save_name)
+            torch.save(student_model.state_dict(), save_path)
+            fold_model_paths.append(save_path)
+            print(f"Model saved: {save_path}")
+        else:
+            print(f"Model discarded (mAP < 0.70)")
+
+        if debug:
+            break  # Run only one fold in debug mode
+
+    return fold_model_paths
+
+
+class PseudoLabelDataset(Dataset):
+    """Dataset for Unlabeled data with Soft Pseudo Labels."""
+
+    def __init__(self, images, ids, soft_masks, transform=None):
+        self.images = images
+        self.ids = ids
+        self.soft_masks = soft_masks  # (N, 128, 128) float
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        mask = self.soft_masks[idx]
+
+        if len(image.shape) == 2:
+            image = np.expand_dims(image, axis=-1)
+
+        if self.transform:
+            # Albumentations expects mask to be numpy
+            # Note: Albumentations might cast float masks if not careful, but usually preserves type if not standardizing
+            # We manually handle normalization for image
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]  # returns numpy
+
+        # Convert mask to tensor (Float for BCE with soft targets)
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.from_numpy(mask)
+        mask = mask.float()
+        # Add channel dim: (H, W) -> (1, H, W)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+
+        return {"image": image, "mask": mask, "id": self.ids[idx]}  # Soft labels
+
+
+def run_stage3_self_training(student_paths, debug=False):
+    """
+    Stage 3: Self-Training with Noisy Student.
+    Generates pseudo-labels on Test set and retrains on Combined (Train+Test) dataset.
+    """
+    print("=" * 50)
+    print("STAGE 3: Self-Training (Noisy Student)")
+    print("=" * 50)
+
+    if not student_paths:
+        print("No valid student models from Stage 2. Skipping Stage 3.")
+        return
+
+    if debug:
+        Config.NUM_EPOCHS_FINAL = 2
+
+    # 1. Load Test Data
+    test_df = pd.read_csv(Config.TEST_CSV)
+    test_imgs, _, test_depths_raw, test_ids = process_data(
+        test_df, "test", Config.CACHE_DIR
+    )
+
+    # Normalize test depths using stats from Stage 2 (re-calculate or load)
+    # For simplicity, we recalculate on training data to ensure consistency
+    train_df = pd.read_csv(Config.TRAIN_CSV)
+    val_df = pd.read_csv(Config.VAL_CSV)
+    _, _, t_depths, _ = process_data(train_df, "train", Config.CACHE_DIR)
+    _, _, v_depths, _ = process_data(val_df, "val", Config.CACHE_DIR)
+    all_depths = np.concatenate([t_depths, v_depths])
+    d_mean, d_std = np.mean(all_depths), np.std(all_depths) + 1e-8
+
+    # Test dataset for inference
+    test_ds = SaltDataset(
+        test_imgs,
+        (test_depths_raw - d_mean) / d_std,
+        test_ids,
+        masks=None,
+        transform=get_transforms("test"),
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # 2. Generate Soft Pseudo Labels (Ensemble + TTA)
+    print("Generating Pseudo Labels...")
+    ensemble_models = []
+    for path in student_paths:
+        m = StudentLinkNet(num_classes=1).to(Config.DEVICE)
+        m.load_state_dict(torch.load(path, map_location=Config.DEVICE))
+        m.eval()
+        ensemble_models.append(m)
+
+    soft_preds = np.zeros(
+        (len(test_imgs), Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32
+    )
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_loader):
+            images = batch["image"].to(Config.DEVICE).float()
+            bs = images.size(0)
+
+            batch_preds = torch.zeros(
+                (bs, 1, Config.IMG_SIZE, Config.IMG_SIZE), device=Config.DEVICE
+            )
+
+            for model in ensemble_models:
+                # Original
+                logits = model(images)["logits"]
+                probs = torch.sigmoid(logits)
+
+                # TTA: Horizontal Flip
+                images_flip = torch.flip(images, dims=[3])
+                logits_flip = model(images_flip)["logits"]
+                probs_flip = torch.flip(torch.sigmoid(logits_flip), dims=[3])
+
+                batch_preds += (probs + probs_flip) / 2.0
+
+            batch_preds /= len(ensemble_models)
+
+            # Store
+            start_idx = batch_idx * Config.BATCH_SIZE
+            end_idx = start_idx + bs
+            soft_preds[start_idx:end_idx] = batch_preds.squeeze(1).cpu().numpy()
+
+    # 3. Prepare Combined Datasets
+    # Labeled Data
+    t_imgs, t_masks, t_depths, t_ids = process_data(train_df, "train", Config.CACHE_DIR)
+    v_imgs, v_masks, v_depths, v_ids = process_data(val_df, "val", Config.CACHE_DIR)
+
+    # Fix: Use only training data for the labeled portion to avoid data leakage on validation set.
+    labeled_imgs = t_imgs
+    labeled_masks = t_masks
+    labeled_depths = (t_depths - d_mean) / d_std
+    labeled_ids = t_ids
+
+    # We use the original validation set to monitor progress.
+
+    labeled_ds = SaltDataset(
+        labeled_imgs,
+        labeled_depths,
+        labeled_ids,
+        labeled_masks,
+        transform=get_transforms("train"),
+    )
+    unlabeled_ds = PseudoLabelDataset(
+        test_imgs, test_ids, soft_preds, transform=get_transforms("train")
+    )
+
+    # Validation set (Original Val)
+    val_ds_final = SaltDataset(
+        v_imgs,
+        (v_depths - d_mean) / d_std,
+        v_ids,
+        v_masks,
+        transform=get_transforms("val"),
+    )
+
+    labeled_loader = DataLoader(
+        labeled_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        drop_last=True,
+    )
+    unlabeled_loader = DataLoader(
+        unlabeled_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds_final,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    # 4. Train Final Student
+    final_model = StudentLinkNet(num_classes=1).to(Config.DEVICE)
+    optimizer = torch.optim.AdamW(
+        final_model.parameters(),
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.NUM_EPOCHS_FINAL
+    )
+
+    # Losses
+    student_loss_fn = StudentLoss()  # Handles Labeled (Seg + MSE)
+    bce_loss = nn.BCEWithLogitsLoss()  # Handles Unlabeled (Soft Labels)
+
+    best_map = 0.0
+    best_model_path = os.path.join(Config.CACHE_DIR, "best_model_stage3.pth")
+
+    print("Starting Final Training Loop...")
+
+    for epoch in range(Config.NUM_EPOCHS_FINAL):
+        final_model.train()
+        train_loss = 0.0
+
+        # Iterate over zipped loaders (limit to length of smaller one, or cycle larger?
+        # Usually labeled is larger (3000) than test (1000). We iterate labeled and cycle unlabeled)
+
+        # Helper to cycle unlabeled
+        def cycle(iterable):
+            while True:
+                for x in iterable:
+                    yield x
+
+        unlabeled_iter = cycle(unlabeled_loader)
+
+        for batch_labeled in labeled_loader:
+            batch_unlabeled = next(unlabeled_iter)
+
+            optimizer.zero_grad()
+
+            # --- Labeled Step ---
+            l_imgs = batch_labeled["image"].to(Config.DEVICE).float()
+            l_masks = batch_labeled["mask"].to(Config.DEVICE).float()
+            l_depths = batch_labeled["depth"].to(Config.DEVICE).float()
+
+            l_out = final_model(l_imgs)
+            # Loss: Seg + MSE (No distillation from teacher here, or we could, but prompt says BCE vs Pseudo)
+            # We pass teacher_logits=None
+            loss_labeled, _ = student_loss_fn(
+                l_out, l_masks, l_depths, teacher_logits=None
+            )
+
+            # --- Unlabeled Step ---
+            u_imgs = batch_unlabeled["image"].to(Config.DEVICE).float()
+            u_masks = batch_unlabeled["mask"].to(Config.DEVICE).float()  # Soft targets
+
+            u_out = final_model(u_imgs)
+            u_logits = u_out["logits"]
+
+            # Loss: BCE against soft targets
+            loss_unlabeled = bce_loss(u_logits, u_masks)
+
+            # Combine
+            loss = loss_labeled + loss_unlabeled
+
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        scheduler.step()
+        train_loss /= len(labeled_loader)
+
+        # Validation
+        # Use a temporary trainer helper to reuse validate logic
+        trainer_temp = from_model_trainer(final_model)
+        val_map, val_thresh = trainer_temp.validate(val_loader)
+
+        print(
+            f"Epoch {epoch+1}/{Config.NUM_EPOCHS_FINAL} | Loss: {train_loss:.6f} | Val mAP: {val_map:.8f}"
+        )
+
+        if val_map > best_map:
+            best_map = val_map
+            torch.save(final_model.state_dict(), best_model_path)
+            # Save threshold
+            with open(os.path.join(Config.CACHE_DIR, "best_threshold.txt"), "w") as f:
+                f.write(str(val_thresh))
+
+    # 5. Generate Final Submission
+    print("Generating Final Submission...")
+    final_model.load_state_dict(torch.load(best_model_path))
+
+    # We need the test loader again (standard one)
+    test_loader_final, _, _ = get_loaders(
+        load_cached_data=True
+    )  # This returns (train, val, test)
+    # Actually get_loaders returns (train, val, test). We just need the 3rd one.
+    _, _, test_loader_std = get_loaders(load_cached_data=True)
+
+    generate_submission(
+        final_model, test_loader_std, Config.DEVICE, Config.SUBMISSION_PATH
+    )
+
+
+# Helper to instantiate a Trainer just for validation reuse
+def from_model_trainer(model):
+    from library.training import Trainer
+
+    return Trainer(model, Config.DEVICE)
+=======
+def run_cv_training(debug=False):
+    """
+    Runs 5-Fold Cross-Validation Training on the SaltModel.
+    """
+    print("=" * 50)
+    print("Running 5-Fold CV Training")
+    print("=" * 50)
+
+    # Load All Data
+    train_df = pd.read_csv(Config.TRAIN_CSV)
+    val_df = pd.read_csv(Config.VAL_CSV)
+
+    # Process data (force reload to ensure clean state)
+    t_imgs, t_masks, t_depths, t_ids = process_data(train_df, "train", Config.CACHE_DIR, load_cached_data=False)
+    v_imgs, v_masks, v_depths, v_ids = process_data(val_df, "val", Config.CACHE_DIR, load_cached_data=False)
+
+    # Combine for CV
+    all_images = np.concatenate([t_imgs, v_imgs], axis=0)
+    all_masks = np.concatenate([t_masks, v_masks], axis=0)
+    all_depths = np.concatenate([t_depths, v_depths], axis=0)
+    all_ids = np.concatenate([t_ids, v_ids], axis=0)
+
+    # Normalize Depths
+    d_mean = np.mean(all_depths)
+    d_std = np.std(all_depths) + 1e-8
+    all_depths_norm = (all_depths - d_mean) / d_std
+
+    # Save stats for test inference
+    stats_path = os.path.join(Config.CACHE_DIR, "depth_stats.csv")
+    pd.DataFrame({"mean": [d_mean], "std": [d_std]}).to_csv(stats_path, index=False)
+
+    # K-Fold
+    kf = KFold(n_splits=5, shuffle=True, random_state=Config.SEED)
+    
+    oof_preds_dict = {} # Map id -> (pred_prob, mask)
+    valid_model_paths = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(all_images)):
+        print(f"\n--- Fold {fold + 1}/5 ---")
+        
+        if debug and fold > 0:
+            break
+
+        # Datasets
+        train_ds = SaltDataset(
+            all_images[train_idx], all_depths_norm[train_idx], all_ids[train_idx], all_masks[train_idx], transform=get_transforms("train")
+        )
+        val_ds = SaltDataset(
+            all_images[val_idx], all_depths_norm[val_idx], all_ids[val_idx], all_masks[val_idx], transform=get_transforms("val")
+        )
+
+        train_loader = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=Config.NUM_WORKERS, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=Config.NUM_WORKERS, pin_memory=True)
+
+        # Model
+        model = SaltModel(num_classes=1).to(Config.DEVICE)
+
+        # Train
+        model, best_oof_preds, best_oof_masks = train_model(model, train_loader, val_loader, Config.DEVICE, Config, fold_idx=fold)
+
+        # Gating Check (Cite Lesson 00067)
+        # Calculate mAP for this fold
+        best_thresh = 0.5
+        best_map = 0.0
+        thresholds = np.arange(0.3, 0.72, 0.02)
+        for t in thresholds:
+            score = calc_map((best_oof_preds > t).astype(np.uint8), best_oof_masks)
+            if score > best_map:
+                best_map = score
+                best_thresh = t
+        
+        print(f"Fold {fold+1} Best mAP: {best_map:.6f} at Threshold {best_thresh:.2f}")
+
+        if best_map >= 0.70:
+            valid_model_paths.append(os.path.join(Config.CACHE_DIR, f"best_model_fold{fold}.pth"))
+            # Store OOF preds
+            fold_ids = all_ids[val_idx]
+            for i, uid in enumerate(fold_ids):
+                oof_preds_dict[uid] = (best_oof_preds[i], best_oof_masks[i])
+        else:
+            print(f"Fold {fold+1} discarded (mAP < 0.70)")
+
+    # Optimize Global Threshold on OOF
+    print("\nOptimizing Global Threshold on OOF Predictions...")
+    if not oof_preds_dict:
+        print("No valid OOF predictions.")
+        return [], 0.5, 0.0
+
+    all_oof_preds = []
+    all_oof_masks = []
+    for uid in oof_preds_dict:
+        p, m = oof_preds_dict[uid]
+        all_oof_preds.append(p)
+        all_oof_masks.append(m)
+    
+    all_oof_preds = np.array(all_oof_preds)
+    all_oof_masks = np.array(all_oof_masks)
+
+    best_global_map = 0.0
+    best_global_thresh = 0.5
+    for t in np.arange(0.3, 0.72, 0.02):
+        score = calc_map((all_oof_preds > t).astype(np.uint8), all_oof_masks)
+        if score > best_global_map:
+            best_global_map = score
+            best_global_thresh = t
+    
+    print(f"Global OOF mAP: {best_global_map:.6f} at Threshold {best_global_thresh:.4f}")
+
+    # Failure Analysis (Correlation Error vs Depth)
+    # Cite Lesson 00029: Check correlation to ensure depth is being used effectively.
+    binary_oof = (all_oof_preds > best_global_thresh).astype(np.uint8)
+    intersection = np.sum(binary_oof & all_oof_masks, axis=(1, 2))
+    union = np.sum(binary_oof | all_oof_masks, axis=(1, 2))
+    
+    ious = np.ones_like(intersection, dtype=np.float32)
+    valid_mask = union > 0
+    ious[valid_mask] = intersection[valid_mask] / union[valid_mask]
+    errors = 1.0 - ious
+
+    # We need depths corresponding to OOF. The OOF loop iterated over dict keys (ids).
+    # We need to fetch depths for these IDs.
+    # Map ID -> Depth
+    id_to_depth = {uid: d for uid, d in zip(all_ids, all_depths)} # Raw depths
+    oof_depths = np.array([id_to_depth[uid] for uid in oof_preds_dict.keys()])
+
+    if np.std(errors) > 0 and np.std(oof_depths) > 0:
+        correlation = np.corrcoef(errors, oof_depths)[0, 1]
+    else:
+        correlation = 0.0
+    
+    print(f"Failure Analysis - Correlation (Error vs Depth): {correlation:.10f}")
+
+    return valid_model_paths, best_global_thresh, best_global_map
+
+
+def generate_ensemble_submission(model_paths, threshold):
+    """
+    Generates submission by ensembling predictions from multiple models.
+    """
+    print("Generating Ensemble Submission...")
+    
+    # Load Test Data
+    test_df = pd.read_csv(Config.TEST_CSV)
+    test_imgs, _, test_depths_raw, test_ids = process_data(test_df, "test", Config.CACHE_DIR, load_cached_data=False)
+
+    # Normalize Depths
+    stats_path = os.path.join(Config.CACHE_DIR, "depth_stats.csv")
+    stats = pd.read_csv(stats_path)
+    d_mean, d_std = stats["mean"][0], stats["std"][0]
+    test_depths_norm = (test_depths_raw - d_mean) / d_std
+
+    test_ds = SaltDataset(test_imgs, test_depths_norm, test_ids, masks=None, transform=get_transforms("test"))
+    test_loader = DataLoader(test_ds, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=Config.NUM_WORKERS)
+
+    # Load Models
+    models = []
+    for path in model_paths:
+        m = SaltModel(num_classes=1).to(Config.DEVICE)
+        m.load_state_dict(torch.load(path, map_location=Config.DEVICE))
+        m.eval()
+        models.append(m)
+    
+    submission_data = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["image"].to(Config.DEVICE).float()
+            depths = batch["depth"].to(Config.DEVICE).float()
+            ids = batch["id"]
+
+            batch_probs = torch.zeros((images.size(0), Config.IMG_SIZE, Config.IMG_SIZE), device=Config.DEVICE)
+
+            for model in models:
+                logits = model(images, depths)
+                probs = torch.sigmoid(logits).squeeze(1)
+                
+                # TTA: Flip
+                logits_flip = model(torch.flip(images, [3]), depths)
+                probs_flip = torch.flip(torch.sigmoid(logits_flip).squeeze(1), [2]) # Flip back W dim (2 since N,H,W)
+
+                batch_probs += (probs + probs_flip) / 2.0
+            
+            batch_probs /= len(models)
+            batch_probs = batch_probs.cpu().numpy()
+
+            for i, img_id in enumerate(ids):
+                p_un = unpad_image(batch_probs[i])
+                mask = (p_un > threshold).astype(np.uint8)
+                rle = rle_encode(mask)
+                submission_data.append([img_id, rle])
+    
+    df = pd.DataFrame(submission_data, columns=["id", "rle_mask"])
+    df.to_csv(Config.SUBMISSION_PATH, index=False)
+    print(f"Submission saved to {Config.SUBMISSION_PATH}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.config import Config, seed_everything
+from library.pipeline import (
+    run_stage1_teacher,
+    run_stage2_student_ensemble,
+    run_stage3_self_training,
+)
+from library.models import StudentLinkNet
+from library.dataset import get_loaders
+from library.utils import unpad_image, calc_map
+from library.training import generate_submission
+
+# Suppress warnings for clean output
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Setup and Reproducibility
+    seed_everything(Config.SEED)
+
+    # 2. Configure for Fast Baseline
+    # Adjust epochs to ensure completion within 2 hours while maintaining performance.
+    # 20 epochs per stage is sufficient for the dataset size (2400 train images).
+    Config.NUM_EPOCHS_TEACHER = 20
+    Config.NUM_EPOCHS_STUDENT = 20
+    Config.NUM_EPOCHS_FINAL = 20
+
+    # Ensure working directory exists
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    print("--- Starting Privileged Multi-Task Ensemble Distillation Pipeline ---")
+
+    # 3. Execute Pipeline Stages
+
+    # Stage 1: Privileged Teacher (Image + Depth)
+    # Trains on labeled data using depth injection
+    teacher_model_path = run_stage1_teacher(debug=False)
+
+    # Stage 2: Multi-Task Student Ensemble (Image Only)
+    # Distills knowledge from Teacher and learns auxiliary depth regression
+    student_model_paths = run_stage2_student_ensemble(teacher_model_path, debug=False)
+
+    # Stage 3: Self-Training (Noisy Student)
+    # Generates pseudo-labels on Test set and retrains final model
+    # This function automatically generates submission.csv if successful
+    run_stage3_self_training(student_model_paths, debug=False)
+
+    # 4. Final Validation and Failure Analysis
+    print("\n--- Performing Final Validation & Failure Analysis ---")
+
+    # Determine which model to evaluate
+    # Prefer Stage 3 model, fallback to best Stage 2 model if Stage 3 didn't run
+    stage3_model_path = os.path.join(Config.CACHE_DIR, "best_model_stage3.pth")
+
+    final_model_path = None
+    if os.path.exists(stage3_model_path):
+        final_model_path = stage3_model_path
+        print("Using Stage 3 Best Model.")
+    elif student_model_paths:
+        final_model_path = student_model_paths[0]  # Take the first valid fold
+        print("Stage 3 model not found. Falling back to Stage 2 Model (Fold 0).")
+    else:
+        print("No valid models trained. Exiting.")
+        return
+
+    # Load Model
+    model = StudentLinkNet(num_classes=1).to(Config.DEVICE)
+    model.load_state_dict(torch.load(final_model_path, map_location=Config.DEVICE))
+    model.eval()
+
+    # Load Validation Data
+    # get_loaders returns (train, val, test)
+    _, val_loader, _ = get_loaders(load_cached_data=True)
+
+    # Load Best Threshold (saved during training)
+    thresh_path = os.path.join(Config.CACHE_DIR, "best_threshold.txt")
+    threshold = 0.5
+    if os.path.exists(thresh_path):
+        with open(thresh_path, "r") as f:
+            try:
+                threshold = float(f.read().strip())
+            except:
+                pass
+    print(f"Using optimized threshold: {threshold}")
+
+    # Inference on Validation Set
+    all_preds = []
+    all_masks = []
+    all_depths = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(Config.DEVICE).float()
+            masks = batch["mask"].numpy()
+            depths = batch["depth"].numpy()  # Normalized depths
+
+            # Student model only needs images
+            outputs = model(images)
+            logits = outputs["logits"]
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            for i in range(len(probs)):
+                # Unpad to original size (101x101)
+                p = unpad_image(probs[i].squeeze(0))
+                m = unpad_image(masks[i].squeeze(0))
+
+                all_preds.append(p)
+                all_masks.append(m)
+                all_depths.append(depths[i][0])
+
+    all_preds = np.array(all_preds)
+    all_masks = np.array(all_masks)
+    all_depths = np.array(all_depths)
+
+    # 5. Compute Metrics
+
+    # Apply threshold to get binary masks
+    binary_preds = (all_preds > threshold).astype(np.uint8)
+
+    # Calculate mAP (Metric for Competition)
+    final_map = calc_map(binary_preds, all_masks)
+    print(f"Final Validation Metric: {final_map:.10f}")
+
+    # 6. Failure Analysis
+    # Calculate IoU per image to correlate with Depth
+    intersection = np.sum(binary_preds & all_masks, axis=(1, 2))
+    union = np.sum(binary_preds | all_masks, axis=(1, 2))
+
+    # Handle division by zero (empty union means both empty -> IoU=1)
+    ious = np.ones_like(intersection, dtype=np.float32)
+    valid_mask = union > 0
+    ious[valid_mask] = intersection[valid_mask] / union[valid_mask]
+
+    errors = 1.0 - ious
+
+    # Correlation (Pearson) between Error and Depth
+    if np.std(errors) > 0 and np.std(all_depths) > 0:
+        correlation = np.corrcoef(errors, all_depths)[0, 1]
+    else:
+        correlation = 0.0
+
+    print(f"Failure Analysis - Correlation (Error vs Depth): {correlation:.10f}")
+
+    # 7. Submission Logic
+    # Only submit if metric > 0.7985
+    if final_map > 0.7985:
+        print("Validation metric meets threshold. Submission preserved.")
+        # Ensure submission exists (generated by Stage 3). If not, generate it now.
+        if not os.path.exists(Config.SUBMISSION_PATH):
+            print("Generating submission file manually...")
+            _, _, test_loader = get_loaders(load_cached_data=True)
+            generate_submission(
+                model, test_loader, Config.DEVICE, Config.SUBMISSION_PATH
+            )
+    else:
+        print(f"Validation metric {final_map} <= 0.7985. Discarding submission.")
+        if os.path.exists(Config.SUBMISSION_PATH):
+            os.remove(Config.SUBMISSION_PATH)
+=======
+from library.config import Config, seed_everything
+from library.pipeline import run_cv_training, generate_ensemble_submission
+from library.dataset import process_data
+
+# Suppress warnings for clean output
+warnings.filterwarnings("ignore")
+
+
+def main():
+    # 1. Setup
+    seed_everything(Config.SEED)
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    print("--- Starting Optimized 5-Fold CV Pipeline (Image + Depth) ---")
+
+    # 2. Run Training Pipeline (5-Fold CV)
+    # This trains models and returns the paths to the best checkpoints and the optimal global threshold
+    valid_model_paths, best_threshold, final_map = run_cv_training(debug=False)
+
+    # 3. Final Validation Reporting
+    print("\n--- Final Validation Report ---")
+    print(f"Final Global OOF mAP: {final_map:.10f}")
+
+    # 4. Submission Logic
+    if final_map > 0.7985:
+        print("Validation metric meets threshold. Generating Ensemble Submission.")
+        generate_ensemble_submission(valid_model_paths, best_threshold)
+    else:
+        print(f"Validation metric {final_map} <= 0.7985. No submission generated.")
+        if os.path.exists(Config.SUBMISSION_PATH):
+            os.remove(Config.SUBMISSION_PATH)
+>>>>>>> REPLACE
+```

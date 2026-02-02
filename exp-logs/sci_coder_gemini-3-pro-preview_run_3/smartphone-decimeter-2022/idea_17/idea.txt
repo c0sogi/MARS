@@ -1,0 +1,49 @@
+Based on the lessons learned, specifically the high precision of **Carrier Phase (TDCP)** measurements (Cite solution_lesson_node_00046), the superiority of **Gradient Boosting** for sensor residuals (Cite solution_lesson_node_00010), and the effectiveness of **Geometric Projection** features (Cite solution_lesson_node_00043), I propose the **RANSAC-Aided TDCP Graph Optimization (RTGO)** strategy.
+
+This strategy structurally evolves the previous best approach (Idea 16) by hardening the physics-based trajectory reconstruction. While Idea 16 introduced carrier-phase constraints, it relied on a simple Least Squares formulation that is vulnerable to cycle slips (phase jumps). This solution introduces **RANSAC** into the odometry engine to explicitly reject corrupted phase measurements and implements a **Factor Graph** with dynamic edge weighting to fuse the ML predictions with the kinematic constraints optimally.
+
+### 1. Model: Split-Band Geometry-Projected Ensemble
+The predictive core remains an ensemble of **LightGBM Regressors**, optimized to predict position errors based on instantaneous signal snapshots.
+
+*   **Architecture:** Independent models for **East** and **North** error components.
+*   **Target:** The model predicts the **ENU (East-North-Up) Residuals** ($P_{GT} - P_{WLS}$) in meters. This leverages the WLS baseline as a robust physical prior (Cite solution_lesson_node_00007).
+*   **Input Features (Innovation):**
+    *   **Split-Band Geometric Projection:** Instead of a single "Net Error Force" vector (Cite solution_lesson_node_00043), compute separate projection vectors for **L1** signals and **L5** signals.
+        *   $F_{L1} = \sum_{L1} w_i r_i \vec{u}_i$ and $F_{L5} = \sum_{L5} w_i r_i \vec{u}_i$.
+        *   Compute separate Geometry Matrix elements (DOP) for L1 and L5 subsets.
+    *   **Rationale:** L5 signals are significantly more robust to multipath. By splitting the features, the GBDT can learn to trust the L5 geometry more heavily when correcting the baseline.
+    *   **Global Context:** Aggregated signal quality and IMU dynamics.
+    *   **Constraint:** Strictly **Point-Wise** features (no temporal windowing) to prevent trajectory memorization (Cite solution_lesson_node_00011).
+
+### 2. Data: Dual-Stream Preprocessing
+The data pipeline splits into two parallel streams: one for Feature Engineering (ML) and one for Odometry (Physics).
+
+*   **Stream A: ML Features**
+    *   Convert Ground Truth and WLS positions to a local ENU frame.
+    *   Compute the Split-Band Geometric Projection features described above for every timestamp.
+*   **Stream B: Robust Odometry (Innovation)**
+    *   Extract `AccumulatedDeltaRangeMeters` (Carrier Phase) and `PseudorangeRateMetersPerSecond` (Doppler).
+    *   **Cycle Slip Detection:** Filter out satellites where `AccumulatedDeltaRangeState` indicates a cycle slip or reset.
+    *   **Delta-Phase Calculation:** For consecutive epochs $(t-1, t)$, compute the change in carrier phase for all valid satellites.
+
+### 3. Training
+*   **Loss Function:** **Mean Absolute Error (MAE)**. This L1 loss ensures the model learns the median error, providing a robust "anchor" point that ignores the massive outliers inherent in urban GNSS data (Cite solution_lesson_node_00007).
+*   **Validation:** **GroupKFold** cross-validation grouped by `drive_id` to strictly enforce evaluation on unseen routes.
+
+### 4. Evaluation: Factor Graph Fusion
+The inference pipeline constructs and solves a Factor Graph to generate the final trajectory.
+
+1.  **Anchor Generation:** Use the trained LightGBM ensemble to predict residuals and correct the WLS baseline, producing a sequence of noisy absolute positions $\hat{P}_{ML, t}$.
+2.  **Robust Odometry Estimation (RANSAC):**
+    *   For every step $t$, estimate the relative displacement vector $\Delta \vec{x}_t = x_t - x_{t-1}$.
+    *   **Method:** Use **RANSAC (Random Sample Consensus)** to solve the Time-Differenced Carrier Phase (TDCP) equation.
+    *   **Benefit:** RANSAC explicitly identifies and excludes satellites with undetected cycle slips or severe multipath, producing a clean, centimeter-accurate relative motion vector.
+    *   **Fallback:** If TDCP fails (insufficient satellites), fall back to RANSAC-solved Doppler velocity.
+    *   **Confidence:** Calculate a weight $w_{odom, t}$ proportional to the number of RANSAC inliers.
+3.  **Global Graph Optimization:**
+    *   Solve for the trajectory $X = \{x_0, \dots, x_N\}$ that minimizes:
+        $$ J(X) = \sum_{t} \rho(x_t - \hat{P}_{ML, t}) + \sum_{t} w_{odom, t} ||(x_t - x_{t-1}) - \Delta \vec{x}_{RANSAC, t}||^2 $$
+    *   **Anchor Term:** $\rho$ is a **Huber Loss**. It pulls the trajectory towards the ML predictions but allows it to "break" away from large ML outliers (fixing the smearing issue of Cite solution_lesson_node_00014).
+    *   **Shape Term:** The weighted L2 term enforces the precise shape derived from the Robust Odometry.
+
+This strategy uses Machine Learning to determine *where* the trajectory is (Global Bias) and Robust Physics to determine *how* it moves (Local Shape).

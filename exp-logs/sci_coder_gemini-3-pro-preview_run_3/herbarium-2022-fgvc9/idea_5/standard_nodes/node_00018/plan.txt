@@ -1,0 +1,398 @@
+The `RuntimeError: cuDNN error: CUDNN_STATUS_EXECUTION_FAILED` is caused by two issues related to target labels in the `PlantDataset` and loss function:
+
+1.  **Sparse Species Labels (Cite debug_lesson_1):** The dataset contains `category_id`s up to 15505, but the model is configured for 15501 classes (the actual number of unique taxa). Passing a raw `category_id` $\ge$ 15501 as a target index causes a device-side assertion error because it exceeds the model's output dimension. We must map these sparse IDs to a contiguous range `[0, 15500]`.
+2.  **Invalid Ignore Index (Cite debug_lesson_6):** The dataset currently uses `-1` as the default value for missing genus/family IDs. However, `nn.CrossEntropyLoss` uses `-100` as the default `ignore_index`. Passing `-1` as a target class is invalid (since class indices must be $\ge 0$) and triggers an execution failure.
+
+To fix this, I will:
+1.  Update `library/config.py` to generate a contiguous `species_label` mapping and ensure the cache is refreshed.
+2.  Update `library/utils.py` to expose the `species_to_label` and `label_to_species` mappings.
+3.  Update `library/dataset.py` to use `species_label` as the training target and `-100` as the default for missing auxiliary labels.
+4.  Update `library/train.py`, `library/inference.py`, and `runfile.py` to map the contiguous predictions back to the original `category_id`s for submission and analysis.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+        # 1. Try to load from cache
+        if load_cached_data and os.path.exists(cache_path):
+            try:
+                print(f"Loading hierarchy mappings from cache: {cache_path}")
+                return pd.read_parquet(cache_path)
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Regenerating...")
+=======
+        # 1. Try to load from cache
+        if load_cached_data and os.path.exists(cache_path):
+            try:
+                print(f"Loading hierarchy mappings from cache: {cache_path}")
+                df = pd.read_parquet(cache_path)
+                # Ensure new column exists, otherwise regenerate
+                if "species_label" in df.columns:
+                    return df
+                print("Cache missing 'species_label'. Regenerating...")
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Regenerating...")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Create integer mappings for Genus and Family
+        # Sort unique values to ensure deterministic mapping
+        unique_genera = sorted(df_cats["genus"].unique())
+        unique_families = sorted(df_cats["family"].unique())
+
+        genus_map = {name: i for i, name in enumerate(unique_genera)}
+        family_map = {name: i for i, name in enumerate(unique_families)}
+
+        # Map to IDs
+        df_cats["genus_id"] = df_cats["genus"].map(genus_map)
+        df_cats["family_id"] = df_cats["family"].map(family_map)
+
+        # Select relevant columns
+        result_df = df_cats[["category_id", "genus_id", "family_id", "genus", "family"]]
+=======
+        # Create integer mappings for Genus and Family
+        # Sort unique values to ensure deterministic mapping
+        unique_genera = sorted(df_cats["genus"].unique())
+        unique_families = sorted(df_cats["family"].unique())
+
+        # Create contiguous mapping for Species (category_id)
+        # Cite debug_lesson_1: Map sparse IDs to contiguous indices
+        unique_species = sorted(df_cats["category_id"].unique())
+        species_map = {cid: i for i, cid in enumerate(unique_species)}
+
+        genus_map = {name: i for i, name in enumerate(unique_genera)}
+        family_map = {name: i for i, name in enumerate(unique_families)}
+
+        # Map to IDs
+        df_cats["species_label"] = df_cats["category_id"].map(species_map)
+        df_cats["genus_id"] = df_cats["genus"].map(genus_map)
+        df_cats["family_id"] = df_cats["family"].map(family_map)
+
+        # Select relevant columns
+        result_df = df_cats[["category_id", "species_label", "genus_id", "family_id", "genus", "family"]]
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+    # Convert DataFrame columns to dictionaries
+    species_to_genus = dict(zip(df["category_id"], df["genus_id"]))
+    species_to_family = dict(zip(df["category_id"], df["family_id"]))
+
+    return species_to_genus, species_to_family
+=======
+    # Convert DataFrame columns to dictionaries
+    species_to_genus = dict(zip(df["category_id"], df["genus_id"]))
+    species_to_family = dict(zip(df["category_id"], df["family_id"]))
+
+    # Mappings for sparse category_id <-> contiguous species_label
+    species_to_label = dict(zip(df["category_id"], df["species_label"]))
+    label_to_species = dict(zip(df["species_label"], df["category_id"]))
+
+    return species_to_genus, species_to_family, species_to_label, label_to_species
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        if not self.is_test:
+            if hierarchy_dicts is None:
+                raise ValueError(
+                    "hierarchy_dicts must be provided for training/validation"
+                )
+            self.species_to_genus, self.species_to_family = hierarchy_dicts
+
+    def __len__(self):
+=======
+        if not self.is_test:
+            if hierarchy_dicts is None:
+                raise ValueError(
+                    "hierarchy_dicts must be provided for training/validation"
+                )
+            self.species_to_genus, self.species_to_family, self.species_to_label, _ = hierarchy_dicts
+
+    def __len__(self):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        if self.is_test:
+            # For test set, return image and ID for submission
+            return image, str(row["image_id"])
+        else:
+            # For train/val, return image and hierarchical targets
+            species_id = int(row["category_id"])
+
+            # Map to parent taxa
+            genus_id = self.species_to_genus.get(species_id, -1)
+            family_id = self.species_to_family.get(species_id, -1)
+
+            targets = {
+                "species": torch.tensor(species_id, dtype=torch.long),
+                "genus": torch.tensor(genus_id, dtype=torch.long),
+                "family": torch.tensor(family_id, dtype=torch.long),
+            }
+            return image, targets
+=======
+        if self.is_test:
+            # For test set, return image and ID for submission
+            return image, str(row["image_id"])
+        else:
+            # For train/val, return image and hierarchical targets
+            category_id = int(row["category_id"])
+
+            # Map sparse category_id to contiguous label (Cite debug_lesson_1)
+            species_label = self.species_to_label[category_id]
+
+            # Map to parent taxa
+            # Use -100 as default to match CrossEntropyLoss ignore_index (Cite debug_lesson_6)
+            genus_id = self.species_to_genus.get(category_id, -100)
+            family_id = self.species_to_family.get(category_id, -100)
+
+            targets = {
+                "species": torch.tensor(species_label, dtype=torch.long),
+                "genus": torch.tensor(genus_id, dtype=torch.long),
+                "family": torch.tensor(family_id, dtype=torch.long),
+            }
+            return image, targets
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.utils import seed_everything, get_logger, save_checkpoint, load_checkpoint
+=======
+from library.utils import seed_everything, get_logger, save_checkpoint, load_checkpoint, get_hierarchy_dicts
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def generate_submission(model, device, logger):
+    """
+    Generates submission file using the trained model.
+    Applies Horizontal Flip TTA.
+    """
+    logger.info("Generating submission...")
+
+    # Use Stage 2 image size for inference
+    image_size = Config.STAGE2_IMAGE_SIZE
+    batch_size = Config.STAGE2_BATCH_SIZE
+
+    test_loader = get_test_dataloader(image_size, batch_size)
+
+    model.eval()
+    predictions = []
+    image_ids = []
+
+    with torch.no_grad():
+        for images, ids in test_loader:
+            images = images.to(device)
+
+            # 1. Forward pass original
+            outputs_orig = model(images)
+            logits_orig = outputs_orig["species"]
+
+            # 2. Forward pass flipped (TTA)
+            images_flipped = torch.flip(
+                images, dims=[3]
+            )  # Flip width dimension (N, C, H, W)
+            outputs_flip = model(images_flipped)
+            logits_flip = outputs_flip["species"]
+
+            # 3. Average logits
+            avg_logits = (logits_orig + logits_flip) / 2.0
+
+            # 4. Get predictions
+            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+
+            predictions.extend(preds)
+            image_ids.extend(ids)
+=======
+def generate_submission(model, device, logger):
+    """
+    Generates submission file using the trained model.
+    Applies Horizontal Flip TTA.
+    """
+    logger.info("Generating submission...")
+
+    # Load label mapping to convert predictions back to category_id
+    hierarchy_dicts = get_hierarchy_dicts(load_cached_data=True)
+    label_to_species = hierarchy_dicts[3]
+
+    # Use Stage 2 image size for inference
+    image_size = Config.STAGE2_IMAGE_SIZE
+    batch_size = Config.STAGE2_BATCH_SIZE
+
+    test_loader = get_test_dataloader(image_size, batch_size)
+
+    model.eval()
+    predictions = []
+    image_ids = []
+
+    with torch.no_grad():
+        for images, ids in test_loader:
+            images = images.to(device)
+
+            # 1. Forward pass original
+            outputs_orig = model(images)
+            logits_orig = outputs_orig["species"]
+
+            # 2. Forward pass flipped (TTA)
+            images_flipped = torch.flip(
+                images, dims=[3]
+            )  # Flip width dimension (N, C, H, W)
+            outputs_flip = model(images_flipped)
+            logits_flip = outputs_flip["species"]
+
+            # 3. Average logits
+            avg_logits = (logits_orig + logits_flip) / 2.0
+
+            # 4. Get predictions
+            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+
+            # Map contiguous labels back to original category_id
+            preds_original = [label_to_species[p] for p in preds]
+
+            predictions.extend(preds_original)
+            image_ids.extend(ids)
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+from library.utils import load_checkpoint
+=======
+from library.utils import load_checkpoint, get_hierarchy_dicts
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def predict_tta(model, loader, device):
+    """
+    Performs inference on the test dataset using Test Time Augmentation (Horizontal Flip).
+    It averages the logits from the original and flipped images for the species head.
+
+    Args:
+        model (torch.nn.Module): The trained hierarchical model.
+        loader (DataLoader): DataLoader for the test set.
+        device (torch.device): Device to perform inference on.
+
+    Returns:
+        pd.DataFrame: DataFrame containing 'Id' and 'Predicted' columns.
+    """
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    # Disable gradient calculation for inference
+    with torch.no_grad():
+        for images, ids in loader:
+            images = images.to(device)
+
+            # 1. Forward pass with original images
+            outputs_orig = model(images)
+            logits_orig = outputs_orig["species"]
+
+            # 2. Forward pass with horizontally flipped images (TTA)
+            # Flip along the width dimension (dim 3 for N, C, H, W)
+            images_flipped = torch.flip(images, dims=[3])
+            outputs_flip = model(images_flipped)
+            logits_flip = outputs_flip["species"]
+
+            # 3. Average logits
+            avg_logits = (logits_orig + logits_flip) / 2.0
+
+            # 4. Get predictions (argmax)
+            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+
+            all_preds.extend(preds)
+            all_ids.extend(ids)
+
+    # Create DataFrame
+    df_submission = pd.DataFrame({"Id": all_ids, "Predicted": all_preds})
+
+    return df_submission
+=======
+def predict_tta(model, loader, device):
+    """
+    Performs inference on the test dataset using Test Time Augmentation (Horizontal Flip).
+    It averages the logits from the original and flipped images for the species head.
+
+    Args:
+        model (torch.nn.Module): The trained hierarchical model.
+        loader (DataLoader): DataLoader for the test set.
+        device (torch.device): Device to perform inference on.
+
+    Returns:
+        pd.DataFrame: DataFrame containing 'Id' and 'Predicted' columns.
+    """
+    # Load label mapping
+    hierarchy_dicts = get_hierarchy_dicts(load_cached_data=True)
+    label_to_species = hierarchy_dicts[3]
+
+    model.eval()
+    all_preds = []
+    all_ids = []
+
+    # Disable gradient calculation for inference
+    with torch.no_grad():
+        for images, ids in loader:
+            images = images.to(device)
+
+            # 1. Forward pass with original images
+            outputs_orig = model(images)
+            logits_orig = outputs_orig["species"]
+
+            # 2. Forward pass with horizontally flipped images (TTA)
+            # Flip along the width dimension (dim 3 for N, C, H, W)
+            images_flipped = torch.flip(images, dims=[3])
+            outputs_flip = model(images_flipped)
+            logits_flip = outputs_flip["species"]
+
+            # 3. Average logits
+            avg_logits = (logits_orig + logits_flip) / 2.0
+
+            # 4. Get predictions (argmax)
+            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+
+            # Map back to category_id
+            preds_original = [label_to_species[p] for p in preds]
+
+            all_preds.extend(preds_original)
+            all_ids.extend(ids)
+
+    # Create DataFrame
+    df_submission = pd.DataFrame({"Id": all_ids, "Predicted": all_preds})
+
+    return df_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Align counts with F1 scores
+    counts_aligned = []
+    f1_aligned = []
+
+    for cls_id, score in zip(unique_classes, class_f1_scores):
+        # Some classes might be in val but not train (unlikely due to stratification)
+        # or vice versa.
+        cnt = class_counts.get(cls_id, 0)
+        counts_aligned.append(cnt)
+        f1_aligned.append(score)
+=======
+    # Align counts with F1 scores
+    counts_aligned = []
+    f1_aligned = []
+
+    # Get mapping to convert label back to category_id
+    label_to_species = hierarchy_dicts[3]
+
+    for cls_label, score in zip(unique_classes, class_f1_scores):
+        # Map label to category_id
+        cls_id = label_to_species[cls_label]
+
+        # Some classes might be in val but not train (unlikely due to stratification)
+        # or vice versa.
+        cnt = class_counts.get(cls_id, 0)
+        counts_aligned.append(cnt)
+        f1_aligned.append(score)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,420 @@
+I will implement the following changes to optimize the solution based on the provided lessons:
+
+1.  **Revert to BiGRU Backbone**: I will replace the `LayerNormBiLSTM` with a standard `BiGRU` backbone. As noted in **Lesson 00108**, GRUs are more parameter-efficient and perform better than LSTMs in this low-data regime (<2,500 samples).
+2.  **Implement Pre-LayerNorm Residuals**: I will replace the "Internal Cell Normalization" strategy (which caused degradation in **Lesson 00135**) with a standard **Pre-LayerNorm** residual block structure (`x + Dropout(GRU(Norm(x)))`). This decoupling of normalization and recurrence improves convergence.
+3.  **Adjust Model Capacity**: I will reduce the `HIDDEN_DIM` from 512 to 384 (**Lesson 00108**) and reduce `DROPOUT` from 0.2 to 0.1 (**Lesson 00129**). The larger capacity of the previous solution led to overfitting/optimization difficulties.
+4.  **Restore Training Budget**: I will increase `EPOCHS` back to 20 inside `runfile.py`, as **Lesson 00131** highlights that sufficient gradient updates are crucial for convergence, especially with the batch size of 32.
+
+The configuration will now closely mirror the best-performing `idea_44` architecture.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    PROJECT_NAME = "RNA_Degradation_Idea_53"
+    SEED = 42
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NUM_WORKERS = 2  # Adjust based on available vCPUs (12 available)
+
+    # ==============================
+    # Data Paths
+    # ==============================
+    # Root directories
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    WORKING_DIR = "./working/idea_53"  # Specific cache directory requirement
+=======
+    PROJECT_NAME = "RNA_Degradation_Idea_54"
+    SEED = 42
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NUM_WORKERS = 2  # Adjust based on available vCPUs (12 available)
+
+    # ==============================
+    # Data Paths
+    # ==============================
+    # Root directories
+    INPUT_DIR = "./input"
+    METADATA_DIR = "./metadata"
+    WORKING_DIR = "./working/idea_54"  # Specific cache directory requirement
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Backbone
+    HIDDEN_DIM = 512  # Explicit Width 512
+    NUM_LAYERS = 6  # 6 Residual Blocks
+    DROPOUT = 0.2  # Inter-layer dropout
+
+    # Note: Internal LayerNorm logic is handled in the model definition,
+    # but the dimension settings here support it.
+
+    # ==============================
+    # Training Hyperparameters
+    # ==============================
+    BATCH_SIZE = 32  # Strictly 32
+    EPOCHS = 20  # Fixed budget
+=======
+    # Backbone
+    HIDDEN_DIM = 384  # Reduced width for GRU efficiency (Cite solution_lesson_node_00108)
+    NUM_LAYERS = 6  # 6 Residual Blocks
+    DROPOUT = 0.1  # Reduced dropout for smaller model (Cite solution_lesson_node_00129)
+
+    # ==============================
+    # Training Hyperparameters
+    # ==============================
+    BATCH_SIZE = 32  # Strictly 32 (Cite solution_lesson_node_00131)
+    EPOCHS = 20  # Fixed budget (Cite solution_lesson_node_00131)
+>>>>>>> REPLACE
+```
+
+```diff
+library/layers.py
+<<<<<<< SEARCH
+class LayerNormLSTMCell(nn.Module):
+    """
+    A specific LSTM cell implementation that applies Layer Normalization
+    to the internal gate activations (input, forget, cell, output)
+    before non-linearities.
+
+    This is critical for stabilizing the 'Width 512' regime as per the
+    Internally-Normalized Wide-Stream Residual BiLSTM strategy.
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super(LayerNormLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        # Linear projections for input-to-hidden and hidden-to-hidden
+        # We project to 4 * hidden_size for (i, f, g, o) gates
+        self.weight_ih = nn.Linear(input_size, 4 * hidden_size, bias=True)
+        self.weight_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=True)
+
+        # Internal Layer Normalization
+        # Applied to the sum of projections before activation
+        self.ln = nn.LayerNorm(4 * hidden_size)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Standard LSTM initialization
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, input_tensor, hidden_state):
+        """
+        Args:
+            input_tensor: (Batch, Input_Size)
+            hidden_state: Tuple (h_prev, c_prev), each (Batch, Hidden_Size)
+
+        Returns:
+            h_next, c_next: (Batch, Hidden_Size)
+        """
+        h_prev, c_prev = hidden_state
+
+        # Compute gates
+        # gates = LN(W_ih * x + W_hh * h_prev)
+        gates = self.weight_ih(input_tensor) + self.weight_hh(h_prev)
+        gates = self.ln(gates)
+
+        # Split into input, forget, cell, output gates
+        i_gate, f_gate, g_gate, o_gate = gates.chunk(4, dim=1)
+
+        # Apply non-linearities
+        i_gate = torch.sigmoid(i_gate)
+        f_gate = torch.sigmoid(f_gate)
+        g_gate = torch.tanh(g_gate)
+        o_gate = torch.sigmoid(o_gate)
+
+        # Update cell state and hidden state
+        c_next = (f_gate * c_prev) + (i_gate * g_gate)
+        h_next = o_gate * torch.tanh(c_next)
+
+        return h_next, c_next
+
+
+class LayerNormBiLSTM(nn.Module):
+    """
+    A wrapper module that constructs a bidirectional layer using
+    LayerNormLSTMCell. It handles the forward and backward passes
+    over the sequence and concatenates the results.
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super(LayerNormBiLSTM, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        # Forward and Backward cells
+        self.cell_fwd = LayerNormLSTMCell(input_size, hidden_size)
+        self.cell_bwd = LayerNormLSTMCell(input_size, hidden_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (Batch, Seq_Len, Input_Size)
+
+        Returns:
+            output: (Batch, Seq_Len, 2 * Hidden_Size)
+        """
+        batch_size, seq_len, _ = x.size()
+        device = x.device
+
+        # Initialize hidden and cell states
+        h_fwd = torch.zeros(batch_size, self.hidden_size, device=device)
+        c_fwd = torch.zeros(batch_size, self.hidden_size, device=device)
+
+        h_bwd = torch.zeros(batch_size, self.hidden_size, device=device)
+        c_bwd = torch.zeros(batch_size, self.hidden_size, device=device)
+
+        # Storage for outputs
+        outputs_fwd = []
+        outputs_bwd = []
+
+        # Forward pass
+        for t in range(seq_len):
+            h_fwd, c_fwd = self.cell_fwd(x[:, t, :], (h_fwd, c_fwd))
+            outputs_fwd.append(h_fwd)
+
+        # Backward pass
+        for t in range(seq_len - 1, -1, -1):
+            h_bwd, c_bwd = self.cell_bwd(x[:, t, :], (h_bwd, c_bwd))
+            outputs_bwd.append(h_bwd)
+
+        # Reverse backward outputs to match sequence order
+        outputs_bwd = outputs_bwd[::-1]
+
+        # Stack along sequence dimension
+        outputs_fwd = torch.stack(outputs_fwd, dim=1)  # (Batch, Seq, Hidden)
+        outputs_bwd = torch.stack(outputs_bwd, dim=1)  # (Batch, Seq, Hidden)
+
+        # Concatenate
+        output = torch.cat([outputs_fwd, outputs_bwd], dim=2)  # (Batch, Seq, 2*Hidden)
+
+        return output
+=======
+# Removed LayerNormLSTMCell and LayerNormBiLSTM in favor of Pre-LayerNorm GRU architecture
+# Cite solution_lesson_node_00135
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.layers import LayerNormBiLSTM, SinusoidalPositionalEmbedding
+=======
+from library.layers import SinusoidalPositionalEmbedding
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class RNAModel(nn.Module):
+    """
+    Internally-Normalized Wide-Stream Residual BiLSTM.
+
+    Architecture:
+    1. Embeddings: Sequence (Atomic), Loop Type, Signed Pair Distance (Sinusoidal).
+    2. Stem: BiLSTM (No Dropout) projecting to Stream Width (512).
+    3. Backbone: 6x LayerNormBiLSTM blocks with Residual Connections and Inter-layer Dropout.
+    4. Aggregation: Scalar Mixture of Stem + 6 Blocks.
+    5. Head: Linear Projection to 3 targets.
+    """
+
+    def __init__(self, config=Config):
+        super(RNAModel, self).__init__()
+        self.config = config
+
+        # 1. Embeddings
+        self.seq_emb = nn.Embedding(4, config.EMBEDDING_DIM)
+        self.loop_emb = nn.Embedding(7, config.LOOP_EMBEDDING_DIM)
+        self.pair_emb = SinusoidalPositionalEmbedding(config.PAIR_EMBEDDING_DIM)
+
+        input_dim = (
+            config.EMBEDDING_DIM + config.LOOP_EMBEDDING_DIM + config.PAIR_EMBEDDING_DIM
+        )
+
+        # Dimensions
+        # Stream width W = 512.
+        # Since we use BiLSTM, the hidden size of each direction is W // 2 = 256.
+        self.stream_dim = config.HIDDEN_DIM
+        lstm_hidden = self.stream_dim // 2
+
+        # 2. Stem
+        # Projects concatenated embeddings to the residual stream width.
+        # No dropout here to preserve initial projection fidelity.
+        self.stem = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=lstm_hidden,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone
+        self.blocks = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        for _ in range(config.NUM_LAYERS):
+            # LayerNormBiLSTM applies LN internally to gates.
+            # Input size is stream_dim (512), output is stream_dim (512).
+            self.blocks.append(LayerNormBiLSTM(self.stream_dim, lstm_hidden))
+            self.dropouts.append(nn.Dropout(config.DROPOUT))
+
+        # 4. Aggregation
+        # Mixture of Stem output + 6 Block outputs = 7 tensors
+        self.mixture = ScalarMixture(config.NUM_LAYERS + 1)
+
+        # 5. Head
+        self.head = nn.Linear(self.stream_dim, config.NUM_CLASSES)
+
+    def forward(self, sequence, loop_type, pairing_distance):
+        # Embed inputs
+        emb_s = self.seq_emb(sequence)
+        emb_l = self.loop_emb(loop_type)
+        emb_p = self.pair_emb(pairing_distance)
+
+        # Concatenate
+        x = torch.cat([emb_s, emb_l, emb_p], dim=-1)
+
+        # Stem
+        x, _ = self.stem(x)
+        # x shape: (Batch, Seq, 512)
+
+        # Collect outputs for mixture
+        layer_outputs = [x]
+
+        # Backbone with Residuals
+        current = x
+        for block, dropout in zip(self.blocks, self.dropouts):
+            out = block(current)
+            out = dropout(out)
+            current = current + out
+            layer_outputs.append(current)
+
+        # Scalar Mixture
+        aggregated = self.mixture(layer_outputs)
+
+        # Head
+        logits = self.head(aggregated)
+
+        return logits
+=======
+class RNAModel(nn.Module):
+    """
+    Pre-LayerNorm Wide-Stream Residual BiGRU.
+    Cite solution_lesson_node_00135 (Pre-LN vs Internal Norm)
+    Cite solution_lesson_node_00108 (GRU vs LSTM)
+
+    Architecture:
+    1. Embeddings: Sequence (Atomic), Loop Type, Signed Pair Distance (Sinusoidal).
+    2. Stem: BiGRU (No Dropout) projecting to Stream Width (384).
+    3. Backbone: 6x Pre-LayerNorm BiGRU blocks with Residual Connections and Inter-layer Dropout.
+    4. Aggregation: Scalar Mixture of Stem + 6 Blocks.
+    5. Head: Linear Projection to 3 targets.
+    """
+
+    def __init__(self, config=Config):
+        super(RNAModel, self).__init__()
+        self.config = config
+
+        # 1. Embeddings
+        self.seq_emb = nn.Embedding(4, config.EMBEDDING_DIM)
+        self.loop_emb = nn.Embedding(7, config.LOOP_EMBEDDING_DIM)
+        self.pair_emb = SinusoidalPositionalEmbedding(config.PAIR_EMBEDDING_DIM)
+
+        input_dim = (
+            config.EMBEDDING_DIM + config.LOOP_EMBEDDING_DIM + config.PAIR_EMBEDDING_DIM
+        )
+
+        # Dimensions
+        # Stream width W = 384.
+        # Since we use BiGRU, the hidden size of each direction is W // 2 = 192.
+        self.stream_dim = config.HIDDEN_DIM
+        gru_hidden = self.stream_dim // 2
+
+        # 2. Stem
+        # Projects concatenated embeddings to the residual stream width.
+        # No dropout here to preserve initial projection fidelity (Cite solution_lesson_node_00109).
+        self.stem = nn.GRU(
+            input_size=input_dim,
+            hidden_size=gru_hidden,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # 3. Backbone
+        self.blocks = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(config.NUM_LAYERS):
+            # Pre-LayerNorm Architecture
+            self.norms.append(nn.LayerNorm(self.stream_dim))
+            self.blocks.append(
+                nn.GRU(
+                    input_size=self.stream_dim,
+                    hidden_size=gru_hidden,
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
+            self.dropouts.append(nn.Dropout(config.DROPOUT))
+
+        # 4. Aggregation
+        # Mixture of Stem output + 6 Block outputs = 7 tensors
+        self.mixture = ScalarMixture(config.NUM_LAYERS + 1)
+
+        # 5. Head
+        self.head = nn.Linear(self.stream_dim, config.NUM_CLASSES)
+
+    def forward(self, sequence, loop_type, pairing_distance):
+        # Embed inputs
+        emb_s = self.seq_emb(sequence)
+        emb_l = self.loop_emb(loop_type)
+        emb_p = self.pair_emb(pairing_distance)
+
+        # Concatenate
+        x = torch.cat([emb_s, emb_l, emb_p], dim=-1)
+
+        # Stem
+        x, _ = self.stem(x)
+        # x shape: (Batch, Seq, 384)
+
+        # Collect outputs for mixture
+        layer_outputs = [x]
+
+        # Backbone with Pre-LayerNorm Residuals
+        current = x
+        for norm, block, dropout in zip(self.norms, self.blocks, self.dropouts):
+            # Pre-LN: x + Dropout(Block(Norm(x)))
+            residual = current
+            
+            # 1. Norm
+            out = norm(current)
+            
+            # 2. Block (GRU)
+            out, _ = block(out)
+            
+            # 3. Dropout
+            out = dropout(out)
+            
+            # 4. Residual
+            current = residual + out
+            
+            layer_outputs.append(current)
+
+        # Scalar Mixture
+        aggregated = self.mixture(layer_outputs)
+
+        # Head
+        logits = self.head(aggregated)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Limit epochs for fast baseline execution as requested
+    config.EPOCHS = 10
+=======
+    # Restore full epoch budget for convergence (Cite solution_lesson_node_00131)
+    config.EPOCHS = 20
+>>>>>>> REPLACE
+```

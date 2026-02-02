@@ -1,0 +1,306 @@
+The strategy involves three targeted optimizations based on the provided lessons:
+
+1.  **Enhanced Data Augmentation (Cite Lesson 00030)**: I will increase the rotation limit from 15 to 30 degrees in `library/dataset.py`. The lessons indicate that for rotationally invariant subjects like leaves, restricting rotation limits the model's ability to learn robust features, and a wider range (e.g., 30 degrees) is superior.
+
+2.  **Ensemble with Validation Checkpointing (Cite Lesson 00031, Lesson 00025)**: I will replace the "Proxy Calibration" (CV) and "Fixed Epoch" training phases in `runfile.py` with a single ensemble training loop. Instead of training for a fixed number of epochs determined by an average across folds, each model in the ensemble will be trained on the full training set (`train_metadata.csv`) and checkpointed based on the validation metric (AUC) on the hold-out set (`val_metadata.csv`). This ensures we capture the peak performance of every seed, avoiding the degradation caused by using the final epoch's weights.
+
+3.  **TTA Efficacy Validation (Cite Lesson 00033)**: I will implement a validation step that explicitly compares the ensemble's performance with and without Test-Time Augmentation (TTA) on the hold-out set. This ensures that TTA is only used if it empirically improves the metric, preventing potential degradation.
+
+I will also add `import copy` to `runfile.py` to support deep copying of the best model states.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                # Robust Augmentation: ShiftScaleRotate and RandomBrightnessContrast
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5
+                ),
+=======
+                # Robust Augmentation: ShiftScaleRotate and RandomBrightnessContrast
+                # Cite Lesson 00030: Domain-Appropriate Geometric Augmentations (Increase rotation)
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5
+                ),
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import sys
+import os
+import pandas as pd
+import numpy as np
+import torch
+=======
+import sys
+import os
+import copy
+import pandas as pd
+import numpy as np
+import torch
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ==========================================
+    # 2. Phase 1: Proxy Calibration (5-Fold CV)
+    # ==========================================
+    # Purpose: Find optimal epoch and determine TTA strategy
+    print("\n==== Phase 1: Proxy Calibration (5-Fold CV) ====")
+
+    skf = StratifiedKFold(
+        n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+    )
+
+    # Storage for metrics
+    fold_val_aucs = np.zeros((Config.N_FOLDS, Config.EPOCHS))
+    fold_models = []  # Store (model, val_loader) for TTA check
+
+    # Prepare stratification label
+    if "stratify_label" in train_df.columns:
+        y_strat = train_df["stratify_label"]
+    else:
+        y_strat = train_df[Config.CLASS_LABELS].idxmax(axis=1)
+
+    # Calculate class weights once for the training set
+    class_weights = get_class_weights(train_df, device=device)
+
+    for fold, (train_idx, cv_val_idx) in enumerate(skf.split(train_df, y_strat)):
+        # Create Fold DataFrames
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[cv_val_idx].reset_index(drop=True)
+
+        # Datasets & Loaders
+        train_dataset = AppleDataset(fold_train_df, transforms=get_transforms("train"))
+        val_dataset = AppleDataset(fold_val_df, transforms=get_transforms("valid"))
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY,
+        )
+
+        # Initialize Model & Optimization
+        model = AppleResNet34(pretrained=True).to(device)
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+
+        # Scheduler: Cosine Annealing synchronized with EPOCHS
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.T_0, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+
+        criterion = WeightedCrossEntropyLoss(weights=class_weights, device=device)
+
+        # Training Loop
+        for epoch in range(Config.EPOCHS):
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, scheduler
+            )
+            val_loss, val_auc = valid_one_epoch(model, val_loader, criterion, device)
+            fold_val_aucs[fold, epoch] = val_auc
+
+        # Move model to CPU to save GPU memory, store for TTA check
+        model.to("cpu")
+        fold_models.append((model, val_loader))
+
+    # --- Analyze Phase 1 Results ---
+
+    # 1. Determine Optimal Epoch
+    mean_auc_per_epoch = fold_val_aucs.mean(axis=0)
+    best_epoch_idx = np.argmax(mean_auc_per_epoch)
+    optimal_epochs = best_epoch_idx + 1
+    print(
+        f"Optimal Epoch determined via CV: {optimal_epochs} (AUC: {mean_auc_per_epoch[best_epoch_idx]:.5f})"
+    )
+
+    # 2. Determine TTA Strategy
+    # We check TTA efficacy using the trained fold models
+    print("Checking TTA efficacy...")
+    auc_no_tta = []
+    auc_tta = []
+
+    for model, loader in fold_models:
+        model.to(device)
+
+        # Get ground truth
+        all_targets = []
+        for _, t in loader:
+            all_targets.append(t.numpy())
+        all_targets = np.concatenate(all_targets)
+
+        # Inference without TTA
+        preds_no_tta = inference_fn(model, loader, device, use_tta=False)
+        auc_no_tta.append(calculate_roc_auc(all_targets, preds_no_tta))
+
+        # Inference with TTA
+        preds_tta = inference_fn(model, loader, device, use_tta=True)
+        auc_tta.append(calculate_roc_auc(all_targets, preds_tta))
+
+        model.to("cpu")
+
+    mean_auc_no_tta = np.mean(auc_no_tta)
+    mean_auc_tta = np.mean(auc_tta)
+
+    use_tta = mean_auc_tta > mean_auc_no_tta
+    print(
+        f"TTA Check: No TTA={mean_auc_no_tta:.5f}, TTA={mean_auc_tta:.5f} -> Use TTA: {use_tta}"
+    )
+
+    # ==========================================
+    # 3. Phase 2: Production Training
+    # ==========================================
+    # Purpose: Train ensemble on 100% of training data for optimal_epochs
+    print("\n==== Phase 2: Production Training (Full-Data Seed Ensemble) ====")
+
+    ensemble_models = []
+
+    # Full Training Loader (using train_metadata.csv)
+    full_train_dataset = AppleDataset(train_df, transforms=get_transforms("train"))
+    full_train_loader = DataLoader(
+        full_train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+    )
+
+    for seed in Config.ENSEMBLE_SEEDS:
+        # print(f"Training Seed Model: {seed}")
+        seed_everything(seed)
+
+        model = AppleResNet34(pretrained=True).to(device)
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.T_0, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+        criterion = WeightedCrossEntropyLoss(weights=class_weights, device=device)
+
+        # Train for exactly optimal_epochs
+        for epoch in range(optimal_epochs):
+            _ = train_one_epoch(
+                model, full_train_loader, optimizer, criterion, device, scheduler
+            )
+
+        model.eval()
+        ensemble_models.append(model)
+=======
+    # ==========================================
+    # 2. Training (Ensemble with Checkpointing)
+    # ==========================================
+    # Cite Lesson 00031: Using validation checkpointing instead of fixed epochs to capture peak performance.
+    # Cite Lesson 00025: Maximizing training data (using full train_df) without fragmentation.
+    print("\n==== Training Ensemble with Validation Checkpointing ====")
+
+    ensemble_models = []
+    
+    # Calculate class weights once for the training set
+    class_weights = get_class_weights(train_df, device=device)
+
+    # Validation Loader (Hold-out) for Checkpointing
+    val_dataset = AppleDataset(val_df, transforms=get_transforms("valid"))
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+    )
+
+    # Training Loader
+    train_dataset = AppleDataset(train_df, transforms=get_transforms("train"))
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=Config.PIN_MEMORY,
+    )
+
+    for seed in Config.ENSEMBLE_SEEDS:
+        print(f"Training Seed: {seed}")
+        seed_everything(seed)
+
+        model = AppleResNet34(pretrained=True).to(device)
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+        
+        # Cite Lesson 00015: Synchronize Cycle-Budget (T_0 == EPOCHS)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=Config.T_0, T_mult=Config.T_MULT, eta_min=Config.MIN_LR
+        )
+        
+        criterion = WeightedCrossEntropyLoss(weights=class_weights, device=device)
+
+        best_auc = 0.0
+        best_model_state = None
+
+        for epoch in range(Config.EPOCHS):
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, scheduler
+            )
+            val_loss, val_auc = valid_one_epoch(model, val_loader, criterion, device)
+            
+            # Checkpointing
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_model_state = copy.deepcopy(model.state_dict())
+        
+        print(f"  Best AUC for Seed {seed}: {best_auc:.5f}")
+        
+        # Load best model
+        model.load_state_dict(best_model_state)
+        model.eval()
+        ensemble_models.append(model)
+    
+    # ==========================================
+    # 3. TTA Selection
+    # ==========================================
+    # Cite Lesson 00033: Validate TTA efficacy on the ensemble.
+    print("\n==== Validating TTA Efficacy ====")
+    
+    val_targets = []
+    for _, t in val_loader:
+        val_targets.append(t.numpy())
+    val_targets = np.concatenate(val_targets)
+
+    # 1. No TTA
+    preds_no_tta = []
+    for model in ensemble_models:
+        preds_no_tta.append(inference_fn(model, val_loader, device, use_tta=False))
+    avg_preds_no_tta = np.mean(preds_no_tta, axis=0)
+    auc_no_tta = calculate_roc_auc(val_targets, avg_preds_no_tta)
+
+    # 2. With TTA
+    preds_tta = []
+    for model in ensemble_models:
+        preds_tta.append(inference_fn(model, val_loader, device, use_tta=True))
+    avg_preds_tta = np.mean(preds_tta, axis=0)
+    auc_tta = calculate_roc_auc(val_targets, avg_preds_tta)
+
+    use_tta = auc_tta > auc_no_tta
+    print(f"Ensemble AUC - No TTA: {auc_no_tta:.5f}, TTA: {auc_tta:.5f} -> Use TTA: {use_tta}")
+>>>>>>> REPLACE
+```

@@ -1,0 +1,488 @@
+The issue is a tensor shape mismatch caused by how PyTorch Geometric batches data. The `Data` objects store targets `y` and `global_features` as 1D tensors (e.g., shape `(2,)`). When batched, PyG concatenates them into a large 1D tensor `(Batch*2,)` instead of stacking them into `(Batch, 2)`. The fix involves updating `library/data.py` to store these attributes as 2D tensors `(1, 2)` in individual `Data` objects, ensuring they batch correctly into `(Batch, 2)`. Additionally, the `get` method and scaler logic must be updated to handle and preserve these 2D shapes. Finally, `runfile.py` must reload the `library.data` module to ensure the changes are applied in the persistent environment (Cite debug_lesson_8).
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    def get(self, idx):
+        data = self.data_list[idx]
+
+        # Apply scaling on the fly
+        # Clone to avoid modifying the cached object in memory
+        data = data.clone()
+
+        if self.global_scaler is not None:
+            # global_features is 1D tensor (10,)
+            feat_np = data.global_features.numpy().reshape(1, -1)
+            scaled_feat = self.global_scaler.transform(feat_np)
+            data.global_features = torch.tensor(scaled_feat[0], dtype=torch.float32)
+
+        if self.target_scaler is not None and not self.is_test:
+            # y is 1D tensor (2,)
+            y_np = data.y.numpy().reshape(1, -1)
+            scaled_y = self.target_scaler.transform(y_np)
+            data.y = torch.tensor(scaled_y[0], dtype=torch.float32)
+
+        return data
+
+    def _process_data(self):
+        df = pd.read_csv(self.metadata_path)
+        data_list = []
+
+        for _, row in df.iterrows():
+            # Load structure
+            file_path = os.path.join(Config.INPUT_DIR, row["file_path"])
+            atoms = load_structure(file_path)
+
+            if atoms is None:
+                continue
+
+            # Build Graph
+            edge_index, edge_distances, atom_numbers = get_pbc_neighbor_graph(
+                atoms, cutoff=Config.CUTOFF_RADIUS
+            )
+
+            # Global Features
+            global_features = get_global_features(atoms)
+
+            # Targets
+            if not self.is_test:
+                y = torch.tensor(
+                    [row["formation_energy_ev_natom"], row["bandgap_energy_ev"]],
+                    dtype=torch.float32,
+                )
+            else:
+                # Dummy target for test set
+                y = torch.zeros(2, dtype=torch.float32)
+
+            # Create PyG Data object
+            # x will be atom numbers (embedding lookup index)
+            data = Data(
+                x=atom_numbers,
+                edge_index=edge_index,
+                edge_attr=edge_distances,
+                global_features=global_features,
+                y=y,
+                id=torch.tensor([row["id"]], dtype=torch.long),
+            )
+            data_list.append(data)
+
+        self.data_list = data_list
+
+    def _save_to_cache(self):
+        # Flatten data for np.savez to avoid pickle
+        if not self.data_list:
+            return
+
+        # Collect all arrays
+        all_x = []
+        all_edge_index = []
+        all_edge_attr = []
+        all_global = []
+        all_y = []
+        all_ids = []
+
+        node_ptr = [0]
+        edge_ptr = [0]
+
+        for data in self.data_list:
+            all_x.append(data.x.numpy())
+            all_edge_index.append(data.edge_index.numpy())
+            all_edge_attr.append(data.edge_attr.numpy())
+            all_global.append(data.global_features.numpy())
+            all_y.append(data.y.numpy())
+            all_ids.append(data.id.numpy())
+
+            node_ptr.append(node_ptr[-1] + data.x.shape[0])
+            edge_ptr.append(edge_ptr[-1] + data.edge_index.shape[1])
+
+        # Concatenate
+        np_x = np.concatenate(all_x)
+        np_edge_index = np.concatenate(all_edge_index, axis=1)  # (2, Total_Edges)
+        np_edge_attr = np.concatenate(all_edge_attr)
+        np_global = np.stack(all_global)
+        np_y = np.stack(all_y)
+        np_ids = np.concatenate(all_ids)
+        np_node_ptr = np.array(node_ptr)
+        np_edge_ptr = np.array(edge_ptr)
+
+        np.savez(
+            self.cache_path,
+            x=np_x,
+            edge_index=np_edge_index,
+            edge_attr=np_edge_attr,
+            global_features=np_global,
+            y=np_y,
+            ids=np_ids,
+            node_ptr=np_node_ptr,
+            edge_ptr=np_edge_ptr,
+        )
+
+    def _load_from_cache(self):
+        data = np.load(self.cache_path)
+
+        x = torch.from_numpy(data["x"])
+        edge_index = torch.from_numpy(data["edge_index"])
+        edge_attr = torch.from_numpy(data["edge_attr"])
+        global_features = torch.from_numpy(data["global_features"])
+        y = torch.from_numpy(data["y"])
+        ids = torch.from_numpy(data["ids"])
+        node_ptr = data["node_ptr"]
+        edge_ptr = data["edge_ptr"]
+
+        data_list = []
+        num_graphs = len(node_ptr) - 1
+
+        for i in range(num_graphs):
+            # Slice nodes
+            n_start, n_end = node_ptr[i], node_ptr[i + 1]
+            x_i = x[n_start:n_end]
+
+            # Slice edges
+            e_start, e_end = edge_ptr[i], edge_ptr[i + 1]
+            edge_index_i = edge_index[:, e_start:e_end]
+            edge_attr_i = edge_attr[e_start:e_end]
+
+            # Slice others
+            global_i = global_features[i]
+            y_i = y[i]
+            id_i = ids[i].unsqueeze(0)  # Keep as tensor
+
+            d = Data(
+                x=x_i,
+                edge_index=edge_index_i,
+                edge_attr=edge_attr_i,
+                global_features=global_i,
+                y=y_i,
+                id=id_i,
+            )
+            data_list.append(d)
+
+        self.data_list = data_list
+
+
+def get_scalers(train_metadata_path):
+    """
+    Computes StandardScalers for global features and targets based on training data.
+    """
+    temp_cache_path = os.path.join(Config.CACHE_DIR, "train_graphs.npz")
+    # We assume training data processing might be needed.
+    # If cache exists, it loads fast. If not, it processes.
+    temp_dataset = CrystalDataset(
+        metadata_path=train_metadata_path,
+        cache_path=temp_cache_path,
+        load_cached_data=True,
+        is_test=False,
+    )
+
+    # Collect all global features and targets
+    all_globals = []
+    all_targets = []
+
+    for data in temp_dataset:
+        all_globals.append(data.global_features.numpy())
+        all_targets.append(data.y.numpy())
+
+    all_globals = np.stack(all_globals)
+    all_targets = np.stack(all_targets)
+
+    global_scaler = StandardScaler()
+    global_scaler.fit(all_globals)
+
+    target_scaler = StandardScaler()
+    target_scaler.fit(all_targets)
+
+    return global_scaler, target_scaler
+=======
+    def get(self, idx):
+        data = self.data_list[idx]
+
+        # Apply scaling on the fly
+        # Clone to avoid modifying the cached object in memory
+        data = data.clone()
+
+        if self.global_scaler is not None:
+            # Ensure input is 2D (1, 10)
+            feat_np = data.global_features.numpy()
+            if feat_np.ndim == 1:
+                feat_np = feat_np.reshape(1, -1)
+            
+            scaled_feat = self.global_scaler.transform(feat_np)
+            # Keep as 2D (1, 10)
+            data.global_features = torch.tensor(scaled_feat, dtype=torch.float32)
+
+        if self.target_scaler is not None and not self.is_test:
+            # Ensure input is 2D (1, 2)
+            y_np = data.y.numpy()
+            if y_np.ndim == 1:
+                y_np = y_np.reshape(1, -1)
+                
+            scaled_y = self.target_scaler.transform(y_np)
+            # Keep as 2D (1, 2)
+            data.y = torch.tensor(scaled_y, dtype=torch.float32)
+
+        return data
+
+    def _process_data(self):
+        df = pd.read_csv(self.metadata_path)
+        data_list = []
+
+        for _, row in df.iterrows():
+            # Load structure
+            file_path = os.path.join(Config.INPUT_DIR, row["file_path"])
+            atoms = load_structure(file_path)
+
+            if atoms is None:
+                continue
+
+            # Build Graph
+            edge_index, edge_distances, atom_numbers = get_pbc_neighbor_graph(
+                atoms, cutoff=Config.CUTOFF_RADIUS
+            )
+
+            # Global Features: Unsqueeze to (1, 10)
+            global_features = get_global_features(atoms).unsqueeze(0)
+
+            # Targets: Unsqueeze to (1, 2)
+            if not self.is_test:
+                y = torch.tensor(
+                    [row["formation_energy_ev_natom"], row["bandgap_energy_ev"]],
+                    dtype=torch.float32,
+                ).unsqueeze(0)
+            else:
+                # Dummy target for test set
+                y = torch.zeros(1, 2, dtype=torch.float32)
+
+            # Create PyG Data object
+            data = Data(
+                x=atom_numbers,
+                edge_index=edge_index,
+                edge_attr=edge_distances,
+                global_features=global_features,
+                y=y,
+                id=torch.tensor([row["id"]], dtype=torch.long),
+            )
+            data_list.append(data)
+
+        self.data_list = data_list
+
+    def _save_to_cache(self):
+        # Flatten data for np.savez to avoid pickle
+        if not self.data_list:
+            return
+
+        # Collect all arrays
+        all_x = []
+        all_edge_index = []
+        all_edge_attr = []
+        all_global = []
+        all_y = []
+        all_ids = []
+
+        node_ptr = [0]
+        edge_ptr = [0]
+
+        for data in self.data_list:
+            all_x.append(data.x.numpy())
+            all_edge_index.append(data.edge_index.numpy())
+            all_edge_attr.append(data.edge_attr.numpy())
+            all_global.append(data.global_features.numpy())
+            all_y.append(data.y.numpy())
+            all_ids.append(data.id.numpy())
+
+            node_ptr.append(node_ptr[-1] + data.x.shape[0])
+            edge_ptr.append(edge_ptr[-1] + data.edge_index.shape[1])
+
+        # Concatenate
+        np_x = np.concatenate(all_x)
+        np_edge_index = np.concatenate(all_edge_index, axis=1)  # (2, Total_Edges)
+        np_edge_attr = np.concatenate(all_edge_attr)
+        
+        # Use vstack to ensure (N, F) shape even if inputs are (1, F)
+        np_global = np.vstack(all_global)
+        np_y = np.vstack(all_y)
+        
+        np_ids = np.concatenate(all_ids)
+        np_node_ptr = np.array(node_ptr)
+        np_edge_ptr = np.array(edge_ptr)
+
+        np.savez(
+            self.cache_path,
+            x=np_x,
+            edge_index=np_edge_index,
+            edge_attr=np_edge_attr,
+            global_features=np_global,
+            y=np_y,
+            ids=np_ids,
+            node_ptr=np_node_ptr,
+            edge_ptr=np_edge_ptr,
+        )
+
+    def _load_from_cache(self):
+        data = np.load(self.cache_path)
+
+        x = torch.from_numpy(data["x"])
+        edge_index = torch.from_numpy(data["edge_index"])
+        edge_attr = torch.from_numpy(data["edge_attr"])
+        global_features = torch.from_numpy(data["global_features"])
+        y = torch.from_numpy(data["y"])
+        ids = torch.from_numpy(data["ids"])
+        node_ptr = data["node_ptr"]
+        edge_ptr = data["edge_ptr"]
+
+        data_list = []
+        num_graphs = len(node_ptr) - 1
+
+        for i in range(num_graphs):
+            # Slice nodes
+            n_start, n_end = node_ptr[i], node_ptr[i + 1]
+            x_i = x[n_start:n_end]
+
+            # Slice edges
+            e_start, e_end = edge_ptr[i], edge_ptr[i + 1]
+            edge_index_i = edge_index[:, e_start:e_end]
+            edge_attr_i = edge_attr[e_start:e_end]
+
+            # Slice others and ensure 2D (1, F)
+            global_i = global_features[i]
+            if global_i.dim() == 1:
+                global_i = global_i.unsqueeze(0)
+                
+            y_i = y[i]
+            if y_i.dim() == 1:
+                y_i = y_i.unsqueeze(0)
+                
+            id_i = ids[i].unsqueeze(0)  # Keep as tensor
+
+            d = Data(
+                x=x_i,
+                edge_index=edge_index_i,
+                edge_attr=edge_attr_i,
+                global_features=global_i,
+                y=y_i,
+                id=id_i,
+            )
+            data_list.append(d)
+
+        self.data_list = data_list
+
+
+def get_scalers(train_metadata_path):
+    """
+    Computes StandardScalers for global features and targets based on training data.
+    """
+    temp_cache_path = os.path.join(Config.CACHE_DIR, "train_graphs.npz")
+    # We assume training data processing might be needed.
+    # If cache exists, it loads fast. If not, it processes.
+    temp_dataset = CrystalDataset(
+        metadata_path=train_metadata_path,
+        cache_path=temp_cache_path,
+        load_cached_data=True,
+        is_test=False,
+    )
+
+    # Collect all global features and targets
+    all_globals = []
+    all_targets = []
+
+    for data in temp_dataset:
+        all_globals.append(data.global_features.numpy())
+        all_targets.append(data.y.numpy())
+
+    # Use vstack to stack (1, F) arrays into (N, F)
+    all_globals = np.vstack(all_globals)
+    all_targets = np.vstack(all_targets)
+
+    global_scaler = StandardScaler()
+    global_scaler.fit(all_globals)
+
+    target_scaler = StandardScaler()
+    target_scaler.fit(all_targets)
+
+    return global_scaler, target_scaler
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import os
+import shutil
+import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch_geometric.data import Batch
+
+# Import from the provided library
+from library.config import Config
+=======
+import os
+import shutil
+import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch_geometric.data import Batch
+
+# Force reload of library modules to ensure changes are picked up in persistent environments
+import sys
+import importlib
+import library.data
+importlib.reload(library.data)
+
+# Import from the provided library
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Test Data Loading
+    print("\n=== Testing Data Loading ===")
+    # This will internally call get_scalers and initialize datasets
+    train_loader, val_loader, test_loader, target_scaler = get_dataloaders(
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        load_cached_data=False,  # Force processing to test logic
+    )
+
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Test batches: {len(test_loader)}")
+
+    # Fetch one batch
+    batch = next(iter(train_loader))
+    print(f"  Batch content: {batch}")
+    assert batch.x.ndim == 1
+    assert batch.edge_index.shape[0] == 2
+    assert batch.y.shape == (batch.num_graphs, 2)
+    assert batch.global_features.shape == (batch.num_graphs, 10)
+=======
+    # 5. Test Data Loading
+    print("\n=== Testing Data Loading ===")
+    # This will internally call get_scalers and initialize datasets
+    # We set load_cached_data=False to force reprocessing with the new logic
+    train_loader, val_loader, test_loader, target_scaler = get_dataloaders(
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        load_cached_data=False,
+    )
+
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Test batches: {len(test_loader)}")
+
+    # Fetch one batch
+    batch = next(iter(train_loader))
+    print(f"  Batch content: {batch}")
+    assert batch.x.ndim == 1
+    assert batch.edge_index.shape[0] == 2
+    
+    # Assert correct shapes for batched 2D tensors
+    assert batch.y.shape == (batch.num_graphs, 2), f"Expected y shape ({batch.num_graphs}, 2), got {batch.y.shape}"
+    assert batch.global_features.shape == (batch.num_graphs, 10), f"Expected global_features shape ({batch.num_graphs}, 10), got {batch.global_features.shape}"
+>>>>>>> REPLACE
+```

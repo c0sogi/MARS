@@ -1,0 +1,513 @@
+Implementation Strategy:
+1.  **Robust Dimension Extraction (Cite Lesson 22, Lesson 1):** In `library/utils.py`, completely rewrite `get_original_dimensions` to replace the unreliable heuristic binary parser with a robust, parallelized image reader using `ProcessPoolExecutor` and `cv2.imread`. This ensures that the original image dimensions used for bounding box scaling are 100% accurate, preventing the "silent failure" where targets are misaligned. I will also rename the cache file to `original_dimensions_safe.parquet` to invalidate any corrupt cache from previous runs.
+2.  **Full Data Training & Extended Schedule (Cite Lesson 19, Lesson 12):** In `runfile.py`, remove the `TRAIN_SUBSET_SIZE` constraint to train on the full dataset (50k images) instead of a subset. Increase `NUM_EPOCHS` from 8 to 15 to allow sufficient convergence time for the larger dataset and the cosine annealing schedule.
+3.  **Pipeline Consistency (Cite Lesson 22):** In `library/dataset.py`, modify `ThoraxDataset` to include the original image dimensions in the returned `targets` dictionary.
+4.  **Evaluation Updates:** Update `evaluate_map` in `runfile.py` and `predict_and_format` in `library/inference.py` to use these passed-through dimensions, ensuring the evaluation metric calculation uses the exact same geometry as the data loading pipeline.
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def parse_dicom_tags(file_path):
+    """
+    Scans a DICOM file binary for specific tags (Rows, Cols, PhotometricInterpretation)
+    without parsing the entire file structure.
+    Assumes Little Endian Explicit VR for simplicity, which covers most datasets.
+    """
+    tags = {"rows": None, "cols": None, "photometric_interpretation": None}
+
+    # Byte signatures for tags (Group, Element) in Little Endian
+    # (0028, 0010) -> Rows
+    SIG_ROWS = b"\x28\x00\x10\x00"
+    # (0028, 0011) -> Columns
+    SIG_COLS = b"\x28\x00\x11\x00"
+    # (0028, 0004) -> Photometric Interpretation
+    SIG_PHOTO = b"\x28\x00\x04\x00"
+
+    try:
+        with open(file_path, "rb") as f:
+            # Read the first 4KB, usually enough for headers
+            header = f.read(4096)
+
+            # Helper to extract value based on signature
+            def find_tag(signature, vr_type):
+                idx = header.find(signature)
+                if idx == -1:
+                    return None
+
+                # Skip Tag (4 bytes)
+                current = idx + 4
+
+                # Read VR (2 bytes)
+                vr = header[current : current + 2]
+                current += 2
+
+                # Explicit VR handling
+                length = 0
+                if vr in [b"OB", b"OW", b"OF", b"SQ", b"UT", b"UN"]:
+                    current += 2  # Skip reserved
+                    length = struct.unpack("<I", header[current : current + 4])[0]
+                    current += 4
+                else:
+                    length = struct.unpack("<H", header[current : current + 2])[0]
+                    current += 2
+
+                value_bytes = header[current : current + length]
+
+                if vr_type == "US":  # Unsigned Short
+                    return struct.unpack("<H", value_bytes)[0]
+                elif vr_type == "CS":  # Code String
+                    return value_bytes.decode("utf-8", errors="ignore").strip()
+                return None
+
+            tags["rows"] = find_tag(SIG_ROWS, "US")
+            tags["cols"] = find_tag(SIG_COLS, "US")
+            tags["photometric_interpretation"] = find_tag(SIG_PHOTO, "CS")
+
+    except Exception as e:
+        # Fallback or silent fail - will be handled by consumer
+        pass
+
+    return tags
+
+
+def fix_photometric_interpretation(image_array, photometric_interpretation):
+=======
+def parse_dicom_tags(file_path):
+    """
+    Scans a DICOM file binary for specific tags (Rows, Cols, PhotometricInterpretation)
+    without parsing the entire file structure.
+    """
+    tags = {"rows": None, "cols": None, "photometric_interpretation": None}
+    # Simplified to only look for Photometric Interpretation for inversion
+    # Dimensions are now handled robustly via full read
+    SIG_PHOTO = b"\x28\x00\x04\x00"
+
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(4096)
+            
+            # Simple heuristic for Photometric Interpretation
+            idx = header.find(SIG_PHOTO)
+            if idx != -1:
+                # This is a very rough heuristic, but sufficient for finding "MONOCHROME1"
+                # if it appears shortly after the tag
+                window = header[idx:idx+50]
+                if b"MONOCHROME1" in window:
+                    tags["photometric_interpretation"] = "MONOCHROME1"
+    except Exception:
+        pass
+
+    return tags
+
+
+def fix_photometric_interpretation(image_array, photometric_interpretation):
+>>>>>>> REPLACE
+```
+
+```diff
+library/utils.py
+<<<<<<< SEARCH
+def get_original_dimensions(df, load_cached_data=True):
+    """
+    Retrieves original dimensions (width, height) for images in the dataframe.
+    Uses caching to avoid re-parsing headers.
+    """
+    cache_file = os.path.join(Config.CACHE_DIR, "original_dimensions.parquet")
+
+    # 1. Load Cache
+    cached_df = pd.DataFrame(columns=["image_id", "orig_width", "orig_height"])
+    if load_cached_data and os.path.exists(cache_file):
+        try:
+            cached_df = pd.read_parquet(cache_file)
+        except Exception:
+            pass  # Corrupt cache, start over
+
+    # 2. Identify Missing IDs
+    # Ensure image_id is string
+    df["image_id"] = df["image_id"].astype(str)
+    cached_df["image_id"] = cached_df["image_id"].astype(str)
+
+    # Filter for unique image_ids in input df
+    unique_ids = df["image_id"].unique()
+
+    # Check what is already in cache
+    known_ids = set(cached_df["image_id"].values)
+    missing_ids = [uid for uid in unique_ids if uid not in known_ids]
+
+    if len(missing_ids) == 0:
+        # All present, return map
+        return dict(
+            zip(
+                cached_df["image_id"],
+                zip(cached_df["orig_width"], cached_df["orig_height"]),
+            )
+        )
+
+    # 3. Process Missing
+    new_rows = []
+
+    # Create a lookup for file paths from the input df
+    # We drop duplicates to have one path per image_id
+    path_lookup = (
+        df.drop_duplicates("image_id").set_index("image_id")["file_path"].to_dict()
+    )
+
+    for img_id in missing_ids:
+        rel_path = path_lookup.get(img_id)
+        if not rel_path:
+            continue
+
+        full_path = os.path.join(Config.INPUT_DIR, rel_path)
+
+        # Try fast tag parsing first
+        tags = parse_dicom_tags(full_path)
+        h, w = tags.get("rows"), tags.get("cols")
+
+        # Fallback to loading image if tags failed
+        if h is None or w is None:
+            try:
+                img = cv2.imread(full_path, -1)
+                if img is not None:
+                    h, w = img.shape[:2]
+            except:
+                pass
+
+        # Default fallback if everything fails
+        if h is None or w is None:
+            h, w = 1024, 1024  # Placeholder
+
+        new_rows.append({"image_id": img_id, "orig_width": w, "orig_height": h})
+
+    # 4. Update Cache
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        combined_df = pd.concat([cached_df, new_df], ignore_index=True)
+        # Drop duplicates just in case
+        combined_df = combined_df.drop_duplicates(subset=["image_id"], keep="last")
+
+        # Save
+        if load_cached_data:
+            combined_df.to_parquet(cache_file)
+
+        cached_df = combined_df
+
+    # 5. Return Dictionary
+    return dict(
+        zip(
+            cached_df["image_id"],
+            zip(cached_df["orig_width"], cached_df["orig_height"]),
+        )
+    )
+=======
+from concurrent.futures import ProcessPoolExecutor
+
+def _get_dims_worker(args):
+    """
+    Worker function for parallel dimension extraction.
+    """
+    img_id, full_path = args
+    try:
+        # Robust read using OpenCV
+        img = cv2.imread(full_path, -1)
+        if img is not None:
+            return img_id, img.shape[1], img.shape[0]
+    except Exception:
+        pass
+    # Fallback only on total failure
+    return img_id, 1024, 1024
+
+def get_original_dimensions(df, load_cached_data=True):
+    """
+    Retrieves original dimensions (width, height) for images in the dataframe.
+    Uses caching to avoid re-parsing headers.
+    Cite Lesson 22: Coupling Geometric Metadata with Image Loading.
+    We use robust full-image reading instead of heuristic parsing.
+    """
+    # Use a new cache file name to avoid loading potentially corrupt data from previous runs
+    cache_file = os.path.join(Config.CACHE_DIR, "original_dimensions_safe.parquet")
+
+    # 1. Load Cache
+    cached_df = pd.DataFrame(columns=["image_id", "orig_width", "orig_height"])
+    if load_cached_data and os.path.exists(cache_file):
+        try:
+            cached_df = pd.read_parquet(cache_file)
+        except Exception:
+            pass
+
+    # 2. Identify Missing IDs
+    df["image_id"] = df["image_id"].astype(str)
+    cached_df["image_id"] = cached_df["image_id"].astype(str)
+
+    unique_ids = df["image_id"].unique()
+    known_ids = set(cached_df["image_id"].values)
+    missing_ids = [uid for uid in unique_ids if uid not in known_ids]
+
+    if len(missing_ids) == 0:
+        return dict(
+            zip(
+                cached_df["image_id"],
+                zip(cached_df["orig_width"], cached_df["orig_height"]),
+            )
+        )
+
+    # 3. Process Missing (Parallelized)
+    path_lookup = (
+        df.drop_duplicates("image_id").set_index("image_id")["file_path"].to_dict()
+    )
+    
+    tasks = []
+    for img_id in missing_ids:
+        rel_path = path_lookup.get(img_id)
+        if rel_path:
+            full_path = os.path.join(Config.INPUT_DIR, rel_path)
+            tasks.append((img_id, full_path))
+
+    new_rows = []
+    if tasks:
+        # Use parallel processing to speed up the robust read
+        max_workers = min(12, os.cpu_count() or 4)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_get_dims_worker, tasks))
+        
+        for r in results:
+            new_rows.append({"image_id": r[0], "orig_width": r[1], "orig_height": r[2]})
+
+    # 4. Update Cache
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        combined_df = pd.concat([cached_df, new_df], ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=["image_id"], keep="last")
+
+        if load_cached_data:
+            combined_df.to_parquet(cache_file)
+        cached_df = combined_df
+
+    return dict(
+        zip(
+            cached_df["image_id"],
+            zip(cached_df["orig_width"], cached_df["orig_height"]),
+        )
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        targets = {
+            "hm": torch.from_numpy(hm),
+            "wh": torch.from_numpy(wh),
+            "reg": torch.from_numpy(reg),
+            "ind": torch.from_numpy(ind),
+            "reg_mask": torch.from_numpy(reg_mask),
+            "global_label": torch.tensor([global_target], dtype=torch.float32),
+        }
+
+        return image, targets, image_id
+=======
+        targets = {
+            "hm": torch.from_numpy(hm),
+            "wh": torch.from_numpy(wh),
+            "reg": torch.from_numpy(reg),
+            "ind": torch.from_numpy(ind),
+            "reg_mask": torch.from_numpy(reg_mask),
+            "global_label": torch.tensor([global_target], dtype=torch.float32),
+            "orig_dims": torch.tensor([orig_w, orig_h], dtype=torch.float32), # Cite Lesson 22
+        }
+
+        return image, targets, image_id
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                    if len(img_scores) == 0:
+                        # Fallback if no objects detected despite global head saying finding exists
+                        # Or we can output "14 1 0 0 1 1" if we trust the detector more
+                        # Here we default to No Finding format if detector finds nothing
+                        pred_str = "14 1 0 0 1 1"
+                    else:
+                        # Rescale boxes to original dimensions
+                        orig_w, orig_h = orig_dims_map.get(str(img_id), (1024, 1024))
+                        current_shape = Config.IMAGE_SIZE  # (512, 512)
+
+                        # rescale_boxes expects (N, 4)
+                        scaled_bboxes = rescale_boxes(
+                            img_bboxes,
+                            current_shape=current_shape,
+                            original_shape=(orig_h, orig_w),
+                        )
+=======
+                    if len(img_scores) == 0:
+                        # Fallback if no objects detected despite global head saying finding exists
+                        # Or we can output "14 1 0 0 1 1" if we trust the detector more
+                        # Here we default to No Finding format if detector finds nothing
+                        pred_str = "14 1 0 0 1 1"
+                    else:
+                        # Rescale boxes to original dimensions
+                        # Cite Lesson 22: Use dimensions passed from dataset if available or map
+                        # Since we modified dataset to pass orig_dims in targets, we could use that,
+                        # but inference loader returns (images, targets, ids).
+                        # Let's trust the map which is now robust.
+                        orig_w, orig_h = orig_dims_map.get(str(img_id), (1024, 1024))
+                        current_shape = Config.IMAGE_SIZE  # (512, 512)
+
+                        # rescale_boxes expects (N, 4)
+                        scaled_bboxes = rescale_boxes(
+                            img_bboxes,
+                            current_shape=current_shape,
+                            original_shape=(orig_h, orig_w),
+                        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+# =============================================================================
+# Configuration Overrides for Fast Baseline
+# =============================================================================
+Config.NUM_EPOCHS = 8  # Reduced epochs for speed
+Config.TRAIN_SUBSET_SIZE = 15000  # Subsample training data
+Config.BATCH_SIZE = 8
+=======
+# =============================================================================
+# Configuration Overrides
+# =============================================================================
+# Cite Lesson 12: Extended training for convergence
+Config.NUM_EPOCHS = 15
+Config.BATCH_SIZE = 8
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def evaluate_map(model, loader, val_df, device, iou_thresh=0.4):
+    """
+    Evaluates mAP on the validation set.
+    """
+    model.eval()
+
+    # 1. Get Original Dimensions for rescaling
+    orig_dims_map = get_original_dimensions(val_df, load_cached_data=True)
+
+    # 2. Collect Predictions and Ground Truths
+    # Structure: class_id -> list of {image_id, box, score}
+    preds_by_class = defaultdict(list)
+    gts_by_class = defaultdict(lambda: defaultdict(list))
+
+    # Pre-process GT
+    # Filter out "No finding" (class 14) for detection mAP
+    gt_df = val_df[val_df["class_id"] != 14]
+    for _, row in gt_df.iterrows():
+        img_id = str(row["image_id"])
+        cls_id = int(row["class_id"])
+        box = [row["x_min"], row["y_min"], row["x_max"], row["y_max"]]
+        gts_by_class[cls_id][img_id].append(box)
+
+    # Run Inference
+    with torch.no_grad():
+        for images, _, image_ids in tqdm(loader, desc="Evaluating mAP", disable=True):
+            images = images.to(device)
+            outputs = model(images)
+
+            # Decode
+            hm = outputs["hm"]
+            wh = outputs["wh"]
+            reg = outputs["reg"]
+
+            # Use lower threshold to get more candidates for PR curve
+            bboxes, scores, clses = decode_predictions(
+                hm, wh, reg, K=100, output_stride=4
+            )
+
+            # Move to CPU
+            bboxes = bboxes.cpu().numpy()
+            scores = scores.cpu().numpy()
+            clses = clses.cpu().numpy()
+
+            for i in range(len(image_ids)):
+                img_id = str(image_ids[i])
+
+                # Rescale to original dimensions
+                orig_w, orig_h = orig_dims_map.get(img_id, (1024, 1024))
+
+                # Filter valid detections
+                valid_mask = scores[i] > 0.01
+=======
+def evaluate_map(model, loader, val_df, device, iou_thresh=0.4):
+    """
+    Evaluates mAP on the validation set.
+    """
+    model.eval()
+
+    # 1. Get Original Dimensions for rescaling
+    # Although we have orig_dims in batch now, we'll use the map for consistency
+    # as we need to process all GTs upfront.
+    orig_dims_map = get_original_dimensions(val_df, load_cached_data=True)
+
+    # 2. Collect Predictions and Ground Truths
+    preds_by_class = defaultdict(list)
+    gts_by_class = defaultdict(lambda: defaultdict(list))
+
+    gt_df = val_df[val_df["class_id"] != 14]
+    for _, row in gt_df.iterrows():
+        img_id = str(row["image_id"])
+        cls_id = int(row["class_id"])
+        box = [row["x_min"], row["y_min"], row["x_max"], row["y_max"]]
+        gts_by_class[cls_id][img_id].append(box)
+
+    # Run Inference
+    with torch.no_grad():
+        for images, targets, image_ids in tqdm(loader, desc="Evaluating mAP", disable=True):
+            images = images.to(device)
+            outputs = model(images)
+
+            hm = outputs["hm"]
+            wh = outputs["wh"]
+            reg = outputs["reg"]
+
+            bboxes, scores, clses = decode_predictions(
+                hm, wh, reg, K=100, output_stride=4
+            )
+
+            bboxes = bboxes.cpu().numpy()
+            scores = scores.cpu().numpy()
+            clses = clses.cpu().numpy()
+            
+            # Cite Lesson 22: Use dimensions from the pipeline if available
+            batch_orig_dims = targets.get("orig_dims")
+
+            for i in range(len(image_ids)):
+                img_id = str(image_ids[i])
+
+                # Rescale to original dimensions
+                if batch_orig_dims is not None:
+                    orig_w, orig_h = batch_orig_dims[i].cpu().numpy()
+                else:
+                    orig_w, orig_h = orig_dims_map.get(img_id, (1024, 1024))
+
+                valid_mask = scores[i] > 0.01
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Subsample training data for fast baseline
+    if len(train_df) > Config.TRAIN_SUBSET_SIZE:
+        print(f"Subsampling training data to {Config.TRAIN_SUBSET_SIZE} samples...")
+        # Sample by image_id to keep objects together
+        unique_img_ids = train_df["image_id"].unique()
+        selected_ids = np.random.choice(
+            unique_img_ids, size=min(len(unique_img_ids), 10000), replace=False
+        )  # Roughly map to subset size
+        train_df = train_df[train_df["image_id"].isin(selected_ids)]
+        # Trim to exact row count if needed, but keeping image integrity is better
+=======
+    # Cite Lesson 19: Prioritize data coverage. Using full dataset.
+    # Removed subsampling block.
+>>>>>>> REPLACE
+```

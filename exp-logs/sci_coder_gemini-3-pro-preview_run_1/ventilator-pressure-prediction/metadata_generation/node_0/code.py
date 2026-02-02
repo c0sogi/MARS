@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+import os
+import shutil
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+
+
+def main():
+    print("Starting metadata generation...")
+
+    # 1. Setup Directories
+    if os.path.exists(METADATA_DIR):
+        shutil.rmtree(METADATA_DIR)
+    os.makedirs(METADATA_DIR)
+
+    # 2. Load Raw Data
+    train_path = os.path.join(INPUT_DIR, "train.csv")
+    test_path = os.path.join(INPUT_DIR, "test.csv")
+
+    if not os.path.exists(train_path) or not os.path.exists(test_path):
+        raise FileNotFoundError("Input files not found in ./input")
+
+    print(f"Loading data from {INPUT_DIR}...")
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    # 3. Perform Group Split (by breath_id)
+    print("Performing group split on breath_id...")
+    unique_breaths = train_df["breath_id"].unique()
+
+    # Shuffle breaths
+    rng = np.random.default_rng(RANDOM_STATE)
+    rng.shuffle(unique_breaths)
+
+    # Split 80:20
+    n_train = int(len(unique_breaths) * 0.8)
+    train_breaths = unique_breaths[:n_train]
+    val_breaths = unique_breaths[n_train:]
+
+    # Create sets for faster filtering
+    train_breath_set = set(train_breaths)
+    val_breath_set = set(val_breaths)
+
+    # Filter dataframes
+    train_meta = train_df[train_df["breath_id"].isin(train_breath_set)].copy()
+    val_meta = train_df[train_df["breath_id"].isin(val_breath_set)].copy()
+    test_meta = test_df.copy()
+
+    # 4. Save Metadata
+    print(f"Saving metadata to {METADATA_DIR}...")
+    train_meta.to_csv(os.path.join(METADATA_DIR, "train.csv"), index=False)
+    val_meta.to_csv(os.path.join(METADATA_DIR, "val.csv"), index=False)
+    test_meta.to_csv(os.path.join(METADATA_DIR, "test.csv"), index=False)
+
+    # 5. Verification and Statistics
+    print("\n=== Verification & Statistics ===")
+
+    # Reload data to verify
+    train_check = pd.read_csv(os.path.join(METADATA_DIR, "train.csv"))
+    val_check = pd.read_csv(os.path.join(METADATA_DIR, "val.csv"))
+    test_check = pd.read_csv(os.path.join(METADATA_DIR, "test.csv"))
+
+    # Basic Stats
+    print(f"Train Shape: {train_check.shape}")
+    print(f"Val Shape:   {val_check.shape}")
+    print(f"Test Shape:  {test_check.shape}")
+
+    train_unique_breaths = train_check["breath_id"].nunique()
+    val_unique_breaths = val_check["breath_id"].nunique()
+
+    print(f"Train Unique Breaths: {train_unique_breaths}")
+    print(f"Val Unique Breaths:   {val_unique_breaths}")
+
+    # Verify Group Split (Disjoint Sets)
+    train_b_ids = set(train_check["breath_id"].unique())
+    val_b_ids = set(val_check["breath_id"].unique())
+
+    intersection = train_b_ids.intersection(val_b_ids)
+    if len(intersection) > 0:
+        raise AssertionError(
+            f"Data Leakage Detected! {len(intersection)} breath_ids found in both train and val."
+        )
+    else:
+        print("Verification Passed: Train and Validation breath_ids are disjoint.")
+
+    # Verify Split Ratio
+    total_breaths = train_unique_breaths + val_unique_breaths
+    actual_train_ratio = train_unique_breaths / total_breaths
+    print(f"Actual Train Ratio (by breath): {actual_train_ratio:.4f}")
+
+    if not (0.79 <= actual_train_ratio <= 0.81):
+        raise AssertionError(
+            f"Split ratio validation failed. Expected ~0.8, got {actual_train_ratio:.4f}"
+        )
+
+    # File Path Check
+    # This dataset is tabular and contains no external file paths (e.g., images).
+    # We check columns to confirm no path-like strings exist that require validation.
+    # If they did, we would check existence in ./input.
+    print("Checking for file paths...")
+    path_columns = [
+        col
+        for col in train_check.columns
+        if "path" in col.lower() or "file" in col.lower()
+    ]
+    if not path_columns:
+        print("No file path columns detected. Skipping file existence check.")
+    else:
+        # This block is a placeholder for logic if paths existed, strictly following requirements
+        # to programmatically check paths if metadata contained them.
+        for col in path_columns:
+            sample_paths = train_check[col].sample(
+                n=min(1000, len(train_check)), random_state=42
+            )
+            missing_count = 0
+            missing_samples = []
+            for path in sample_paths:
+                full_path = os.path.join(INPUT_DIR, path)
+                if not os.path.exists(full_path):
+                    missing_count += 1
+                    if len(missing_samples) < 5:
+                        missing_samples.append(path)
+
+            missing_ratio = missing_count / len(sample_paths)
+            if missing_ratio > 0.5:
+                print(f"Sample missing paths: {missing_samples}")
+                raise FileNotFoundError(
+                    f"More than 50% of files missing in column {col}. Ratio: {missing_ratio}"
+                )
+
+    print("\nMetadata generation and verification complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,403 @@
+I will optimize the solution by replacing the Conformer architecture with a Bidirectional GRU, as suggested by **Lesson 00017**, which states that RNNs outperform Transformers for this specific task (short sequences, limited data). I will also ensure the validation metric is calculated only on the three scored columns (`reactivity`, `deg_Mg_pH10`, `deg_Mg_50C`) to align with the competition metric and the findings in **Lesson 00017**. Finally, I will adjust the hyperparameters in `Config` to suit the RNN architecture.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Model Hyperparameters (Conformer Encoder)
+    # =========================================================================
+    DIM_MODEL = 128
+    NUM_HEADS = 4
+    NUM_LAYERS = 4
+    CONV_KERNEL_SIZE = 7  # Odd number preferred for symmetric padding
+    DROPOUT = 0.1
+=======
+    # =========================================================================
+    # Model Hyperparameters (BiGRU)
+    # =========================================================================
+    DIM_MODEL = 256
+    NUM_LAYERS = 3
+    DROPOUT = 0.3
+
+    # Scored Columns Indices (reactivity, deg_Mg_pH10, deg_Mg_50C)
+    # Indices in TARGET_COLS: 0, 1, 3
+    SCORED_COLS_INDICES = [0, 1, 3]
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class FeedForwardModule(nn.Module):
+    """
+    Conformer Feed Forward Module.
+    Structure: LN -> Linear -> SiLU -> Dropout -> Linear -> Dropout
+    Uses a 0.5 scale factor on the residual output (Macaron-Net style).
+    """
+
+    def __init__(self, dim, expansion_factor=4, dropout=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+        self.linear1 = nn.Linear(dim, dim * expansion_factor)
+        self.activation = nn.SiLU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim * expansion_factor, dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Seq_Len, Dim)
+        residual = x
+        x = self.layer_norm(x)
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout1(x)
+        x = self.linear2(x)
+        x = self.dropout2(x)
+        return residual + 0.5 * x
+
+
+class MultiHeadSelfAttentionModule(nn.Module):
+    """
+    Conformer Multi-Head Self Attention Module.
+    Structure: LN -> MHSA -> Dropout -> Residual
+    """
+
+    def __init__(self, dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Seq_Len, Dim)
+        residual = x
+        x = self.layer_norm(x)
+        # Self-attention with no mask (full context)
+        x, _ = self.attention(x, x, x)
+        x = self.dropout(x)
+        return residual + x
+
+
+class ConformerConvModule(nn.Module):
+    """
+    Conformer Convolution Module.
+    Structure: LN -> Pointwise Conv -> GLU -> Depthwise Conv -> BN -> Swish -> Pointwise Conv -> Dropout
+    """
+
+    def __init__(self, dim, kernel_size, dropout=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+
+        # Pointwise convolution (expansion for GLU)
+        self.pointwise_conv1 = nn.Conv1d(dim, 2 * dim, kernel_size=1)
+        self.glu = nn.GLU(dim=1)
+
+        # Depthwise convolution
+        # Padding ensures output length matches input length
+        padding = (kernel_size - 1) // 2
+        self.depthwise_conv = nn.Conv1d(
+            dim, dim, kernel_size=kernel_size, padding=padding, groups=dim  # Depthwise
+        )
+
+        self.batch_norm = nn.BatchNorm1d(dim)
+        self.activation = nn.SiLU()
+
+        self.pointwise_conv2 = nn.Conv1d(dim, dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (Batch, Seq_Len, Dim)
+        residual = x
+        x = self.layer_norm(x)
+
+        # Transpose for Conv1d: (Batch, Dim, Seq_Len)
+        x = x.transpose(1, 2)
+
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+
+        # Transpose back: (Batch, Seq_Len, Dim)
+        x = x.transpose(1, 2)
+
+        return residual + x
+
+
+class ConformerBlock(nn.Module):
+    """
+    Single Conformer Block.
+    Composition:
+    1. FeedForward (Half-step)
+    2. MultiHeadSelfAttention
+    3. Convolution
+    4. FeedForward (Half-step)
+    5. LayerNorm
+    """
+
+    def __init__(self, dim, num_heads, kernel_size, dropout=0.1):
+        super().__init__()
+        self.ff1 = FeedForwardModule(dim, expansion_factor=4, dropout=dropout)
+        self.mhsa = MultiHeadSelfAttentionModule(dim, num_heads, dropout=dropout)
+        self.conv = ConformerConvModule(dim, kernel_size, dropout=dropout)
+        self.ff2 = FeedForwardModule(dim, expansion_factor=4, dropout=dropout)
+        self.layer_norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.ff1(x)
+        x = self.mhsa(x)
+        x = self.conv(x)
+        x = self.ff2(x)
+        x = self.layer_norm(x)
+        return x
+
+
+class RNAConformer(nn.Module):
+    """
+    Main Conformer-based RNA Degradation Predictor.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Load hyperparameters from Config
+        dim = Config.DIM_MODEL
+        num_heads = Config.NUM_HEADS
+        num_layers = Config.NUM_LAYERS
+        kernel_size = Config.CONV_KERNEL_SIZE
+        dropout = Config.DROPOUT
+        input_channels = Config.INPUT_CHANNELS
+        output_channels = Config.OUTPUT_CHANNELS
+        seq_len = Config.SEQ_LENGTH
+
+        # 1. Input Projection
+        # Projects one-hot features (14 channels) to model dimension
+        self.embedding = nn.Linear(input_channels, dim)
+
+        # 2. Positional Encoding
+        # Learnable positional embeddings
+        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, dim))
+
+        # 3. Conformer Encoder
+        self.layers = nn.ModuleList(
+            [
+                ConformerBlock(dim, num_heads, kernel_size, dropout)
+                for _ in range(num_layers)
+            ]
+        )
+
+        # 4. Output Head
+        self.head = nn.Linear(dim, output_channels)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize positional encoding with small values
+        nn.init.normal_(self.pos_encoding, mean=0.0, std=0.02)
+
+        # Initialize linear layers
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, Seq_Len, 14)
+        Returns:
+            torch.Tensor: Predictions of shape (Batch, Seq_Len, 5)
+        """
+        # Project input
+        x = self.embedding(x)  # (B, L, Dim)
+
+        # Add positional encoding
+        x = x + self.pos_encoding
+
+        # Pass through Conformer blocks
+        for layer in self.layers:
+            x = layer(x)
+
+        # Project to output targets
+        x = self.head(x)  # (B, L, 5)
+
+        return x
+=======
+class RNAGRU(nn.Module):
+    """
+    Bidirectional GRU for RNA Degradation Prediction.
+    Cite Lesson 00017: Prefer RNNs over Transformers for short sequences with limited data.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Load hyperparameters from Config
+        input_channels = Config.INPUT_CHANNELS
+        dim = Config.DIM_MODEL
+        num_layers = Config.NUM_LAYERS
+        dropout = Config.DROPOUT
+        output_channels = Config.OUTPUT_CHANNELS
+
+        # Bidirectional GRU
+        self.gru = nn.GRU(
+            input_size=input_channels,
+            hidden_size=dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0,
+        )
+
+        # Output Head
+        # Input dim is doubled because of bidirectionality
+        self.head = nn.Linear(dim * 2, output_channels)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input features of shape (Batch, Seq_Len, 14)
+        Returns:
+            torch.Tensor: Predictions of shape (Batch, Seq_Len, 5)
+        """
+        # x: (Batch, Seq_Len, 14)
+        
+        # Pass through GRU
+        x, _ = self.gru(x)  # (Batch, Seq_Len, Dim * 2)
+
+        # Project to output targets
+        x = self.head(x)  # (Batch, Seq_Len, 5)
+
+        return x
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import RNAConformer
+
+
+class Trainer:
+    """
+    Trainer class for the RNA Conformer model.
+=======
+from library.model import RNAGRU
+
+
+class Trainer:
+    """
+    Trainer class for the RNA model.
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def __init__(self, model=None, device=None):
+        """
+        Initialize the Trainer.
+
+        Args:
+            model (nn.Module, optional): The model to train. If None, instantiates RNAConformer.
+            device (str, optional): Device to run on. If None, uses Config.DEVICE.
+        """
+        self.config = Config
+        self.device = device if device else self.config.DEVICE
+
+        # Initialize model
+        self.model = model if model else RNAConformer()
+        self.model.to(self.device)
+=======
+    def __init__(self, model=None, device=None):
+        """
+        Initialize the Trainer.
+
+        Args:
+            model (nn.Module, optional): The model to train. If None, instantiates RNAGRU.
+            device (str, optional): Device to run on. If None, uses Config.DEVICE.
+        """
+        self.config = Config
+        self.device = device if device else self.config.DEVICE
+
+        # Initialize model
+        self.model = model if model else RNAGRU()
+        self.model.to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                # Slice to scored length
+                preds_scored = preds[:, : self.config.SCORED_LENGTH, :]
+                targets_scored = targets[:, : self.config.SCORED_LENGTH, :]
+
+                all_preds.append(preds_scored.cpu())
+                all_targets.append(targets_scored.cpu())
+=======
+                # Slice to scored length and scored columns
+                # Cite Lesson 00017: Filter evaluation to specific scored columns.
+                preds_scored = preds[:, : self.config.SCORED_LENGTH, :]
+                targets_scored = targets[:, : self.config.SCORED_LENGTH, :]
+                
+                # Filter to only the 3 scored columns
+                preds_scored = preds_scored[:, :, self.config.SCORED_COLS_INDICES]
+                targets_scored = targets_scored[:, :, self.config.SCORED_COLS_INDICES]
+
+                all_preds.append(preds_scored.cpu())
+                all_targets.append(targets_scored.cpu())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import RNAConformer
+from library.trainer import Trainer
+=======
+from library.model import RNAGRU
+from library.trainer import Trainer
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Adjust Config for "Fast Baseline"
+    # Reducing epochs to ensure completion within strict time limits while allowing convergence
+    Config.EPOCHS = 25
+
+    print("Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # 2. Model Initialization
+    print("Initializing Model...")
+    model = RNAConformer()
+=======
+    # Adjust Config for training
+    # Cite Lesson 00017: BiGRU requires sufficient training.
+    Config.EPOCHS = 40
+
+    print("Initializing DataLoaders...")
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # 2. Model Initialization
+    print("Initializing Model...")
+    model = RNAGRU()
+>>>>>>> REPLACE
+```

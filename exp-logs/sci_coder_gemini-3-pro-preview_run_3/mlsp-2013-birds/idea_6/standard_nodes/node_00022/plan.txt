@@ -1,0 +1,792 @@
+To improve the model's performance, I will implement a strategy based on the lessons learned from previous iterations, specifically reverting to a simpler, more robust pipeline that leverages pre-computed spectrograms and the provided iterative stratification splits.
+
+**Strategy Outline:**
+
+1.  **Data Loading & Augmentation:**
+    *   **Switch to BMP Spectrograms:** Instead of generating spectrograms from scratch (which failed in `idea_6`), I will load the pre-computed BMP spectrograms provided in `supplemental_data`. These have proven effective in the baseline (`idea_1`).
+    *   **Rigid Input Structure (Cite Lesson 00019):** Resize all images to 224x224. This aligns with the pre-trained ResNet18's expected input features better than custom pooling layers on small datasets.
+    *   **Augmentations:**
+        *   **Horizontal Translation (Cite Lesson 00007):** Use `RandomAffine` to shift the spectrogram in time.
+        *   **Photometric Jitter (Cite Lesson 00009):** Use `ColorJitter` to simulate gain and SNR variations.
+        *   **No Horizontal Flip (Cite Lesson 00006):** Explicitly avoid flipping, which reverses time.
+        *   **Mixup (Cite Lesson 00007):** Retain Mixup regularization in the trainer.
+
+2.  **Model Architecture:**
+    *   **Standard ResNet18 (Cite Lesson 00019):** Remove the Spatial Pyramid Pooling (SPP) layer. Use the standard Global Average Pooling and Linear classifier of ResNet18. This reduces complexity and relies on robust pre-trained features.
+
+3.  **Training & Validation:**
+    *   **Fixed Split (Cite Lesson 00017):** Abandon random K-Fold cross-validation. Instead, train on the provided `train.csv` and validate on `val.csv`. These splits were generated using Iterative Stratification, ensuring that rare classes are properly represented, which is critical for this small, imbalanced dataset.
+
+4.  **Configuration:**
+    *   Update paths to point to the new working directory (`idea_7`) and map the WAV file paths in metadata to the corresponding BMP files.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Strictly following the requirement to use ./working/idea_6/
+    WORKING_DIR = "./working/idea_6/"
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+=======
+    # Strictly following the requirement to use ./working/idea_7/
+    WORKING_DIR = "./working/idea_7/"
+    CACHE_DIR = os.path.join(WORKING_DIR, "cache")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # =========================================================================
+    # Audio Processing Parameters
+    # =========================================================================
+    SR = 16000  # Sampling Rate (16kHz as per dataset)
+    DURATION = 10  # Duration in seconds
+    N_MELS = 128  # Number of Mel bands
+    N_FFT = 1024  # FFT window size
+    HOP_LENGTH = 320  # Hop length (approx 20ms)
+    FMIN = 0  # Min frequency
+    FMAX = 8000  # Max frequency (Nyquist)
+
+    # =========================================================================
+    # Model Parameters
+    # =========================================================================
+    MODEL_NAME = "resnet18"
+    PRETRAINED = True
+    NUM_CLASSES = 19
+    IMAGE_SIZE = 224  # Input size for the model (224x224)
+    IN_CHANNELS = 3  # Replicate mono spectrogram to 3 channels
+
+    # SPP Grid levels (e.g., 1x1, 2x2, 4x4)
+    SPP_LEVELS = [1, 2, 4]
+=======
+    # =========================================================================
+    # Audio Processing Parameters
+    # =========================================================================
+    # Not used for BMP loading, but kept for reference
+    SR = 16000
+
+    # =========================================================================
+    # Model Parameters
+    # =========================================================================
+    MODEL_NAME = "resnet18"
+    PRETRAINED = True
+    NUM_CLASSES = 19
+    IMAGE_SIZE = 224  # Input size for the model (224x224)
+    IN_CHANNELS = 3  # Replicate mono spectrogram to 3 channels
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Cross Validation
+    N_FOLDS = 5  # Number of folds for Iterative Stratification
+=======
+    # Cross Validation
+    N_FOLDS = 1  # Fixed split
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import os
+import glob
+import numpy as np
+import pandas as pd
+import torch
+import torchaudio
+import torchvision.transforms as T
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import KFold
+from library.config import Config
+from library.utils import log_message
+
+# Ensure torchaudio uses the correct backend if necessary, though defaults are usually fine
+torchaudio.set_audio_backend("soundfile")
+
+
+class BirdDataset(Dataset):
+    """
+    PyTorch Dataset for Bird Species Classification.
+    Handles loading cached spectrograms, applying augmentations, and formatting for ResNet.
+    """
+
+    def __init__(self, metadata_df, phase="train", transform=None):
+        """
+        Args:
+            metadata_df (pd.DataFrame): DataFrame containing 'rec_id' and 'labels'.
+            phase (str): 'train', 'val', or 'test'. Controls augmentations.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.metadata = metadata_df.reset_index(drop=True)
+        self.phase = phase
+        self.transform = transform
+        self.num_classes = Config.NUM_CLASSES
+
+        # Pre-define augmentations
+        # Brightness and Contrast Jitter for photometric augmentation
+        self.jitter = T.ColorJitter(brightness=0.2, contrast=0.2)
+
+        # Normalization for ImageNet pre-trained models
+        self.normalize = T.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        rec_id = row["rec_id"]
+
+        # Load cached spectrogram: shape (1, 224, 224)
+        cache_path = os.path.join(Config.CACHE_DIR, f"{rec_id}.npy")
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(
+                f"Cached file not found: {cache_path}. Run cache_data() first."
+            )
+
+        spec = np.load(cache_path)  # Shape: (1, 224, 224)
+        spec_tensor = torch.from_numpy(spec).float()
+
+        # 1. Augmentation: Time Shifting (Train only)
+        # Random horizontal roll
+        if self.phase == "train":
+            shift = np.random.randint(0, spec_tensor.shape[-1])
+            spec_tensor = torch.roll(spec_tensor, shifts=shift, dims=-1)
+
+        # 2. Channel Replication: 1 -> 3
+        # Replicate to match ResNet input expectation
+        image = spec_tensor.repeat(3, 1, 1)  # Shape: (3, 224, 224)
+
+        # 3. Augmentation: Photometric Jitter (Train only)
+        if self.phase == "train":
+            image = self.jitter(image)
+
+        # 4. Normalization
+        # ImageNet normalization
+        image = self.normalize(image)
+
+        # 5. Labels
+        label_str = str(row["labels"])
+        label_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+
+        if label_str != "?" and label_str != "nan":
+            try:
+                indices = [int(x) for x in label_str.split()]
+                label_vec[indices] = 1.0
+            except ValueError:
+                pass  # Handle empty or malformed labels gracefully
+
+        return image, label_vec, rec_id
+
+
+def process_audio(file_path):
+    """
+    Loads audio, computes Log-Mel Spectrogram, and resizes it.
+    Returns a numpy array of shape (1, 224, 224).
+    """
+    full_path = os.path.join(Config.INPUT_DIR, file_path)
+
+    # Load audio
+    waveform, sr = torchaudio.load(full_path)
+
+    # Resample if necessary
+    if sr != Config.SR:
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=Config.SR)
+        waveform = resampler(waveform)
+
+    # Ensure constant duration (pad or truncate)
+    target_len = Config.SR * Config.DURATION
+    current_len = waveform.shape[1]
+
+    if current_len < target_len:
+        pad_amt = target_len - current_len
+        waveform = torch.nn.functional.pad(waveform, (0, pad_amt))
+    elif current_len > target_len:
+        waveform = waveform[:, :target_len]
+
+    # Compute Mel Spectrogram
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=Config.SR,
+        n_mels=Config.N_MELS,
+        n_fft=Config.N_FFT,
+        hop_length=Config.HOP_LENGTH,
+        f_min=Config.FMIN,
+        f_max=Config.FMAX,
+    )
+    mel_spec = mel_transform(waveform)
+
+    # Convert to Log Scale (dB)
+    db_transform = torchaudio.transforms.AmplitudeToDB()
+    log_mel = db_transform(mel_spec)
+
+    # Resize to 224x224
+    resize_transform = T.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE), antialias=True)
+    resized_spec = resize_transform(log_mel)
+
+    # Min-Max Normalize to [0, 1] for stability before saving
+    # This helps with subsequent augmentations and model stability
+    min_val = resized_spec.min()
+    max_val = resized_spec.max()
+    if max_val - min_val > 1e-6:
+        resized_spec = (resized_spec - min_val) / (max_val - min_val)
+    else:
+        resized_spec = torch.zeros_like(resized_spec)
+
+    return resized_spec.numpy()
+
+
+def prepare_cache(load_cached_data=True):
+    """
+    Iterates through all metadata files, processes audio, and caches spectrograms.
+    """
+    log_message("Preparing data cache...")
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    # Load all metadata
+    train_df = pd.read_csv(Config.TRAIN_METADATA)
+    val_df = pd.read_csv(Config.VAL_METADATA)
+    test_df = pd.read_csv(Config.TEST_METADATA)
+
+    all_data = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    unique_files = all_data[["rec_id", "file_path"]].drop_duplicates()
+
+    processed_count = 0
+    skipped_count = 0
+
+    for _, row in unique_files.iterrows():
+        rec_id = row["rec_id"]
+        file_path = row["file_path"]
+        cache_path = os.path.join(Config.CACHE_DIR, f"{rec_id}.npy")
+
+        if load_cached_data and os.path.exists(cache_path):
+            skipped_count += 1
+            continue
+
+        try:
+            spec = process_audio(file_path)
+            np.save(cache_path, spec)
+            processed_count += 1
+        except Exception as e:
+            log_message(f"Error processing {file_path}: {e}")
+
+    log_message(
+        f"Cache preparation complete. Processed: {processed_count}, Skipped (Cached): {skipped_count}"
+    )
+
+
+def get_cv_folds():
+    """
+    Merges Train and Validation sets and performs K-Fold Cross Validation.
+    Returns a DataFrame with a 'fold' column.
+    """
+    # Load and merge train/val
+    train_df = pd.read_csv(Config.TRAIN_METADATA)
+    val_df = pd.read_csv(Config.VAL_METADATA)
+
+    # Combine
+    full_train_df = pd.concat([train_df, val_df], ignore_index=True)
+
+    # Prepare X (indices)
+    X = full_train_df[["rec_id"]].values
+
+    # K-Fold Cross Validation
+    # We use KFold instead of IterativeStratification to ensure every sample is assigned to a fold.
+    kf = KFold(n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED)
+
+    full_train_df["fold"] = -1
+
+    fold_idx = 0
+    for _, test_index in kf.split(X):
+        full_train_df.iloc[test_index, full_train_df.columns.get_loc("fold")] = fold_idx
+        fold_idx += 1
+
+    # Verify coverage
+    if (full_train_df["fold"] == -1).any():
+        log_message("Warning: Some samples were not assigned a fold!")
+
+    return full_train_df
+
+
+def get_dataloaders(fold_idx, load_cached_data=True):
+    """
+    Main entry point to get DataLoaders for a specific fold.
+
+    Args:
+        fold_idx (int): The fold index (0 to N_FOLDS-1) to be used as Validation.
+        load_cached_data (bool): Whether to use existing cache.
+
+    Returns:
+        train_loader, val_loader
+    """
+    # 1. Ensure Cache Exists
+    prepare_cache(load_cached_data=load_cached_data)
+
+    # 2. Get Folds
+    df = get_cv_folds()
+
+    # 3. Split based on fold_idx
+    train_df = df[df["fold"] != fold_idx].copy()
+    val_df = df[df["fold"] == fold_idx].copy()
+
+    # 4. Create Datasets
+    train_dataset = BirdDataset(train_df, phase="train")
+    val_dataset = BirdDataset(val_df, phase="val")
+
+    # 5. Create Loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+=======
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torchvision.transforms as T
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from library.config import Config
+from library.utils import log_message
+
+
+class BirdDataset(Dataset):
+    """
+    PyTorch Dataset for Bird Species Classification using pre-computed BMP spectrograms.
+    """
+
+    def __init__(self, metadata_df, phase="train"):
+        """
+        Args:
+            metadata_df (pd.DataFrame): DataFrame containing 'rec_id', 'file_path', and 'labels'.
+            phase (str): 'train', 'val', or 'test'.
+        """
+        self.metadata = metadata_df.reset_index(drop=True)
+        self.phase = phase
+        self.num_classes = Config.NUM_CLASSES
+
+        # Augmentations
+        # Cite Lesson 00019: Resize to 224x224 (Rigid adherence to pretrained input)
+        # Cite Lesson 00007: RandomAffine (Horizontal translation only)
+        # Cite Lesson 00009: ColorJitter (Photometric augmentation)
+        
+        transforms = []
+        transforms.append(T.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE), antialias=True))
+        
+        if self.phase == "train":
+            # Horizontal translation (time shifting)
+            transforms.append(T.RandomAffine(degrees=0, translate=(0.2, 0)))
+            # Photometric Jitter
+            transforms.append(T.ColorJitter(brightness=0.2, contrast=0.2))
+        
+        transforms.append(T.ToTensor())
+        
+        # Normalization for ImageNet pre-trained models
+        transforms.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+        
+        self.transform = T.Compose(transforms)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        
+        # Map WAV path to BMP path
+        # Original: essential_data/src_wavs/filename.wav
+        # Target: supplemental_data/spectrograms/filename.bmp
+        wav_path = row["file_path"]
+        filename = os.path.basename(wav_path).replace(".wav", ".bmp")
+        bmp_path = os.path.join(Config.INPUT_DIR, "supplemental_data", "spectrograms", filename)
+        
+        # Load Image
+        try:
+            image = Image.open(bmp_path).convert("RGB")
+        except Exception as e:
+            # Fallback (should not happen based on verification)
+            image = Image.new("RGB", (Config.IMAGE_SIZE, Config.IMAGE_SIZE))
+            
+        # Apply Transforms
+        image = self.transform(image)
+
+        # Labels
+        label_str = str(row["labels"])
+        label_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+
+        if label_str != "?" and label_str != "nan":
+            try:
+                indices = [int(x) for x in label_str.split()]
+                label_vec[indices] = 1.0
+            except ValueError:
+                pass
+
+        return image, label_vec, row["rec_id"]
+
+
+def get_dataloaders(fold_idx=0, load_cached_data=False):
+    """
+    Returns DataLoaders for the fixed Train/Val split.
+    Ignores fold_idx and load_cached_data (kept for compatibility).
+    """
+    # Load fixed splits (Cite Lesson 00017: Use Iterative Stratification provided in metadata)
+    train_df = pd.read_csv(Config.TRAIN_METADATA)
+    val_df = pd.read_csv(Config.VAL_METADATA)
+
+    # Create Datasets
+    train_dataset = BirdDataset(train_df, phase="train")
+    val_dataset = BirdDataset(val_df, phase="val")
+
+    # Create Loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def get_test_loader(load_cached_data=True):
+    """
+    Returns DataLoader for the test set.
+    """
+    prepare_cache(load_cached_data=load_cached_data)
+
+    test_df = pd.read_csv(Config.TEST_METADATA)
+    test_dataset = BirdDataset(test_df, phase="test")
+=======
+def get_test_loader(load_cached_data=False):
+    """
+    Returns DataLoader for the test set.
+    """
+    test_df = pd.read_csv(Config.TEST_METADATA)
+    test_dataset = BirdDataset(test_df, phase="test")
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SpatialPyramidPooling(nn.Module):
+    """
+    Spatial Pyramid Pooling (SPP) Layer.
+
+    Aggregates features from feature maps using multiple grid sizes. This allows the network
+    to maintain spatial (and thus temporal/frequency) context which is often lost with
+    standard Global Average Pooling.
+
+    Args:
+        levels (list): A list of integers representing the grid sizes for pooling.
+                       Default is [1, 2, 4], corresponding to 1x1, 2x2, and 4x4 grids.
+    """
+
+    def __init__(self, levels=[1, 2, 4]):
+        super(SpatialPyramidPooling, self).__init__()
+        self.levels = levels
+
+    def forward(self, x):
+        # x shape: (Batch_Size, Channels, Height, Width)
+        N, C, H, W = x.size()
+        outputs = []
+
+        for level in self.levels:
+            # We use Adaptive Max Pooling.
+            # Rationale: Bird calls are often sparse, high-energy events in the spectrogram.
+            # Max pooling captures the strongest activation within a grid cell, indicating presence,
+            # whereas Average pooling might dilute the signal with background silence/noise.
+            # Output shape for level 'n': (N, C, n, n)
+            pooled = F.adaptive_max_pool2d(x, output_size=(level, level))
+
+            # Flatten the spatial dimensions: (N, C * level * level)
+            outputs.append(pooled.view(N, -1))
+
+        # Concatenate all flattened levels along the feature dimension
+        # Total features = C * sum(level^2 for level in levels)
+        return torch.cat(outputs, dim=1)
+
+
+class BirdResNetSPP(nn.Module):
+    """
+    ResNet-18 with Spatial Pyramid Pooling for Multi-Label Bird Species Classification.
+
+    This architecture replaces the standard Global Average Pooling and Fully Connected layer
+    of ResNet-18 with an SPP module and a new classifier.
+
+    Args:
+        pretrained (bool): Whether to load ImageNet pretrained weights.
+        num_classes (int): Number of output classes (species).
+        spp_levels (list): Grid levels for the SPP layer.
+    """
+
+    def __init__(
+        self,
+        pretrained=Config.PRETRAINED,
+        num_classes=Config.NUM_CLASSES,
+        spp_levels=Config.SPP_LEVELS,
+    ):
+        super(BirdResNetSPP, self).__init__()
+
+        # 1. Load Pretrained ResNet-18 Backbone
+        # Handle different torchvision versions for weight loading
+        try:
+            from torchvision.models import ResNet18_Weights
+
+            weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            self.backbone = models.resnet18(weights=weights)
+        except ImportError:
+            # Fallback for older torchvision versions
+            self.backbone = models.resnet18(pretrained=pretrained)
+
+        # 2. Feature Extractor
+        # Retain layers: conv1, bn1, relu, maxpool, layer1, layer2, layer3, layer4
+        # Remove the last two layers: avgpool and fc
+        layers = list(self.backbone.children())[:-2]
+        self.features = nn.Sequential(*layers)
+
+        # 3. Spatial Pyramid Pooling
+        self.spp = SpatialPyramidPooling(levels=spp_levels)
+
+        # 4. Classifier Head
+        # Calculate the input dimension for the linear layer
+        # ResNet-18 layer4 outputs 512 channels
+        backbone_out_channels = 512
+
+        # SPP concatenates flattened vectors from all grids
+        # e.g., for levels [1, 2, 4]: 1*1 + 2*2 + 4*4 = 21 regions
+        # Total dim = 512 * 21 = 10752
+        spp_out_dim = backbone_out_channels * sum([l * l for l in spp_levels])
+
+        self.classifier = nn.Linear(spp_out_dim, num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, 3, 224, 224).
+
+        Returns:
+            torch.Tensor: Logits of shape (Batch, Num_Classes).
+        """
+        # Extract features using ResNet backbone
+        # Output shape: (Batch, 512, 7, 7) for 224x224 input
+        x = self.features(x)
+
+        # Apply Spatial Pyramid Pooling
+        # Output shape: (Batch, spp_out_dim)
+        x = self.spp(x)
+
+        # Classification
+        # Output shape: (Batch, num_classes)
+        logits = self.classifier(x)
+
+        return logits
+=======
+class BirdResNetSPP(nn.Module):
+    """
+    Standard ResNet-18 for Multi-Label Bird Species Classification.
+    Renamed class kept for compatibility with imports, but implementation is standard ResNet.
+    Cite Lesson 00019: Use standard architecture on small datasets.
+    """
+
+    def __init__(
+        self,
+        pretrained=Config.PRETRAINED,
+        num_classes=Config.NUM_CLASSES,
+        spp_levels=None, # Ignored
+    ):
+        super(BirdResNetSPP, self).__init__()
+
+        # 1. Load Pretrained ResNet-18 Backbone
+        try:
+            from torchvision.models import ResNet18_Weights
+            weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            self.backbone = models.resnet18(weights=weights)
+        except ImportError:
+            self.backbone = models.resnet18(pretrained=pretrained)
+
+        # 2. Replace Classifier
+        # ResNet18 fc input dim is 512
+        self.backbone.fc = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Dictionary to store Out-Of-Fold predictions: rec_id -> probability vector
+    oof_preds_dict = {}
+
+    # 2. Training Loop
+    for fold_idx in range(Config.N_FOLDS):
+        log_message(f"\n=== Training Fold {fold_idx} ===")
+
+        # Get DataLoaders (cached data will be generated if missing)
+        train_loader, val_loader = get_dataloaders(fold_idx, load_cached_data=True)
+
+        # Initialize Model
+        model = BirdResNetSPP()
+
+        # Initialize Trainer
+        trainer = Trainer(model, device)
+
+        # Train
+        best_auc = trainer.fit(train_loader, val_loader, fold_idx)
+
+        # Generate predictions for the validation fold (OOF)
+        # We use the best model state which was loaded at the end of fit()
+        ids, probs = trainer.predict(val_loader)
+
+        # Store predictions
+        for i, rec_id in enumerate(ids):
+            oof_preds_dict[rec_id] = probs[i]
+
+    log_message("\nTraining Complete.")
+=======
+    # Dictionary to store predictions: rec_id -> probability vector
+    val_preds_dict = {}
+
+    # 2. Training Loop (Single Fold / Fixed Split)
+    # Cite Lesson 00017: Use fixed Iterative Stratification split
+    log_message(f"\n=== Training on Fixed Split ===")
+
+    # Get DataLoaders
+    train_loader, val_loader = get_dataloaders()
+
+    # Initialize Model
+    model = BirdResNetSPP()
+
+    # Initialize Trainer
+    trainer = Trainer(model, device)
+
+    # Train (Fold 0 is just a placeholder name here)
+    best_auc = trainer.fit(train_loader, val_loader, fold_idx=0)
+
+    # Generate predictions for the validation set
+    ids, probs = trainer.predict(val_loader)
+
+    # Store predictions
+    for i, rec_id in enumerate(ids):
+        val_preds_dict[rec_id] = probs[i]
+
+    log_message("\nTraining Complete.")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Align OOF predictions with the validation metadata
+    # We only evaluate on the samples present in val.csv
+    missing_ids = 0
+    for idx, row in val_df.iterrows():
+        rec_id = row["rec_id"]
+
+        if rec_id in oof_preds_dict:
+            # Parse ground truth labels
+            lbl_str = str(row["labels"])
+            label_vec = np.zeros(Config.NUM_CLASSES)
+            if lbl_str != "?" and lbl_str != "nan":
+                try:
+                    indices = [int(x) for x in lbl_str.split()]
+                    label_vec[indices] = 1.0
+                except ValueError:
+                    pass
+
+            y_true.append(label_vec)
+            y_pred.append(oof_preds_dict[rec_id])
+        else:
+            missing_ids += 1
+
+    if missing_ids > 0:
+        log_message(
+            f"Warning: {missing_ids} validation samples missing from OOF predictions."
+        )
+=======
+    # Align predictions with the validation metadata
+    missing_ids = 0
+    for idx, row in val_df.iterrows():
+        rec_id = row["rec_id"]
+
+        if rec_id in val_preds_dict:
+            # Parse ground truth labels
+            lbl_str = str(row["labels"])
+            label_vec = np.zeros(Config.NUM_CLASSES)
+            if lbl_str != "?" and lbl_str != "nan":
+                try:
+                    indices = [int(x) for x in lbl_str.split()]
+                    label_vec[indices] = 1.0
+                except ValueError:
+                    pass
+
+            y_true.append(label_vec)
+            y_pred.append(val_preds_dict[rec_id])
+        else:
+            missing_ids += 1
+
+    if missing_ids > 0:
+        log_message(
+            f"Warning: {missing_ids} validation samples missing from predictions."
+        )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Ensemble Inference
+        ensemble_probs = None
+        test_ids = None
+
+        for fold_idx in range(Config.N_FOLDS):
+            log_message(f"Inference with model from Fold {fold_idx}...")
+
+            # Load Model
+            model = BirdResNetSPP()
+            checkpoint_path = os.path.join(
+                Config.CHECKPOINT_DIR, f"fold_{fold_idx}_best.pth"
+            )
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
+            # Predict
+            trainer = Trainer(model, device)
+            ids, probs = trainer.predict(test_loader)
+
+            if ensemble_probs is None:
+                ensemble_probs = probs
+                test_ids = ids
+            else:
+                ensemble_probs += probs
+
+        # Average
+        ensemble_probs /= Config.N_FOLDS
+=======
+        # Inference with single model
+        log_message(f"Inference with best model...")
+
+        # Load Model
+        model = BirdResNetSPP()
+        checkpoint_path = os.path.join(Config.CHECKPOINT_DIR, f"fold_0_best.pth")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
+        # Predict
+        trainer = Trainer(model, device)
+        test_ids, ensemble_probs = trainer.predict(test_loader)
+>>>>>>> REPLACE
+```

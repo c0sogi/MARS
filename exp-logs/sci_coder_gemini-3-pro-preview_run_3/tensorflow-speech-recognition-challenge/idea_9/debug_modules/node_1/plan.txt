@@ -1,0 +1,392 @@
+To resolve the `OSError: undefined symbol` caused by binary incompatibility between the installed `torch` and `torchaudio` packages, I will remove the dependency on `torchaudio` entirely. This involves replacing `torchaudio`'s audio loading, feature extraction, and model components with native PyTorch and `soundfile` implementations, as recommended in Debug Lesson 1 (Eliminate Binary Incompatibility by Replacing Extension Libraries with Native Implementations).
+
+**Implementation Strategy:**
+
+1.  **Modify `library/preprocess.py`**:
+    *   Replace `import torchaudio` with `import soundfile as sf`.
+    *   Implement helper classes `MelSpectrogram` (using `torch.stft`) and `AmplitudeToDB` to replace `torchaudio.transforms`.
+    *   Implement a `create_mel_filterbank` function using NumPy to generate the Mel basis matrix without external dependencies.
+    *   Update `FeatureExtractor` to use these custom implementations.
+    *   Update `CachingDataset` to load audio using `soundfile` and perform resampling using `torch.nn.functional.interpolate`.
+
+2.  **Modify `library/model.py`**:
+    *   Remove `import torchaudio`.
+    *   In `SKResNetConformer`, replace the `torchaudio.models.Conformer` module with `torch.nn.TransformerEncoder`. This maintains the architecture's ability to model global context (Cite Debug Lesson 1) while using only standard PyTorch components.
+
+```diff
+library/preprocess.py
+<<<<<<< SEARCH
+import os
+import hashlib
+import pandas as pd
+import numpy as np
+import torch
+import torchaudio
+import torchaudio.transforms as T
+from torch.utils.data import Dataset, DataLoader
+from library.config import AudioConfig, TrainConfig
+=======
+import os
+import hashlib
+import pandas as pd
+import numpy as np
+import torch
+import soundfile as sf
+from torch.utils.data import Dataset, DataLoader
+from library.config import AudioConfig, TrainConfig
+>>>>>>> REPLACE
+```
+
+```diff
+library/preprocess.py
+<<<<<<< SEARCH
+class FeatureExtractor:
+    """
+    Computes 3-Channel Multi-Resolution Log-Mel Spectrograms.
+    Channels correspond to Short, Medium, and Long STFT windows.
+    """
+
+    def __init__(self):
+        self.transforms = []
+        # Initialize a MelSpectrogram transform for each resolution defined in config
+        for n_fft, win_length in AudioConfig.resolutions:
+            t = T.MelSpectrogram(
+                sample_rate=AudioConfig.sr,
+                n_fft=n_fft,
+                win_length=win_length,
+                hop_length=AudioConfig.hop_length,
+                n_mels=AudioConfig.n_mels,
+                f_min=AudioConfig.fmin,
+                f_max=AudioConfig.fmax,
+                center=True,  # Ensures consistent time dimension across resolutions
+                pad_mode="reflect",
+                power=2.0,
+                normalized=False,
+            )
+            self.transforms.append(t)
+
+        self.db_transform = T.AmplitudeToDB(stype="power", top_db=AudioConfig.top_db)
+
+    def __call__(self, waveform):
+        """
+        Args:
+            waveform (torch.Tensor): Audio waveform (1, time) or (channels, time)
+        Returns:
+            np.ndarray: (3, n_mels, time)
+        """
+        # Ensure mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Pad or Truncate to fixed length
+        target_samples = AudioConfig.n_samples
+        num_samples = waveform.shape[1]
+
+        if num_samples < target_samples:
+            # Pad with zeros at the end
+            padding = target_samples - num_samples
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        elif num_samples > target_samples:
+            # Truncate
+            waveform = waveform[:, :target_samples]
+
+        # Compute features for each resolution
+        channels = []
+        for transform in self.transforms:
+            # Compute MelSpec: Output (1, n_mels, time)
+            spec = transform(waveform)
+            # Convert to DB
+            spec_db = self.db_transform(spec)
+            channels.append(spec_db)
+
+        # Stack along channel dimension: (3, n_mels, time)
+        multires_spec = torch.cat(channels, dim=0)
+
+        return multires_spec.numpy()
+=======
+def create_mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
+    """
+    Creates a Mel filterbank matrix using native NumPy.
+    Cite Debug Lesson 1: Native implementation to avoid library dependency.
+    Returns: (n_freqs, n_mels)
+    """
+    n_freqs = n_fft // 2 + 1
+    
+    # Mel scale conversion
+    def hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+    def mel_to_hz(mel):
+        return 700.0 * (10.0**(mel / 2595.0) - 1.0)
+
+    # Grid points
+    mel_min = hz_to_mel(fmin)
+    mel_max = hz_to_mel(fmax if fmax else sr / 2.0)
+    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz_points = mel_to_hz(mel_points)
+    
+    # Bin mapping
+    bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(int)
+    
+    weights = np.zeros((n_mels, n_freqs))
+    
+    for i in range(n_mels):
+        start = bin_points[i]
+        center = bin_points[i+1]
+        end = bin_points[i+2]
+        
+        if center > start:
+            weights[i, start:center] = (np.arange(start, center) - start) / (center - start)
+        if end > center:
+            weights[i, center:end] = (end - np.arange(center, end)) / (end - center)
+            
+    return torch.from_numpy(weights.T).float()
+
+
+class MelSpectrogram(torch.nn.Module):
+    """
+    Custom MelSpectrogram implementation using torch.stft.
+    Replaces torchaudio.transforms.MelSpectrogram.
+    """
+    def __init__(self, sample_rate, n_fft, win_length, hop_length, n_mels, f_min, f_max):
+        super().__init__()
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.hop_length = hop_length
+        
+        # Create Mel Basis
+        self.mel_basis = create_mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max)
+        
+        # Create Window
+        self.window = torch.hann_window(win_length)
+        
+    def forward(self, waveform):
+        # waveform: (1, time) or (time)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+            
+        # STFT
+        # Output: (Batch, Freq, Frames) complex tensor
+        stft = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window.to(waveform.device),
+            center=True,
+            return_complex=True,
+            pad_mode='reflect'
+        )
+        
+        # Power Spectrogram
+        spec = stft.abs().pow(2.0)
+        
+        # Mel Spectrogram
+        # spec: (Batch, Freq, Frames)
+        # mel_basis: (Freq, Mels)
+        # Output: (Batch, Mels, Frames)
+        mel_spec = torch.matmul(self.mel_basis.to(waveform.device).T, spec)
+        
+        return mel_spec
+
+
+class AmplitudeToDB(torch.nn.Module):
+    """
+    Custom AmplitudeToDB implementation.
+    Replaces torchaudio.transforms.AmplitudeToDB.
+    """
+    def __init__(self, top_db=80.0):
+        super().__init__()
+        self.top_db = top_db
+        
+    def forward(self, x):
+        # 10 * log10(x)
+        x_db = 10.0 * torch.log10(torch.clamp(x, min=1e-10))
+        x_max = x_db.max()
+        x_db = torch.clamp(x_db, min=x_max - self.top_db)
+        return x_db
+
+
+class FeatureExtractor:
+    """
+    Computes 3-Channel Multi-Resolution Log-Mel Spectrograms.
+    Channels correspond to Short, Medium, and Long STFT windows.
+    """
+
+    def __init__(self):
+        self.transforms = []
+        # Initialize a MelSpectrogram transform for each resolution defined in config
+        for n_fft, win_length in AudioConfig.resolutions:
+            t = MelSpectrogram(
+                sample_rate=AudioConfig.sr,
+                n_fft=n_fft,
+                win_length=win_length,
+                hop_length=AudioConfig.hop_length,
+                n_mels=AudioConfig.n_mels,
+                f_min=AudioConfig.fmin,
+                f_max=AudioConfig.fmax
+            )
+            self.transforms.append(t)
+
+        self.db_transform = AmplitudeToDB(top_db=AudioConfig.top_db)
+
+    def __call__(self, waveform):
+        """
+        Args:
+            waveform (torch.Tensor): Audio waveform (1, time) or (channels, time)
+        Returns:
+            np.ndarray: (3, n_mels, time)
+        """
+        # Ensure mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Pad or Truncate to fixed length
+        target_samples = AudioConfig.n_samples
+        num_samples = waveform.shape[1]
+
+        if num_samples < target_samples:
+            # Pad with zeros at the end
+            padding = target_samples - num_samples
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        elif num_samples > target_samples:
+            # Truncate
+            waveform = waveform[:, :target_samples]
+
+        # Compute features for each resolution
+        channels = []
+        for transform in self.transforms:
+            # Compute MelSpec: Output (1, n_mels, time)
+            spec = transform(waveform)
+            # Convert to DB
+            spec_db = self.db_transform(spec)
+            channels.append(spec_db)
+
+        # Stack along channel dimension: (3, n_mels, time)
+        multires_spec = torch.cat(channels, dim=0)
+
+        return multires_spec.numpy()
+>>>>>>> REPLACE
+```
+
+```diff
+library/preprocess.py
+<<<<<<< SEARCH
+        # Load and Process
+        full_path = os.path.join(self.input_dir, rel_path)
+        try:
+            # Load audio (normalize=True scales to [-1, 1])
+            waveform, sr = torchaudio.load(full_path, normalize=True)
+
+            # Resample if necessary
+            if sr != AudioConfig.sr:
+                resampler = T.Resample(orig_freq=sr, new_freq=AudioConfig.sr)
+                waveform = resampler(waveform)
+
+            # Compute 3-channel features
+            features = self.extractor(waveform)
+
+            # Save to disk
+            np.save(cache_path, features)
+=======
+        # Load and Process
+        full_path = os.path.join(self.input_dir, rel_path)
+        try:
+            # Load audio using soundfile (replaces torchaudio.load)
+            # sf.read returns (samples, channels) or (samples,)
+            data, sr = sf.read(full_path)
+            
+            # Convert to tensor (Channels, Time)
+            if data.ndim == 1:
+                waveform = torch.from_numpy(data).float().unsqueeze(0)
+            else:
+                waveform = torch.from_numpy(data.T).float()
+
+            # Resample if necessary (Native PyTorch implementation)
+            if sr != AudioConfig.sr:
+                waveform = torch.nn.functional.interpolate(
+                    waveform.unsqueeze(0),
+                    scale_factor=AudioConfig.sr / sr,
+                    mode='linear',
+                    align_corners=False
+                ).squeeze(0)
+
+            # Compute 3-channel features
+            features = self.extractor(waveform)
+
+            # Save to disk
+            np.save(cache_path, features)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import torchaudio
+from library.config import ModelConfig
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from library.config import ModelConfig
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # --- 2. Neck (Conformer) ---
+        self.conformer = torchaudio.models.Conformer(
+            input_dim=ModelConfig.backbone_out_dim,
+            num_heads=ModelConfig.conformer_heads,
+            ffn_dim=ModelConfig.backbone_out_dim * 4,
+            num_layers=ModelConfig.conformer_layers,
+            depthwise_conv_kernel_size=ModelConfig.conformer_kernel_size,
+            dropout=ModelConfig.conformer_dropout,
+        )
+
+        # --- 3. Head ---
+=======
+        # --- 2. Neck (Transformer Encoder) ---
+        # Replaces torchaudio.models.Conformer with standard TransformerEncoder
+        # Cite Debug Lesson 1: Replace extension library with native implementation
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=ModelConfig.backbone_out_dim,
+            nhead=ModelConfig.conformer_heads,
+            dim_feedforward=ModelConfig.backbone_out_dim * 4,
+            dropout=ModelConfig.conformer_dropout,
+            batch_first=True
+        )
+        self.conformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=ModelConfig.conformer_layers
+        )
+
+        # --- 3. Head ---
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+        # --- Conformer Forward ---
+        # Create lengths tensor (all samples are padded to full length)
+        B, T, D = x.shape
+        lengths = torch.full((B,), T, device=x.device, dtype=torch.long)
+
+        # Conformer returns (output, lengths)
+        x, _ = self.conformer(x, lengths)
+
+        # --- Pooling & Classification ---
+=======
+        # --- Transformer Forward ---
+        x = self.conformer(x)
+
+        # --- Pooling & Classification ---
+>>>>>>> REPLACE
+```

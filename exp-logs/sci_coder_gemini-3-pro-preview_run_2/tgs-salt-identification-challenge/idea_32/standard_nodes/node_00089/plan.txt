@@ -1,0 +1,635 @@
+Based on the provided lessons and analysis of the previous solution, I will implement the following optimizations:
+
+1.  **Switch to Supervised Learning with Explicit Injection (where possible) or Robust Single-Modality**: Since test depths are missing (Lesson 20) and distillation failed to bridge the gap (Lesson 32), I will revert to a robust **Supervised Image-Only Student** model. I will abandon the Teacher-Student distillation pipeline to focus compute budget on maximizing convergence of the student model directly on labeled data.
+2.  **Optimize Loss Aggregation**: I will modify `LovaszHingeLoss` to compute the loss per-image and average across the batch, rather than flattening the entire batch. This prevents outliers from dominating the gradient (Cite `solution_lesson_node_00044`).
+3.  **Dynamic Thresholding**: I will implement dynamic threshold optimization during the validation loop of every epoch to ensure checkpoints are saved based on their optimal operating point, rather than a fixed 0.5 threshold (Cite `solution_lesson_node_00033`).
+4.  **Hyperparameter Tuning**:
+    *   Increase `BATCH_SIZE` to 64 and scale `LEARNING_RATE` to `2e-4` to maintain gradient update volume (Cite `solution_lesson_node_00063`).
+    *   Increase `EPOCHS` to 40 to ensure convergence (Cite `solution_lesson_node_00045`).
+    *   Use `CosineAnnealingLR` for better convergence (Cite `solution_lesson_node_00068`).
+
+Here are the code changes:
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (B, 1, H, W) or (B, H, W) logits
+            targets: (B, 1, H, W) or (B, H, W) binary targets (0 or 1)
+        """
+        return lovasz_hinge_flat(
+            *flatten_binary_scores(logits, targets, ignore=self.ignore_index)
+        )
+=======
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (B, 1, H, W) or (B, H, W) logits
+            targets: (B, 1, H, W) or (B, H, W) binary targets (0 or 1)
+        """
+        # Cite solution_lesson_node_00044: Prefer Per-Image Loss Aggregation
+        losses = []
+        for i in range(logits.size(0)):
+            single_logit = logits[i]
+            single_target = targets[i]
+            loss = lovasz_hinge_flat(
+                *flatten_binary_scores(single_logit, single_target, ignore=self.ignore_index)
+            )
+            losses.append(loss)
+        return torch.stack(losses).mean()
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 64  # A100 allows larger batches
+    NUM_WORKERS = 4
+
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Stage 1: Specialist Teacher Ensemble
+    STAGE1_EPOCHS = 50
+    STAGE1_FOLDS = 5
+    # Gating: Discard models with mAP < 0.75
+    STAGE1_GATING_THRESHOLD = 0.75
+
+    # Stage 2: Marginalization (Inference params)
+    # Scan depths at these sigma deviations
+    DEPTH_SCAN_SIGMAS = [-1.5, -0.75, 0, 0.75, 1.5]
+
+    # Stage 3: Generalist Student
+    STAGE3_EPOCHS = 50
+=======
+    # =========================================================================
+    # Training Hyperparameters
+    # =========================================================================
+    SEED = 42
+    BATCH_SIZE = 64  # A100 allows larger batches
+    NUM_WORKERS = 4
+
+    # Cite solution_lesson_node_00063: Scale LR with Batch Size (32->64 => 1e-4->2e-4)
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Supervised Student Training
+    EPOCHS = 40
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+    return labeled_loader, unlabeled_loader
+=======
+    return labeled_loader, unlabeled_loader
+
+
+def get_supervised_loaders():
+    """
+    Prepares DataLoaders for Supervised Training.
+    Train: metadata/train.csv (2400)
+    Val: metadata/val.csv (600)
+    """
+    # Train Data
+    data_train = process_and_cache_data(
+        Config.TRAIN_METADATA_PATH, "train", load_cached_data=True
+    )
+    
+    # Val Data
+    data_val = process_and_cache_data(
+        Config.VAL_METADATA_PATH, "val", load_cached_data=True
+    )
+
+    # Datasets
+    train_ds = SaltDataset(data_train, mode="train", transform=get_transforms("train"))
+    val_ds = SaltDataset(data_val, mode="val", transform=get_transforms("val"))
+
+    # Loaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+    def train_teacher_fold(self, fold, epochs=Config.STAGE1_EPOCHS):
+        """
+        Stage 1: Train a single Specialist Teacher fold.
+        """
+        log(f"--- Starting Stage 1: Specialist Teacher (Fold {fold}) ---")
+
+        train_loader, val_loader = get_stage1_loaders(fold=fold)
+
+        model = SpecialistTeacher().to(self.device)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+        criterion = MixedLoss()
+
+        best_map = 0.0
+        patience_counter = 0
+        best_epoch = 0
+
+        checkpoint_dir = os.path.join(Config.TEACHER_CHECKPOINT_DIR, f"fold_{fold}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
+
+            for batch in train_loader:
+                images = batch["image"].to(self.device)
+                masks = batch["mask"].to(self.device)
+                depths = batch["depth"].to(self.device)  # (B, 1) normalized
+
+                optimizer.zero_grad()
+                logits = model(images, depths)
+                loss = criterion(logits, masks)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+
+            avg_train_loss = (
+                train_loss / len(train_loader) if len(train_loader) > 0 else 0
+            )
+
+            # Validation
+            model.eval()
+            val_preds = []
+            val_targets = []
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    images = batch["image"].to(self.device)
+                    masks = batch["mask"].to(self.device)
+                    depths = batch["depth"].to(self.device)
+
+                    logits = model(images, depths)
+                    probs = torch.sigmoid(logits)
+
+                    val_preds.append(probs.cpu().numpy())
+                    val_targets.append(masks.cpu().numpy())
+
+            if len(val_preds) > 0:
+                val_preds = np.concatenate(val_preds, axis=0)
+                val_targets = np.concatenate(val_targets, axis=0)
+                curr_map = float(do_kaggle_metric(val_preds, val_targets))
+            else:
+                curr_map = 0.0
+
+            log(
+                f"Fold {fold} Epoch {epoch+1}/{epochs} - Loss: {avg_train_loss:.6f} - Val mAP: {curr_map:.6f}"
+            )
+
+            # Checkpoint
+            is_best = curr_map > best_map
+            if is_best:
+                best_map = curr_map
+                best_epoch = epoch
+                patience_counter = 0
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "state_dict": model.state_dict(),
+                        "best_map": best_map,
+                    },
+                    is_best=True,
+                    checkpoint_dir=checkpoint_dir,
+                )
+            else:
+                patience_counter += 1
+
+            if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                log(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
+        log(f"Fold {fold} finished. Best mAP: {best_map:.6f} at epoch {best_epoch+1}")
+        return best_map, os.path.join(checkpoint_dir, "best_model.pth")
+
+    def run_teacher_ensemble(self):
+        """
+        Runs training for all folds and filters models based on performance.
+        """
+        valid_models = []
+
+        for fold in range(Config.STAGE1_FOLDS):
+            best_map, model_path = self.train_teacher_fold(fold)
+
+            if best_map >= Config.STAGE1_GATING_THRESHOLD:
+                valid_models.append(model_path)
+                log(f"Fold {fold} accepted for ensemble.")
+            else:
+                log(
+                    f"Fold {fold} rejected (mAP {best_map:.4f} < {Config.STAGE1_GATING_THRESHOLD})."
+                )
+
+        # Fallback: if all failed, take the best one to avoid crash
+        if not valid_models:
+            log("Warning: No models passed gating. Using Fold 0 as fallback.")
+            fallback_path = os.path.join(
+                Config.TEACHER_CHECKPOINT_DIR, "fold_0", "best_model.pth"
+            )
+            if os.path.exists(fallback_path):
+                valid_models.append(fallback_path)
+
+        return valid_models
+
+    def generate_marginalized_labels(self, teacher_paths):
+        """
+        Stage 2: Generate soft pseudo-labels by marginalizing over depth.
+        """
+        log("--- Starting Stage 2: Marginalized Soft Pseudo-Labeling ---")
+
+        # Load all models
+        models = []
+        for path in teacher_paths:
+            m = SpecialistTeacher().to(self.device)
+            ckpt = torch.load(path, map_location=self.device)
+            m.load_state_dict(ckpt["state_dict"])
+            m.eval()
+            models.append(m)
+
+        test_loader = get_test_loader()
+        pseudo_labels = {}  # id -> mask
+
+        # Sigmas to scan (normalized depth values)
+        sigmas = Config.DEPTH_SCAN_SIGMAS
+
+        with torch.no_grad():
+            for batch in test_loader:
+                images = batch["image"].to(self.device)  # (B, 1, H, W)
+                ids = batch["id"]
+                B = images.size(0)
+
+                # Accumulator for marginalized probabilities
+                batch_probs_sum = torch.zeros_like(images).float()
+
+                # Marginalization: Average over models and depths
+                count = 0
+                for model in models:
+                    for s in sigmas:
+                        # Create depth tensor (B, 1) with value s
+                        d_tensor = torch.full(
+                            (B, 1), s, device=self.device, dtype=torch.float32
+                        )
+
+                        logits = model(images, d_tensor)
+                        probs = torch.sigmoid(logits)
+                        batch_probs_sum += probs
+                        count += 1
+
+                avg_probs = batch_probs_sum / count
+                avg_probs_np = avg_probs.cpu().numpy()  # (B, 1, 128, 128)
+
+                # Store in dict
+                for i, img_id in enumerate(ids):
+                    # Remove channel dim: (128, 128)
+                    pseudo_labels[img_id] = avg_probs_np[i, 0]
+
+        log(f"Generated pseudo-labels for {len(pseudo_labels)} images.")
+        return pseudo_labels
+
+    def train_student_distillation(self, pseudo_labels, epochs=Config.STAGE3_EPOCHS):
+        """
+        Stage 3: Train Generalist Student on Labeled + Pseudo-Labeled data.
+        """
+        log("--- Starting Stage 3: Generalist Student Distillation ---")
+
+        labeled_loader, unlabeled_loader = get_stage3_loaders(
+            pseudo_labels_dict=pseudo_labels
+        )
+
+        # If no unlabeled data (e.g. debugging), handle gracefully
+        if unlabeled_loader is None:
+            log("Warning: No unlabeled loader returned. Training on labeled only.")
+            unlabeled_iter = None
+        else:
+            unlabeled_iter = cycle(unlabeled_loader)
+
+        model = GeneralistStudent().to(self.device)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = StudentLoss()
+
+        best_map = 0.0
+        patience_counter = 0
+        checkpoint_dir = Config.STUDENT_CHECKPOINT_DIR
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        val_loader = self.get_val_loader()
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
+            steps = 0
+
+            for lab_batch in labeled_loader:
+                # Labeled Data
+                l_img = lab_batch["image"].to(self.device)
+                l_mask = lab_batch["mask"].to(self.device)
+                l_depth = lab_batch["depth"].to(self.device)  # GT Depth
+
+                # Unlabeled Data
+                if unlabeled_iter:
+                    try:
+                        unlab_batch = next(unlabeled_iter)
+                    except StopIteration:
+                        unlabeled_iter = cycle(unlabeled_loader)
+                        unlab_batch = next(unlabeled_iter)
+
+                    u_img = unlab_batch["image"].to(self.device)
+                    u_mask = unlab_batch["mask"].to(self.device)  # Soft targets
+                    # u_depth is not used/available for loss
+
+                optimizer.zero_grad()
+
+                # Forward Labeled
+                l_logits, l_d_pred = model(l_img)
+                loss_l = criterion(l_logits, l_d_pred, l_mask, l_depth)
+
+                # Forward Unlabeled
+                loss_u = 0.0
+                if unlabeled_iter:
+                    u_logits, u_d_pred = model(u_img)
+                    loss_u = criterion(u_logits, u_d_pred, u_mask, depth_targets=None)
+
+                # Combined Loss
+                loss = loss_l + loss_u
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+                steps += 1
+
+            scheduler.step()
+            avg_loss = train_loss / steps if steps > 0 else 0
+
+            # Validation
+            model.eval()
+            val_preds = []
+            val_targets = []
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    images = batch["image"].to(self.device)
+                    masks = batch["mask"].to(self.device)
+
+                    logits, _ = model(images)
+                    probs = torch.sigmoid(logits)
+
+                    val_preds.append(probs.cpu().numpy())
+                    val_targets.append(masks.cpu().numpy())
+
+            if len(val_preds) > 0:
+                val_preds = np.concatenate(val_preds, axis=0)
+                val_targets = np.concatenate(val_targets, axis=0)
+                curr_map = float(do_kaggle_metric(val_preds, val_targets))
+            else:
+                curr_map = 0.0
+
+            log(
+                f"Student Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f} - Val mAP: {curr_map:.6f}"
+            )
+
+            if curr_map > best_map:
+                best_map = curr_map
+                patience_counter = 0
+                save_checkpoint(
+                    {"state_dict": model.state_dict(), "best_map": best_map},
+                    is_best=True,
+                    checkpoint_dir=checkpoint_dir,
+                    filename="student_best.pth",
+                )
+            else:
+                patience_counter += 1
+
+            if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                log("Student early stopping.")
+                break
+
+        return os.path.join(checkpoint_dir, "best_model.pth")
+=======
+    def train_supervised_student(self, epochs=Config.EPOCHS):
+        """
+        Trains the Generalist Student on the labeled dataset (Train split).
+        Validates on the Val split with dynamic threshold optimization.
+        """
+        from library.data import get_supervised_loaders
+        log("--- Starting Supervised Student Training ---")
+
+        train_loader, val_loader = get_supervised_loaders()
+
+        model = GeneralistStudent().to(self.device)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=Config.LEARNING_RATE,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
+        # Cite solution_lesson_node_00068: Use Scheduler
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = StudentLoss()
+
+        best_map = 0.0
+        best_threshold = 0.5
+        patience_counter = 0
+        checkpoint_dir = Config.STUDENT_CHECKPOINT_DIR
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
+
+            for batch in train_loader:
+                images = batch["image"].to(self.device)
+                masks = batch["mask"].to(self.device)
+                depths = batch["depth"].to(self.device)
+
+                optimizer.zero_grad()
+                logits, depth_pred = model(images)
+                
+                # Cite solution_lesson_node_00062: Ensure aux head is connected
+                loss = criterion(logits, depth_pred, masks, depths)
+                
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+
+            scheduler.step()
+            avg_loss = train_loss / len(train_loader)
+
+            # Validation with Dynamic Thresholding
+            # Cite solution_lesson_node_00033: Align Model Checkpointing via Adaptive Thresholding
+            model.eval()
+            val_preds = []
+            val_targets = []
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    images = batch["image"].to(self.device)
+                    masks = batch["mask"].to(self.device)
+
+                    logits, _ = model(images)
+                    probs = torch.sigmoid(logits)
+
+                    val_preds.append(probs.cpu().numpy())
+                    val_targets.append(masks.cpu().numpy())
+
+            if len(val_preds) > 0:
+                val_preds = np.concatenate(val_preds, axis=0)
+                val_targets = np.concatenate(val_targets, axis=0)
+                
+                # Search for best threshold for this epoch
+                epoch_best_map = 0.0
+                epoch_best_t = 0.5
+                for t in np.arange(0.3, 0.75, 0.05):
+                    score = do_kaggle_metric(val_preds, val_targets, threshold=t)
+                    if score > epoch_best_map:
+                        epoch_best_map = score
+                        epoch_best_t = t
+            else:
+                epoch_best_map = 0.0
+                epoch_best_t = 0.5
+
+            log(
+                f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.6f} - Val mAP: {epoch_best_map:.6f} (Thresh: {epoch_best_t:.2f})"
+            )
+
+            if epoch_best_map > best_map:
+                best_map = epoch_best_map
+                best_threshold = epoch_best_t
+                patience_counter = 0
+                save_checkpoint(
+                    {
+                        "state_dict": model.state_dict(), 
+                        "best_map": best_map,
+                        "best_threshold": best_threshold
+                    },
+                    is_best=True,
+                    checkpoint_dir=checkpoint_dir,
+                    filename="student_best.pth",
+                )
+            else:
+                patience_counter += 1
+
+            if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                log("Early stopping triggered.")
+                break
+
+        return os.path.join(checkpoint_dir, "best_model.pth"), best_threshold
+>>>>>>> REPLACE
+```
+
+```diff
+library/pipeline.py
+<<<<<<< SEARCH
+    def run(self):
+        # Stage 1: Train Ensemble
+        teacher_paths = self.run_teacher_ensemble()
+
+        # Stage 2: Marginalize
+        pseudo_labels = self.generate_marginalized_labels(teacher_paths)
+
+        # Stage 3: Distill
+        student_path = self.train_student_distillation(pseudo_labels)
+
+        # Optimization
+        best_threshold = self.optimize_threshold(student_path)
+
+        # Final Output
+        self.generate_submission(student_path, best_threshold)
+=======
+    def run(self):
+        # Supervised Training with Dynamic Thresholding
+        student_path, best_threshold = self.train_supervised_student()
+
+        # Final Output
+        self.generate_submission(student_path, best_threshold)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Adjust hyperparameters for a fast but effective run within time limits
+    Config.STAGE1_FOLDS = 2  # Train only 2 folds for the teacher ensemble
+    Config.STAGE1_EPOCHS = 10  # Reduced epochs for speed
+    Config.STAGE3_EPOCHS = 10  # Reduced epochs for speed
+    Config.STAGE1_GATING_THRESHOLD = (
+        0.4  # Lower threshold to ensure models pass gating in short run
+    )
+    Config.BATCH_SIZE = 32  # Safe batch size for A100
+
+    # =========================================================================
+    # 2. Pipeline Execution
+    # =========================================================================
+    pipeline = Pipeline()
+
+    print("=== Starting Pipeline Execution ===")
+
+    # Stage 1: Train Specialist Teacher Ensemble
+    # Returns list of valid checkpoint paths
+    teacher_paths = pipeline.run_teacher_ensemble()
+
+    # Stage 2: Generate Marginalized Soft Pseudo-Labels
+    # Returns dict {id: mask_probability}
+    pseudo_labels = pipeline.generate_marginalized_labels(teacher_paths)
+
+    # Stage 3: Train Generalist Student
+    # Returns path to the best student model checkpoint
+    student_path = pipeline.train_student_distillation(
+        pseudo_labels, epochs=Config.STAGE3_EPOCHS
+    )
+
+    # Optimization: Find best binarization threshold
+    # Uses the internal validation subset (part of train) for threshold tuning
+    best_threshold = pipeline.optimize_threshold(student_path)
+=======
+    # Adjust hyperparameters for a fast but effective run within time limits
+    # Cite solution_lesson_node_00045: Maximize supervised convergence
+    Config.EPOCHS = 40 
+    Config.BATCH_SIZE = 64
+    
+    # =========================================================================
+    # 2. Pipeline Execution
+    # =========================================================================
+    pipeline = Pipeline()
+
+    print("=== Starting Pipeline Execution ===")
+
+    # Train Supervised Student
+    student_path, best_threshold = pipeline.train_supervised_student()
+>>>>>>> REPLACE
+```

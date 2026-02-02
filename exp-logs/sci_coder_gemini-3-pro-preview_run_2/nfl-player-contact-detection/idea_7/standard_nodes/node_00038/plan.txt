@@ -1,0 +1,1005 @@
+Here is the implementation strategy and the code changes.
+
+### Strategy
+1.  **Architecture Shift (CNN $\to$ MLP):** Based on **Lessons 00015 and 00023**, I will replace the KETR-Net (1D CNN) with a **Kinematic MLP** trained on "wide" feature vectors. The previous CNN approach used vertical window expansion, which was identified as less robust than vectorized lag-shifting for centered event detection.
+2.  **Vectorized Feature Engineering:** I will rewrite the `FeatureEngineer` to create temporal windows using **vectorized `shift()` operations** on the tracking data before merging. This ensures perfect temporal alignment and allows the MLP to learn time-specific weights for every lag (e.g., distinguishing $t=0$ from $t=-5$).
+3.  **Feature Scaling:** Cite **Lesson 00037**, I will implement `StandardScaler` to normalize the heterogeneous input features (combining binary flags like `is_ground` with continuous kinematic variables). This is critical for MLP convergence and proper weighting of rare binary signals.
+4.  **Explicit Physics Features:** Cite **Lessons 00005, 00007, and 00033**, I will explicitly calculate `log_distance`, `relative_speed`, and `closing_speed` (with numerical stability clamping) for every lag in the window, rather than relying on the model to infer them.
+5.  **Ground Imputation:** Cite **Lesson 00024 and 00034**, I will maintain the logic where Ground position is imputed as the player's position (distance $\to$ 0) but Ground velocity is strictly zeroed out to preserve relative kinematic signals.
+
+### Code Changes
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Window size for the 1D CNN (must be odd to have a center frame)
+    # 11 frames = t-5 to t+5 (approx +/- 0.5 seconds context)
+    window_size: int = 11
+
+    # Features to be used by the model
+    # These correspond to the columns generated during feature engineering
+    feature_cols: List[str] = field(
+        default_factory=lambda: [
+            "log_distance",  # Log1p(distance) for resolution near 0
+            "relative_speed",  # |v1 - v2|
+            "relative_acceleration",  # |a1 - a2|
+            "closing_speed",  # Rate of change of distance
+            "speed_1",  # Absolute speed player 1
+            "speed_2",  # Absolute speed player 2 (0 if Ground)
+            "acceleration_1",  # Absolute accel player 1
+            "acceleration_2",  # Absolute accel player 2 (0 if Ground)
+            "is_ground",  # Binary flag
+            "orientation_cos_1",  # Cosine of orientation
+            "orientation_sin_1",  # Sine of orientation
+            "direction_cos_1",  # Cosine of movement direction
+            "direction_sin_1",  # Sine of movement direction
+        ]
+    )
+
+    # --- Model Architecture ---
+    # Number of filters in the 1D Conv layers
+    cnn_filters: int = 64
+    # Kernel size for convolution
+    cnn_kernel_size: int = 3
+    # Hidden units in the dense head
+    dense_hidden_units: int = 64
+    dropout: float = 0.2
+=======
+    # Window size for the MLP (t-5 to t+5)
+    window_size: int = 11
+
+    # Path for the fitted scaler
+    scaler_path: str = "./working/idea_7/scaler.joblib"
+
+    # --- Model Architecture ---
+    # MLP Architecture
+    hidden_units: List[int] = field(default_factory=lambda: [512, 256, 128])
+    dropout: float = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_processing.py
+<<<<<<< SEARCH
+import os
+import gc
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from library.config import Config
+
+
+class NFLContactDataset(Dataset):
+    """
+    PyTorch Dataset for NFL Contact Detection.
+    Serves 3D tensors of shape (Batch, Window_Size, Features).
+    """
+
+    def __init__(self, features, labels=None, contact_ids=None):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.FloatTensor(labels) if labels is not None else None
+        self.contact_ids = contact_ids
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        x = self.features[idx]
+        if self.labels is not None:
+            y = self.labels[idx]
+            return x, y
+        return x
+
+
+class FeatureEngineer:
+    """
+    Handles data loading, merging, ground imputation, and kinematic feature generation.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.window_size = config.window_size
+        self.half_window = self.window_size // 2
+
+    def load_tracking(self, split_name, relevant_games):
+        """
+        Loads and filters tracking data.
+        """
+        # Determine file name based on split (train/val use train_tracking, test uses test_tracking)
+        filename = (
+            "test_player_tracking.csv"
+            if split_name == "test"
+            else "train_player_tracking.csv"
+        )
+        path = os.path.join(self.config.input_dir, filename)
+
+        # Load specific columns to save memory
+        cols = [
+            "game_play",
+            "step",
+            "nfl_player_id",
+            "x_position",
+            "y_position",
+            "speed",
+            "acceleration",
+            "orientation",
+            "direction",
+        ]
+
+        df = pd.read_csv(path, usecols=cols)
+
+        # Filter to relevant games
+        df = df[df["game_play"].isin(relevant_games)].copy()
+
+        # Optimize dtypes
+        df["step"] = df["step"].astype(np.int32)
+        float_cols = [
+            "x_position",
+            "y_position",
+            "speed",
+            "acceleration",
+            "orientation",
+            "direction",
+        ]
+        for c in float_cols:
+            df[c] = df[c].astype(np.float32)
+
+        return df
+
+    def expand_temporal_window(self, metadata_df):
+        """
+        Expands each row in metadata into 'window_size' rows (t-k ... t+k).
+        """
+        # Create offsets
+        offsets = np.arange(-self.half_window, self.half_window + 1)
+
+        # Repeat metadata rows
+        # We use index to keep track of groups
+        metadata_df = metadata_df.reset_index(drop=True)
+        metadata_df["sample_id"] = metadata_df.index
+
+        # Replicate
+        expanded = metadata_df.loc[metadata_df.index.repeat(self.window_size)].copy()
+
+        # Add offsets to step
+        expanded["window_idx"] = np.tile(offsets, len(metadata_df))
+        expanded["step"] = expanded["step"] + expanded["window_idx"]
+
+        return expanded
+
+    def process(self, metadata_df, tracking_df):
+        """
+        Main processing pipeline: Merge -> Impute -> Calculate Features -> Reshape.
+        """
+        # 1. Expand Metadata to Window
+        print("  Expanding temporal windows...")
+        expanded = self.expand_temporal_window(metadata_df)
+
+        # 2. Prepare Player IDs for Merge
+        # Ensure IDs are numeric where possible, keep 'G' as is for now
+        # Tracking data IDs are numeric.
+
+        # 3. Merge Player 1
+        print("  Merging Player 1 tracking...")
+        tracking_df_p1 = tracking_df.add_suffix("_1")
+        expanded = expanded.merge(
+            tracking_df_p1,
+            left_on=["game_play", "step", "nfl_player_id_1"],
+            right_on=["game_play_1", "step_1", "nfl_player_id_1"],
+            how="left",
+        )
+
+        # 4. Merge Player 2
+        print("  Merging Player 2 tracking...")
+        # Handle 'G' temporarily by creating a numeric join column
+        expanded["nfl_player_id_2_join"] = pd.to_numeric(
+            expanded["nfl_player_id_2"], errors="coerce"
+        )
+
+        tracking_df_p2 = tracking_df.add_suffix("_2")
+        expanded = expanded.merge(
+            tracking_df_p2,
+            left_on=["game_play", "step", "nfl_player_id_2_join"],
+            right_on=["game_play_2", "step_2", "nfl_player_id_2"],
+            how="left",
+            suffixes=("", "_tracking"),
+        )
+
+        # Clean up merge cols
+        drop_cols = [
+            "game_play_1",
+            "step_1",
+            "game_play_2",
+            "step_2",
+            "nfl_player_id_2_join",
+        ]
+        expanded.drop(
+            columns=[c for c in drop_cols if c in expanded.columns], inplace=True
+        )
+
+        # 5. Hybrid-Physics Ground Imputation
+        print("  Imputing Ground physics...")
+        is_ground = expanded["nfl_player_id_2"] == "G"
+
+        # Position: Ground takes P1's position (Distance -> 0)
+        expanded.loc[is_ground, "x_position_2"] = expanded.loc[
+            is_ground, "x_position_1"
+        ]
+        expanded.loc[is_ground, "y_position_2"] = expanded.loc[
+            is_ground, "y_position_1"
+        ]
+
+        # Kinematics: Ground has 0 velocity/accel
+        expanded.loc[is_ground, "speed_2"] = 0.0
+        expanded.loc[is_ground, "acceleration_2"] = 0.0
+        expanded.loc[is_ground, "orientation_2"] = 0.0
+        expanded.loc[is_ground, "direction_2"] = 0.0
+
+        # Fill remaining NaNs (missing tracking data) with 0 or appropriate defaults
+        # This prevents NaN propagation in features
+        fill_cols = [
+            c
+            for c in expanded.columns
+            if "position" in c
+            or "speed" in c
+            or "acceleration" in c
+            or "orientation" in c
+            or "direction" in c
+        ]
+        expanded[fill_cols] = expanded[fill_cols].fillna(0.0)
+
+        # 6. Feature Engineering
+        print("  Calculating explicit kinematic features...")
+
+        # Is Ground Flag
+        expanded["is_ground"] = is_ground.astype(np.float32)
+
+        # Coordinates
+        dx = expanded["x_position_1"] - expanded["x_position_2"]
+        dy = expanded["y_position_1"] - expanded["y_position_2"]
+        dist = np.sqrt(dx**2 + dy**2)
+
+        # Log Distance
+        expanded["log_distance"] = np.log1p(dist)
+
+        # Vector Velocity Components
+        # Direction is in degrees, 0 is Y-axis (usually), need to check convention.
+        # Standard NFL tracking: 0 is Y axis (short axis), 90 is X axis.
+        # Convert to radians
+        dir_rad_1 = np.radians(expanded["direction_1"])
+        dir_rad_2 = np.radians(expanded["direction_2"])
+
+        vx_1 = expanded["speed_1"] * np.sin(dir_rad_1)
+        vy_1 = expanded["speed_1"] * np.cos(dir_rad_1)
+        vx_2 = expanded["speed_2"] * np.sin(dir_rad_2)
+        vy_2 = expanded["speed_2"] * np.cos(dir_rad_2)
+
+        # Relative Speed (Vector magnitude difference)
+        dvx = vx_1 - vx_2
+        dvy = vy_1 - vy_2
+        expanded["relative_speed"] = np.sqrt(dvx**2 + dvy**2)
+
+        # Relative Acceleration (Scalar difference approximation as full vector accel is not provided)
+        expanded["relative_acceleration"] = np.abs(
+            expanded["acceleration_1"] - expanded["acceleration_2"]
+        )
+
+        # Closing Speed: - (v_rel . r_rel) / |r_rel|
+        # r_rel = (dx, dy) pointing from 2 to 1?
+        # dx = x1 - x2.
+        # If moving towards each other, v1 is neg, v2 is pos?
+        # Closing speed = rate of decrease of distance.
+        # Projection: (vx_rel * dx + vy_rel * dy) / dist
+        # If this dot product is negative, they are closing in.
+        # We want positive value for closing speed.
+        dot_prod = dvx * dx + dvy * dy
+        # Clamp distance to avoid div/0
+        clamped_dist = np.maximum(dist, 1e-6)
+        # Closing speed: positive if closing
+        expanded["closing_speed"] = -(dot_prod / clamped_dist)
+
+        # Trig features for orientation/direction
+        expanded["orientation_cos_1"] = np.cos(np.radians(expanded["orientation_1"]))
+        expanded["orientation_sin_1"] = np.sin(np.radians(expanded["orientation_1"]))
+        expanded["direction_cos_1"] = np.cos(dir_rad_1)
+        expanded["direction_sin_1"] = np.sin(dir_rad_1)
+
+        # 7. Reshape to (Batch, Window, Features)
+        print("  Reshaping to 3D tensor...")
+        feature_cols = self.config.feature_cols
+
+        # Sort to ensure correct window order: sample_id, then window_idx (-5 to +5)
+        expanded = expanded.sort_values(by=["sample_id", "window_idx"])
+
+        # Extract numpy array
+        # Shape: (N_samples * Window, N_features)
+        flat_features = expanded[feature_cols].values.astype(np.float32)
+
+        # Reshape
+        num_samples = len(metadata_df)
+        num_features = len(feature_cols)
+
+        # Safety check
+        if len(flat_features) != num_samples * self.window_size:
+            print(
+                f"Warning: Feature length mismatch. Expected {num_samples * self.window_size}, got {len(flat_features)}"
+            )
+            # Truncate or pad if necessary (shouldn't happen with logic above)
+
+        X = flat_features.reshape(num_samples, self.window_size, num_features)
+
+        return X
+
+
+def load_and_process_data(
+    split="train", debug=False, load_cached_data=True, config=None
+):
+    """
+    Orchestrates data loading and processing with caching.
+    Args:
+        split: 'train', 'validation', or 'test'
+        debug: If True, subsets data.
+        load_cached_data: If True, attempts to load from disk.
+        config: Optional Config instance. If None, uses default Config().
+    Returns:
+        dataset: NFLContactDataset
+        metadata_df: The metadata dataframe (useful for IDs in test)
+    """
+    if config is None:
+        config = Config()
+
+    # Define cache paths
+    cache_prefix = f"{split}"
+    if debug:
+        cache_prefix += "_debug"
+
+    path_X = os.path.join(config.artifact_dir, f"{cache_prefix}_X.npy")
+    path_y = os.path.join(config.artifact_dir, f"{cache_prefix}_y.npy")
+    path_ids = os.path.join(
+        config.artifact_dir, f"{cache_prefix}_ids.npy"
+    )  # For contact_ids
+
+    # 1. Try Loading Cache
+    if load_cached_data and os.path.exists(path_X):
+        print(f"Loading cached {split} data from {config.artifact_dir}...")
+        X = np.load(path_X)
+        if split != "test":
+            y = np.load(path_y)
+        else:
+            y = None
+
+        # Load metadata to return alongside
+        meta_path = os.path.join(config.metadata_dir, f"{split}.csv")
+        metadata_df = pd.read_csv(meta_path)
+        if debug:
+            metadata_df = metadata_df.iloc[: config.debug_sample_size].copy()
+
+        return NFLContactDataset(X, y, metadata_df["contact_id"].values), metadata_df
+
+    # 2. Process from Scratch
+    print(f"Processing {split} data from scratch...")
+
+    # Load Metadata
+    meta_path = os.path.join(config.metadata_dir, f"{split}.csv")
+    metadata_df = pd.read_csv(meta_path)
+
+    if debug:
+        print(f"  Debug mode: Sampling {config.debug_sample_size} rows.")
+        metadata_df = metadata_df.iloc[: config.debug_sample_size].copy()
+
+    # Load Tracking
+    relevant_games = metadata_df["game_play"].unique()
+    fe = FeatureEngineer(config)
+    tracking_df = fe.load_tracking(split, relevant_games)
+
+    # Process Features
+    X = fe.process(metadata_df, tracking_df)
+
+    # Process Labels
+    y = None
+    if "contact" in metadata_df.columns and split != "test":
+        y = metadata_df["contact"].values.astype(np.float32)
+
+    # Save to Cache
+    print(f"Saving {split} data to cache...")
+    np.save(path_X, X)
+    if y is not None:
+        np.save(path_y, y)
+    np.save(path_ids, metadata_df["contact_id"].values)
+
+    # Clean up
+    del tracking_df
+    gc.collect()
+
+    return NFLContactDataset(X, y, metadata_df["contact_id"].values), metadata_df
+=======
+import os
+import gc
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from sklearn.preprocessing import StandardScaler
+from library.config import Config
+
+
+class NFLContactDataset(Dataset):
+    """
+    PyTorch Dataset for NFL Contact Detection.
+    Serves 1D tensors of shape (Features,).
+    """
+
+    def __init__(self, features, labels=None, contact_ids=None):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.FloatTensor(labels) if labels is not None else None
+        self.contact_ids = contact_ids
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        x = self.features[idx]
+        if self.labels is not None:
+            y = self.labels[idx]
+            return x, y
+        return x
+
+
+class FeatureEngineer:
+    """
+    Handles data loading, vectorized lag creation, merging, and feature scaling.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.window_size = config.window_size
+        self.half_window = self.window_size // 2
+
+    def load_tracking(self, split_name, relevant_games):
+        """
+        Loads and filters tracking data.
+        """
+        filename = (
+            "test_player_tracking.csv"
+            if split_name == "test"
+            else "train_player_tracking.csv"
+        )
+        path = os.path.join(self.config.input_dir, filename)
+
+        cols = [
+            "game_play",
+            "step",
+            "nfl_player_id",
+            "x_position",
+            "y_position",
+            "speed",
+            "acceleration",
+            "orientation",
+            "direction",
+        ]
+
+        df = pd.read_csv(path, usecols=cols)
+        df = df[df["game_play"].isin(relevant_games)].copy()
+
+        df["step"] = df["step"].astype(np.int32)
+        float_cols = [
+            "x_position",
+            "y_position",
+            "speed",
+            "acceleration",
+            "orientation",
+            "direction",
+        ]
+        for c in float_cols:
+            df[c] = df[c].astype(np.float32)
+
+        return df
+
+    def create_wide_tracking(self, tracking_df):
+        """
+        Creates lagged features for tracking data using vectorized shifts.
+        Cite: Lesson 00015 (Vectorized Lag-Shifting)
+        """
+        # Sort for correct shifting
+        tracking_df = tracking_df.sort_values(
+            ["game_play", "nfl_player_id", "step"]
+        ).reset_index(drop=True)
+
+        # Columns to lag
+        lag_cols = [
+            "x_position",
+            "y_position",
+            "speed",
+            "acceleration",
+            "orientation",
+            "direction",
+        ]
+        
+        # GroupBy shift is safe for creating lags within player tracks
+        grouped = tracking_df.groupby(["game_play", "nfl_player_id"])
+
+        lagged_dfs = []
+        
+        # Lags: -half to +half
+        offsets = range(-self.half_window, self.half_window + 1)
+
+        for k in offsets:
+            # Shift amount: if k=-5 (past), we need shift(5) to bring past value to current row.
+            # if k=5 (future), we need shift(-5).
+            shift_amount = -k
+            
+            # Select columns and shift
+            shifted = grouped[lag_cols].shift(shift_amount)
+            
+            # Rename columns
+            shifted.columns = [f"{c}_lag_{k}" for c in lag_cols]
+            
+            lagged_dfs.append(shifted)
+
+        # Concatenate all lags horizontally
+        wide_tracking = pd.concat([tracking_df[["game_play", "step", "nfl_player_id"]]] + lagged_dfs, axis=1)
+        
+        return wide_tracking
+
+    def process(self, metadata_df, tracking_df, split="train"):
+        """
+        Main processing pipeline: Wide Tracking -> Merge -> Impute -> Features -> Scale.
+        """
+        # 1. Create Wide Tracking Data
+        print("  Creating vectorized lags...")
+        wide_tracking = self.create_wide_tracking(tracking_df)
+
+        # 2. Merge Player 1
+        print("  Merging Player 1...")
+        p1_cols = {c: f"{c}_1" for c in wide_tracking.columns if c not in ["game_play", "step"]}
+        wide_p1 = wide_tracking.rename(columns=p1_cols)
+        
+        merged = metadata_df.merge(
+            wide_p1,
+            left_on=["game_play", "step", "nfl_player_id_1"],
+            right_on=["game_play", "step", "nfl_player_id_1_1"],
+            how="left"
+        )
+
+        # 3. Merge Player 2
+        print("  Merging Player 2...")
+        merged["nfl_player_id_2_join"] = pd.to_numeric(merged["nfl_player_id_2"], errors="coerce")
+        
+        p2_cols = {c: f"{c}_2" for c in wide_tracking.columns if c not in ["game_play", "step"]}
+        wide_p2 = wide_tracking.rename(columns=p2_cols)
+        
+        merged = merged.merge(
+            wide_p2,
+            left_on=["game_play", "step", "nfl_player_id_2_join"],
+            right_on=["game_play", "step", "nfl_player_id_2_2"],
+            how="left"
+        )
+
+        # 4. Hybrid-Physics Ground Imputation
+        # Cite: Lesson 00024 (Geometric Consistency) & Lesson 00034 (Kinematics Separation)
+        print("  Imputing Ground physics...")
+        is_ground = merged["nfl_player_id_2"] == "G"
+        
+        offsets = range(-self.half_window, self.half_window + 1)
+        
+        for k in offsets:
+            # Position: Ground = Player 1
+            merged.loc[is_ground, f"x_position_lag_{k}_2"] = merged.loc[is_ground, f"x_position_lag_{k}_1"]
+            merged.loc[is_ground, f"y_position_lag_{k}_2"] = merged.loc[is_ground, f"y_position_lag_{k}_1"]
+            
+            # Kinematics: Ground = 0
+            merged.loc[is_ground, f"speed_lag_{k}_2"] = 0.0
+            merged.loc[is_ground, f"acceleration_lag_{k}_2"] = 0.0
+            merged.loc[is_ground, f"orientation_lag_{k}_2"] = 0.0
+            merged.loc[is_ground, f"direction_lag_{k}_2"] = 0.0
+
+        # Fill NaNs (missing tracking)
+        num_cols = [c for c in merged.columns if "_lag_" in c]
+        merged[num_cols] = merged[num_cols].fillna(0.0)
+
+        # 5. Feature Engineering (Derived Features)
+        # Cite: Lesson 00005 (Non-Linear Transformations) & Lesson 00033 (Explicit Kinematics)
+        print("  Calculating derived kinematic features...")
+        
+        feature_cols = []
+        
+        # Global features
+        merged["is_ground"] = is_ground.astype(np.float32)
+        feature_cols.append("is_ground")
+
+        for k in offsets:
+            suffix_1 = f"_lag_{k}_1"
+            suffix_2 = f"_lag_{k}_2"
+            
+            # Distance
+            dx = merged[f"x_position{suffix_1}"] - merged[f"x_position{suffix_2}"]
+            dy = merged[f"y_position{suffix_1}"] - merged[f"y_position{suffix_2}"]
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            # Log Distance
+            col_log_dist = f"log_dist_lag_{k}"
+            merged[col_log_dist] = np.log1p(dist)
+            feature_cols.append(col_log_dist)
+            
+            # Relative Speed
+            dir_1 = np.radians(merged[f"direction{suffix_1}"])
+            dir_2 = np.radians(merged[f"direction{suffix_2}"])
+            
+            vx_1 = merged[f"speed{suffix_1}"] * np.sin(dir_1)
+            vy_1 = merged[f"speed{suffix_1}"] * np.cos(dir_1)
+            vx_2 = merged[f"speed{suffix_2}"] * np.sin(dir_2)
+            vy_2 = merged[f"speed{suffix_2}"] * np.cos(dir_2)
+            
+            dvx = vx_1 - vx_2
+            dvy = vy_1 - vy_2
+            rel_speed = np.sqrt(dvx**2 + dvy**2)
+            
+            col_rel_speed = f"rel_speed_lag_{k}"
+            merged[col_rel_speed] = rel_speed
+            feature_cols.append(col_rel_speed)
+            
+            # Closing Speed
+            # Cite: Lesson 00007 (Numerical Stability)
+            dot_prod = dvx * dx + dvy * dy
+            clamped_dist = np.maximum(dist, 1e-6)
+            closing_speed = -(dot_prod / clamped_dist)
+            
+            col_closing = f"closing_speed_lag_{k}"
+            merged[col_closing] = closing_speed
+            feature_cols.append(col_closing)
+            
+            # Add raw kinematics
+            feature_cols.extend([f"speed{suffix_1}", f"speed{suffix_2}", f"acceleration{suffix_1}", f"acceleration{suffix_2}"])
+
+        # 6. Scaling
+        # Cite: Lesson 00037 (Feature Scaling)
+        print("  Scaling features...")
+        X = merged[feature_cols].values.astype(np.float32)
+        
+        if split == "train":
+            scaler = StandardScaler()
+            X = scaler.fit_transform(X)
+            joblib.dump(scaler, self.config.scaler_path)
+            print(f"  Scaler saved to {self.config.scaler_path}")
+        else:
+            if os.path.exists(self.config.scaler_path):
+                scaler = joblib.load(self.config.scaler_path)
+                X = scaler.transform(X)
+            else:
+                print("Warning: Scaler not found during validation/test. Using unscaled data.")
+
+        return X
+
+
+def load_and_process_data(
+    split="train", debug=False, load_cached_data=True, config=None
+):
+    if config is None:
+        config = Config()
+
+    cache_prefix = f"{split}"
+    if debug:
+        cache_prefix += "_debug"
+
+    path_X = os.path.join(config.artifact_dir, f"{cache_prefix}_X.npy")
+    path_y = os.path.join(config.artifact_dir, f"{cache_prefix}_y.npy")
+    path_ids = os.path.join(config.artifact_dir, f"{cache_prefix}_ids.npy")
+
+    if load_cached_data and os.path.exists(path_X):
+        print(f"Loading cached {split} data from {config.artifact_dir}...")
+        X = np.load(path_X)
+        if split != "test":
+            y = np.load(path_y)
+        else:
+            y = None
+        
+        meta_path = os.path.join(config.metadata_dir, f"{split}.csv")
+        metadata_df = pd.read_csv(meta_path)
+        if debug:
+            metadata_df = metadata_df.iloc[: config.debug_sample_size].copy()
+            
+        return NFLContactDataset(X, y, metadata_df["contact_id"].values), metadata_df
+
+    print(f"Processing {split} data from scratch...")
+    meta_path = os.path.join(config.metadata_dir, f"{split}.csv")
+    metadata_df = pd.read_csv(meta_path)
+
+    if debug:
+        print(f"  Debug mode: Sampling {config.debug_sample_size} rows.")
+        metadata_df = metadata_df.iloc[: config.debug_sample_size].copy()
+
+    relevant_games = metadata_df["game_play"].unique()
+    fe = FeatureEngineer(config)
+    tracking_df = fe.load_tracking(split, relevant_games)
+
+    X = fe.process(metadata_df, tracking_df, split=split)
+
+    y = None
+    if "contact" in metadata_df.columns and split != "test":
+        y = metadata_df["contact"].values.astype(np.float32)
+
+    print(f"Saving {split} data to cache...")
+    np.save(path_X, X)
+    if y is not None:
+        np.save(path_y, y)
+    np.save(path_ids, metadata_df["contact_id"].values)
+
+    del tracking_df
+    gc.collect()
+
+    return NFLContactDataset(X, y, metadata_df["contact_id"].values), metadata_df
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class KETRNet(nn.Module):
+    """
+    Kinematically-Explicit Time-Resolved Network (KETR-Net).
+
+    A 1D Convolutional Network designed for contact detection that strictly preserves
+    temporal alignment and prioritizes the instantaneous state at the center frame.
+
+    Architecture:
+    1. Input: (Batch, Window_Size, Features)
+    2. Conv1D Backbone: Extracts temporal patterns without pooling.
+    3. Residual Connection: Concatenates flattened Conv output with raw Center Frame features.
+    4. Head: Dense layers for classification.
+    """
+
+    def __init__(self, config: Config):
+        super(KETRNet, self).__init__()
+
+        self.window_size = config.window_size
+        self.num_features = len(config.feature_cols)
+        self.filters = config.cnn_filters
+        self.kernel_size = config.cnn_kernel_size
+        self.dropout_rate = config.dropout
+
+        # Ensure window size is odd for a distinct center frame
+        if self.window_size % 2 == 0:
+            raise ValueError(f"Window size must be odd, got {self.window_size}")
+
+        self.center_idx = self.window_size // 2
+
+        # --- Time-Resolved Backbone ---
+        # Stack of 1D Convolutions.
+        # padding='same' ensures output length == input length (Window_Size).
+        # No pooling layers are used to preserve temporal resolution.
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(
+                in_channels=self.num_features,
+                out_channels=self.filters,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(
+                in_channels=self.filters,
+                out_channels=self.filters * 2,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters * 2),
+            nn.ReLU(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(
+                in_channels=self.filters * 2,
+                out_channels=self.filters,
+                kernel_size=self.kernel_size,
+                padding="same",
+            ),
+            nn.BatchNorm1d(self.filters),
+            nn.ReLU(),
+        )
+
+        # --- Dimension Calculation ---
+        # Flattened Conv Output Size = Filters * Window_Size
+        self.flattened_conv_size = self.filters * self.window_size
+
+        # Total Dense Input Size = Flattened Conv Output + Raw Center Features
+        self.dense_input_size = self.flattened_conv_size + self.num_features
+
+        # --- Unified Classification Head ---
+        self.head = nn.Sequential(
+            nn.Linear(self.dense_input_size, config.dense_hidden_units),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            nn.Linear(config.dense_hidden_units, config.dense_hidden_units // 2),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout_rate),
+            nn.Linear(config.dense_hidden_units // 2, 1),  # Output logit
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (Batch, Window_Size, Features)
+
+        Returns:
+            logits: Tensor of shape (Batch, 1)
+        """
+        batch_size = x.size(0)
+
+        # 1. Extract Center Frame Features for Residual Connection
+        # Shape: (Batch, Features)
+        center_features = x[:, self.center_idx, :]
+
+        # 2. Process through Conv Backbone
+        # Permute for Conv1d: (Batch, Features, Window_Size)
+        x_permuted = x.permute(0, 2, 1)
+
+        # Apply Convolutions
+        # Output Shape: (Batch, Filters, Window_Size)
+        conv_out = self.conv_block(x_permuted)
+
+        # 3. Flatten Temporal Features
+        # Shape: (Batch, Filters * Window_Size)
+        conv_flat = conv_out.view(batch_size, -1)
+
+        # 4. Center-Frame Residual Connection
+        # Concatenate learned temporal context with exact instantaneous state
+        # Shape: (Batch, Filters*Window + Features)
+        combined = torch.cat([conv_flat, center_features], dim=1)
+
+        # 5. Classification Head
+        logits = self.head(combined)
+
+        return logits.squeeze(1)
+=======
+class KinematicMLP(nn.Module):
+    """
+    Simple Kinematic MLP for Wide-Format Features.
+    Cite: Lesson 00023 (Simplicity Enables Data Scale)
+    """
+
+    def __init__(self, config: Config):
+        super(KinematicMLP, self).__init__()
+        
+        self.hidden_units = config.hidden_units
+        self.dropout_rate = config.dropout
+        
+        layers = []
+        # Input -> Hidden 1
+        # Using LazyLinear to infer input dimension from the first batch
+        layers.append(nn.LazyLinear(self.hidden_units[0]))
+        layers.append(nn.BatchNorm1d(self.hidden_units[0]))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(self.dropout_rate))
+        
+        # Hidden 1 -> Hidden 2
+        layers.append(nn.Linear(self.hidden_units[0], self.hidden_units[1]))
+        layers.append(nn.BatchNorm1d(self.hidden_units[1]))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(self.dropout_rate))
+        
+        # Hidden 2 -> Hidden 3
+        layers.append(nn.Linear(self.hidden_units[1], self.hidden_units[2]))
+        layers.append(nn.BatchNorm1d(self.hidden_units[2]))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(self.dropout_rate))
+        
+        # Output
+        layers.append(nn.Linear(self.hidden_units[2], 1))
+        
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x shape: (Batch, Features)
+        return self.model(x).squeeze(1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import KETRNet
+
+
+class Trainer:
+    """
+    Manages the training, validation, and optimization lifecycle of the KETR-Net model.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize Model
+        self.model = KETRNet(config).to(self.device)
+
+        # Initialize Optimizer (AdamW)
+=======
+from library.model import KinematicMLP
+
+
+class Trainer:
+    """
+    Manages the training, validation, and optimization lifecycle of the Kinematic MLP model.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize Model
+        self.model = KinematicMLP(config).to(self.device)
+
+        # Initialize Optimizer (AdamW)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate error magnitude
+    errors = np.abs(y_true - y_prob)
+
+    # Extract features for correlation analysis
+    # We use the center frame (t=0) features as they are most representative
+    center_idx = config.window_size // 2
+    # Convert tensor to numpy, handle potential device mismatch if dataset was on GPU (it's CPU usually)
+    val_features = val_dataset.features[:, center_idx, :].numpy()
+
+    feature_names = config.feature_cols
+    correlations = []
+
+    for i, name in enumerate(feature_names):
+        feat_values = val_features[:, i]
+        # Check for constant values to avoid division by zero in correlation
+        if np.std(feat_values) > 1e-9:
+            corr = np.corrcoef(errors, feat_values)[0, 1]
+            correlations.append((name, corr))
+        else:
+            correlations.append((name, 0.0))
+=======
+    # 5. Failure Analysis
+    print("\n=== Failure Analysis ===")
+    # Calculate error magnitude
+    errors = np.abs(y_true - y_prob)
+
+    # Extract features for correlation analysis
+    # The features are now flattened. We need to identify the indices for t=0.
+    # Based on data_processing: is_ground is idx 0.
+    # Then for each lag k in [-5...5]:
+    #   log_dist, rel_speed, closing, s1, s2, a1, a2 (7 features)
+    # t=0 corresponds to k=0.
+    
+    val_features = val_dataset.features.numpy()
+    
+    # Index calculation:
+    # 1 (is_ground) + 5 * 7 (lags -5 to -1) = 36.
+    # So t=0 starts at index 36.
+    
+    start_idx = 1 + 5 * 7
+    feature_names_t0 = [
+        "log_dist_t0", "rel_speed_t0", "closing_speed_t0", 
+        "speed_1_t0", "speed_2_t0", "accel_1_t0", "accel_2_t0"
+    ]
+    
+    correlations = []
+    
+    # Add is_ground
+    ground_vals = val_features[:, 0]
+    if np.std(ground_vals) > 1e-9:
+        corr = np.corrcoef(errors, ground_vals)[0, 1]
+        correlations.append(("is_ground", corr))
+        
+    # Add t=0 features
+    for i, name in enumerate(feature_names_t0):
+        idx = start_idx + i
+        feat_values = val_features[:, idx]
+        if np.std(feat_values) > 1e-9:
+            corr = np.corrcoef(errors, feat_values)[0, 1]
+            correlations.append((name, corr))
+        else:
+            correlations.append((name, 0.0))
+>>>>>>> REPLACE
+```

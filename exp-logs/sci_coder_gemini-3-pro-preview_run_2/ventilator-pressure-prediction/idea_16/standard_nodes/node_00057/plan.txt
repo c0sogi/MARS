@@ -1,0 +1,238 @@
+My strategy is to optimize the `HFSI-BiLSTM` model by reverting the detrimental "bottleneck" in the injection path and removing redundant features, while extending the training horizon to ensure convergence.
+
+1.  **Architecture Refinement (Cite solution_lesson_node_00056):** I will modify the `SelectiveInjectionBlock` in `library/model.py` to remove the linear bottleneck layer after the Gated Linear Unit (GLU). Instead of compressing the context to 64 dimensions, I will inject the full 128-dimensional GLU output alongside the raw features. This "Wide Injection" strategy ensures that deep layers receive high-fidelity context, which was shown to reduce error by ~16% compared to the bottlenecked version.
+2.  **Feature Simplification (Cite solution_lesson_node_00055):** I will update `library/dataset.py` to remove explicit future lag features (`u_in_lag_back`) and redundant interaction terms (`cross`, `area`). These features were identified as causing overfitting in BiLSTMs, which natively handle bidirectional temporal dependencies.
+3.  **Extended Training (Cite solution_lesson_node_00029, solution_lesson_node_00043):** I will update `library/config.py` and `runfile.py` to increase the training duration from 15 to 180 epochs and match `T_MAX` for the Cosine Annealing scheduler. This addresses the "Long-Tail Convergence" lesson, allowing the model to fully optimize the continuous function approximation.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+        # Specific working directory for Idea 16
+        self.WORKING_DIR = "./working/idea_16"
+        self.SUBMISSION_DIR = "./submission"
+=======
+        # Specific working directory for Idea 17
+        self.WORKING_DIR = "./working/idea_17"
+        self.SUBMISSION_DIR = "./submission"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # ==========================================
+        # 2. Model Hyperparameters (HFSI-BiLSTM)
+        # ==========================================
+        self.HIDDEN_DIM = 512  # Capacity for Deep Recurrent Backbone
+        self.BOTTLENECK_DIM = 64  # Dimension for Context Path projection
+        self.N_LAYERS = 4  # Number of BiLSTM layers
+        self.DROPOUT = 0.1  # Inter-layer dropout
+        self.BIDIRECTIONAL = True
+
+        # ==========================================
+        # 3. Training Hyperparameters
+        # ==========================================
+        self.SEED = 42
+        self.BATCH_SIZE = 256  # Optimized for A100 GPU
+        self.LEARNING_RATE = 1e-3
+        self.WEIGHT_DECAY = 1e-6
+        self.EPOCHS = 200  # Stretched horizon convergence
+        self.T_MAX = 200  # Cosine Annealing horizon
+=======
+        # ==========================================
+        # 2. Model Hyperparameters (HFSI-BiLSTM)
+        # ==========================================
+        self.HIDDEN_DIM = 512  # Capacity for Deep Recurrent Backbone
+        self.CONTEXT_DIM = 128  # Dimension for Context Path (GLU output)
+        self.N_LAYERS = 4  # Number of BiLSTM layers
+        self.DROPOUT = 0.1  # Inter-layer dropout
+        self.BIDIRECTIONAL = True
+
+        # ==========================================
+        # 3. Training Hyperparameters
+        # ==========================================
+        self.SEED = 42
+        self.BATCH_SIZE = 256  # Optimized for A100 GPU
+        self.LEARNING_RATE = 1e-3
+        self.WEIGHT_DECAY = 1e-6
+        self.EPOCHS = 180  # Stretched horizon convergence
+        self.T_MAX = 180  # Cosine Annealing horizon
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # Lag features (Temporal Context)
+    df["u_in_lag1"] = df.groupby("breath_id")["u_in"].shift(1).fillna(0)
+    df["u_in_lag2"] = df.groupby("breath_id")["u_in"].shift(2).fillna(0)
+    df["u_in_lag_back1"] = df.groupby("breath_id")["u_in"].shift(-1).fillna(0)
+    df["u_in_lag_back2"] = df.groupby("breath_id")["u_in"].shift(-2).fillna(0)
+
+    # Finite Differences (Dynamics)
+    df["u_in_diff1"] = df["u_in"] - df["u_in_lag1"]
+    df["u_in_diff2"] = df["u_in_diff1"] - (df["u_in_lag1"] - df["u_in_lag2"])
+
+    # Additional interactions
+    df["area"] = df["time_step"] * df["u_in"]
+    df["cross"] = df["u_in"] * df["u_out"]
+    df["cross2"] = df["time_step"] * df["u_out"]
+=======
+    # Lag features (Temporal Context)
+    df["u_in_lag1"] = df.groupby("breath_id")["u_in"].shift(1).fillna(0)
+    df["u_in_lag2"] = df.groupby("breath_id")["u_in"].shift(2).fillna(0)
+
+    # Finite Differences (Dynamics)
+    df["u_in_diff1"] = df["u_in"] - df["u_in_lag1"]
+    df["u_in_diff2"] = df["u_in_diff1"] - (df["u_in_lag1"] - df["u_in_lag2"])
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            "R_u_in",
+            "vol_C",
+            "u_in_lag1",
+            "u_in_lag2",
+            "u_in_lag_back1",
+            "u_in_lag_back2",
+            "u_in_diff1",
+            "u_in_diff2",
+            "area",
+            "cross",
+            "cross2",
+            "dt",
+=======
+            "R_u_in",
+            "vol_C",
+            "u_in_lag1",
+            "u_in_lag2",
+            "u_in_diff1",
+            "u_in_diff2",
+            "dt",
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SelectiveInjectionBlock(nn.Module):
+    """
+    Implements the Selective-Injection mechanism.
+
+    Structure:
+    1. Fidelity Path: Identity mapping of raw features to preserve floating-point
+       magnitudes of physical constants (R, C) and controls (u_in).
+    2. Context Path: A Gated Linear Unit (GLU) based non-linear extraction
+       projected down to a bottleneck dimension.
+
+    Output:
+    Concatenation of the Fidelity Path and the Context Path.
+    """
+
+    def __init__(self, input_dim: int, bottleneck_dim: int):
+        super().__init__()
+        # Context Path Components
+        # Intermediate dimension for the GLU layer.
+        # 128 is chosen to capture physics interactions efficiently.
+        self.glu_hidden_dim = 128
+
+        # Projects input to 2 * glu_hidden_dim for GLU operation (split into gates and values)
+        self.fc_context = nn.Linear(input_dim, self.glu_hidden_dim * 2)
+        self.glu = nn.GLU(dim=-1)
+
+        # Projects GLU output to bottleneck dimension
+        self.fc_bottleneck = nn.Linear(self.glu_hidden_dim, bottleneck_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, Seq_Len, Input_Dim)
+
+        # 1. Fidelity Path (Identity)
+        # Strictly preserves raw signals.
+        fidelity = x
+
+        # 2. Context Path (Bottlenecked GLU)
+        # Extracts non-linear physics context and compresses it.
+        context = self.fc_context(x)
+        context = self.glu(context)
+        context = self.fc_bottleneck(context)
+
+        # 3. Fusion
+        # Concatenate raw signals with compressed context
+        injection_payload = torch.cat([fidelity, context], dim=-1)
+
+        return injection_payload
+=======
+class SelectiveInjectionBlock(nn.Module):
+    """
+    Implements the Selective-Injection mechanism.
+
+    Structure:
+    1. Fidelity Path: Identity mapping of raw features to preserve floating-point
+       magnitudes of physical constants (R, C) and controls (u_in).
+    2. Context Path: A Gated Linear Unit (GLU) based non-linear extraction.
+       No bottleneck is applied to preserve high-fidelity context.
+
+    Output:
+    Concatenation of the Fidelity Path and the Context Path.
+    """
+
+    def __init__(self, input_dim: int, context_dim: int):
+        super().__init__()
+        # Context Path Components
+        self.context_dim = context_dim
+
+        # Projects input to 2 * context_dim for GLU operation (split into gates and values)
+        self.fc_context = nn.Linear(input_dim, self.context_dim * 2)
+        self.glu = nn.GLU(dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, Seq_Len, Input_Dim)
+
+        # 1. Fidelity Path (Identity)
+        fidelity = x
+
+        # 2. Context Path (GLU)
+        context = self.fc_context(x)
+        context = self.glu(context)
+
+        # 3. Fusion
+        # Concatenate raw signals with context
+        injection_payload = torch.cat([fidelity, context], dim=-1)
+
+        return injection_payload
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    def __init__(self, config: Config, input_dim: int):
+        super().__init__()
+        self.config = config
+
+        # --- Selective Injection Block ---
+        self.injection_block = SelectiveInjectionBlock(input_dim, config.BOTTLENECK_DIM)
+
+        # Dimension of the payload (Input Features + Context Bottleneck)
+        self.injection_dim = input_dim + config.BOTTLENECK_DIM
+
+        # --- Deep Recurrent Backbone ---
+=======
+    def __init__(self, config: Config, input_dim: int):
+        super().__init__()
+        self.config = config
+
+        # --- Selective Injection Block ---
+        self.injection_block = SelectiveInjectionBlock(input_dim, config.CONTEXT_DIM)
+
+        # Dimension of the payload (Input Features + Context)
+        self.injection_dim = input_dim + config.CONTEXT_DIM
+
+        # --- Deep Recurrent Backbone ---
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override config for Fast Baseline Execution
+    # 15 epochs is sufficient for the model to converge reasonably well on A100
+    # while staying well within the 2-hour limit.
+    config.EPOCHS = 15
+    config.T_MAX = 15
+    config.DEBUG = False  # Use full dataset for valid metrics
+=======
+    # Use full dataset and extended training
+    config.DEBUG = False
+>>>>>>> REPLACE
+```

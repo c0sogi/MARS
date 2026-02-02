@@ -1,0 +1,360 @@
+I will optimize the solution by simplifying the neural architecture and scaling up the training process. Specifically, I will replace the complex hybrid "CAP-Net" (TCN + LSTM) with a robust, deep **Bidirectional LSTM** (Cite Lesson 00014). This aligns the model's inductive bias with the integral nature of the Equation of Motion for respiratory mechanics. Furthermore, I will switch from the debug configuration to **full dataset training** with increased batch size (512) and epochs (50) to fully utilize the A100 GPU and ensure convergence (Cite Lesson 00010).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================
+    # Model Architecture (CAP-Net)
+    # ==========================
+    # Branch 1: LSTM (Contextualized Elastic Stream)
+    # Captures low-frequency, integral-based dynamics (P = V/C)
+    LSTM_HIDDEN_SIZE = 256
+    LSTM_NUM_LAYERS = 3
+    LSTM_BIDIRECTIONAL = True
+
+    # Branch 2: TCN (Contextualized Resistive Stream)
+    # Captures high-frequency, derivative-based dynamics (P = R*Flow)
+    # List defines the number of channels for each dilated layer
+    TCN_CHANNELS = [64, 128, 256, 512]
+    TCN_KERNEL_SIZE = 3
+    TCN_DROPOUT = 0.2
+
+    # Fusion Head
+    # Combines outputs from both branches
+    FC_HIDDEN_SIZE = 128
+    DROPOUT = 0.1
+=======
+    # ==========================
+    # Model Architecture (Bi-LSTM)
+    # ==========================
+    # Unified Recurrent Architecture (Cite Lesson 00014)
+    # Captures both resistive and elastic dynamics via deep recurrence
+    LSTM_HIDDEN_SIZE = 512
+    LSTM_NUM_LAYERS = 4
+    LSTM_BIDIRECTIONAL = True
+
+    # Regression Head
+    FC_HIDDEN_SIZE = 256
+    DROPOUT = 0.1
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+# ==========================================
+# TCN Components
+# ==========================================
+
+
+class Chomp1d(nn.Module):
+    """
+    Removes the last 'chomp_size' elements from the input.
+    Used to ensure causality in TCN by removing padding from the future.
+    """
+
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        if self.chomp_size == 0:
+            return x
+        return x[:, :, : -self.chomp_size]
+
+
+class TemporalBlock(nn.Module):
+    """
+    A single residual block for the TCN.
+    Contains two dilated convolutions with causal padding, ReLU, and Dropout.
+    """
+
+    def __init__(
+        self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2
+    ):
+        super(TemporalBlock, self).__init__()
+
+        # First dilated convolution
+        self.conv1 = weight_norm(
+            nn.Conv1d(
+                n_inputs,
+                n_outputs,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Second dilated convolution
+        self.conv2 = weight_norm(
+            nn.Conv1d(
+                n_outputs,
+                n_outputs,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1,
+            self.chomp1,
+            self.relu1,
+            self.dropout1,
+            self.conv2,
+            self.chomp2,
+            self.relu2,
+            self.dropout2,
+        )
+
+        # Residual connection: 1x1 conv if dimensions change
+        self.downsample = (
+            nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        )
+        self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCNBranch(nn.Module):
+    """
+    The TCN Branch of CAP-Net.
+    Stacks TemporalBlocks with increasing dilation.
+    """
+
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TCNBranch, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2**i
+            in_channels = num_inputs if i == 0 else num_channels[i - 1]
+            out_channels = num_channels[i]
+            layers += [
+                TemporalBlock(
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    stride=1,
+                    dilation=dilation_size,
+                    padding=(kernel_size - 1) * dilation_size,
+                    dropout=dropout,
+                )
+            ]
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x shape: (Batch, Features, Length)
+        return self.network(x)
+
+
+# ==========================================
+# CAP-Net Model
+# ==========================================
+
+
+class CAPNet(nn.Module):
+    """
+    Context-Aware Parallel Hybrid Network.
+    Combines a TCN branch (Resistive dynamics) and an LSTM branch (Elastic dynamics).
+    """
+
+    def __init__(self):
+        super(CAPNet, self).__init__()
+
+        # --- TCN Branch ---
+        # Input to TCN: (Batch, Input_Dim, Seq_Len)
+        self.tcn = TCNBranch(
+            num_inputs=Config.INPUT_DIM,
+            num_channels=Config.TCN_CHANNELS,
+            kernel_size=Config.TCN_KERNEL_SIZE,
+            dropout=Config.TCN_DROPOUT,
+        )
+        tcn_out_dim = Config.TCN_CHANNELS[-1]
+
+        # --- LSTM Branch ---
+        # Input to LSTM: (Batch, Seq_Len, Input_Dim)
+        self.lstm = nn.LSTM(
+            input_size=Config.INPUT_DIM,
+            hidden_size=Config.LSTM_HIDDEN_SIZE,
+            num_layers=Config.LSTM_NUM_LAYERS,
+            batch_first=True,
+            bidirectional=Config.LSTM_BIDIRECTIONAL,
+        )
+        lstm_out_dim = (
+            Config.LSTM_HIDDEN_SIZE * 2
+            if Config.LSTM_BIDIRECTIONAL
+            else Config.LSTM_HIDDEN_SIZE
+        )
+
+        # --- Fusion Head ---
+        fusion_dim = tcn_out_dim + lstm_out_dim
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, Config.FC_HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.FC_HIDDEN_SIZE, 1),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Features)
+
+        # 1. TCN Path
+        # Permute for Conv1d: (Batch, Features, Seq_Len)
+        x_tcn_in = x.permute(0, 2, 1)
+        tcn_out = self.tcn(x_tcn_in)
+        # Permute back: (Batch, Seq_Len, TCN_Channels)
+        tcn_out = tcn_out.permute(0, 2, 1)
+
+        # 2. LSTM Path
+        # Standard LSTM input: (Batch, Seq_Len, Features)
+        lstm_out, _ = self.lstm(x)
+
+        # 3. Fusion
+        # Concatenate along feature dimension
+        combined = torch.cat([tcn_out, lstm_out], dim=2)
+
+        # Prediction
+        # Output: (Batch, Seq_Len, 1)
+        pred = self.head(combined)
+
+        # Remove last dimension: (Batch, Seq_Len)
+        return pred.squeeze(-1)
+=======
+# ==========================================
+# Bi-LSTM Model
+# ==========================================
+
+
+class BiLSTMModel(nn.Module):
+    """
+    Bidirectional LSTM Model.
+    Replaces the hybrid CAP-Net with a robust recurrent architecture.
+    Cite Lesson 00014: Prioritize architectural alignment with physical dynamics.
+    """
+
+    def __init__(self):
+        super(BiLSTMModel, self).__init__()
+
+        # Deep Recurrent Backbone
+        self.lstm = nn.LSTM(
+            input_size=Config.INPUT_DIM,
+            hidden_size=Config.LSTM_HIDDEN_SIZE,
+            num_layers=Config.LSTM_NUM_LAYERS,
+            batch_first=True,
+            bidirectional=Config.LSTM_BIDIRECTIONAL,
+        )
+        
+        lstm_out_dim = (
+            Config.LSTM_HIDDEN_SIZE * 2
+            if Config.LSTM_BIDIRECTIONAL
+            else Config.LSTM_HIDDEN_SIZE
+        )
+
+        # Regression Head
+        self.head = nn.Sequential(
+            nn.Linear(lstm_out_dim, Config.FC_HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT),
+            nn.Linear(Config.FC_HIDDEN_SIZE, 1),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, Seq_Len, Features)
+        
+        # LSTM Pass
+        lstm_out, _ = self.lstm(x)
+        
+        # Prediction
+        pred = self.head(lstm_out)
+
+        # Remove last dimension: (Batch, Seq_Len)
+        return pred.squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import CAPNet, train_epoch, validate, generate_submission
+=======
+from library.model import BiLSTMModel, train_epoch, validate, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 5. Model Initialization
+    model = CAPNet().to(device)
+=======
+    # 5. Model Initialization
+    model = BiLSTMModel().to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import CAPNet, train_epoch, validate, generate_submission
+=======
+from library.model import BiLSTMModel, train_epoch, validate, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline
+    Config.EPOCHS = 15
+    Config.BATCH_SIZE = 128
+    Config.LEARNING_RATE = 1e-3
+
+    # Use a subset of data to ensure speed (Fast Baseline)
+    Config.DEBUG = True
+    Config.DEBUG_SIZE = 15000
+=======
+    # Override Config for Full Training
+    # Cite Lesson 00010: Align training budget with convergence needs.
+    Config.EPOCHS = 50
+    Config.BATCH_SIZE = 512  # Increased for A100 efficiency
+    Config.LEARNING_RATE = 1e-3
+
+    # Use full dataset
+    Config.DEBUG = False
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 3. Model Initialization
+    # ---------------------------------------------------------
+    model = CAPNet().to(device)
+=======
+    # ---------------------------------------------------------
+    # 3. Model Initialization
+    # ---------------------------------------------------------
+    model = BiLSTMModel().to(device)
+>>>>>>> REPLACE
+```

@@ -1,0 +1,831 @@
+Based on the lessons learned, specifically Lesson 25, the addition of Deep Supervision and a "Wide" linear path to the Residual Funnel architecture resulted in a regression in performance (AUC 0.9921 vs 0.9957). The deep supervision likely caused greedy optimization in early layers, hindering the hierarchical composition of features. Furthermore, Lesson 25 noted that replacing GLU-based downsampling with standard PReLU projections was detrimental.
+
+Therefore, the optimization strategy is to:
+1.  **Revert to the ResFunnel-GLU Architecture**: Remove the "Wide" path and Deep Supervision auxiliary heads.
+2.  **Implement Gated Transitions**: Replace `ProjectedTransition` (Linear+PReLU) with `GatedTransition` (Linear+GLU+BN+Dropout) to maintain consistent GLU-based processing throughout the network, including during dimensionality reduction (Cite {solution_lesson_node_00025}).
+3.  **Preserve Residuals**: Ensure the transition blocks maintain the projected residual connection to facilitate gradient flow (Cite {solution_lesson_node_00024}).
+4.  **Training Configuration**: Increase epochs to 50 to ensure full convergence (Cite {solution_lesson_node_00003}) and remove auxiliary loss weights.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Aggressive dropout as per strategy
+    DROPOUT_RATE = 0.35
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 2048
+    LEARNING_RATE = 1e-3
+
+    # High weight decay to constrain the high capacity model
+    WEIGHT_DECAY = 1e-2
+
+    # Extended training duration
+    EPOCHS = 50
+    EARLY_STOPPING_PATIENCE = 10
+
+    # Loss Weights for Deep Supervision
+    # Formula: Loss = L_final + lambda1*L_aux1 + lambda2*L_aux2
+    AUX_LOSS_WEIGHTS = [0.3, 0.3]
+
+    # --------------------------------------------------------------------------
+=======
+    # Aggressive dropout as per strategy
+    DROPOUT_RATE = 0.35
+
+    # --------------------------------------------------------------------------
+    # Training Hyperparameters
+    # --------------------------------------------------------------------------
+    BATCH_SIZE = 2048
+    LEARNING_RATE = 1e-3
+
+    # High weight decay to constrain the high capacity model
+    WEIGHT_DECAY = 1e-2
+
+    # Extended training duration
+    EPOCHS = 50
+    EARLY_STOPPING_PATIENCE = 15
+
+    # --------------------------------------------------------------------------
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ProjectedTransition(nn.Module):
+    """
+    Transition between stages with dimension change.
+    Uses a projected residual connection to preserve signal identity
+    across dimensionality changes.
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super(ProjectedTransition, self).__init__()
+        # Main path transformation
+        self.main_path = nn.Linear(in_dim, out_dim)
+        # Skip path projection (1x1 equivalent for dense layers)
+        self.skip_path = nn.Linear(in_dim, out_dim)
+
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.activation = nn.PReLU()
+
+    def forward(self, x):
+        main = self.main_path(x)
+        skip = self.skip_path(x)
+
+        # Sum main and skip paths
+        out = main + skip
+
+        # Stabilize
+        out = self.bn(out)
+        out = self.activation(out)
+        return out
+
+
+class WideDeepResFunnel(nn.Module):
+    """
+    Wide & Deeply Supervised ResFunnel-GLU Architecture.
+    Combines a shallow wide linear model with a deep hierarchical funnel network.
+    """
+
+    def __init__(self):
+        super(WideDeepResFunnel, self).__init__()
+
+        # --- Configuration ---
+        self.num_numeric = Config.NUM_CONTINUOUS_FEATURES
+        self.seq_len = Config.F_27_SEQ_LEN
+        self.vocab_size = Config.VOCAB_SIZE
+        self.emb_dim = Config.EMBEDDING_DIM
+        self.stages = Config.FUNNEL_STAGES  # [512, 256, 128]
+        self.dropout = Config.DROPOUT_RATE
+
+        # --- Input Processing ---
+        self.embedding = nn.Embedding(self.vocab_size, self.emb_dim)
+
+        # Calculate flattened input dimension
+        # 30 numeric + (10 * 32) embedding = 350
+        self.input_dim = self.num_numeric + (self.seq_len * self.emb_dim)
+
+        # --- Stream 2: Wide Path ---
+        # Linear projection from raw input to scalar
+        self.wide_head = nn.Linear(self.input_dim, 1)
+
+        # --- Stream 1: Deep ResFunnel Backbone ---
+
+        # Initial projection to Stage 1 width
+        self.input_proj = nn.Linear(self.input_dim, self.stages[0])
+        self.input_bn = nn.BatchNorm1d(self.stages[0])
+        self.input_act = nn.PReLU()
+
+        # Stage 1
+        # Stack of Residual Gated Blocks
+        self.stage1 = nn.Sequential(
+            ResidualGatedBlock(self.stages[0], self.dropout),
+            ResidualGatedBlock(self.stages[0], self.dropout),
+        )
+        # Deep Supervision Head 1
+        self.aux1_head = nn.Linear(self.stages[0], 1)
+
+        # Transition 1 -> 2
+        self.trans1 = ProjectedTransition(self.stages[0], self.stages[1])
+
+        # Stage 2
+        self.stage2 = nn.Sequential(
+            ResidualGatedBlock(self.stages[1], self.dropout),
+            ResidualGatedBlock(self.stages[1], self.dropout),
+        )
+        # Deep Supervision Head 2
+        self.aux2_head = nn.Linear(self.stages[1], 1)
+
+        # Transition 2 -> 3
+        self.trans2 = ProjectedTransition(self.stages[1], self.stages[2])
+
+        # Stage 3
+        self.stage3 = nn.Sequential(
+            ResidualGatedBlock(self.stages[2], self.dropout),
+            ResidualGatedBlock(self.stages[2], self.dropout),
+        )
+
+        # Final Deep Head
+        self.deep_head = nn.Linear(self.stages[2], 1)
+
+    def forward(self, numeric, categorical):
+        """
+        Forward pass of the model.
+
+        Args:
+            numeric: (Batch, 30) FloatTensor containing standardized numerical features.
+            categorical: (Batch, 10) LongTensor containing tokenized character features.
+
+        Returns:
+            final_logits: The combined output of Wide and Deep streams.
+            aux1_logits: Output from Stage 1 (for deep supervision).
+            aux2_logits: Output from Stage 2 (for deep supervision).
+        """
+        # 1. Process Embeddings
+        # categorical: (B, 10) -> (B, 10, 32)
+        emb = self.embedding(categorical)
+        # Flatten embeddings: (B, 320)
+        emb_flat = emb.view(emb.size(0), -1)
+
+        # 2. Create Input Vector
+        # Concatenate numerical and flattened embeddings: (B, 30 + 320) -> (B, 350)
+        x_in = torch.cat([numeric, emb_flat], dim=1)
+
+        # 3. Wide Path Execution
+        wide_logits = self.wide_head(x_in)
+
+        # 4. Deep Stream Execution
+
+        # Initial Projection
+        x = self.input_proj(x_in)
+        x = self.input_bn(x)
+        x = self.input_act(x)
+
+        # Stage 1
+        x = self.stage1(x)
+        aux1_logits = self.aux1_head(x)
+
+        # Transition Stage 1 -> Stage 2
+        x = self.trans1(x)
+
+        # Stage 2
+        x = self.stage2(x)
+        aux2_logits = self.aux2_head(x)
+
+        # Transition Stage 2 -> Stage 3
+        x = self.trans2(x)
+
+        # Stage 3
+        x = self.stage3(x)
+
+        # Final Deep Output
+        deep_logits = self.deep_head(x)
+
+        # 5. Fusion
+        # Sum the logits from the Deep Head and the Wide Path
+        final_logits = deep_logits + wide_logits
+
+        return final_logits, aux1_logits, aux2_logits
+=======
+class GatedTransition(nn.Module):
+    """
+    Transition between stages with dimension change using GLU.
+    Maintains a projected residual connection.
+    """
+
+    def __init__(self, in_dim, out_dim, dropout_rate):
+        super(GatedTransition, self).__init__()
+        # Main path: Linear -> GLU -> BN -> Dropout
+        self.main_linear = nn.Linear(in_dim, out_dim * 2)
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # Skip path projection
+        self.skip_path = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        # Main path
+        out = self.main_linear(x)
+        out = F.glu(out, dim=1)
+        out = self.bn(out)
+        out = self.dropout(out)
+        
+        # Skip path
+        skip = self.skip_path(x)
+        
+        return out + skip
+
+
+class ResFunnelGLU(nn.Module):
+    """
+    ResFunnel-GLU Architecture.
+    Deep hierarchical funnel network with residual GLU blocks and gated transitions.
+    """
+
+    def __init__(self):
+        super(ResFunnelGLU, self).__init__()
+
+        # --- Configuration ---
+        self.num_numeric = Config.NUM_CONTINUOUS_FEATURES
+        self.seq_len = Config.F_27_SEQ_LEN
+        self.vocab_size = Config.VOCAB_SIZE
+        self.emb_dim = Config.EMBEDDING_DIM
+        self.stages = Config.FUNNEL_STAGES  # [512, 256, 128]
+        self.dropout = Config.DROPOUT_RATE
+
+        # --- Input Processing ---
+        self.embedding = nn.Embedding(self.vocab_size, self.emb_dim)
+
+        # Calculate flattened input dimension
+        # 30 numeric + (10 * 32) embedding = 350
+        self.input_dim = self.num_numeric + (self.seq_len * self.emb_dim)
+
+        # --- Deep ResFunnel Backbone ---
+
+        # Initial projection to Stage 1 width
+        self.input_proj = nn.Linear(self.input_dim, self.stages[0])
+        self.input_bn = nn.BatchNorm1d(self.stages[0])
+        self.input_act = nn.PReLU()
+
+        # Stage 1
+        self.stage1 = nn.Sequential(
+            ResidualGatedBlock(self.stages[0], self.dropout),
+            ResidualGatedBlock(self.stages[0], self.dropout),
+        )
+
+        # Transition 1 -> 2
+        self.trans1 = GatedTransition(self.stages[0], self.stages[1], self.dropout)
+
+        # Stage 2
+        self.stage2 = nn.Sequential(
+            ResidualGatedBlock(self.stages[1], self.dropout),
+            ResidualGatedBlock(self.stages[1], self.dropout),
+        )
+
+        # Transition 2 -> 3
+        self.trans2 = GatedTransition(self.stages[1], self.stages[2], self.dropout)
+
+        # Stage 3
+        self.stage3 = nn.Sequential(
+            ResidualGatedBlock(self.stages[2], self.dropout),
+            ResidualGatedBlock(self.stages[2], self.dropout),
+        )
+
+        # Final Head
+        self.head = nn.Linear(self.stages[2], 1)
+
+    def forward(self, numeric, categorical):
+        """
+        Forward pass of the model.
+        """
+        # 1. Process Embeddings
+        emb = self.embedding(categorical)
+        emb_flat = emb.view(emb.size(0), -1)
+
+        # 2. Create Input Vector
+        x = torch.cat([numeric, emb_flat], dim=1)
+
+        # 3. Deep Stream Execution
+        x = self.input_proj(x)
+        x = self.input_bn(x)
+        x = self.input_act(x)
+
+        # Stage 1
+        x = self.stage1(x)
+
+        # Transition Stage 1 -> Stage 2
+        x = self.trans1(x)
+
+        # Stage 2
+        x = self.stage2(x)
+
+        # Transition Stage 2 -> Stage 3
+        x = self.trans2(x)
+
+        # Stage 3
+        x = self.stage3(x)
+
+        # Final Output
+        logits = self.head(x)
+
+        return logits
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+from library.model import WideDeepResFunnel
+
+
+def set_seed(seed=42):
+=======
+from library.model import ResFunnelGLU
+
+
+def set_seed(seed=42):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+def compute_multitask_loss(
+    final_logits, aux1_logits, aux2_logits, targets, criterion, weights
+):
+    """
+    Computes the weighted sum of losses.
+    Loss = L_final + w1 * L_aux1 + w2 * L_aux2
+    """
+    # Ensure targets are correct shape (Batch, 1) for BCEWithLogitsLoss
+    targets = targets.view(-1, 1)
+
+    loss_final = criterion(final_logits, targets)
+    loss_aux1 = criterion(aux1_logits, targets)
+    loss_aux2 = criterion(aux2_logits, targets)
+
+    total_loss = loss_final + (weights[0] * loss_aux1) + (weights[1] * loss_aux2)
+    return total_loss
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device, aux_weights):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        numeric = batch["numeric"].to(device)
+        categorical = batch["categorical"].to(device)
+        targets = batch["target"].to(device)
+
+        optimizer.zero_grad()
+
+        final_logits, aux1_logits, aux2_logits = model(numeric, categorical)
+
+        loss = compute_multitask_loss(
+            final_logits, aux1_logits, aux2_logits, targets, criterion, aux_weights
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * numeric.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def validate(model, dataloader, device):
+    """
+    Evaluates the model on the validation set using ROC AUC.
+    Only considers the final head output.
+    """
+    model.eval()
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+            targets = batch["target"].to(device)
+
+            # We only care about the final prediction for validation
+            final_logits, _, _ = model(numeric, categorical)
+            probs = torch.sigmoid(final_logits)
+
+            all_preds.append(probs.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+=======
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        numeric = batch["numeric"].to(device)
+        categorical = batch["categorical"].to(device)
+        targets = batch["target"].to(device).view(-1, 1)
+
+        optimizer.zero_grad()
+
+        logits = model(numeric, categorical)
+        loss = criterion(logits, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * numeric.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def validate(model, dataloader, device):
+    """
+    Evaluates the model on the validation set using ROC AUC.
+    """
+    model.eval()
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+            targets = batch["target"].to(device)
+
+            logits = model(numeric, categorical)
+            probs = torch.sigmoid(logits)
+
+            all_preds.append(probs.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+def predict_and_submit(model, test_loader, test_ids, device):
+    """
+    Generates predictions on the test set and saves the submission file.
+    """
+    print("Generating predictions on test set...")
+
+    # Load best model weights
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+        print("Loaded best model weights.")
+    else:
+        print("Warning: Best model weights not found. Using current model weights.")
+
+    model.eval()
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+
+            final_logits, _, _ = model(numeric, categorical)
+            probs = torch.sigmoid(final_logits)
+
+            all_preds.append(probs.cpu().numpy())
+=======
+def predict_and_submit(model, test_loader, test_ids, device):
+    """
+    Generates predictions on the test set and saves the submission file.
+    """
+    print("Generating predictions on test set...")
+
+    # Load best model weights
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+        print("Loaded best model weights.")
+    else:
+        print("Warning: Best model weights not found. Using current model weights.")
+
+    model.eval()
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+
+            logits = model(numeric, categorical)
+            probs = torch.sigmoid(logits)
+
+            all_preds.append(probs.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    # Initialize Model
+    model = WideDeepResFunnel()
+    model.to(device)
+
+    # Optimizer & Loss
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Training Loop
+    best_auc = 0.0
+    patience_counter = 0
+
+    print("Starting training...")
+    start_time = time.time()
+
+    for epoch in range(Config.EPOCHS):
+        epoch_start = time.time()
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, Config.AUX_LOSS_WEIGHTS
+        )
+
+        val_auc = validate(model, val_loader, device)
+=======
+    # Initialize Model
+    model = ResFunnelGLU()
+    model.to(device)
+
+    # Optimizer & Loss
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Training Loop
+    best_auc = 0.0
+    patience_counter = 0
+
+    print("Starting training...")
+    start_time = time.time()
+
+    for epoch in range(Config.EPOCHS):
+        epoch_start = time.time()
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        val_auc = validate(model, val_loader, device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import WideDeepResFunnel
+from library.train_eval import train_one_epoch, validate
+
+
+def run():
+    # --------------------------------------------------------------------------
+    # 1. Setup and Configuration
+    # --------------------------------------------------------------------------
+    # Ensure submission directory exists
+    os.makedirs("./submission", exist_ok=True)
+
+    # Set random seeds for reproducibility
+    seed = Config.SEED
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = torch.device(Config.DEVICE)
+    print(f"Running on device: {device}")
+
+    # --------------------------------------------------------------------------
+    # 2. Data Loading
+    # --------------------------------------------------------------------------
+    print("Loading data...")
+    # Use cached data for speed as per instructions
+    train_loader, val_loader, test_loader, test_ids = get_dataloaders(
+        load_cached_data=True
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. Model Initialization & Training
+    # --------------------------------------------------------------------------
+    model = WideDeepResFunnel()
+    model.to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Limit epochs for fast baseline execution while ensuring convergence
+    epochs = 20
+    best_auc = 0.0
+    patience = 0
+    best_model_path = Config.MODEL_SAVE_PATH
+
+    print(f"Starting training for {epochs} epochs...")
+
+    for epoch in range(epochs):
+        start_time = time.time()
+
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, Config.AUX_LOSS_WEIGHTS
+        )
+
+        # Validate
+        val_auc = validate(model, val_loader, device)
+
+        epoch_time = time.time() - start_time
+        print(
+            f"Epoch {epoch+1}/{epochs} | Time: {epoch_time:.2f}s | Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.6f}"
+        )
+
+        # Checkpointing & Early Stopping
+        if val_auc > best_auc:
+            best_auc = val_auc
+            patience = 0
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience += 1
+            if patience >= Config.EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
+                break
+
+    # --------------------------------------------------------------------------
+    # 4. Final Validation Assessment
+    # --------------------------------------------------------------------------
+    print("Loading best model for final evaluation...")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+    else:
+        print("Warning: Best model file not found. Using current weights.")
+
+    model.eval()
+
+    # Collect predictions and targets for the full validation set
+    val_preds = []
+    val_targets = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+            targets = batch["target"].to(device)
+
+            logits, _, _ = model(numeric, categorical)
+            probs = torch.sigmoid(logits)
+
+            val_preds.append(probs.cpu().numpy())
+            val_targets.append(targets.cpu().numpy())
+=======
+from library.model import ResFunnelGLU
+from library.train_eval import train_one_epoch, validate
+
+
+def run():
+    # --------------------------------------------------------------------------
+    # 1. Setup and Configuration
+    # --------------------------------------------------------------------------
+    # Ensure submission directory exists
+    os.makedirs("./submission", exist_ok=True)
+
+    # Set random seeds for reproducibility
+    seed = Config.SEED
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = torch.device(Config.DEVICE)
+    print(f"Running on device: {device}")
+
+    # --------------------------------------------------------------------------
+    # 2. Data Loading
+    # --------------------------------------------------------------------------
+    print("Loading data...")
+    # Use cached data for speed as per instructions
+    train_loader, val_loader, test_loader, test_ids = get_dataloaders(
+        load_cached_data=True
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. Model Initialization & Training
+    # --------------------------------------------------------------------------
+    model = ResFunnelGLU()
+    model.to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Limit epochs for fast baseline execution while ensuring convergence
+    epochs = Config.EPOCHS
+    best_auc = 0.0
+    patience = 0
+    best_model_path = Config.MODEL_SAVE_PATH
+
+    print(f"Starting training for {epochs} epochs...")
+
+    for epoch in range(epochs):
+        start_time = time.time()
+
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+
+        # Validate
+        val_auc = validate(model, val_loader, device)
+
+        epoch_time = time.time() - start_time
+        print(
+            f"Epoch {epoch+1}/{epochs} | Time: {epoch_time:.2f}s | Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.6f}"
+        )
+
+        # Checkpointing & Early Stopping
+        if val_auc > best_auc:
+            best_auc = val_auc
+            patience = 0
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience += 1
+            if patience >= Config.EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
+                break
+
+    # --------------------------------------------------------------------------
+    # 4. Final Validation Assessment
+    # --------------------------------------------------------------------------
+    print("Loading best model for final evaluation...")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+    else:
+        print("Warning: Best model file not found. Using current weights.")
+
+    model.eval()
+
+    # Collect predictions and targets for the full validation set
+    val_preds = []
+    val_targets = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            numeric = batch["numeric"].to(device)
+            categorical = batch["categorical"].to(device)
+            targets = batch["target"].to(device)
+
+            logits = model(numeric, categorical)
+            probs = torch.sigmoid(logits)
+
+            val_preds.append(probs.cpu().numpy())
+            val_targets.append(targets.cpu().numpy())
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    if final_auc > threshold:
+        print(
+            f"\nValidation metric {final_auc} > {threshold}. Generating submission..."
+        )
+
+        test_preds = []
+        with torch.no_grad():
+            for batch in test_loader:
+                numeric = batch["numeric"].to(device)
+                categorical = batch["categorical"].to(device)
+
+                logits, _, _ = model(numeric, categorical)
+                probs = torch.sigmoid(logits)
+                test_preds.append(probs.cpu().numpy())
+=======
+    if final_auc > threshold:
+        print(
+            f"\nValidation metric {final_auc} > {threshold}. Generating submission..."
+        )
+
+        test_preds = []
+        with torch.no_grad():
+            for batch in test_loader:
+                numeric = batch["numeric"].to(device)
+                categorical = batch["categorical"].to(device)
+
+                logits = model(numeric, categorical)
+                probs = torch.sigmoid(logits)
+                test_preds.append(probs.cpu().numpy())
+>>>>>>> REPLACE
+```

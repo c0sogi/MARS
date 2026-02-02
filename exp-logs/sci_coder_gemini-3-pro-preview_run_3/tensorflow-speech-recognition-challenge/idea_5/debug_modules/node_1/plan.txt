@@ -1,0 +1,413 @@
+To resolve the `OSError: undefined symbol` caused by binary incompatibility between `torch` and the `torchaudio` extension (Cite debug_lesson_1), I will remove the dependency on `torchaudio` entirely from `library/dataset.py`. I will replace it with native implementations using `soundfile` for audio I/O and standard `torch` operations for signal processing. Specifically, I will:
+
+1.  Replace `import torchaudio` with `import soundfile as sf`.
+2.  Implement a helper function `create_mel_filterbank` using `numpy` to generate the Mel basis matrix, replacing `torchaudio.transforms.MelSpectrogram`.
+3.  Update `SpeechCommandsDataset` to:
+    *   Use `sf.read` instead of `torchaudio.load` in `_get_audio` and the silence cache initialization.
+    *   Compute the Mel Spectrogram manually in `__getitem__` using `torch.stft`, the precomputed Mel basis, and matrix multiplication.
+    *   Implement `AmplitudeToDB` and masking augmentations (`freq_mask`, `time_mask`) using basic tensor operations.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+import os
+import torch
+import torchaudio
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from library.config import Config
+
+
+class SpeechCommandsDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, mode: str = "train"):
+        """
+        Args:
+            df (pd.DataFrame): DataFrame containing 'filepath', 'label', etc.
+            mode (str): 'train', 'val', or 'test'. Controls augmentation and silence handling.
+        """
+        self.df = df.reset_index(drop=True)
+        self.mode = mode
+        self.target_length = Config.N_SAMPLES
+
+        # Define Multi-Resolution MelSpectrogram transforms
+        # We use a fixed n_fft that covers the largest window size (960) -> 2048
+        self.mel_transforms = torch.nn.ModuleList(
+            [
+                torchaudio.transforms.MelSpectrogram(
+                    sample_rate=Config.SAMPLE_RATE,
+                    n_fft=2048,
+                    win_length=win_size,
+                    hop_length=Config.HOP_LENGTH,
+                    n_mels=Config.N_MELS,
+                    f_min=Config.F_MIN,
+                    f_max=Config.F_MAX,
+                    power=2.0,
+                )
+                for win_size in Config.WINDOW_SIZES
+            ]
+        )
+
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(
+            stype="power", top_db=80
+        )
+
+        # Augmentation
+        self.freq_masking = torchaudio.transforms.FrequencyMasking(
+            freq_mask_param=Config.FREQ_MASK_PARAM
+        )
+        self.time_masking = torchaudio.transforms.TimeMasking(
+            time_mask_param=Config.TIME_MASK_PARAM
+        )
+
+        # Cache background noise files for 'silence' class to avoid repeated IO
+        self.silence_cache = {}
+        if "label" in self.df.columns:
+            silence_files = self.df[self.df["label"] == "silence"]["filepath"].unique()
+            for rel_path in silence_files:
+                full_path = os.path.join(Config.INPUT_DIR, rel_path)
+                if os.path.exists(full_path):
+                    try:
+                        wav, sr = torchaudio.load(full_path)
+                        # Resample if necessary (though analysis says 16k)
+                        if sr != Config.SAMPLE_RATE:
+                            resampler = torchaudio.transforms.Resample(
+                                sr, Config.SAMPLE_RATE
+                            )
+                            wav = resampler(wav)
+                        # Ensure mono
+                        if wav.shape[0] > 1:
+                            wav = torch.mean(wav, dim=0, keepdim=True)
+                        self.silence_cache[rel_path] = wav
+                    except Exception as e:
+                        print(f"Warning: Failed to load silence file {rel_path}: {e}")
+
+    def __len__(self):
+        return len(self.df)
+
+    def _get_audio(self, idx):
+        row = self.df.iloc[idx]
+        filepath = row["filepath"]
+        label = row["label"] if "label" in row else "unknown"
+
+        # Handle Silence (Background Noise)
+        if label == "silence" and filepath in self.silence_cache:
+            full_wav = self.silence_cache[filepath]
+            wav_len = full_wav.shape[-1]
+
+            if self.mode == "train":
+                # Random crop for training
+                if wav_len > self.target_length:
+                    offset = torch.randint(
+                        0, wav_len - self.target_length + 1, (1,)
+                    ).item()
+                    wav = full_wav[:, offset : offset + self.target_length]
+                else:
+                    wav = full_wav
+            else:
+                # Deterministic crop for val/test (take the beginning or center)
+                # Taking the beginning is safer for consistency
+                if wav_len > self.target_length:
+                    wav = full_wav[:, : self.target_length]
+                else:
+                    wav = full_wav
+        else:
+            # Standard Audio Loading
+            full_path = os.path.join(Config.INPUT_DIR, filepath)
+            if not os.path.exists(full_path):
+                # Fallback for missing files (should not happen based on validation)
+                return torch.zeros(1, self.target_length)
+
+            wav, sr = torchaudio.load(full_path)
+
+            if sr != Config.SAMPLE_RATE:
+                resampler = torchaudio.transforms.Resample(sr, Config.SAMPLE_RATE)
+                wav = resampler(wav)
+
+            if wav.shape[0] > 1:
+                wav = torch.mean(wav, dim=0, keepdim=True)
+
+        # Pad or Crop to fixed length
+        c, n = wav.shape
+        if n < self.target_length:
+            # Pad
+            padding = self.target_length - n
+            # Center padding usually works well, but right padding is standard for RNNs
+            wav = torch.nn.functional.pad(wav, (0, padding))
+        elif n > self.target_length:
+            # Crop (Center crop for non-silence standard files)
+            start = (n - self.target_length) // 2
+            wav = wav[:, start : start + self.target_length]
+
+        return wav
+
+    def __getitem__(self, idx):
+        # 1. Load Audio
+        waveform = self._get_audio(idx)
+
+        # 2. Compute Multi-Resolution Spectrograms
+        # waveform shape: (1, 16000)
+        specs = []
+        for transform in self.mel_transforms:
+            # Spec shape: (1, n_mels, time)
+            spec = transform(waveform)
+            specs.append(spec)
+
+        # Stack along channel dimension: (3, n_mels, time)
+        multi_res_spec = torch.cat(specs, dim=0)
+
+        # Convert to Log-Mel (dB)
+        multi_res_spec = self.amplitude_to_db(multi_res_spec)
+
+        # 3. Augmentation (Train only)
+        if self.mode == "train":
+            # Apply masking. Note: Torchaudio masks apply to (..., freq, time).
+            # We apply to the whole 3-channel block. The mask will be applied
+            # independently per channel if passed as (3, F, T) or same if we force it.
+            # Standard torchaudio behavior on (C, F, T) is independent masks or error depending on version.
+            # To ensure structural consistency (masking same time step across channels),
+            # we can apply mask to one and broadcast, but independent masking is a stronger regularizer.
+            # We will apply directly.
+            try:
+                multi_res_spec = self.freq_masking(multi_res_spec)
+                multi_res_spec = self.time_masking(multi_res_spec)
+            except:
+                pass  # Fallback if dimension mismatch occurs in specific versions
+
+        # 4. Label
+        label_str = self.df.iloc[idx]["label"]
+        label_id = Config.LABEL2ID.get(label_str, Config.LABEL2ID["unknown"])
+
+        return multi_res_spec, label_id
+=======
+import os
+import torch
+import soundfile as sf
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from library.config import Config
+
+
+def create_mel_filterbank(sr, n_fft, n_mels, f_min, f_max):
+    """
+    Creates a Mel filterbank matrix using NumPy.
+    """
+    # FFT bin frequencies
+    fft_freqs = np.linspace(0, sr / 2, n_fft // 2 + 1)
+
+    # Mel scale conversion
+    def hz_to_mel(f):
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+
+    def mel_to_hz(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    # Mel points
+    m_min = hz_to_mel(f_min)
+    m_max = hz_to_mel(f_max)
+    m_pts = np.linspace(m_min, m_max, n_mels + 2)
+    f_pts = mel_to_hz(m_pts)
+
+    # Map to FFT bins
+    bin_pts = np.floor((n_fft + 1) * f_pts / sr).astype(int)
+
+    filters = np.zeros((n_mels, n_fft // 2 + 1))
+
+    for i in range(n_mels):
+        start = bin_pts[i]
+        center = bin_pts[i + 1]
+        end = bin_pts[i + 2]
+
+        if center > start:
+            filters[i, start:center] = (np.arange(start, center) - start) / (
+                center - start
+            )
+        if end > center:
+            filters[i, center:end] = (end - np.arange(center, end)) / (end - center)
+
+    return filters
+
+
+class SpeechCommandsDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, mode: str = "train"):
+        """
+        Args:
+            df (pd.DataFrame): DataFrame containing 'filepath', 'label', etc.
+            mode (str): 'train', 'val', or 'test'. Controls augmentation and silence handling.
+        """
+        self.df = df.reset_index(drop=True)
+        self.mode = mode
+        self.target_length = Config.N_SAMPLES
+
+        # Precompute Mel Filterbanks
+        self.mel_bases = []
+        for _ in Config.WINDOW_SIZES:
+            # n_fft is fixed to 2048 to cover largest window
+            mel_basis = create_mel_filterbank(
+                Config.SAMPLE_RATE, 2048, Config.N_MELS, Config.F_MIN, Config.F_MAX
+            )
+            self.mel_bases.append(torch.from_numpy(mel_basis).float())
+
+        # Cache background noise files for 'silence' class to avoid repeated IO
+        self.silence_cache = {}
+        if "label" in self.df.columns:
+            silence_files = self.df[self.df["label"] == "silence"]["filepath"].unique()
+            for rel_path in silence_files:
+                full_path = os.path.join(Config.INPUT_DIR, rel_path)
+                if os.path.exists(full_path):
+                    try:
+                        # Use soundfile instead of torchaudio
+                        wav_np, sr = sf.read(full_path)
+                        wav = torch.from_numpy(wav_np).float()
+                        if wav.dim() == 1:
+                            wav = wav.unsqueeze(0)  # (1, T)
+                        elif wav.dim() == 2:
+                            wav = wav.t()  # (C, T)
+
+                        # Resample if necessary
+                        if sr != Config.SAMPLE_RATE:
+                            wav = torch.nn.functional.interpolate(
+                                wav.unsqueeze(0),
+                                size=int(wav.shape[1] * Config.SAMPLE_RATE / sr),
+                                mode="linear",
+                                align_corners=False,
+                            ).squeeze(0)
+
+                        # Ensure mono
+                        if wav.shape[0] > 1:
+                            wav = torch.mean(wav, dim=0, keepdim=True)
+                        self.silence_cache[rel_path] = wav
+                    except Exception as e:
+                        print(f"Warning: Failed to load silence file {rel_path}: {e}")
+
+    def __len__(self):
+        return len(self.df)
+
+    def _get_audio(self, idx):
+        row = self.df.iloc[idx]
+        filepath = row["filepath"]
+        label = row["label"] if "label" in row else "unknown"
+
+        # Handle Silence (Background Noise)
+        if label == "silence" and filepath in self.silence_cache:
+            full_wav = self.silence_cache[filepath]
+            wav_len = full_wav.shape[-1]
+
+            if self.mode == "train":
+                # Random crop for training
+                if wav_len > self.target_length:
+                    offset = torch.randint(
+                        0, wav_len - self.target_length + 1, (1,)
+                    ).item()
+                    wav = full_wav[:, offset : offset + self.target_length]
+                else:
+                    wav = full_wav
+            else:
+                # Deterministic crop for val/test
+                if wav_len > self.target_length:
+                    wav = full_wav[:, : self.target_length]
+                else:
+                    wav = full_wav
+        else:
+            # Standard Audio Loading
+            full_path = os.path.join(Config.INPUT_DIR, filepath)
+            if not os.path.exists(full_path):
+                return torch.zeros(1, self.target_length)
+
+            # Use soundfile
+            wav_np, sr = sf.read(full_path)
+            wav = torch.from_numpy(wav_np).float()
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            elif wav.dim() == 2:
+                wav = wav.t()
+
+            if sr != Config.SAMPLE_RATE:
+                wav = torch.nn.functional.interpolate(
+                    wav.unsqueeze(0),
+                    size=int(wav.shape[1] * Config.SAMPLE_RATE / sr),
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0)
+
+            if wav.shape[0] > 1:
+                wav = torch.mean(wav, dim=0, keepdim=True)
+
+        # Pad or Crop to fixed length
+        c, n = wav.shape
+        if n < self.target_length:
+            padding = self.target_length - n
+            wav = torch.nn.functional.pad(wav, (0, padding))
+        elif n > self.target_length:
+            start = (n - self.target_length) // 2
+            wav = wav[:, start : start + self.target_length]
+
+        return wav
+
+    def __getitem__(self, idx):
+        # 1. Load Audio
+        waveform = self._get_audio(idx)
+
+        # 2. Compute Multi-Resolution Spectrograms
+        specs = []
+        for i, win_size in enumerate(Config.WINDOW_SIZES):
+            # Create window
+            window = torch.hann_window(win_size)
+            # STFT
+            stft = torch.stft(
+                waveform,
+                n_fft=2048,
+                hop_length=Config.HOP_LENGTH,
+                win_length=win_size,
+                window=window,
+                center=True,
+                return_complex=True,
+            )
+            # Power Spectrogram: (1, F, T)
+            power_spec = stft.abs().pow(2.0)
+
+            # Apply Mel Basis: (n_mels, F) @ (1, F, T) -> (1, n_mels, T)
+            # We use broadcasting or explicit matmul.
+            # mel_basis is (n_mels, F), power_spec is (1, F, T)
+            # We want (1, n_mels, T).
+            mel_spec = torch.matmul(self.mel_bases[i], power_spec)
+            specs.append(mel_spec)
+
+        # Stack: (3, n_mels, time)
+        multi_res_spec = torch.cat(specs, dim=0)
+
+        # Convert to Log-Mel (dB)
+        # 10 * log10(x)
+        multi_res_spec = 10.0 * torch.log10(
+            torch.clamp(multi_res_spec, min=1e-10)
+        )
+        top_db = 80.0
+        max_val = multi_res_spec.max()
+        multi_res_spec = torch.clamp(multi_res_spec, min=max_val - top_db)
+
+        # 3. Augmentation (Train only)
+        if self.mode == "train":
+            # Frequency Masking
+            F = Config.FREQ_MASK_PARAM
+            if F > 0:
+                f_len = multi_res_spec.shape[1]
+                f = np.random.randint(1, F + 1)
+                f0 = np.random.randint(0, f_len - f + 1)
+                multi_res_spec[:, f0 : f0 + f, :] = multi_res_spec.min()
+
+            # Time Masking
+            T = Config.TIME_MASK_PARAM
+            if T > 0:
+                t_len = multi_res_spec.shape[2]
+                t = np.random.randint(1, T + 1)
+                t0 = np.random.randint(0, t_len - t + 1)
+                multi_res_spec[:, :, t0 : t0 + t] = multi_res_spec.min()
+
+        # 4. Label
+        label_str = self.df.iloc[idx]["label"]
+        label_id = Config.LABEL2ID.get(label_str, Config.LABEL2ID["unknown"])
+
+        return multi_res_spec, label_id
+>>>>>>> REPLACE
+```

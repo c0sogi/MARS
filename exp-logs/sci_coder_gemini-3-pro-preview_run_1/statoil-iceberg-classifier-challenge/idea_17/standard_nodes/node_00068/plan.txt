@@ -1,0 +1,373 @@
+To optimize the solution, I will focus on removing the Consistency Regularization and reverting to a robust supervised training pipeline with Test-Time Augmentation (TTA), as suggested by **Lesson 00066**. The previous attempt's use of consistency loss likely interfered with the optimization on this small dataset.
+
+Here is the strategy:
+1.  **Configuration**: Lower the learning rate to `2e-4` and weight decay to `1e-4` to stabilize fine-tuning (Cite **Lesson 00067**, **Lesson 00009**). Remove consistency loss weights.
+2.  **Optimization**: Replace `ConsistencyLoss` with a standard `IcebergLoss` (BCEWithLogits + Label Smoothing). This simplifies the objective function and prevents the conflict between consistency and discrimination (Cite **Lesson 00066**).
+3.  **Data Loading**: Modify `IcebergDataset` to return a single augmented image during training instead of dual views, as we are dropping the consistency constraint.
+4.  **Training Engine**: Update the training loop to handle single inputs and the new loss function.
+5.  **Execution**: In `runfile.py`, relax the "fast baseline" constraints. I will increase the calibration epochs to 50 and the ensemble size to 5 to maximize performance within the 4-hour limit (Cite **Lesson 00038** regarding sufficient gradient steps).
+
+```diff
+library/configuration.py
+<<<<<<< SEARCH
+    # Optimizer (AdamW)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 0.01
+
+    # Scheduler (ReduceLROnPlateau)
+    SCHEDULER_FACTOR = 0.5
+    SCHEDULER_PATIENCE = 3
+
+    # Loss Functions
+    LABEL_SMOOTHING = 0.05
+    # Weight for the Geometric Consistency Regularization term
+    CONSISTENCY_LOSS_WEIGHT = 1.0
+=======
+    # Optimizer (AdamW)
+    # Lower LR and Weight Decay for stable fine-tuning (Cite Lesson 00067, 00009)
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 1e-4
+
+    # Scheduler (ReduceLROnPlateau)
+    SCHEDULER_FACTOR = 0.5
+    SCHEDULER_PATIENCE = 3
+
+    # Loss Functions
+    LABEL_SMOOTHING = 0.05
+>>>>>>> REPLACE
+```
+
+```diff
+library/optimization.py
+<<<<<<< SEARCH
+class ConsistencyLoss(nn.Module):
+    """
+    Custom loss function implementing BCE with Label Smoothing and Geometric Consistency Regularization.
+
+    Formula:
+        L = BCEWithLogits(f(x), y_smooth) + lambda * ||sigma(f(x)) - sigma(f(x'))||^2
+
+    Where:
+        f(x) is the output for the first view.
+        f(x') is the output for the second view.
+        sigma is the sigmoid function.
+        lambda is the consistency weight.
+    """
+
+    def __init__(self):
+        super(ConsistencyLoss, self).__init__()
+        self.smoothing = Config.LABEL_SMOOTHING
+        self.consistency_weight = Config.CONSISTENCY_LOSS_WEIGHT
+
+    def forward(self, logits1, logits2, targets):
+        """
+        Args:
+            logits1 (torch.Tensor): Logits from the first augmented view (Batch, 1).
+            logits2 (torch.Tensor): Logits from the second augmented view (Batch, 1).
+            targets (torch.Tensor): Ground truth labels (Batch,).
+        """
+        # Ensure targets are the correct shape (Batch, 1)
+        targets = targets.view(-1, 1)
+
+        # 1. Label Smoothing
+        # y_smooth = y * (1 - epsilon) + 0.5 * epsilon
+        with torch.no_grad():
+            targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+
+        # 2. BCE Loss on the first view
+        # We use binary_cross_entropy_with_logits for numerical stability
+        bce_loss = F.binary_cross_entropy_with_logits(logits1, targets_smooth)
+
+        # 3. Consistency Loss (MSE between probabilities)
+        probs1 = torch.sigmoid(logits1)
+        probs2 = torch.sigmoid(logits2)
+        consistency_loss = F.mse_loss(probs1, probs2)
+
+        # 4. Total Loss
+        total_loss = bce_loss + self.consistency_weight * consistency_loss
+
+        return total_loss
+=======
+class IcebergLoss(nn.Module):
+    """
+    Standard BCE Loss with Label Smoothing.
+    Replaces ConsistencyLoss to prioritize discriminative learning (Cite Lesson 00066).
+    """
+
+    def __init__(self):
+        super(IcebergLoss, self).__init__()
+        self.smoothing = Config.LABEL_SMOOTHING
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits (torch.Tensor): Logits (Batch, 1).
+            targets (torch.Tensor): Ground truth labels (Batch,).
+        """
+        targets = targets.view(-1, 1)
+
+        # Label Smoothing
+        with torch.no_grad():
+            targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+
+        return self.bce(logits, targets_smooth)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+        if self.mode == "train":
+            # Dual-View for Consistency Regularization
+            if self.transform:
+                # Apply transform twice to get two different views
+                aug1 = self.transform(image=image)["image"]
+                aug2 = self.transform(image=image)["image"]
+            else:
+                # Fallback to tensor conversion if no transform provided
+                converter = ToTensorV2()
+                aug1 = converter(image=image)["image"]
+                aug2 = converter(image=image)["image"]
+
+            label = self.labels[idx]
+            return (
+                (aug1, aug2),
+                torch.tensor(angle, dtype=torch.float32),
+                torch.tensor(label, dtype=torch.float32),
+            )
+=======
+        if self.mode == "train":
+            # Single view for standard training (Cite Lesson 00066)
+            if self.transform:
+                image = self.transform(image=image)["image"]
+            else:
+                converter = ToTensorV2()
+                image = converter(image=image)["image"]
+
+            label = self.labels[idx]
+            return (
+                image,
+                torch.tensor(angle, dtype=torch.float32),
+                torch.tensor(label, dtype=torch.float32),
+            )
+>>>>>>> REPLACE
+```
+
+```diff
+library/training_engine.py
+<<<<<<< SEARCH
+def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch):
+    """
+    Trains the model for one epoch using Geometric Consistency Regularization.
+
+    Args:
+        model (nn.Module): The model to train.
+        loader (DataLoader): Training dataloader returning ((img1, img2), angle, label).
+        optimizer (Optimizer): The optimizer.
+        loss_fn (nn.Module): The ConsistencyLoss function.
+        device (str): Device to run on.
+        epoch (int): Current epoch number.
+
+    Returns:
+        float: Average loss for the epoch.
+    """
+    model.train()
+    losses = AverageMeter()
+
+    for batch_idx, (images, angles, labels) in enumerate(loader):
+        # Unpack dual views
+        img1, img2 = images
+
+        # Move to device
+        img1 = img1.to(device, non_blocking=True)
+        img2 = img2.to(device, non_blocking=True)
+        angles = angles.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward passes
+        logits1 = model(img1, angles)
+        logits2 = model(img2, angles)
+
+        # Compute Consistency Loss
+        loss = loss_fn(logits1, logits2, labels)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Update metrics
+        losses.update(loss.item(), img1.size(0))
+
+    print(f"Epoch {epoch} Train Loss: {losses.avg}")
+    return losses.avg
+=======
+def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch):
+    """
+    Trains the model for one epoch using standard supervision.
+
+    Args:
+        model (nn.Module): The model to train.
+        loader (DataLoader): Training dataloader returning (img, angle, label).
+        optimizer (Optimizer): The optimizer.
+        loss_fn (nn.Module): The IcebergLoss function.
+        device (str): Device to run on.
+        epoch (int): Current epoch number.
+
+    Returns:
+        float: Average loss for the epoch.
+    """
+    model.train()
+    losses = AverageMeter()
+
+    for batch_idx, (images, angles, labels) in enumerate(loader):
+        # Move to device
+        images = images.to(device, non_blocking=True)
+        angles = angles.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(images, angles)
+
+        # Compute Loss
+        loss = loss_fn(logits, labels)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        # Update metrics
+        losses.update(loss.item(), images.size(0))
+
+    print(f"Epoch {epoch} Train Loss: {losses.avg}")
+    return losses.avg
+>>>>>>> REPLACE
+```
+
+```diff
+library/training_engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, angles, _ in loader:
+            # Handle dual-view tuple if passed from train loader,
+            # though usually we use a clean loader for BN update.
+            if isinstance(images, (list, tuple)):
+                images = images[0]  # Take first view
+
+            images = images.to(device)
+=======
+    with torch.no_grad():
+        for images, angles, _ in loader:
+            images = images.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+library/experiment_manager.py
+<<<<<<< SEARCH
+from library.optimization import ConsistencyLoss, get_optimizer, get_scheduler
+=======
+from library.optimization import IcebergLoss, get_optimizer, get_scheduler
+>>>>>>> REPLACE
+```
+
+```diff
+library/experiment_manager.py
+<<<<<<< SEARCH
+            # Initialize Model & Optimization
+            model = IcebergResNet().to(self.device)
+            optimizer = get_optimizer(model)
+            scheduler = get_scheduler(optimizer)
+            criterion = ConsistencyLoss()
+
+            best_fold_loss = float("inf")
+=======
+            # Initialize Model & Optimization
+            model = IcebergResNet().to(self.device)
+            optimizer = get_optimizer(model)
+            scheduler = get_scheduler(optimizer)
+            criterion = IcebergLoss()
+
+            best_fold_loss = float("inf")
+>>>>>>> REPLACE
+```
+
+```diff
+library/experiment_manager.py
+<<<<<<< SEARCH
+            model = IcebergResNet().to(self.device)
+            optimizer = get_optimizer(model)
+            scheduler = get_scheduler(optimizer)
+            criterion = ConsistencyLoss()
+
+            # 1. Standard Training Phase
+=======
+            model = IcebergResNet().to(self.device)
+            optimizer = get_optimizer(model)
+            scheduler = get_scheduler(optimizer)
+            criterion = IcebergLoss()
+
+            # 1. Standard Training Phase
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.optimization import get_optimizer, get_scheduler, ConsistencyLoss
+=======
+from library.optimization import get_optimizer, get_scheduler, IcebergLoss
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Configuration for Fast Baseline Execution
+    # Reducing epochs to ensure completion within time limits while maintaining convergence
+    Config.MAX_EPOCHS_PHASE_1 = 30
+    Config.NUM_ENSEMBLE_MODELS = 3
+    Config.SWA_EPOCHS = 10
+
+    print("Configuration configured for fast baseline.")
+    print(f"Phase 1 Epochs: {Config.MAX_EPOCHS_PHASE_1}")
+    print(f"Ensemble Size: {Config.NUM_ENSEMBLE_MODELS}")
+=======
+    # Override Configuration for Optimized Execution
+    # Increasing epochs and ensemble size for better performance (Cite Lesson 00038)
+    Config.MAX_EPOCHS_PHASE_1 = 50
+    Config.NUM_ENSEMBLE_MODELS = 5
+    Config.SWA_EPOCHS = 12
+
+    print("Configuration configured for performance optimization.")
+    print(f"Phase 1 Epochs: {Config.MAX_EPOCHS_PHASE_1}")
+    print(f"Ensemble Size: {Config.NUM_ENSEMBLE_MODELS}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Initialize Model for Validation Run
+    val_model = IcebergResNet().to(Config.DEVICE)
+    optimizer = get_optimizer(val_model)
+    scheduler = get_scheduler(optimizer)
+    criterion = ConsistencyLoss()
+
+    # Train for the determined best_epoch
+=======
+    # Initialize Model for Validation Run
+    val_model = IcebergResNet().to(Config.DEVICE)
+    optimizer = get_optimizer(val_model)
+    scheduler = get_scheduler(optimizer)
+    criterion = IcebergLoss()
+
+    # Train for the determined best_epoch
+>>>>>>> REPLACE
+```

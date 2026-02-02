@@ -1,0 +1,311 @@
+I will implement the **Dual-Pooling Contracted Network (DPCNet)** strategy which was identified as the superior architecture in Lesson `solution_lesson_node_00073`. This involves replacing the multiplicative gating mechanism (which caused instability) with simple feature concatenation for the incidence angle metadata. I will also adjust the convolutional backbone to use a `[64, 128, 128, 64]` filter progression with **Dual-Stream Pooling** (Lesson `solution_lesson_node_00070`) and a terminal channel contraction (Lesson `solution_lesson_node_00041`) to control parameter count. Finally, I will remove the artificial epoch limit in the runfile to enable the "Low and Slow" training regimen (Lesson `solution_lesson_node_00023`) required for convergence on this noisy dataset.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+# GDP-Net Specifics
+CONTRACTED_FILTERS = 32  # Filters in the final conv block before pooling
+GATING_VECTOR_DIM = 64  # Dimension of the incidence angle gating vector
+DROPOUT_RATE = 0.2  # Dropout probability in the dense head
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS
+# =============================================================================
+SEED = 42
+NUM_FOLDS = 5
+BATCH_SIZE = 32
+LEARNING_RATE = 2e-4
+MAX_EPOCHS = 100  # Upper limit, controlled by Early Stopping
+=======
+# DPC-Net Specifics
+CONTRACTED_FILTERS = 64  # Filters in the final conv block before pooling (Cite solution_lesson_node_00041)
+DROPOUT_RATE = 0.2  # Dropout probability in the dense head
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS
+# =============================================================================
+SEED = 42
+NUM_FOLDS = 5
+BATCH_SIZE = 32
+LEARNING_RATE = 2e-4  # Low learning rate (Cite solution_lesson_node_00023)
+MAX_EPOCHS = 100  # Upper limit, controlled by Early Stopping
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class GDPNetBlock(nn.Module):
+    """
+    A single block of the GDP-Net Visual Branch.
+    Structure: Conv -> BN -> ReLU -> CBAM -> DualPooling
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(GDPNetBlock, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.cbam = CBAM(out_channels)
+        self.pool = DualPooling()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.cbam(x)
+        x = self.pool(x)
+        return x
+
+
+class GDPNet(nn.Module):
+    def __init__(self):
+        super(GDPNet, self).__init__()
+
+        # --- Visual Branch (Backbone) ---
+        # 4-Stage CNN with Dual Pooling
+
+        # Block 1: Input 3 -> Conv 32 -> Pool (32+32=64)
+        # 75x75 -> 37x37
+        self.block1 = GDPNetBlock(config.NUM_INPUT_CHANNELS, 32)
+
+        # Block 2: Input 64 -> Conv 48 -> Pool (48+48=96)
+        # 37x37 -> 18x18
+        self.block2 = GDPNetBlock(64, 48)
+
+        # Block 3: Input 96 -> Conv 64 -> Pool (64+64=128)
+        # 18x18 -> 9x9
+        self.block3 = GDPNetBlock(96, 64)
+
+        # Block 4: Input 128 -> Conv 32 (Contracted) -> Pool (32+32=64)
+        # 9x9 -> 4x4
+        self.block4 = GDPNetBlock(128, config.CONTRACTED_FILTERS)
+
+        # --- Metadata Branch (Gating Generator) ---
+        # Maps incidence angle to a gating vector matching the visual feature depth (64)
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, config.GATING_VECTOR_DIM),
+            nn.Sigmoid(),
+        )
+
+        # --- Classification Head ---
+        # Final visual map is 64 x 4 x 4 = 1024
+        # We concatenate the raw incidence angle (1 dim)
+        self.head_input_dim = (config.CONTRACTED_FILTERS * 2 * 4 * 4) + 1
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.head_input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(256, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, inc_angle):
+        # x: [Batch, 3, 75, 75]
+        # inc_angle: [Batch] or [Batch, 1]
+
+        # Ensure inc_angle is [Batch, 1]
+        if inc_angle.dim() == 1:
+            inc_angle = inc_angle.view(-1, 1)
+
+        # 1. Visual Branch
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)  # Output: [Batch, 64, 4, 4]
+
+        # 2. Metadata Branch (Gating)
+        gating_vector = self.meta_mlp(inc_angle)  # Output: [Batch, 64]
+
+        # 3. Gated Fusion
+        # Reshape gate for broadcasting: [Batch, 64, 1, 1]
+        gate = gating_vector.view(-1, config.GATING_VECTOR_DIM, 1, 1)
+
+        # Element-wise multiplication (Modulation)
+        x = x * gate
+
+        # Flatten visual features
+        x = x.view(x.size(0), -1)  # Output: [Batch, 1024]
+
+        # Concatenate with raw incidence angle
+        x = torch.cat([x, inc_angle], dim=1)  # Output: [Batch, 1025]
+
+        # 4. Classification
+        out = self.classifier(x)
+
+        return out
+=======
+class DPCNetBlock(nn.Module):
+    """
+    A single block of the DPC-Net (Dual-Pooling Contracted Network).
+    Structure: Conv -> BN -> ReLU -> CBAM -> DualPooling
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(DPCNetBlock, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.cbam = CBAM(out_channels)
+        self.pool = DualPooling()  # Cite solution_lesson_node_00070
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.cbam(x)
+        x = self.pool(x)
+        return x
+
+
+class DPCNet(nn.Module):
+    def __init__(self):
+        super(DPCNet, self).__init__()
+
+        # --- Visual Branch (Backbone) ---
+        # 4-Stage CNN with Dual Pooling
+        # Backbone width strategy: [64, 128, 128, 64] (Cite solution_lesson_node_00049)
+
+        # Block 1: Input 3 -> Conv 64 -> Pool (64+64=128)
+        # 75x75 -> 37x37
+        self.block1 = DPCNetBlock(config.NUM_INPUT_CHANNELS, 64)
+
+        # Block 2: Input 128 -> Conv 128 -> Pool (128+128=256)
+        # 37x37 -> 18x18
+        self.block2 = DPCNetBlock(128, 128)
+
+        # Block 3: Input 256 -> Conv 128 -> Pool (128+128=256)
+        # 18x18 -> 9x9
+        self.block3 = DPCNetBlock(256, 128)
+
+        # Block 4: Input 256 -> Conv 64 (Contracted) -> Pool (64+64=128)
+        # 9x9 -> 4x4
+        # Cite solution_lesson_node_00041 (Channel Contraction)
+        self.block4 = DPCNetBlock(256, config.CONTRACTED_FILTERS)
+
+        # --- Classification Head ---
+        # Final visual map is 128 x 4 x 4 = 2048
+        # We concatenate the raw incidence angle (1 dim)
+        # Cite solution_lesson_node_00073 (Concatenation over Gating)
+        self.head_input_dim = (config.CONTRACTED_FILTERS * 2 * 4 * 4) + 1
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.head_input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(256, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, inc_angle):
+        # x: [Batch, 3, 75, 75]
+        # inc_angle: [Batch] or [Batch, 1]
+
+        # Ensure inc_angle is [Batch, 1]
+        if inc_angle.dim() == 1:
+            inc_angle = inc_angle.view(-1, 1)
+
+        # 1. Visual Branch
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)  # Output: [Batch, 128, 4, 4]
+
+        # Flatten visual features
+        x = x.view(x.size(0), -1)  # Output: [Batch, 2048]
+
+        # 2. Multimodal Fusion (Concatenation)
+        # Cite solution_lesson_node_00073
+        x = torch.cat([x, inc_angle], dim=1)  # Output: [Batch, 2049]
+
+        # 3. Classification
+        out = self.classifier(x)
+
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Model Initialization
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = model.GDPNet().to(device)
+
+    # 3. Setup Training Components
+=======
+    # 2. Model Initialization
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = model.DPCNet().to(device)
+
+    # 3. Setup Training Components
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override config for fast baseline execution
+    # Reducing epochs to ensure completion within time limit while allowing convergence
+    config.MAX_EPOCHS = 30
+    print(f"Configuration: MAX_EPOCHS set to {config.MAX_EPOCHS} for fast baseline.")
+
+    # 2. Data Loading
+=======
+    # 2. Data Loading
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Initialize Model and Training Components
+        net = model.GDPNet().to(device)
+        criterion = nn.BCEWithLogitsLoss()
+=======
+        # Initialize Model and Training Components
+        net = model.DPCNet().to(device)
+        criterion = nn.BCEWithLogitsLoss()
+>>>>>>> REPLACE
+```

@@ -1,0 +1,1035 @@
+To improve the model's performance on the semantic similarity task, I will implement a solution based on the **Lesson (solution_lesson_node_00001)** which advises against learning embeddings from scratch and recommends using pre-trained vectors. Given the availability of the `transformers` library and a GPU, I will replace the `SiameseDAN` (Deep Averaging Network) with a **Transformer-based architecture** (specifically `distilbert-base-uncased`). This model comes with pre-trained embeddings and a powerful encoder that can capture the semantic nuances better than a simple averaging network.
+
+My strategy involves the following targeted changes:
+1.  **Configuration**: Update hyperparameters in `library/config.py` to support a Transformer model (lower learning rate, smaller batch size, fewer epochs).
+2.  **Data Loading**: Modify `library/data_loader.py` to replace the custom `Vocabulary` with a HuggingFace `AutoTokenizer`. The input format will be changed to concatenate the anchor, target, and context into a single string: `[CLS] anchor [SEP] target [SEP] context [SEP]`.
+3.  **Model Architecture**: Replace the `SiameseDAN` class in `library/model.py` with a `PatentBert` class that utilizes `AutoModel` to generate a regression score from the `[CLS]` token embedding.
+4.  **Integration**: Update `library/trainer.py` and `runfile.py` to accommodate the changes in data loading (handling `input_ids` and `attention_mask` instead of raw text tensors) and model initialization.
+
+These changes directly address the limitation of the previous solution by injecting pre-trained linguistic knowledge into the model.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # ==========================================
+    # Data Processing Hyperparameters
+    # ==========================================
+    MAX_LEN = 32  # Max sequence length (based on EDA)
+    VOCAB_MIN_FREQ = 1  # Minimum frequency to include a token in vocab
+    UNK_TOKEN = "<UNK>"  # Token for unknown words
+    PAD_TOKEN = "<PAD>"  # Token for padding
+
+    # ==========================================
+    # Model Architecture Hyperparameters
+    # ==========================================
+    EMBEDDING_DIM = 100  # Dimension of word embeddings
+    CONTEXT_EMBEDDING_DIM = 32  # Dimension of context (CPC) embeddings
+    HIDDEN_DIM = 128  # Dimension of dense projection layers
+    DROPOUT = 0.2  # Dropout rate
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-3
+    EPOCHS = 25
+=======
+    # ==========================================
+    # Data Processing Hyperparameters
+    # ==========================================
+    MAX_LEN = 64  # Increased for concatenated input
+
+    # ==========================================
+    # Model Architecture Hyperparameters
+    # ==========================================
+    # Cite solution_lesson_node_00001: Using pre-trained transformer instead of scratch embeddings
+    MODEL_NAME = "distilbert-base-uncased"
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 2e-5
+    EPOCHS = 5
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from collections import Counter
+from library.config import Config
+
+
+class Vocabulary:
+    def __init__(self, min_freq=1):
+        self.min_freq = min_freq
+        self.itos = {0: Config.PAD_TOKEN, 1: Config.UNK_TOKEN}
+        self.stoi = {Config.PAD_TOKEN: 0, Config.UNK_TOKEN: 1}
+        self.freqs = Counter()
+
+    def __len__(self):
+        return len(self.itos)
+
+    def build_vocabulary(self, sentence_list):
+        """
+        Builds the vocabulary from a list of sentences.
+        """
+        for sentence in sentence_list:
+            if not isinstance(sentence, str):
+                continue
+            tokens = sentence.lower().split()
+            self.freqs.update(tokens)
+
+        idx = 2
+        # Sort to ensure deterministic ordering for same frequencies
+        for word, freq in sorted(self.freqs.items()):
+            if freq >= self.min_freq:
+                self.stoi[word] = idx
+                self.itos[idx] = word
+                idx += 1
+
+    def numericalize(self, text):
+        """
+        Converts a text string into a list of indices.
+        """
+        if not isinstance(text, str):
+            return [self.stoi[Config.UNK_TOKEN]]
+
+        tokens = text.lower().split()
+        result = []
+        for token in tokens:
+            if token in self.stoi:
+                result.append(self.stoi[token])
+            else:
+                result.append(self.stoi[Config.UNK_TOKEN])
+        return result
+
+    def save(self, path):
+        """
+        Saves the vocabulary mapping to a parquet file.
+        """
+        data = {"token": list(self.stoi.keys()), "index": list(self.stoi.values())}
+        df = pd.DataFrame(data)
+        df.to_parquet(path, index=False)
+
+    def load(self, path):
+        """
+        Loads the vocabulary mapping from a parquet file.
+        """
+        df = pd.read_parquet(path)
+        self.stoi = dict(zip(df["token"], df["index"]))
+        self.itos = {i: t for t, i in self.stoi.items()}
+
+
+class PhraseDataset(Dataset):
+    def __init__(self, df, vocab, context_map):
+        self.df = df
+        self.vocab = vocab
+        self.context_map = context_map
+
+        # Pre-fetch columns to lists for faster indexing
+        self.ids = df["id"].tolist()
+        self.anchors = df["anchor"].tolist()
+        self.targets = df["target"].tolist()
+        self.contexts = df["context"].tolist()
+
+        if "score" in df.columns:
+            self.scores = df["score"].astype(float).tolist()
+        else:
+            self.scores = None
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        anchor_text = self.anchors[idx]
+        target_text = self.targets[idx]
+        context_text = self.contexts[idx]
+
+        # Tokenize and Numericalize
+        anchor_indices = self.vocab.numericalize(anchor_text)
+        target_indices = self.vocab.numericalize(target_text)
+
+        # Truncate to MAX_LEN
+        if len(anchor_indices) > Config.MAX_LEN:
+            anchor_indices = anchor_indices[: Config.MAX_LEN]
+        if len(target_indices) > Config.MAX_LEN:
+            target_indices = target_indices[: Config.MAX_LEN]
+
+        # Context Mapping (default to 0 if unseen, though unlikely in this dataset)
+        context_idx = self.context_map.get(context_text, 0)
+
+        item = {
+            "anchor": torch.tensor(anchor_indices, dtype=torch.long),
+            "target": torch.tensor(target_indices, dtype=torch.long),
+            "context": torch.tensor(context_idx, dtype=torch.long),
+            "id": self.ids[idx],
+        }
+
+        if self.scores is not None:
+            item["score"] = torch.tensor(self.scores[idx], dtype=torch.float)
+
+        return item
+
+
+def collate_fn(batch):
+    """
+    Custom collate function to pad sequences and stack tensors.
+    """
+    anchors = [item["anchor"] for item in batch]
+    targets = [item["target"] for item in batch]
+    contexts = torch.tensor([item["context"] for item in batch], dtype=torch.long)
+    ids = [item["id"] for item in batch]
+
+    # Pad sequences with 0 (PAD_TOKEN)
+    anchors_padded = pad_sequence(anchors, batch_first=True, padding_value=0)
+    targets_padded = pad_sequence(targets, batch_first=True, padding_value=0)
+
+    batch_out = {
+        "anchor": anchors_padded,
+        "target": targets_padded,
+        "context": contexts,
+        "id": ids,
+    }
+
+    if "score" in batch[0]:
+        scores = torch.tensor([item["score"] for item in batch], dtype=torch.float)
+        batch_out["score"] = scores
+
+    return batch_out
+
+
+def get_dataloaders(load_cached_data=True):
+    """
+    Prepares and returns DataLoaders for train, validation, and test sets.
+    Handles caching of Vocabulary and Context mappings.
+
+    Args:
+        load_cached_data (bool): If True, attempts to load vocab/context maps from disk.
+                                 If False or load fails, rebuilds them.
+
+    Returns:
+        train_loader, val_loader, test_loader, vocab_size, num_contexts
+    """
+    # Ensure working directory exists
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+    # 1. Load DataFrames
+    df_train = pd.read_csv(Config.TRAIN_DATA_PATH)
+    df_val = pd.read_csv(Config.VAL_DATA_PATH)
+    df_test = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Handle Debug Mode
+    if Config.DEBUG:
+        df_train = df_train.head(Config.DEBUG_SAMPLE_SIZE)
+        df_val = df_val.head(Config.DEBUG_SAMPLE_SIZE)
+        df_test = df_test.head(Config.DEBUG_SAMPLE_SIZE)
+        print(f"DEBUG Mode: Reduced train size to {len(df_train)}")
+
+    # 2. Manage Vocabulary and Context Maps
+    vocab_path = os.path.join(Config.WORKING_DIR, "vocab.parquet")
+    context_path = os.path.join(Config.WORKING_DIR, "context_map.parquet")
+
+    vocab = Vocabulary(min_freq=Config.VOCAB_MIN_FREQ)
+    context_map = {}
+
+    cache_loaded = False
+
+    if load_cached_data:
+        if os.path.exists(vocab_path) and os.path.exists(context_path):
+            try:
+                print("Loading cached vocabulary and context map...")
+                vocab.load(vocab_path)
+
+                context_df = pd.read_parquet(context_path)
+                context_map = dict(zip(context_df["context"], context_df["index"]))
+                cache_loaded = True
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Rebuilding...")
+        else:
+            print("Cache not found. Rebuilding...")
+
+    if not cache_loaded:
+        print("Building vocabulary and context map...")
+        # Build Vocab from Train (Anchor + Target)
+        text_corpus = (
+            pd.concat([df_train["anchor"], df_train["target"]]).astype(str).tolist()
+        )
+        vocab.build_vocabulary(text_corpus)
+        vocab.save(vocab_path)
+
+        # Build Context Map
+        unique_contexts = sorted(df_train["context"].unique().tolist())
+        context_map = {ctx: i for i, ctx in enumerate(unique_contexts)}
+
+        # Save Context Map
+        c_df = pd.DataFrame(
+            {"context": list(context_map.keys()), "index": list(context_map.values())}
+        )
+        c_df.to_parquet(context_path, index=False)
+
+    print(f"Vocabulary Size: {len(vocab)}")
+    print(f"Number of Contexts: {len(context_map)}")
+
+    # 3. Create Datasets
+    train_dataset = PhraseDataset(df_train, vocab, context_map)
+    val_dataset = PhraseDataset(df_val, vocab, context_map)
+    test_dataset = PhraseDataset(df_test, vocab, context_map)
+
+    # 4. Create DataLoaders
+    # Use pin_memory=True if GPU is available for faster transfer
+    use_pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    return train_loader, val_loader, test_loader, len(vocab), len(context_map)
+=======
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from library.config import Config
+
+
+class PhraseDataset(Dataset):
+    def __init__(self, df, tokenizer):
+        self.df = df
+        self.tokenizer = tokenizer
+
+        # Pre-fetch columns to lists for faster indexing
+        self.ids = df["id"].tolist()
+        self.anchors = df["anchor"].astype(str).tolist()
+        self.targets = df["target"].astype(str).tolist()
+        self.contexts = df["context"].astype(str).tolist()
+
+        if "score" in df.columns:
+            self.scores = df["score"].astype(float).tolist()
+        else:
+            self.scores = None
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        anchor = self.anchors[idx]
+        target = self.targets[idx]
+        context = self.contexts[idx]
+        
+        # Cite solution_lesson_node_00001: Using pre-trained model input format
+        # Construct input text: anchor + [SEP] + target + [SEP] + context
+        text = f"{anchor} {self.tokenizer.sep_token} {target} {self.tokenizer.sep_token} {context}"
+        
+        encoded = self.tokenizer(
+            text,
+            max_length=Config.MAX_LEN,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        item = {
+            "input_ids": encoded['input_ids'].squeeze(0),
+            "attention_mask": encoded['attention_mask'].squeeze(0),
+            "id": self.ids[idx]
+        }
+
+        if self.scores is not None:
+            item["score"] = torch.tensor(self.scores[idx], dtype=torch.float)
+
+        return item
+
+
+def collate_fn(batch):
+    """
+    Custom collate function to stack tensors.
+    """
+    input_ids = torch.stack([item["input_ids"] for item in batch])
+    attention_mask = torch.stack([item["attention_mask"] for item in batch])
+    ids = [item["id"] for item in batch]
+
+    batch_out = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "id": ids,
+    }
+
+    if "score" in batch[0]:
+        scores = torch.tensor([item["score"] for item in batch], dtype=torch.float)
+        batch_out["score"] = scores
+
+    return batch_out
+
+
+def get_dataloaders(load_cached_data=True):
+    """
+    Prepares and returns DataLoaders for train, validation, and test sets.
+    """
+    # Ensure working directory exists
+    os.makedirs(Config.WORKING_DIR, exist_ok=True)
+
+    # 1. Load DataFrames
+    df_train = pd.read_csv(Config.TRAIN_DATA_PATH)
+    df_val = pd.read_csv(Config.VAL_DATA_PATH)
+    df_test = pd.read_csv(Config.TEST_DATA_PATH)
+
+    # Handle Debug Mode
+    if Config.DEBUG:
+        df_train = df_train.head(Config.DEBUG_SAMPLE_SIZE)
+        df_val = df_val.head(Config.DEBUG_SAMPLE_SIZE)
+        df_test = df_test.head(Config.DEBUG_SAMPLE_SIZE)
+        print(f"DEBUG Mode: Reduced train size to {len(df_train)}")
+
+    # 2. Initialize Tokenizer
+    print(f"Loading tokenizer for {Config.MODEL_NAME}...")
+    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_NAME)
+
+    # 3. Create Datasets
+    train_dataset = PhraseDataset(df_train, tokenizer)
+    val_dataset = PhraseDataset(df_val, tokenizer)
+    test_dataset = PhraseDataset(df_test, tokenizer)
+
+    # 4. Create DataLoaders
+    use_pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=use_pin_memory,
+    )
+
+    return train_loader, val_loader, test_loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+import os
+import sys
+
+# Import from provided library files
+from library.config import Config, set_seed
+from library.data_loader import get_dataloaders
+=======
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+import os
+import sys
+from transformers import AutoModel
+
+# Import from provided library files
+from library.config import Config, set_seed
+from library.data_loader import get_dataloaders
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SiameseDAN(nn.Module):
+    """
+    Siamese Deep Averaging Network (DAN) for phrase similarity.
+    """
+
+    def __init__(
+        self,
+        vocab_size,
+        num_contexts,
+        embedding_dim,
+        hidden_dim,
+        context_dim,
+        dropout_rate=0.2,
+    ):
+        super(SiameseDAN, self).__init__()
+
+        # 1. Shared Encoder Components
+        # Padding index is 0, so the vector for padding will be zero-initialized and not updated if frozen,
+        # or learned to be near zero. We handle averaging explicitly to be safe.
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+
+        # Projection layer: Dense -> ReLU -> Dropout
+        self.projection = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout_rate)
+        )
+
+        # 2. Context Branch
+        self.context_embedding = nn.Embedding(num_contexts, context_dim)
+
+        # 3. Regression Head
+        # Inputs: u (hidden), v (hidden), |u-v| (hidden), u*v (hidden), context (context_dim)
+        combined_dim = (hidden_dim * 4) + context_dim
+        self.fc_out = nn.Linear(combined_dim, 1)
+
+    def encode_text(self, x):
+        """
+        Encodes a batch of text sequences (B, L) into dense vectors (B, H).
+        """
+        # x: [Batch, SeqLen]
+
+        # Create mask for non-padding tokens (assuming 0 is padding)
+        mask = (x != 0).float().unsqueeze(-1)  # [Batch, SeqLen, 1]
+
+        # Get embeddings
+        embeds = self.embedding(x)  # [Batch, SeqLen, EmbDim]
+
+        # Masked Sum
+        masked_embeds = embeds * mask
+        sum_embeds = masked_embeds.sum(dim=1)  # [Batch, EmbDim]
+
+        # Count non-padding tokens
+        token_counts = mask.sum(dim=1).clamp(min=1)  # [Batch, 1]
+
+        # Global Average Pooling
+        avg_embeds = sum_embeds / token_counts  # [Batch, EmbDim]
+
+        # Projection
+        projected = self.projection(avg_embeds)  # [Batch, HiddenDim]
+
+        return projected
+
+    def forward(self, anchor, target, context):
+        # Encode phrases using shared encoder
+        u = self.encode_text(anchor)  # [Batch, HiddenDim]
+        v = self.encode_text(target)  # [Batch, HiddenDim]
+
+        # Encode context
+        ctx_emb = self.context_embedding(context)  # [Batch, ContextDim]
+
+        # Interaction Features
+        abs_diff = torch.abs(u - v)
+        prod = u * v
+
+        # Concatenate: u, v, |u-v|, u*v, context
+        features = torch.cat([u, v, abs_diff, prod, ctx_emb], dim=1)
+
+        # Regression
+        score = self.fc_out(features)  # [Batch, 1]
+
+        # Squeeze to [Batch]
+        return score.squeeze(-1)
+=======
+class PatentBert(nn.Module):
+    """
+    Transformer-based model for phrase similarity.
+    Cite solution_lesson_node_00001: Replaces DAN with pre-trained Transformer.
+    """
+    def __init__(self, model_name):
+        super(PatentBert, self).__init__()
+        self.transformer = AutoModel.from_pretrained(model_name)
+        self.fc = nn.Linear(self.transformer.config.hidden_size, 1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
+        # Use CLS token embedding (index 0)
+        cls_emb = outputs.last_hidden_state[:, 0, :]
+        score = self.fc(cls_emb)
+        return score.squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        anchor = batch["anchor"].to(device)
+        target = batch["target"].to(device)
+        context = batch["context"].to(device)
+        labels = batch["score"].to(device)
+
+        optimizer.zero_grad()
+
+        predictions = model(anchor, target, context)
+        loss = criterion(predictions, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * anchor.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            anchor = batch["anchor"].to(device)
+            target = batch["target"].to(device)
+            context = batch["context"].to(device)
+            labels = batch["score"].to(device)
+
+            predictions = model(anchor, target, context)
+            loss = criterion(predictions, labels)
+
+            running_loss += loss.item() * anchor.size(0)
+
+            all_preds.append(predictions.cpu())
+            all_labels.append(labels.cpu())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    # Calculate Pearson Correlation
+    all_preds = torch.cat(all_preds)
+    all_labels = torch.cat(all_labels)
+
+    # Handle case with constant output to avoid NaN
+    if torch.std(all_preds) == 0 or torch.std(all_labels) == 0:
+        pearson = 0.0
+    else:
+        vx = all_preds - torch.mean(all_preds)
+        vy = all_labels - torch.mean(all_labels)
+        pearson = torch.sum(vx * vy) / (
+            torch.sqrt(torch.sum(vx**2)) * torch.sqrt(torch.sum(vy**2))
+        )
+        pearson = pearson.item()
+
+    return epoch_loss, pearson
+
+
+def generate_submission(model, test_loader, device, output_path):
+    model.eval()
+    ids = []
+    scores = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            anchor = batch["anchor"].to(device)
+            target = batch["target"].to(device)
+            context = batch["context"].to(device)
+            batch_ids = batch["id"]
+
+            predictions = model(anchor, target, context)
+
+            # Clip predictions to valid range [0, 1]
+            predictions = torch.clamp(predictions, 0.0, 1.0)
+
+            ids.extend(batch_ids)
+            scores.extend(predictions.cpu().numpy())
+
+    df_sub = pd.DataFrame({"id": ids, "score": scores})
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_sub.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+
+
+def run_task():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # 2. Data Loading
+    print("Loading data...")
+    train_loader, val_loader, test_loader, vocab_size, num_contexts = get_dataloaders(
+        load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    model = SiameseDAN(
+        vocab_size=vocab_size,
+        num_contexts=num_contexts,
+        embedding_dim=Config.EMBEDDING_DIM,
+        hidden_dim=Config.HIDDEN_DIM,
+        context_dim=Config.CONTEXT_EMBEDDING_DIM,
+        dropout_rate=Config.DROPOUT,
+    ).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+
+    # 4. Training Loop with Early Stopping
+    print("Starting training...")
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    for epoch in range(Config.EPOCHS):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_pearson = evaluate(model, val_loader, criterion, device)
+
+        print(
+            f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val Pearson: {val_pearson:.6f}"
+        )
+
+        # Early Stopping Check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), Config.MODEL_SAVE_PATH)
+        else:
+            patience_counter += 1
+            if patience_counter >= Config.PATIENCE:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
+    # 5. Inference
+    print("Loading best model for inference...")
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+    else:
+        print("Warning: Model file not found, using current model weights.")
+
+    print("Generating submission...")
+    generate_submission(model, test_loader, device, Config.SUBMISSION_PATH)
+=======
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["score"].to(device)
+
+        optimizer.zero_grad()
+
+        predictions = model(input_ids, attention_mask)
+        loss = criterion(predictions, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * input_ids.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["score"].to(device)
+
+            predictions = model(input_ids, attention_mask)
+            loss = criterion(predictions, labels)
+
+            running_loss += loss.item() * input_ids.size(0)
+
+            all_preds.append(predictions.cpu())
+            all_labels.append(labels.cpu())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+
+    # Calculate Pearson Correlation
+    all_preds = torch.cat(all_preds)
+    all_labels = torch.cat(all_labels)
+
+    if torch.std(all_preds) == 0 or torch.std(all_labels) == 0:
+        pearson = 0.0
+    else:
+        vx = all_preds - torch.mean(all_preds)
+        vy = all_labels - torch.mean(all_labels)
+        pearson = torch.sum(vx * vy) / (
+            torch.sqrt(torch.sum(vx**2)) * torch.sqrt(torch.sum(vy**2))
+        )
+        pearson = pearson.item()
+
+    return epoch_loss, pearson
+
+
+def generate_submission(model, test_loader, device, output_path):
+    model.eval()
+    ids = []
+    scores = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            batch_ids = batch["id"]
+
+            predictions = model(input_ids, attention_mask)
+
+            # Clip predictions to valid range [0, 1]
+            predictions = torch.clamp(predictions, 0.0, 1.0)
+
+            ids.extend(batch_ids)
+            scores.extend(predictions.cpu().numpy())
+
+    df_sub = pd.DataFrame({"id": ids, "score": scores})
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_sub.to_csv(output_path, index=False)
+    print(f"Submission saved to {output_path}")
+
+
+def run_task():
+    # 1. Setup
+    set_seed(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # 2. Data Loading
+    print("Loading data...")
+    train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=True)
+
+    # 3. Model Initialization
+    model = PatentBert(Config.MODEL_NAME).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+
+    # 4. Training Loop with Early Stopping
+    print("Starting training...")
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    for epoch in range(Config.EPOCHS):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_pearson = evaluate(model, val_loader, criterion, device)
+
+        print(
+            f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Val Pearson: {val_pearson:.6f}"
+        )
+
+        # Early Stopping Check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), Config.MODEL_SAVE_PATH)
+        else:
+            patience_counter += 1
+            if patience_counter >= Config.PATIENCE:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
+    # 5. Inference
+    print("Loading best model for inference...")
+    if os.path.exists(Config.MODEL_SAVE_PATH):
+        model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH, map_location=device))
+    else:
+        print("Warning: Model file not found, using current model weights.")
+
+    print("Generating submission...")
+    generate_submission(model, test_loader, device, Config.SUBMISSION_PATH)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+from library.model import SiameseDAN, train_one_epoch, evaluate, generate_submission
+=======
+from library.model import PatentBert, train_one_epoch, evaluate, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Load Data
+        # Caching logic is handled internally by get_dataloaders via load_cached_data flag
+        train_loader, val_loader, test_loader, vocab_size, num_contexts = (
+            get_dataloaders(load_cached_data=load_cached_data)
+        )
+
+        # Initialize Model
+        model = SiameseDAN(
+            vocab_size=vocab_size,
+            num_contexts=num_contexts,
+            embedding_dim=Config.EMBEDDING_DIM,
+            hidden_dim=Config.HIDDEN_DIM,
+            context_dim=Config.CONTEXT_EMBEDDING_DIM,
+            dropout_rate=Config.DROPOUT,
+        ).to(self.device)
+=======
+        # Load Data
+        # Caching logic is handled internally by get_dataloaders via load_cached_data flag
+        train_loader, val_loader, test_loader = get_dataloaders(load_cached_data=load_cached_data)
+
+        # Initialize Model
+        model = PatentBert(Config.MODEL_NAME).to(self.device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import SiameseDAN, evaluate
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model errors on the validation set.
+    Calculates correlation between error magnitude and input features.
+    """
+    print("\n--- Failure Analysis ---")
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    # Collect predictions and labels
+    with torch.no_grad():
+        for batch in val_loader:
+            anchor = batch["anchor"].to(device)
+            target = batch["target"].to(device)
+            context = batch["context"].to(device)
+            labels = batch["score"].to(device)
+
+            preds = model(anchor, target, context)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+=======
+from library.model import PatentBert, evaluate
+
+
+def perform_failure_analysis(model, val_loader, device):
+    """
+    Analyzes model errors on the validation set.
+    Calculates correlation between error magnitude and input features.
+    """
+    print("\n--- Failure Analysis ---")
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    # Collect predictions and labels
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["score"].to(device)
+
+            preds = model(input_ids, attention_mask)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Configure for Fast Baseline
+    # We reduce epochs and ensure batch size is efficient
+    Config.BATCH_SIZE = 128
+    FAST_EPOCHS = 10
+
+    print(
+        f"Initializing Fast Baseline Run (Epochs={FAST_EPOCHS}, Batch={Config.BATCH_SIZE})..."
+    )
+=======
+    # Configure for Fast Baseline
+    # We reduce epochs and ensure batch size is efficient
+    Config.BATCH_SIZE = 64
+    FAST_EPOCHS = 4
+
+    print(
+        f"Initializing Fast Baseline Run (Epochs={FAST_EPOCHS}, Batch={Config.BATCH_SIZE})..."
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Post-Training Validation & Analysis
+    # We reload the best model to ensure we are evaluating the optimal state
+    print("\n--- Post-Training Evaluation ---")
+
+    # Re-load dataloaders (should be fast due to caching)
+    _, val_loader, _, vocab_size, num_contexts = get_dataloaders(load_cached_data=True)
+
+    # Initialize model structure
+    model = SiameseDAN(
+        vocab_size=vocab_size,
+        num_contexts=num_contexts,
+        embedding_dim=Config.EMBEDDING_DIM,
+        hidden_dim=Config.HIDDEN_DIM,
+        context_dim=Config.CONTEXT_EMBEDDING_DIM,
+        dropout_rate=Config.DROPOUT,
+    ).to(device)
+=======
+    # 4. Post-Training Validation & Analysis
+    # We reload the best model to ensure we are evaluating the optimal state
+    print("\n--- Post-Training Evaluation ---")
+
+    # Re-load dataloaders (should be fast due to caching)
+    _, val_loader, _ = get_dataloaders(load_cached_data=True)
+
+    # Initialize model structure
+    model = PatentBert(Config.MODEL_NAME).to(device)
+>>>>>>> REPLACE
+```

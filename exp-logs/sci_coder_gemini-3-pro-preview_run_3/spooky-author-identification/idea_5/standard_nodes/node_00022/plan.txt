@@ -1,0 +1,331 @@
+The `torch.OutOfMemoryError` indicates that the GPU (Tesla T4, ~16GB) cannot handle the memory requirements of the DeBERTa-v3-base model with a batch size of 16 in full precision (FP32). To resolve this, I will implement Mixed Precision (FP16) training using `torch.cuda.amp` to significantly reduce memory usage and computational load (Cite debug_lesson_7). Additionally, I will reduce the batch sizes in `library/config.py` from 16 to 8 to ensure the model fits within the available VRAM (Cite debug_lesson_6).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Loop
+    EPOCHS = 5
+    # Batch size 16 fits comfortably on A100 (40GB) with 512 seq len
+    BATCH_SIZE = 16
+    GRAD_ACCUMULATION_STEPS = 1
+=======
+    # Training Loop
+    EPOCHS = 5
+    # Reduced batch size to 8 to fit in 16GB VRAM (Cite debug_lesson_6)
+    BATCH_SIZE = 8
+    GRAD_ACCUMULATION_STEPS = 1
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Domain-Adaptive Pre-training (Masked Language Modeling)
+    # =========================================================================
+    PERFORM_MLM = True
+    MLM_EPOCHS = 3
+    MLM_BATCH_SIZE = 16
+    MLM_LR = 5e-5
+=======
+    # Domain-Adaptive Pre-training (Masked Language Modeling)
+    # =========================================================================
+    PERFORM_MLM = True
+    MLM_EPOCHS = 3
+    # Reduced batch size to 8 to fit in 16GB VRAM (Cite debug_lesson_6)
+    MLM_BATCH_SIZE = 8
+    MLM_LR = 5e-5
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+from transformers import (
+    AutoModelForMaskedLM,
+    AutoConfig,
+    get_linear_schedule_with_warmup,
+)
+from torch.optim import AdamW
+
+from library.config import Config
+=======
+from transformers import (
+    AutoModelForMaskedLM,
+    AutoConfig,
+    get_linear_schedule_with_warmup,
+)
+from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
+
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    # Optimizer and Scheduler
+    optimizer = AdamW(
+        model.parameters(), lr=Config.MLM_LR, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    num_train_steps = len(train_loader) * epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * num_train_steps),
+        num_training_steps=num_train_steps,
+    )
+
+    print(f"Starting MLM training for {model_name}...")
+
+    for epoch in range(epochs):
+        monitor = MetricMonitor()
+
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass (loss is calculated internally by HuggingFace models when labels are provided)
+            outputs = model(
+                input_ids=input_ids, attention_mask=attention_mask, labels=labels
+            )
+            loss = outputs.loss
+
+            loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+            optimizer.step()
+            scheduler.step()
+
+            monitor.update("loss", loss.item(), input_ids.size(0))
+=======
+    # Optimizer and Scheduler
+    optimizer = AdamW(
+        model.parameters(), lr=Config.MLM_LR, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Initialize GradScaler for Mixed Precision (Cite debug_lesson_7)
+    scaler = GradScaler()
+
+    num_train_steps = len(train_loader) * epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * num_train_steps),
+        num_training_steps=num_train_steps,
+    )
+
+    print(f"Starting MLM training for {model_name}...")
+
+    for epoch in range(epochs):
+        monitor = MetricMonitor()
+
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            optimizer.zero_grad()
+
+            # Mixed Precision Forward Pass
+            with autocast():
+                outputs = model(
+                    input_ids=input_ids, attention_mask=attention_mask, labels=labels
+                )
+                loss = outputs.loss
+
+            # Scaled Backward Pass
+            scaler.scale(loss).backward()
+
+            # Unscale before clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+
+            # Scaled Optimizer Step
+            scaler.step(optimizer)
+            scaler.update()
+
+            scheduler.step()
+
+            monitor.update("loss", loss.item(), input_ids.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    model.train()
+    monitor = MetricMonitor()
+    criterion = nn.CrossEntropyLoss()
+
+    # Initialize AWP only if enabled and past the start epoch
+    awp = None
+    if use_awp and epoch >= Config.AWP_START_EPOCH:
+        awp = AWP(
+            model,
+            optimizer,
+            adv_lr=Config.AWP_LR,
+            adv_eps=Config.AWP_EPS,
+            start_epoch=Config.AWP_START_EPOCH,
+        )
+
+    for batch in train_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+
+        # 1. Standard Forward Pass
+        logits = model(input_ids, attention_mask)
+        loss = criterion(logits, labels)
+
+        # 2. Standard Backward Pass (accumulate gradients)
+        loss.backward()
+
+        # 3. Adversarial Training Step (AWP)
+        if awp:
+            # Save gradients and perturb weights (ascent)
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            adv_logits = model(input_ids, attention_mask)
+            adv_loss = criterion(adv_logits, labels)
+
+            # Backward pass with perturbed weights (accumulate gradients)
+            adv_loss.backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # 4. Optimization Step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        monitor.update("loss", loss.item(), input_ids.size(0))
+=======
+    model.train()
+    monitor = MetricMonitor()
+    criterion = nn.CrossEntropyLoss()
+    scaler = GradScaler()
+
+    # Initialize AWP only if enabled and past the start epoch
+    awp = None
+    if use_awp and epoch >= Config.AWP_START_EPOCH:
+        awp = AWP(
+            model,
+            optimizer,
+            adv_lr=Config.AWP_LR,
+            adv_eps=Config.AWP_EPS,
+            start_epoch=Config.AWP_START_EPOCH,
+            scaler=scaler,
+        )
+
+    for batch in train_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+
+        optimizer.zero_grad()
+
+        # 1. Standard Forward Pass (Mixed Precision)
+        with autocast():
+            logits = model(input_ids, attention_mask)
+            loss = criterion(logits, labels)
+
+        # 2. Standard Backward Pass (accumulate gradients)
+        scaler.scale(loss).backward()
+
+        # 3. Adversarial Training Step (AWP)
+        if awp:
+            # Save gradients and perturb weights (ascent)
+            awp.attack_step()
+
+            # Forward pass with perturbed weights
+            with autocast():
+                adv_logits = model(input_ids, attention_mask)
+                adv_loss = criterion(adv_logits, labels)
+
+            # Backward pass with perturbed weights (accumulate gradients)
+            scaler.scale(adv_loss).backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # 4. Optimization Step
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.MAX_GRAD_NORM)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        scheduler.step()
+
+        monitor.update("loss", loss.item(), input_ids.size(0))
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(input_ids, attention_mask)
+            loss = criterion(logits, labels)
+
+            monitor.update("loss", loss.item(), input_ids.size(0))
+
+            # Calculate probabilities
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds.append(probs)
+=======
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+
+            with autocast():
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
+
+            monitor.update("loss", loss.item(), input_ids.size(0))
+
+            # Calculate probabilities
+            probs = torch.softmax(logits, dim=1).float().cpu().numpy()
+            preds.append(probs)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            logits = model(input_ids, attention_mask)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds.append(probs)
+=======
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            with autocast():
+                logits = model(input_ids, attention_mask)
+            
+            probs = torch.softmax(logits, dim=1).float().cpu().numpy()
+            preds.append(probs)
+>>>>>>> REPLACE
+```

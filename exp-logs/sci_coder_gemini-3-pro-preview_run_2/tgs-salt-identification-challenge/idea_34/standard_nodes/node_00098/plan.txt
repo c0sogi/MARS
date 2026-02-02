@@ -1,0 +1,1336 @@
+My strategy is to revert the complex and unstable "Marginalized Distillation" pipeline to a robust, single-stage supervised training approach, addressing the specific causes of failure identified in the previous run.
+
+1.  **FP32 Stability**: The previous solution failed with `nan` losses because it used Automatic Mixed Precision (AMP) with `LovaszHingeLoss`, which involves sorting and cumulative sums that are unstable in FP16. I will remove AMP and enforce full FP32 training to guarantee numerical stability. Cite {solution_lesson_node_00097}.
+2.  **Explicit Feature Injection**: I will abandon the distillation strategy (which failed to converge) and return to the "Specialist" architecture that explicitly injects depth information into the encoder bottleneck. This has been proven superior to distillation for this task. Cite {solution_lesson_node_00032}.
+3.  **Optimization Schedule**: I will re-introduce the `CosineAnnealingLR` scheduler, which was missing in the previous run's student phase. A proper learning rate schedule is critical for fine-tuning pretrained encoders. Cite {solution_lesson_node_00068}.
+4.  **Augmentation Refinement**: I will reduce the probability of `ElasticTransform` from 0.5 to 0.2 to avoid excessive domain shift while retaining necessary non-rigid regularization. Cite {solution_lesson_node_00073}.
+5.  **Test-Time Augmentation (TTA)**: I will ensure TTA (Horizontal Flip) is enabled during inference to maximize the mAP score. Cite {solution_lesson_node_00095}.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Training Horizons
+    EPOCHS_STAGE1 = 50  # Specialist Teacher (Supervised)
+    EPOCHS_STAGE3 = 50  # Student (Distillation)
+
+    # Optimization
+    EARLY_STOPPING_PATIENCE = 15
+    WEIGHT_DECAY = 1e-2
+
+    # =========================================================================
+    # Augmentation Hyperparameters
+    # =========================================================================
+    # Non-Rigid (Elastic Transform) - Critical for performance
+    AUG_ELASTIC_ALPHA = 120
+    AUG_ELASTIC_SIGMA = 6
+    AUG_ELASTIC_ALPHA_AFFINE = 6
+
+    # Rigid (Geometric)
+    AUG_RIGID_P = 0.2  # Probability for ShiftScaleRotate
+
+    # =========================================================================
+    # Marginalization & Inference Strategy
+    # =========================================================================
+    # Standard deviations for scanning depth during pseudo-label generation.
+    # Used to marginalize out depth uncertainty for the test set.
+    DEPTH_SCAN_VALUES = [-1.5, -0.75, 0, 0.75, 1.5]
+
+    # Test-Time Augmentation
+    TTA_ENABLED = True  # Use Horizontal Flip TTA
+=======
+    # Training Horizons
+    EPOCHS = 50
+
+    # Optimization
+    EARLY_STOPPING_PATIENCE = 15
+    WEIGHT_DECAY = 1e-2
+
+    # =========================================================================
+    # Augmentation Hyperparameters
+    # =========================================================================
+    # Non-Rigid (Elastic Transform) - Critical for performance
+    AUG_ELASTIC_ALPHA = 120
+    AUG_ELASTIC_SIGMA = 6
+    AUG_ELASTIC_ALPHA_AFFINE = 6
+    AUG_ELASTIC_P = 0.2  # Reduced from 0.5 to prevent domain shift
+
+    # Rigid (Geometric)
+    AUG_RIGID_P = 0.2  # Probability for ShiftScaleRotate
+
+    # =========================================================================
+    # Inference Strategy
+    # =========================================================================
+    # Test-Time Augmentation
+    TTA_ENABLED = True  # Use Horizontal Flip TTA
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+                # Non-Rigid Augmentation (Critical)
+                A.ElasticTransform(
+                    alpha=Config.AUG_ELASTIC_ALPHA,
+                    sigma=Config.AUG_ELASTIC_SIGMA,
+                    alpha_affine=Config.AUG_ELASTIC_ALPHA_AFFINE,
+                    p=0.5,  # Apply with probability to retain some original geometry
+                    border_mode=cv2.BORDER_REFLECT_101,
+                ),
+=======
+                # Non-Rigid Augmentation (Critical)
+                A.ElasticTransform(
+                    alpha=Config.AUG_ELASTIC_ALPHA,
+                    sigma=Config.AUG_ELASTIC_SIGMA,
+                    alpha_affine=Config.AUG_ELASTIC_ALPHA_AFFINE,
+                    p=Config.AUG_ELASTIC_P,  # Reduced probability (Cite {solution_lesson_node_00073})
+                    border_mode=cv2.BORDER_REFLECT_101,
+                ),
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SpecialistTeacher(nn.Module):
+    """
+    Teacher model with Depth Injection.
+    Projects scalar depth to feature maps and concatenates with bottleneck.
+    """
+
+    def __init__(self):
+        super(SpecialistTeacher, self).__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Depth Injection Module
+        self.depth_channels = 64
+        self.depth_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, self.depth_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder Blocks
+        # Block 4: Input e5 (512) + depth (64) = 576. Output 256 (matches e4).
+        self.dec4 = DecoderBlock(512 + self.depth_channels, 256)
+        # Block 3: Input 256. Output 128 (matches e3).
+        self.dec3 = DecoderBlock(256, 128)
+        # Block 2: Input 128. Output 64 (matches e2).
+        self.dec2 = DecoderBlock(128, 64)
+        # Block 1: Input 64. Output 64 (matches e1).
+        self.dec1 = DecoderBlock(64, 64)
+
+        # Final Upsampling to restore original resolution (e.g. 64x64 -> 128x128)
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x, depth):
+        # Encoder
+        e1, e2, e3, e4, e5 = self.encoder(x)
+
+        # Depth Injection
+        # depth: (B, 1) -> (B, 64) -> (B, 64, 1, 1) -> (B, 64, H_e5, W_e5)
+        d = self.depth_mlp(depth)
+        d = d.view(-1, self.depth_channels, 1, 1)
+        d = d.expand(-1, -1, e5.size(2), e5.size(3))
+
+        e5_aug = torch.cat([e5, d], dim=1)
+
+        # Decoder with Additive Skip Connections
+        d4 = self.dec4(e5_aug)
+        d4 = d4 + e4
+
+        d3 = self.dec3(d4)
+        d3 = d3 + e3
+
+        d2 = self.dec2(d3)
+        d2 = d2 + e2
+
+        d1 = self.dec1(d2)
+        d1 = d1 + e1
+
+        # Final Prediction
+        out = self.final_conv(d1)
+        return out
+
+
+class GeneralistStudent(nn.Module):
+    """
+    Student model with Multi-Task Auxiliary Depth Head.
+    No depth injection input, but predicts depth as a regularizer.
+    """
+
+    def __init__(self):
+        super(GeneralistStudent, self).__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Auxiliary Depth Head (Multi-Task Regularization)
+        self.aux_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+        )
+
+        # Decoder Blocks (Standard ResNet channels)
+        self.dec4 = DecoderBlock(512, 256)
+        self.dec3 = DecoderBlock(256, 128)
+        self.dec2 = DecoderBlock(128, 64)
+        self.dec1 = DecoderBlock(64, 64)
+
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        e1, e2, e3, e4, e5 = self.encoder(x)
+
+        # Auxiliary Task Prediction
+        depth_pred = self.aux_head(e5)
+
+        # Decoder
+        d4 = self.dec4(e5)
+        d4 = d4 + e4
+
+        d3 = self.dec3(d4)
+        d3 = d3 + e3
+
+        d2 = self.dec2(d3)
+        d2 = d2 + e2
+
+        d1 = self.dec1(d2)
+        d1 = d1 + e1
+
+        out = self.final_conv(d1)
+
+        # Return both for multi-task loss
+        return out, depth_pred
+=======
+class SaltModel(nn.Module):
+    """
+    ResNet34-WideLinkNet with Explicit Depth Injection.
+    Projects scalar depth to feature maps and concatenates with bottleneck.
+    """
+
+    def __init__(self):
+        super(SaltModel, self).__init__()
+        self.encoder = ResNet34Encoder()
+
+        # Depth Injection Module
+        self.depth_channels = 64
+        self.depth_mlp = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, self.depth_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder Blocks
+        # Block 4: Input e5 (512) + depth (64) = 576. Output 256 (matches e4).
+        self.dec4 = DecoderBlock(512 + self.depth_channels, 256)
+        # Block 3: Input 256. Output 128 (matches e3).
+        self.dec3 = DecoderBlock(256, 128)
+        # Block 2: Input 128. Output 64 (matches e2).
+        self.dec2 = DecoderBlock(128, 64)
+        # Block 1: Input 64. Output 64 (matches e1).
+        self.dec1 = DecoderBlock(64, 64)
+
+        # Final Upsampling to restore original resolution (e.g. 64x64 -> 128x128)
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False
+            ),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x, depth):
+        # Encoder
+        e1, e2, e3, e4, e5 = self.encoder(x)
+
+        # Depth Injection
+        # depth: (B, 1) -> (B, 64) -> (B, 64, 1, 1) -> (B, 64, H_e5, W_e5)
+        d = self.depth_mlp(depth)
+        d = d.view(-1, self.depth_channels, 1, 1)
+        d = d.expand(-1, -1, e5.size(2), e5.size(3))
+
+        e5_aug = torch.cat([e5, d], dim=1)
+
+        # Decoder with Additive Skip Connections
+        d4 = self.dec4(e5_aug)
+        d4 = d4 + e4
+
+        d3 = self.dec3(d4)
+        d3 = d3 + e3
+
+        d2 = self.dec2(d3)
+        d2 = d2 + e2
+
+        d1 = self.dec1(d2)
+        d1 = d1 + e1
+
+        # Final Prediction
+        out = self.final_conv(d1)
+        return out
+>>>>>>> REPLACE
+```
+
+```diff
+library/losses.py
+<<<<<<< SEARCH
+class StudentMultiTaskLoss(nn.Module):
+    """
+    Combined loss for the Student model in the Multi-Task Generalist strategy.
+    Combines:
+    1. BCEWithLogitsLoss for segmentation (supports soft pseudo-labels).
+    2. MSELoss for auxiliary depth regression.
+    """
+
+    def __init__(self, depth_weight=1.0):
+        super(StudentMultiTaskLoss, self).__init__()
+        self.depth_weight = depth_weight
+        self.bce = nn.BCEWithLogitsLoss()
+        self.mse = nn.MSELoss()
+
+    def forward(self, seg_logits, seg_targets, depth_preds=None, depth_targets=None):
+        """
+        Args:
+            seg_logits: (B, 1, H, W) segmentation logits.
+            seg_targets: (B, 1, H, W) segmentation targets (binary or soft).
+            depth_preds: (B, 1) depth predictions (optional).
+            depth_targets: (B, 1) depth targets (optional).
+
+        Returns:
+            total_loss: Scalar loss.
+        """
+        # Segmentation Loss
+        # BCEWithLogitsLoss handles logits and probabilities (soft targets)
+        seg_loss = self.bce(seg_logits, seg_targets)
+
+        depth_loss = torch.tensor(0.0, device=seg_logits.device)
+
+        # Depth Loss (only if auxiliary head outputs and targets are provided)
+        if depth_preds is not None and depth_targets is not None:
+            # Ensure shapes match
+            if depth_preds.shape != depth_targets.shape:
+                depth_targets = depth_targets.view_as(depth_preds)
+
+            depth_loss = self.mse(depth_preds, depth_targets)
+
+        total_loss = seg_loss + self.depth_weight * depth_loss
+
+        return total_loss
+=======
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+import os
+import random
+import numpy as np
+import torch
+import torch.cuda.amp as amp
+from library.config import Config
+from library.utils import do_kaggle_metric, rle_encode, crop_image
+
+
+def set_seed(seed=42):
+    """
+    Sets the random seed for reproducibility.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def train_one_epoch(model, dataloader, optimizer, device, loss_fn, is_student=False):
+    """
+    Trains the model for one epoch.
+    Handles both Specialist Teacher (depth input) and Generalist Student (auxiliary depth task).
+    """
+    model.train()
+    running_loss = 0.0
+    scaler = amp.GradScaler()
+
+    for i, (images, masks, depths, ids) in enumerate(dataloader):
+        images = images.to(device, dtype=torch.float32)
+        masks = masks.to(device, dtype=torch.float32)
+        depths = depths.to(device, dtype=torch.float32)
+
+        optimizer.zero_grad()
+
+        with amp.autocast():
+            if is_student:
+                # Student: Input (Image) -> Output (Seg, DepthPred)
+                seg_logits, depth_preds = model(images)
+                loss = loss_fn(seg_logits, masks, depth_preds, depths)
+            else:
+                # Teacher: Input (Image, Depth) -> Output (Seg)
+                logits = model(images, depths)
+                loss = loss_fn(logits, masks)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / len(dataloader)
+    return epoch_loss
+
+
+def validate(model, dataloader, device, loss_fn, is_student=False):
+    """
+    Validates the model on the validation set.
+    Computes Loss and Mean Average Precision (mAP).
+    """
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_masks = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device, dtype=torch.float32)
+            masks = masks.to(device, dtype=torch.float32)
+            depths = depths.to(device, dtype=torch.float32)
+
+            with amp.autocast():
+                if is_student:
+                    seg_logits, depth_preds = model(images)
+                    loss = loss_fn(seg_logits, masks, depth_preds, depths)
+                    preds = torch.sigmoid(seg_logits)
+                else:
+                    logits = model(images, depths)
+                    loss = loss_fn(logits, masks)
+                    preds = torch.sigmoid(logits)
+
+            running_loss += loss.item()
+
+            # Store predictions for metric calculation
+            preds_np = preds.detach().cpu().numpy()
+            masks_np = masks.detach().cpu().numpy()
+
+            all_preds.append(preds_np)
+            all_masks.append(masks_np)
+
+    epoch_loss = running_loss / len(dataloader)
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_masks = np.concatenate(all_masks, axis=0)
+
+    # Remove channel dimension if present (N, 1, H, W) -> (N, H, W)
+    if all_preds.ndim == 4:
+        all_preds = all_preds.squeeze(1)
+    if all_masks.ndim == 4:
+        all_masks = all_masks.squeeze(1)
+
+    # Calculate mAP using default threshold of 0.5 for reporting
+    metric_score = do_kaggle_metric(all_preds, all_masks, threshold=0.5)
+
+    return epoch_loss, metric_score
+
+
+def fit_model(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    loss_fn,
+    epochs,
+    is_student=False,
+    patience=15,
+    save_path=None,
+):
+    """
+    Orchestrates the training process with Early Stopping.
+    """
+    best_metric = -1.0
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, loss_fn, is_student
+        )
+        val_loss, val_metric = validate(model, val_loader, device, loss_fn, is_student)
+
+        # Print full precision metrics
+        print(
+            f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f} - Val Loss: {val_loss:.6f} - Val mAP: {val_metric:.16f}"
+        )
+
+        # Early Stopping check
+        if val_metric > best_metric:
+            best_metric = val_metric
+            patience_counter = 0
+            if save_path:
+                torch.save(model.state_dict(), save_path)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+    return best_metric
+
+
+def predict_marginalized(teacher_model, dataloader, device):
+    """
+    Stage 2: Generates soft pseudo-labels by marginalizing over depth uncertainty.
+    Scans through Config.DEPTH_SCAN_VALUES and averages the probability maps.
+    """
+    teacher_model.eval()
+    results = {}
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch[0]
+            ids = batch[-1]
+            images = images.to(device, dtype=torch.float32)
+            batch_size = images.size(0)
+
+            # Accumulator for marginalized probabilities
+            accum_probs = torch.zeros(
+                (batch_size, 1, images.size(2), images.size(3)), device=device
+            )
+
+            # Scan through defined depth values
+            for z_val in Config.DEPTH_SCAN_VALUES:
+                # Create a constant depth tensor for the batch
+                z_tensor = torch.full(
+                    (batch_size, 1), z_val, device=device, dtype=torch.float32
+                )
+
+                with amp.autocast():
+                    logits = teacher_model(images, z_tensor)
+                    probs = torch.sigmoid(logits)
+
+                accum_probs += probs
+
+            # Average the probabilities
+            avg_probs = accum_probs / len(Config.DEPTH_SCAN_VALUES)
+            avg_probs = avg_probs.detach().cpu().numpy()
+
+            for idx, img_id in enumerate(ids):
+                results[img_id] = avg_probs[idx]
+
+    return results
+
+
+def predict_student(student_model, dataloader, device):
+    """
+    Stage 3 Inference: Generates predictions using the Student model.
+    Applies Test-Time Augmentation (Horizontal Flip).
+    """
+    student_model.eval()
+    results = {}
+
+    with torch.no_grad():
+        for images, _, ids in dataloader:
+            images = images.to(device, dtype=torch.float32)
+
+            with amp.autocast():
+                # Standard Forward
+                logits, _ = student_model(images)
+                probs = torch.sigmoid(logits)
+
+                if Config.TTA_ENABLED:
+                    # Horizontal Flip TTA
+                    images_flip = torch.flip(images, [3])
+                    logits_flip, _ = student_model(images_flip)
+                    probs_flip = torch.sigmoid(logits_flip)
+                    probs_flip = torch.flip(probs_flip, [3])
+
+                    # Average original and flipped predictions
+                    probs = (probs + probs_flip) / 2.0
+
+            probs = probs.detach().cpu().numpy()
+
+            for idx, img_id in enumerate(ids):
+                results[img_id] = probs[idx]
+
+    return results
+
+
+def generate_submission(model, test_loader, device, threshold=0.5):
+    """
+    Generates the final submission CSV.
+    Runs inference, applies threshold, crops to original size, and RLE encodes.
+    """
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # Run Inference
+    preds_dict = predict_student(model, test_loader, device)
+
+    submission_lines = ["id,rle_mask"]
+    sorted_ids = sorted(preds_dict.keys())
+
+    for img_id in sorted_ids:
+        prob_map = preds_dict[img_id]  # Shape: (1, 128, 128)
+
+        # Squeeze channel dim
+        if prob_map.ndim == 3:
+            prob_map = prob_map[0]
+
+        # Binarize
+        mask = (prob_map > threshold).astype(np.uint8)
+
+        # Crop back to original 101x101
+        mask = crop_image(mask, original_size=Config.ORIG_SIZE)
+
+        # Encode
+        rle = rle_encode(mask)
+        submission_lines.append(f"{img_id},{rle}")
+
+    with open(Config.SUBMISSION_PATH, "w") as f:
+        f.write("\n".join(submission_lines))
+
+    print(f"Submission saved to {Config.SUBMISSION_PATH}")
+=======
+import os
+import random
+import numpy as np
+import torch
+from library.config import Config
+from library.utils import do_kaggle_metric, rle_encode, crop_image
+
+
+def set_seed(seed=42):
+    """
+    Sets the random seed for reproducibility.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def train_one_epoch(model, dataloader, optimizer, device, loss_fn):
+    """
+    Trains the model for one epoch using FP32 (Cite {solution_lesson_node_00097}).
+    """
+    model.train()
+    running_loss = 0.0
+
+    for i, (images, masks, depths, ids) in enumerate(dataloader):
+        images = images.to(device, dtype=torch.float32)
+        masks = masks.to(device, dtype=torch.float32)
+        depths = depths.to(device, dtype=torch.float32)
+
+        optimizer.zero_grad()
+
+        # Teacher: Input (Image, Depth) -> Output (Seg)
+        logits = model(images, depths)
+        loss = loss_fn(logits, masks)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / len(dataloader)
+    return epoch_loss
+
+
+def validate(model, dataloader, device, loss_fn):
+    """
+    Validates the model on the validation set using FP32.
+    Computes Loss and Mean Average Precision (mAP).
+    """
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_masks = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in dataloader:
+            images = images.to(device, dtype=torch.float32)
+            masks = masks.to(device, dtype=torch.float32)
+            depths = depths.to(device, dtype=torch.float32)
+
+            logits = model(images, depths)
+            loss = loss_fn(logits, masks)
+            preds = torch.sigmoid(logits)
+
+            running_loss += loss.item()
+
+            # Store predictions for metric calculation
+            preds_np = preds.detach().cpu().numpy()
+            masks_np = masks.detach().cpu().numpy()
+
+            all_preds.append(preds_np)
+            all_masks.append(masks_np)
+
+    epoch_loss = running_loss / len(dataloader)
+
+    # Concatenate all batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_masks = np.concatenate(all_masks, axis=0)
+
+    # Remove channel dimension if present (N, 1, H, W) -> (N, H, W)
+    if all_preds.ndim == 4:
+        all_preds = all_preds.squeeze(1)
+    if all_masks.ndim == 4:
+        all_masks = all_masks.squeeze(1)
+
+    # Calculate mAP using default threshold of 0.5 for reporting
+    metric_score = do_kaggle_metric(all_preds, all_masks, threshold=0.5)
+
+    return epoch_loss, metric_score
+
+
+def fit_model(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    scheduler,
+    device,
+    loss_fn,
+    epochs,
+    patience=15,
+    save_path=None,
+):
+    """
+    Orchestrates the training process with Early Stopping and Scheduler.
+    """
+    best_metric = -1.0
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, loss_fn)
+        val_loss, val_metric = validate(model, val_loader, device, loss_fn)
+
+        if scheduler:
+            scheduler.step()
+
+        # Print full precision metrics
+        print(
+            f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f} - Val Loss: {val_loss:.6f} - Val mAP: {val_metric:.16f}"
+        )
+
+        # Early Stopping check
+        if val_metric > best_metric:
+            best_metric = val_metric
+            patience_counter = 0
+            if save_path:
+                torch.save(model.state_dict(), save_path)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+    return best_metric
+
+
+def predict(model, dataloader, device):
+    """
+    Generates predictions using the model with TTA.
+    """
+    model.eval()
+    results = {}
+
+    with torch.no_grad():
+        for images, depths, ids in dataloader:
+            images = images.to(device, dtype=torch.float32)
+            depths = depths.to(device, dtype=torch.float32)
+
+            # Standard Forward
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            if Config.TTA_ENABLED:
+                # Horizontal Flip TTA (Cite {solution_lesson_node_00095})
+                images_flip = torch.flip(images, [3])
+                logits_flip = model(images_flip, depths)
+                probs_flip = torch.sigmoid(logits_flip)
+                probs_flip = torch.flip(probs_flip, [3])
+
+                # Average original and flipped predictions
+                probs = (probs + probs_flip) / 2.0
+
+            probs = probs.detach().cpu().numpy()
+
+            for idx, img_id in enumerate(ids):
+                results[img_id] = probs[idx]
+
+    return results
+
+
+def generate_submission(model, test_loader, device, threshold=0.5):
+    """
+    Generates the final submission CSV.
+    """
+    os.makedirs(Config.SUBMISSION_DIR, exist_ok=True)
+
+    # Run Inference
+    preds_dict = predict(model, test_loader, device)
+
+    submission_lines = ["id,rle_mask"]
+    sorted_ids = sorted(preds_dict.keys())
+
+    for img_id in sorted_ids:
+        prob_map = preds_dict[img_id]  # Shape: (1, 128, 128)
+
+        # Squeeze channel dim
+        if prob_map.ndim == 3:
+            prob_map = prob_map[0]
+
+        # Binarize
+        mask = (prob_map > threshold).astype(np.uint8)
+
+        # Crop back to original 101x101
+        mask = crop_image(mask, original_size=Config.ORIG_SIZE)
+
+        # Encode
+        rle = rle_encode(mask)
+        submission_lines.append(f"{img_id},{rle}")
+
+    with open(Config.SUBMISSION_PATH, "w") as f:
+        f.write("\n".join(submission_lines))
+
+    print(f"Submission saved to {Config.SUBMISSION_PATH}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import sys
+import os
+import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# Import library modules
+from library.config import Config
+from library.dataset import load_data, SaltDataset, get_transforms
+from library.model import SpecialistTeacher, GeneralistStudent
+from library.losses import LovaszHingeLoss, StudentMultiTaskLoss
+from library.engine import (
+    set_seed,
+    fit_model,
+    predict_marginalized,
+    generate_submission,
+    validate,
+    do_kaggle_metric,
+)
+from library.utils import calculate_iou, optimize_threshold
+
+
+def run_stage1_teacher(device, train_loader, val_loader):
+    print("\n=== Stage 1: Training Specialist Teacher ===")
+
+    model = SpecialistTeacher().to(device)
+
+    # Loss: Lovasz + BCE
+    bce_fn = nn.BCEWithLogitsLoss()
+    lovasz_fn = LovaszHingeLoss()
+
+    def criterion(logits, targets):
+        return 0.5 * bce_fn(logits, targets) + 0.5 * lovasz_fn(logits, targets)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Train
+    epochs = 15
+
+    best_metric = fit_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        device=device,
+        loss_fn=criterion,
+        epochs=epochs,
+        is_student=False,
+        patience=5,
+        save_path=os.path.join(Config.CHECKPOINT_DIR, "teacher_stage1.pth"),
+    )
+
+    print(f"Stage 1 Best Val mAP: {best_metric}")
+    return model
+
+
+def run_stage2_pseudo(device, teacher_model, test_loader):
+    print("\n=== Stage 2: Generating Marginalized Pseudo-Labels ===")
+
+    # Predict using marginalized inference
+    # Returns dict {id: prob_map_numpy}
+    pseudo_results = predict_marginalized(teacher_model, test_loader, device)
+
+    return pseudo_results
+
+
+def prepare_student_data(train_dataset, test_dataset, pseudo_results):
+    print("Preparing Combined Dataset for Student...")
+
+    # Extract Train Data
+    train_imgs = train_dataset.images
+    train_masks = train_dataset.masks
+    train_depths = train_dataset.depths
+    train_ids = train_dataset.ids
+
+    # Extract Test Data & Pseudo Labels
+    test_imgs = test_dataset.images
+    test_depths = test_dataset.depths
+    test_ids = test_dataset.ids
+
+    # Align pseudo labels with test images
+    test_masks_list = []
+    valid_indices = []
+
+    for i, img_id in enumerate(test_ids):
+        if img_id in pseudo_results:
+            # Pseudo label is (1, H, W) or (H, W) prob map
+            mask = pseudo_results[img_id]
+            if mask.ndim == 3:
+                mask = mask.squeeze(0)  # Ensure (H, W) for Dataset compatibility
+
+            test_masks_list.append(mask)
+            valid_indices.append(i)
+
+    test_masks = np.array(test_masks_list)
+
+    # Ensure train masks are compatible (N, 128, 128)
+    if train_masks.ndim == 4:
+        train_masks = train_masks.squeeze(1)
+
+    # Filter test images/depths
+    test_imgs = test_imgs[valid_indices]
+    test_depths = test_depths[valid_indices]
+    test_ids = test_ids[valid_indices]
+
+    # Concatenate
+    combined_imgs = np.concatenate([train_imgs, test_imgs], axis=0)
+    combined_masks = np.concatenate([train_masks, test_masks], axis=0)
+    combined_depths = np.concatenate([train_depths, test_depths], axis=0)
+    combined_ids = np.concatenate([train_ids, test_ids], axis=0)
+
+    # Create Dataset
+    student_dataset = SaltDataset(
+        images=combined_imgs,
+        masks=combined_masks,
+        depths=combined_depths,
+        ids=combined_ids,
+        transform=get_transforms("train"),
+        mode="train",
+    )
+
+    return student_dataset
+
+
+def run_stage3_student(device, combined_dataset, val_loader):
+    print("\n=== Stage 3: Training Generalist Student ===")
+
+    train_loader = DataLoader(
+        combined_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    model = GeneralistStudent().to(device)
+
+    # Loss: MultiTask (BCE + MSE)
+    criterion = StudentMultiTaskLoss(depth_weight=0.5)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    epochs = 15
+
+    best_metric = fit_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        device=device,
+        loss_fn=criterion,
+        epochs=epochs,
+        is_student=True,
+        patience=5,
+        save_path=os.path.join(Config.CHECKPOINT_DIR, "student_stage3.pth"),
+    )
+
+    print(f"Stage 3 Best Val mAP: {best_metric}")
+    return model
+
+
+def failure_analysis(model, val_loader, device, is_student=True):
+    print("\n=== Failure Analysis ===")
+    model.eval()
+
+    ious = []
+    depths_list = []
+    salt_coverages = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in val_loader:
+            images = images.to(device, dtype=torch.float32)
+            masks_gpu = masks.to(device, dtype=torch.float32)
+            depths_gpu = depths.to(device, dtype=torch.float32)
+
+            if is_student:
+                logits, _ = model(images)
+            else:
+                logits = model(images, depths_gpu)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+
+            # Calculate IoU per image
+            for i in range(len(images)):
+                p = preds[i].cpu().numpy().flatten()
+                t = masks_gpu[i].cpu().numpy().flatten()
+
+                intersection = np.logical_and(p, t).sum()
+                union = np.logical_or(p, t).sum()
+                iou = intersection / union if union > 0 else 1.0
+
+                ious.append(iou)
+                depths_list.append(depths_gpu[i].item())
+                salt_coverages.append(t.mean())
+
+    ious = np.array(ious)
+    depths_list = np.array(depths_list)
+    salt_coverages = np.array(salt_coverages)
+
+    # Correlations (Error = 1 - IoU)
+    error = 1.0 - ious
+
+    corr_depth = np.corrcoef(error, depths_list)[0, 1]
+    if np.std(salt_coverages) > 0:
+        corr_salt = np.corrcoef(error, salt_coverages)[0, 1]
+    else:
+        corr_salt = 0.0
+
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_salt:.4f}")
+
+    return ious.mean()
+
+
+def main():
+    set_seed(Config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Load Data
+    print("Loading datasets...")
+    train_dataset = load_data("train", load_cached_data=True)
+    val_dataset = load_data("val", load_cached_data=True)
+    test_dataset = load_data("test", load_cached_data=True)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 2. Stage 1: Teacher
+    teacher_model = run_stage1_teacher(device, train_loader, val_loader)
+
+    # 3. Stage 2: Pseudo-Labeling
+    pseudo_results = run_stage2_pseudo(device, teacher_model, test_loader)
+
+    # 4. Prepare Student Data
+    combined_dataset = prepare_student_data(train_dataset, test_dataset, pseudo_results)
+
+    # 5. Stage 3: Student
+    student_model = run_stage3_student(device, combined_dataset, val_loader)
+
+    # 6. Final Validation & Threshold Optimization
+    print("\n=== Final Validation ===")
+
+    student_model.eval()
+    val_preds = []
+    val_truths = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in val_loader:
+            images = images.to(device, dtype=torch.float32)
+
+            # Student inference (no depth input)
+            logits, _ = student_model(images)
+            probs = torch.sigmoid(logits)
+
+            # TTA
+            if Config.TTA_ENABLED:
+                images_flip = torch.flip(images, [3])
+                logits_flip, _ = student_model(images_flip)
+                probs_flip = torch.sigmoid(logits_flip)
+                probs_flip = torch.flip(probs_flip, [3])
+                probs = (probs + probs_flip) / 2.0
+
+            val_preds.append(probs.cpu().numpy())
+            val_truths.append(masks.numpy())
+
+    val_preds = np.concatenate(val_preds, axis=0).squeeze()
+    val_truths = np.concatenate(val_truths, axis=0).squeeze()
+
+    # Optimize Threshold
+    best_threshold = optimize_threshold(val_preds, val_truths)
+    print(f"Optimal Threshold: {best_threshold:.4f}")
+
+    # Calculate Final Metric
+    final_metric = do_kaggle_metric(val_preds, val_truths, threshold=best_threshold)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 7. Failure Analysis
+    failure_analysis(student_model, val_loader, device, is_student=True)
+
+    # 8. Submission
+    if final_metric > 0.7985:
+        print("\nGenerating Submission...")
+        generate_submission(
+            student_model, test_loader, device, threshold=best_threshold
+        )
+    else:
+        print(f"\nMetric {final_metric} <= 0.7985. Skipping submission.")
+=======
+import sys
+import os
+import torch
+import numpy as np
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Import library modules
+from library.config import Config
+from library.dataset import load_data, SaltDataset, get_transforms
+from library.model import SaltModel
+from library.losses import LovaszHingeLoss
+from library.engine import (
+    set_seed,
+    fit_model,
+    generate_submission,
+    validate,
+    do_kaggle_metric,
+)
+from library.utils import calculate_iou, optimize_threshold
+
+
+def failure_analysis(model, val_loader, device):
+    print("\n=== Failure Analysis ===")
+    model.eval()
+
+    ious = []
+    depths_list = []
+    salt_coverages = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in val_loader:
+            images = images.to(device, dtype=torch.float32)
+            masks_gpu = masks.to(device, dtype=torch.float32)
+            depths_gpu = depths.to(device, dtype=torch.float32)
+
+            logits = model(images, depths_gpu)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+
+            # Calculate IoU per image
+            for i in range(len(images)):
+                p = preds[i].cpu().numpy().flatten()
+                t = masks_gpu[i].cpu().numpy().flatten()
+
+                intersection = np.logical_and(p, t).sum()
+                union = np.logical_or(p, t).sum()
+                iou = intersection / union if union > 0 else 1.0
+
+                ious.append(iou)
+                depths_list.append(depths_gpu[i].item())
+                salt_coverages.append(t.mean())
+
+    ious = np.array(ious)
+    depths_list = np.array(depths_list)
+    salt_coverages = np.array(salt_coverages)
+
+    # Correlations (Error = 1 - IoU)
+    error = 1.0 - ious
+
+    corr_depth = np.corrcoef(error, depths_list)[0, 1]
+    if np.std(salt_coverages) > 0:
+        corr_salt = np.corrcoef(error, salt_coverages)[0, 1]
+    else:
+        corr_salt = 0.0
+
+    print(f"Correlation (Error vs Depth): {corr_depth:.4f}")
+    print(f"Correlation (Error vs Salt Coverage): {corr_salt:.4f}")
+
+    return ious.mean()
+
+
+def main():
+    set_seed(Config.SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Load Data
+    print("Loading datasets...")
+    train_dataset = load_data("train", load_cached_data=True)
+    val_dataset = load_data("val", load_cached_data=True)
+    test_dataset = load_data("test", load_cached_data=True)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # 2. Setup Model
+    print("\n=== Training SaltModel (ResNet34 + Depth Injection) ===")
+    model = SaltModel().to(device)
+
+    # Loss: Lovasz + BCE
+    bce_fn = nn.BCEWithLogitsLoss()
+    lovasz_fn = LovaszHingeLoss()
+
+    def criterion(logits, targets):
+        return 0.5 * bce_fn(logits, targets) + 0.5 * lovasz_fn(logits, targets)
+
+    optimizer = optim.AdamW(
+        model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY
+    )
+
+    # Scheduler (Cite {solution_lesson_node_00068})
+    scheduler = CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+
+    # 3. Train
+    best_metric = fit_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        loss_fn=criterion,
+        epochs=Config.EPOCHS,
+        patience=Config.EARLY_STOPPING_PATIENCE,
+        save_path=os.path.join(Config.CHECKPOINT_DIR, "best_model.pth"),
+    )
+
+    print(f"Best Val mAP: {best_metric}")
+
+    # 4. Final Validation & Threshold Optimization
+    print("\n=== Final Validation ===")
+    model.load_state_dict(torch.load(os.path.join(Config.CHECKPOINT_DIR, "best_model.pth")))
+    model.eval()
+    
+    val_preds = []
+    val_truths = []
+
+    with torch.no_grad():
+        for images, masks, depths, ids in val_loader:
+            images = images.to(device, dtype=torch.float32)
+            depths = depths.to(device, dtype=torch.float32)
+
+            # Inference with TTA (Cite {solution_lesson_node_00095})
+            logits = model(images, depths)
+            probs = torch.sigmoid(logits)
+
+            if Config.TTA_ENABLED:
+                images_flip = torch.flip(images, [3])
+                logits_flip = model(images_flip, depths)
+                probs_flip = torch.sigmoid(logits_flip)
+                probs_flip = torch.flip(probs_flip, [3])
+                probs = (probs + probs_flip) / 2.0
+
+            val_preds.append(probs.cpu().numpy())
+            val_truths.append(masks.numpy())
+
+    val_preds = np.concatenate(val_preds, axis=0).squeeze()
+    val_truths = np.concatenate(val_truths, axis=0).squeeze()
+
+    # Optimize Threshold
+    best_threshold = optimize_threshold(val_preds, val_truths)
+    print(f"Optimal Threshold: {best_threshold:.4f}")
+
+    # Calculate Final Metric
+    final_metric = do_kaggle_metric(val_preds, val_truths, threshold=best_threshold)
+    print(f"Final Validation Metric: {final_metric}")
+
+    # 5. Failure Analysis
+    failure_analysis(model, val_loader, device)
+
+    # 6. Submission
+    if final_metric > 0.7985:
+        print("\nGenerating Submission...")
+        generate_submission(
+            model, test_loader, device, threshold=best_threshold
+        )
+    else:
+        print(f"\nMetric {final_metric} <= 0.7985. Skipping submission.")
+>>>>>>> REPLACE
+```

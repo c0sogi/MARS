@@ -1,0 +1,734 @@
+I will optimize the solution by reverting the complex "SIRV" input strategy to the robust "Middle Slice" heuristic (Cite solution_lesson_node_00002) and simplifying the architecture to a standard EfficientNet-B0 with 3 input channels. This avoids the potential noise introduced by cross-modality ROI mapping (Cite solution_lesson_node_00036). I will retain the aggressive data augmentation (Elastic/Grid) and weight decay ($10^{-2}$) which previously showed promise (Cite solution_lesson_node_00010), but I will reset the dropout rate to the default 0.2 to prevent underfitting (Cite solution_lesson_node_00012). I will also ensure independent channel normalization (Cite solution_lesson_node_00023).
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Working directory for caching processed tensors/dataframes
+    # idea_28 corresponds to the current SIRV strategy
+    CACHE_DIR = "./working/idea_28"
+
+    # Output directory for submissions
+    SUBMISSION_DIR = "./submission"
+    SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # ==========================================
+    # Data Configuration
+    # ==========================================
+    # Image dimensions
+    IMAGE_SIZE = 224
+
+    # Input channels: 3 modalities (FLAIR, T1wCE, T2w) * 3 depths = 9 channels
+    IN_CHANNELS = 9
+
+    # Relative depths for sampling (Scale-Invariant)
+    # 40%, 50% (Center), 60% of the Brain ROI
+    RELATIVE_DEPTHS = [0.4, 0.5, 0.6]
+=======
+    # Working directory for caching processed tensors/dataframes
+    # idea_29: Middle Slice + Aggressive Reg + Independent Norm
+    CACHE_DIR = "./working/idea_29"
+
+    # Output directory for submissions
+    SUBMISSION_DIR = "./submission"
+    SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission.csv")
+
+    # ==========================================
+    # Data Configuration
+    # ==========================================
+    # Image dimensions
+    IMAGE_SIZE = 224
+
+    # Input channels: 3 modalities (FLAIR, T1wCE, T2w)
+    IN_CHANNELS = 3
+
+    # Relative depths for sampling (Scale-Invariant)
+    # Removed in favor of simple middle slice heuristic (Cite solution_lesson_node_00036)
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Regularization
+    WEIGHT_DECAY = 1e-2
+    DROPOUT_RATE = 0.3
+=======
+    # Regularization
+    WEIGHT_DECAY = 1e-2
+    # Revert to default dropout (0.2) to avoid underfitting (Cite solution_lesson_node_00012)
+    DROPOUT_RATE = 0.2
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SIRVEfficientNet(nn.Module):
+    """
+    Scale-Invariant Relative-Volumetric (SIRV) Network.
+
+    This model utilizes an EfficientNet-B0 backbone adapted for 9-channel input
+    (3 modalities x 3 relative depths). It employs a Gaussian Weight Inflation
+    strategy to initialize the first convolutional layer, preserving ImageNet
+    priors while enabling volumetric feature extraction.
+    """
+
+    def __init__(
+        self,
+        model_name=Config.MODEL_NAME,
+        pretrained=True,
+        num_classes=1,
+        dropout_rate=Config.DROPOUT_RATE,
+    ):
+        """
+        Args:
+            model_name (str): Name of the backbone model (default: efficientnet_b0).
+            pretrained (bool): Whether to load ImageNet pre-trained weights.
+            num_classes (int): Number of output classes (1 for binary classification).
+            dropout_rate (float): Dropout rate for the classifier head.
+        """
+        super(SIRVEfficientNet, self).__init__()
+
+        # Load the backbone model using timm
+        # drop_rate sets the dropout probability before the final classifier
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            drop_rate=dropout_rate,
+        )
+
+        # Identify the first convolutional layer.
+        # In timm's EfficientNet implementation, this is named 'conv_stem'.
+        old_conv = self.backbone.conv_stem
+
+        # Create a new convolutional layer with 9 input channels.
+        # We preserve the original output channels, kernel size, stride, and padding.
+        # The input channels correspond to:
+        # [0-2]: FLAIR, T1wCE, T2w at 40% Depth (Peripheral)
+        # [3-5]: FLAIR, T1wCE, T2w at 50% Depth (Center)
+        # [6-8]: FLAIR, T1wCE, T2w at 60% Depth (Peripheral)
+        new_conv = nn.Conv2d(
+            in_channels=Config.IN_CHANNELS,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=(old_conv.bias is not None),
+        )
+
+        # Apply Gaussian Weight Inflation initialization
+        self.inflate_weights(old_conv, new_conv)
+
+        # Replace the first layer in the backbone
+        self.backbone.conv_stem = new_conv
+
+    def inflate_weights(self, original_conv, new_conv):
+        """
+        Initializes the new 9-channel convolution using Gaussian Weight Inflation.
+
+        Strategy:
+        - Center channels (3-5) receive 50% of the original RGB weight energy.
+        - Peripheral channels (0-2 and 6-8) receive 25% of the original RGB weight energy.
+
+        This ensures the model starts with a strong prior focused on the middle slice
+        (analogous to standard 2D transfer learning) while allowing gradients to
+        flow from the volumetric context immediately.
+        """
+        with torch.no_grad():
+            # Original weights shape: (Out, 3, K, K)
+            w_old = original_conv.weight
+
+            # Calculate weighted components
+            # Center triplet (Channels 3-5) -> 50% energy
+            w_center = w_old * 0.5
+
+            # Peripheral triplets (Channels 0-2 and 6-8) -> 25% energy
+            w_periph = w_old * 0.25
+
+            # Concatenate along the channel dimension (dim=1)
+            # Order matches input tensor: [Peripheral (40%), Center (50%), Peripheral (60%)]
+            w_new = torch.cat([w_periph, w_center, w_periph], dim=1)
+
+            # Assign the new weights
+            new_conv.weight.copy_(w_new)
+
+            # Copy bias if it exists in the original layer
+            if original_conv.bias is not None:
+                new_conv.bias.copy_(original_conv.bias)
+
+    def forward(self, x):
+        """
+        Forward pass of the network.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (Batch, 9, H, W).
+
+        Returns:
+            torch.Tensor: Logits of shape (Batch, 1).
+        """
+        return self.backbone(x)
+=======
+class MGMTModel(nn.Module):
+    """
+    Standard EfficientNet-B0 backbone.
+    Uses 3-channel input (FLAIR, T1wCE, T2w) corresponding to the middle slice.
+    """
+
+    def __init__(
+        self,
+        model_name=Config.MODEL_NAME,
+        pretrained=True,
+        num_classes=1,
+        dropout_rate=Config.DROPOUT_RATE,
+    ):
+        super(MGMTModel, self).__init__()
+
+        # Load the backbone model using timm
+        # Explicitly set in_chans=3 to use standard ImageNet weights without modification
+        # Cite solution_lesson_node_00009: Avoid naive channel stacking > 3
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=num_classes,
+            drop_rate=dropout_rate,
+            in_chans=Config.IN_CHANNELS,
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_brain_roi(modality_dir):
+    """
+    Scans a directory of DICOM files to find the brain ROI.
+    Returns:
+        files: List of filenames sorted by instance number.
+        start_idx: Index of the first slice with tissue.
+        end_idx: Index of the last slice with tissue.
+    """
+    if not os.path.exists(modality_dir):
+        return [], 0, 0
+
+    files = [f for f in os.listdir(modality_dir) if f.endswith(".dcm")]
+    if not files:
+        return [], 0, 0
+
+    # Sort files numerically
+    files.sort(key=get_image_plane_number)
+
+    # Identify ROI (slices with max pixel > 0)
+    first_idx = -1
+    last_idx = -1
+
+    # We scan all files to be accurate about the ROI
+    for i, f in enumerate(files):
+        path = os.path.join(modality_dir, f)
+        img = read_dicom(path)
+        if img.max() > 0:
+            if first_idx == -1:
+                first_idx = i
+            last_idx = i
+
+    if first_idx == -1:
+        # No tissue found, use entire range
+        first_idx = 0
+        last_idx = len(files) - 1
+
+    return files, first_idx, last_idx
+
+
+def generate_roi_cache(df, cache_path):
+    """
+    Generates ROI metadata for all subjects in df and saves to Parquet.
+    """
+    print(f"Generating ROI cache at {cache_path}...")
+    cache_list = []
+    modalities = ["FLAIR", "T1wCE", "T2w"]
+
+    total = len(df)
+    for idx, row in df.iterrows():
+        bid = row["BraTS21ID"]
+
+        for mod in modalities:
+            rel_path = row[f"{mod.lower()}_path"]
+            full_path = os.path.join(Config.INPUT_DIR, rel_path)
+
+            files, start, end = get_brain_roi(full_path)
+
+            # Store as a flat record
+            cache_list.append(
+                {
+                    "BraTS21ID": bid,
+                    "Modality": mod,
+                    "StartIdx": start,
+                    "EndIdx": end,
+                    "Files": ";".join(files),  # Store list as delimited string
+                }
+            )
+
+        if (idx + 1) % 50 == 0:
+            print(f"Processed {idx + 1}/{total} subjects...")
+
+    cache_df = pd.DataFrame(cache_list)
+    cache_df.to_parquet(cache_path, index=False)
+    print("Cache generation complete.")
+    return cache_df
+
+
+class SIRVDataset(Dataset):
+    def __init__(self, df, cache_df, transform=None, is_test=False):
+        self.df = df
+        self.transform = transform
+        self.is_test = is_test
+        self.modalities = ["FLAIR", "T1wCE", "T2w"]
+        self.depths = Config.RELATIVE_DEPTHS  # [0.4, 0.5, 0.6]
+
+        # Convert cache dataframe to a nested dictionary for O(1) lookup
+        # Structure: { BraTS21ID: { Modality: { 'files': [], 'start': int, 'end': int } } }
+        self.cache = {}
+        for _, row in cache_df.iterrows():
+            bid = row["BraTS21ID"]
+            mod = row["Modality"]
+            if bid not in self.cache:
+                self.cache[bid] = {}
+
+            self.cache[bid][mod] = {
+                "files": row["Files"].split(";") if row["Files"] else [],
+                "start": row["StartIdx"],
+                "end": row["EndIdx"],
+            }
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        bid = row["BraTS21ID"]
+
+        channels = []
+
+        # Retrieve subject cache
+        subj_cache = self.cache.get(bid, {})
+
+        # Loop Order: Depths (Outer) -> Modalities (Inner)
+        # This creates [Mod1_D1, Mod2_D1, Mod3_D1, Mod1_D2, ...]
+        # Matches model expectation: [Peripheral(40%), Center(50%), Peripheral(60%)]
+        for depth_ratio in self.depths:
+            for mod in self.modalities:
+                img = np.zeros((Config.IMAGE_SIZE, Config.IMAGE_SIZE), dtype=np.float32)
+
+                if mod in subj_cache:
+                    info = subj_cache[mod]
+                    files = info["files"]
+                    start = info["start"]
+                    end = info["end"]
+
+                    if files:
+                        roi_len = end - start + 1
+                        # Calculate relative index
+                        rel_idx = int(start + (roi_len * depth_ratio))
+                        rel_idx = min(max(rel_idx, 0), len(files) - 1)
+
+                        file_name = files[rel_idx]
+                        # Reconstruct path
+                        rel_path = row[f"{mod.lower()}_path"]
+                        full_path = os.path.join(Config.INPUT_DIR, rel_path, file_name)
+
+                        loaded_img = read_dicom(full_path)
+
+                        # Resize strictly to ensure stackability
+                        if loaded_img.shape != (Config.IMAGE_SIZE, Config.IMAGE_SIZE):
+                            loaded_img = cv2.resize(
+                                loaded_img,
+                                (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+
+                        img = loaded_img
+
+                channels.append(img)
+
+        # Stack channels: (H, W, 9)
+        image = np.stack(channels, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+
+        # Get Target
+        if self.is_test:
+            target = 0.5
+        else:
+            target = row["MGMT_value"]
+
+        return image, torch.tensor(target, dtype=torch.float32)
+=======
+class MiddleSliceDataset(Dataset):
+    def __init__(self, df, transform=None, is_test=False):
+        self.df = df
+        self.transform = transform
+        self.is_test = is_test
+        self.modalities = ["FLAIR", "T1wCE", "T2w"]
+        self.file_lists = {} # Simple in-memory cache for file lists
+
+    def _get_middle_file(self, rel_path):
+        full_path = os.path.join(Config.INPUT_DIR, rel_path)
+        
+        # Check in-memory cache
+        if full_path not in self.file_lists:
+            if os.path.exists(full_path):
+                # Sort by instance number
+                files = sorted([f for f in os.listdir(full_path) if f.endswith('.dcm')], 
+                             key=lambda x: int(x.split('-')[-1].split('.')[0]))
+                self.file_lists[full_path] = files
+            else:
+                self.file_lists[full_path] = []
+        
+        files = self.file_lists[full_path]
+        if not files:
+            return None
+        
+        # Return middle file
+        return os.path.join(full_path, files[len(files)//2])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        channels = []
+
+        for mod in self.modalities:
+            rel_path = row[f"{mod.lower()}_path"]
+            file_path = self._get_middle_file(rel_path)
+            
+            if file_path:
+                img = read_dicom(file_path)
+                # Resize if necessary
+                if img.shape != (Config.IMAGE_SIZE, Config.IMAGE_SIZE):
+                    img = cv2.resize(img, (Config.IMAGE_SIZE, Config.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
+            else:
+                img = np.zeros((Config.IMAGE_SIZE, Config.IMAGE_SIZE), dtype=np.float32)
+            
+            channels.append(img)
+
+        # Stack channels: (H, W, 3)
+        # Cite solution_lesson_node_00023: Independent normalization is handled in read_dicom
+        image = np.stack(channels, axis=-1)
+
+        # Apply Augmentations
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+
+        # Get Target
+        if self.is_test:
+            target = 0.5
+        else:
+            target = row["MGMT_value"]
+
+        return image, torch.tensor(target, dtype=torch.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data.py
+<<<<<<< SEARCH
+def get_dataloader(
+    split,
+    batch_size=Config.BATCH_SIZE,
+    num_workers=Config.NUM_WORKERS,
+    load_cached_data=True,
+    fold_idx=None,
+):
+    """
+    Creates a DataLoader for the requested split.
+    Handles caching, cross-validation splitting, and dataset creation.
+    """
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    # 1. Determine Data Source and Cache Filename
+    if split == "test":
+        df = pd.read_csv(Config.TEST_METADATA_PATH)
+        cache_file = "roi_cache_test.parquet"
+        df_for_cache = df
+    else:
+        # Load full training data
+        df_train = pd.read_csv(Config.TRAIN_METADATA_PATH)
+        df_val = pd.read_csv(Config.VAL_METADATA_PATH)
+
+        # Filter exclusions
+        df_train = df_train[~df_train["BraTS21ID"].isin(Config.EXCLUDE_CASES)]
+        df_val = df_val[~df_val["BraTS21ID"].isin(Config.EXCLUDE_CASES)]
+
+        df_full = pd.concat([df_train, df_val]).reset_index(drop=True)
+
+        # Determine specific split dataframe
+        if fold_idx is not None:
+            # Dynamic K-Fold Split
+            skf = StratifiedKFold(
+                n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+            )
+            fold_gen = skf.split(df_full, df_full["MGMT_value"])
+            train_idx, val_idx = list(fold_gen)[fold_idx]
+
+            if split == "train":
+                df = df_full.iloc[train_idx].reset_index(drop=True)
+            else:
+                df = df_full.iloc[val_idx].reset_index(drop=True)
+        else:
+            # Static Split from metadata files
+            df = df_train if split == "train" else df_val
+
+        cache_file = "roi_cache_train_val.parquet"
+        df_for_cache = df_full  # Cache everything to support all folds
+
+    if Config.DEBUG:
+        df = df.head(Config.DEBUG_DATASET_SIZE)
+        # If debugging, we still might want full cache or just debug cache.
+        # For simplicity, we cache what we use or full if available.
+        if split != "test":
+            df_for_cache = df_full.head(Config.DEBUG_DATASET_SIZE * 2)  # Approximation
+
+    # 2. Manage Cache
+    cache_path = os.path.join(Config.CACHE_DIR, cache_file)
+    cache_df = None
+
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            print(f"Loaded ROI cache from {cache_path}")
+        except Exception:
+            print("Cache load failed, regenerating...")
+
+    if cache_df is None:
+        cache_df = generate_roi_cache(df_for_cache, cache_path)
+
+    # 3. Create Dataset and Loader
+    transform = get_transforms(split)
+    dataset = SIRVDataset(df, cache_df, transform=transform, is_test=(split == "test"))
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
+
+    return loader
+=======
+def get_dataloader(
+    split,
+    batch_size=Config.BATCH_SIZE,
+    num_workers=Config.NUM_WORKERS,
+    load_cached_data=True,
+    fold_idx=None,
+):
+    """
+    Creates a DataLoader for the requested split.
+    """
+    os.makedirs(Config.CACHE_DIR, exist_ok=True)
+
+    # 1. Determine Data Source
+    if split == "test":
+        df = pd.read_csv(Config.TEST_METADATA_PATH)
+    else:
+        # Load full training data
+        df_train = pd.read_csv(Config.TRAIN_METADATA_PATH)
+        df_val = pd.read_csv(Config.VAL_METADATA_PATH)
+
+        # Filter exclusions
+        df_train = df_train[~df_train["BraTS21ID"].isin(Config.EXCLUDE_CASES)]
+        df_val = df_val[~df_val["BraTS21ID"].isin(Config.EXCLUDE_CASES)]
+
+        df_full = pd.concat([df_train, df_val]).reset_index(drop=True)
+
+        # Determine specific split dataframe
+        if fold_idx is not None:
+            # Dynamic K-Fold Split
+            skf = StratifiedKFold(
+                n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
+            )
+            fold_gen = skf.split(df_full, df_full["MGMT_value"])
+            train_idx, val_idx = list(fold_gen)[fold_idx]
+
+            if split == "train":
+                df = df_full.iloc[train_idx].reset_index(drop=True)
+            else:
+                df = df_full.iloc[val_idx].reset_index(drop=True)
+        else:
+            # Static Split from metadata files
+            df = df_train if split == "train" else df_val
+
+    if Config.DEBUG:
+        df = df.head(Config.DEBUG_DATASET_SIZE)
+
+    # 2. Create Dataset and Loader
+    transform = get_transforms(split)
+    # No external cache needed for MiddleSliceDataset
+    dataset = MiddleSliceDataset(df, transform=transform, is_test=(split == "test"))
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
+
+    return loader
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import SIRVEfficientNet
+from library.data import get_dataloader
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+=======
+from library.model import MGMTModel
+from library.data import get_dataloader
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 2. Model Initialization
+    model = SIRVEfficientNet(
+        model_name=Config.MODEL_NAME,
+        pretrained=True,
+        num_classes=1,
+        dropout_rate=Config.DROPOUT_RATE,
+    )
+    model = model.to(device)
+=======
+    # 2. Model Initialization
+    model = MGMTModel(
+        model_name=Config.MODEL_NAME,
+        pretrained=True,
+        num_classes=1,
+        dropout_rate=Config.DROPOUT_RATE,
+    )
+    model = model.to(device)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.train import run_training_fold
+from library.data import get_dataloader
+from library.model import SIRVEfficientNet
+
+
+def main():
+=======
+from library.train import run_training_fold
+from library.data import get_dataloader
+from library.model import MGMTModel
+
+
+def main():
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        # Load the best model for this fold
+        model = SIRVEfficientNet(num_classes=1)
+        model_path = os.path.join(Config.CACHE_DIR, f"best_model_fold{fold}.pth")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+=======
+        # Load the best model for this fold
+        model = MGMTModel(num_classes=1)
+        model_path = os.path.join(Config.CACHE_DIR, f"best_model_fold{fold}.pth")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Failure Analysis
+    print("\n=== Failure Analysis ===")
+    errors = np.abs(oof_preds - oof_targets)
+
+    # Load cache to get slice counts (metadata features)
+    cache_path = os.path.join(Config.CACHE_DIR, "roi_cache_train_val.parquet")
+    if os.path.exists(cache_path):
+        cache_df = pd.read_parquet(cache_path)
+
+        # Calculate slice count per modality for each subject
+        cache_df["slice_count"] = cache_df["Files"].apply(
+            lambda x: len(x.split(";")) if x else 0
+        )
+
+        # Pivot to get features: BraTS21ID | FLAIR_count | T1wCE_count | T2w_count
+        features_df = cache_df.pivot(
+            index="BraTS21ID", columns="Modality", values="slice_count"
+        ).reset_index()
+        features_df.columns = ["BraTS21ID", "FLAIR_count", "T1wCE_count", "T2w_count"]
+
+        # Merge errors with features
+        analysis_df = pd.DataFrame({"BraTS21ID": oof_ids, "error": errors})
+        analysis_df = analysis_df.merge(features_df, on="BraTS21ID", how="left").fillna(
+            0
+        )
+
+        print("Correlation between Error Magnitude and Slice Counts:")
+        for col in ["FLAIR_count", "T1wCE_count", "T2w_count"]:
+            if col in analysis_df.columns:
+                corr, _ = pearsonr(analysis_df["error"], analysis_df[col])
+                print(f"  {col}: {corr:.4f}")
+    else:
+        print("Warning: ROI cache not found. Skipping detailed correlation analysis.")
+=======
+    # Failure Analysis
+    print("\n=== Failure Analysis ===")
+    errors = np.abs(oof_preds - oof_targets)
+    print(f"Mean Absolute Error: {np.mean(errors):.4f}")
+    # ROI cache removed to simplify pipeline; skipping slice count correlation.
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+        for fold in range(Config.N_FOLDS):
+            print(f"Inference with model fold {fold}...")
+            model = SIRVEfficientNet(num_classes=1)
+            model_path = os.path.join(Config.CACHE_DIR, f"best_model_fold{fold}.pth")
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.to(device)
+            model.eval()
+=======
+        for fold in range(Config.N_FOLDS):
+            print(f"Inference with model fold {fold}...")
+            model = MGMTModel(num_classes=1)
+            model_path = os.path.join(Config.CACHE_DIR, f"best_model_fold{fold}.pth")
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.to(device)
+            model.eval()
+>>>>>>> REPLACE
+```

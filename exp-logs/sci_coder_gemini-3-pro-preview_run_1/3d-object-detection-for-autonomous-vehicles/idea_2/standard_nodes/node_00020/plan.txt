@@ -1,0 +1,482 @@
+The solution strategy focuses on correcting the coordinate frame mismatch identified as the root cause of the previous failure (Lesson `solution_lesson_node_00017`) and improving the feature map granularity (Lesson `solution_lesson_node_00019`).
+
+1.  **Coordinate Transformation (Global $\leftrightarrow$ Sensor):**
+    *   The previous model failed to learn because it attempted to map global coordinates (e.g., x=1800m) onto a local BEV grid (±100m), resulting in zero valid targets.
+    *   I will modify `BEVDataset` to load the `ego_pose` and `calibrated_sensor` metadata.
+    *   In `__getitem__`, I will calculate the transformation matrix from Global to Sensor frame.
+    *   For training, I will transform the ground truth annotations from Global to Sensor frame before generating heatmaps.
+    *   For inference, I will pass the inverse transformation (Sensor to Global) to the predictor to ensure the submission uses the required global coordinates.
+
+2.  **Resolution Optimization:**
+    *   The previous resolution of 0.8m/pixel was too coarse for the DLA-34 backbone to resolve objects effectively.
+    *   I will increase the resolution to **0.4m/pixel** (Input Size: 512x512). This provides a 4x increase in pixel density, allowing the model to better capture object dimensions and orientation while remaining computationally feasible within the time limit.
+
+3.  **Configuration:**
+    *   Update `WORKING_DIR` to `idea_3` to ensure clean caching.
+    *   Update `BEV_RESOLUTION` and `INPUT_SIZE`.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_2"
+    CACHE_DIR = WORKING_DIR
+    MODEL_SAVE_PATH = os.path.join(WORKING_DIR, "dla34_best_model.pth")
+=======
+    WORKING_DIR = "./working/idea_3"
+    CACHE_DIR = WORKING_DIR
+    MODEL_SAVE_PATH = os.path.join(WORKING_DIR, "dla34_best_model.pth")
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    BEV_RESOLUTION = 0.8
+
+    # Resulting Grid Size: (200 / 0.8) = 250
+    # Input size (W, H)
+    # Adjusted to 256 to be divisible by 32 (network stride)
+    INPUT_SIZE = (256, 256)
+=======
+    BEV_RESOLUTION = 0.4
+
+    # Resulting Grid Size: (200 / 0.4) = 500
+    # Input size (W, H)
+    # Adjusted to 512 to be divisible by 32 (network stride)
+    INPUT_SIZE = (512, 512)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        self.grid_w = Config.INPUT_SIZE[0]
+        self.grid_h = Config.INPUT_SIZE[1]
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        sample_token = sample["sample_token"]
+
+        # 1. Load/Generate BEV Map
+        bev_map = self._get_bev_map(sample)
+
+        # 2. Handle Targets (Train/Val) vs Inference (Test)
+        if self.split in ["train", "val"]:
+            anns = sample["annotations"]
+
+            # Augmentation (only for training)
+            if self.split == "train":
+                bev_map, anns = self._augment(bev_map, anns)
+
+            # Generate CenterNet Targets
+            targets = self._generate_targets(anns)
+
+            return {"input": torch.from_numpy(bev_map).float(), **targets}
+        else:
+            # Test mode
+            return {
+                "input": torch.from_numpy(bev_map).float(),
+                "sample_token": sample_token,
+            }
+
+    def _get_bev_map(self, sample):
+=======
+        self.grid_w = Config.INPUT_SIZE[0]
+        self.grid_h = Config.INPUT_SIZE[1]
+
+        # Load Pose Data
+        self._load_pose_data()
+
+    def _load_pose_data(self):
+        """
+        Loads sample_data, ego_pose, and calibrated_sensor JSONs for coordinate transformation.
+        Cite solution_lesson_node_00017: Verify reference frames before spatial mapping.
+        """
+        data_dir = "train_data" if self.split in ["train", "val"] else "test_data"
+        base_path = os.path.join(Config.INPUT_DIR, data_dir)
+
+        # Load tables
+        with open(os.path.join(base_path, "sample_data.json"), "r") as f:
+            sample_data = json.load(f)
+        with open(os.path.join(base_path, "ego_pose.json"), "r") as f:
+            ego_pose = json.load(f)
+        with open(os.path.join(base_path, "calibrated_sensor.json"), "r") as f:
+            calibrated_sensor = json.load(f)
+
+        # Indexing
+        self.ego_pose_map = {item["token"]: item for item in ego_pose}
+        self.calib_sensor_map = {item["token"]: item for item in calibrated_sensor}
+        
+        # Map sample_token -> lidar_sample_data
+        self.sample_to_lidar = {}
+        for sd in sample_data:
+            # We assume LIDAR_TOP or similar. Usually identified by filename ending in .bin
+            if sd["filename"].endswith(".bin") or sd["filename"].endswith(".pcd"):
+                self.sample_to_lidar[sd["sample_token"]] = sd
+
+    def _get_transform_matrix(self, sample_token):
+        """
+        Computes the transformation matrix from Global to Sensor frame.
+        Returns:
+            global_to_sensor (4x4), sensor_to_global (4x4), yaw_correction (float)
+        """
+        if sample_token not in self.sample_to_lidar:
+            # Fallback (Identity)
+            return np.eye(4), np.eye(4), 0.0
+
+        sd = self.sample_to_lidar[sample_token]
+        ego = self.ego_pose_map[sd["ego_pose_token"]]
+        calib = self.calib_sensor_map[sd["calibrated_sensor_token"]]
+
+        # Global -> Ego
+        # T_global_ego = [R_ego | t_ego]
+        # We need inv(T_global_ego)
+        
+        # Rotation (Quaternion to Matrix)
+        def q_to_rot(q):
+            # q = [w, x, y, z]
+            w, x, y, z = q
+            return np.array([
+                [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+                [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+                [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+            ])
+
+        R_ego = q_to_rot(ego["rotation"])
+        t_ego = np.array(ego["translation"])
+        
+        # T_ego_global (Ego to Global)
+        T_ego_global = np.eye(4)
+        T_ego_global[:3, :3] = R_ego
+        T_ego_global[:3, 3] = t_ego
+
+        # Ego -> Sensor
+        R_calib = q_to_rot(calib["rotation"])
+        t_calib = np.array(calib["translation"])
+        
+        # T_sensor_ego (Sensor to Ego)
+        T_sensor_ego = np.eye(4)
+        T_sensor_ego[:3, :3] = R_calib
+        T_sensor_ego[:3, 3] = t_calib
+
+        # T_sensor_global = T_ego_global @ T_sensor_ego
+        T_sensor_global = T_ego_global @ T_sensor_ego
+        
+        # T_global_sensor = inv(T_sensor_global)
+        T_global_sensor = np.linalg.inv(T_sensor_global)
+
+        # Yaw correction
+        # Yaw_global = Yaw_sensor + Yaw_bias
+        # Yaw_bias is the yaw component of T_sensor_global
+        # We can extract it from the rotation matrix
+        # yaw = atan2(R[1,0], R[0,0])
+        yaw_bias = np.arctan2(T_sensor_global[1, 0], T_sensor_global[0, 0])
+
+        return T_global_sensor, T_sensor_global, yaw_bias
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        sample_token = sample["sample_token"]
+
+        # 1. Load/Generate BEV Map
+        bev_map = self._get_bev_map(sample)
+
+        # 2. Get Coordinate Transforms
+        global_to_sensor, sensor_to_global, yaw_bias = self._get_transform_matrix(sample_token)
+
+        # 3. Handle Targets (Train/Val) vs Inference (Test)
+        if self.split in ["train", "val"]:
+            anns = sample["annotations"]
+            
+            # Transform annotations to Sensor Frame
+            # Cite solution_lesson_node_00017
+            anns_sensor = []
+            for ann in anns:
+                # Center
+                pt_global = np.array([ann["center_x"], ann["center_y"], ann["center_z"], 1.0])
+                pt_sensor = global_to_sensor @ pt_global
+                
+                # Yaw
+                yaw_sensor = ann["yaw"] - yaw_bias
+                # Normalize yaw
+                while yaw_sensor > np.pi: yaw_sensor -= 2*np.pi
+                while yaw_sensor < -np.pi: yaw_sensor += 2*np.pi
+                
+                new_ann = ann.copy()
+                new_ann["center_x"] = pt_sensor[0]
+                new_ann["center_y"] = pt_sensor[1]
+                new_ann["center_z"] = pt_sensor[2]
+                new_ann["yaw"] = yaw_sensor
+                anns_sensor.append(new_ann)
+
+            # Augmentation (only for training)
+            if self.split == "train":
+                bev_map, anns_sensor = self._augment(bev_map, anns_sensor)
+
+            # Generate CenterNet Targets
+            targets = self._generate_targets(anns_sensor)
+
+            return {
+                "input": torch.from_numpy(bev_map).float(), 
+                "sensor_to_global": torch.from_numpy(sensor_to_global).float(),
+                "yaw_bias": torch.tensor(yaw_bias).float(),
+                **targets
+            }
+        else:
+            # Test mode
+            return {
+                "input": torch.from_numpy(bev_map).float(),
+                "sample_token": sample_token,
+                "sensor_to_global": torch.from_numpy(sensor_to_global).float(),
+                "yaw_bias": torch.tensor(yaw_bias).float()
+            }
+
+    def _get_bev_map(self, sample):
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    def decode_predictions(self, outputs, K=50, score_thresh=0.2):
+        """
+        Decodes model outputs into 3D bounding boxes.
+        Args:
+            outputs: Dictionary of model outputs
+            K: Max number of detections
+            score_thresh: Minimum score threshold
+        Returns:
+            detections: List of lists containing detection dicts for each sample in batch
+        """
+        # 1. Heatmap Processing
+        hm = torch.sigmoid(outputs["hm"])
+        hm = _nms(hm)
+
+        # 2. Extract Top K
+        scores, inds, clses, ys, xs = _topk(hm, K=K)
+
+        # 3. Gather Regression Heads
+        # reg: (B, K, 2) - offsets
+        reg = _transpose_and_gather_feat(outputs["reg"], inds)
+        # wh: (B, K, 3) - dimensions
+        wh = _transpose_and_gather_feat(outputs["wh"], inds)
+        # depth: (B, K, 1) - z coordinate
+        depth = _transpose_and_gather_feat(outputs["depth"], inds)
+        # rot: (B, K, 2) - sin, cos
+        rot = _transpose_and_gather_feat(outputs["rot"], inds)
+
+        # 4. Convert to World Coordinates
+        # Apply offsets to grid coordinates
+        xs = xs.view(xs.size(0), K, 1) + reg[:, :, 0:1]
+        ys = ys.view(ys.size(0), K, 1) + reg[:, :, 1:2]
+
+        # Scale to world coordinates
+        # x_world = x_grid * resolution + x_min
+        # y_world = y_grid * resolution + y_min
+
+        # Note: dataset.py uses: x_c = (x - x_min) / res
+        # So: x = x_c * res + x_min
+        xs_world = xs * Config.BEV_RESOLUTION + Config.X_RANGE[0]
+        ys_world = ys * Config.BEV_RESOLUTION + Config.Y_RANGE[0]
+
+        # 5. Process Attributes
+        # Rotation: atan2(sin, cos)
+        yaw = torch.atan2(rot[:, :, 0:1], rot[:, :, 1:2])
+
+        # 6. Assemble Detections
+        batch_size = scores.size(0)
+        results = []
+
+        for i in range(batch_size):
+            sample_dets = []
+            for j in range(K):
+                score = scores[i, j].item()
+                if score < score_thresh:
+                    continue
+
+                cls_id = clses[i, j].item()
+                cls_name = Config.ID_TO_CLASS[cls_id]
+
+                det = {
+                    "score": score,
+                    "center_x": xs_world[i, j].item(),
+                    "center_y": ys_world[i, j].item(),
+                    "center_z": depth[i, j].item(),
+                    "width": wh[i, j, 0].item(),
+                    "length": wh[i, j, 1].item(),
+                    "height": wh[i, j, 2].item(),
+                    "yaw": yaw[i, j].item(),
+                    "class_name": cls_name,
+                }
+                sample_dets.append(det)
+            results.append(sample_dets)
+
+        return results
+=======
+    def decode_predictions(self, outputs, sensor_to_global, yaw_bias, K=50, score_thresh=0.2):
+        """
+        Decodes model outputs into 3D bounding boxes.
+        Args:
+            outputs: Dictionary of model outputs
+            sensor_to_global: (B, 4, 4) Transformation matrices
+            yaw_bias: (B,) Yaw correction
+            K: Max number of detections
+            score_thresh: Minimum score threshold
+        Returns:
+            detections: List of lists containing detection dicts for each sample in batch
+        """
+        # 1. Heatmap Processing
+        hm = torch.sigmoid(outputs["hm"])
+        hm = _nms(hm)
+
+        # 2. Extract Top K
+        scores, inds, clses, ys, xs = _topk(hm, K=K)
+
+        # 3. Gather Regression Heads
+        reg = _transpose_and_gather_feat(outputs["reg"], inds)
+        wh = _transpose_and_gather_feat(outputs["wh"], inds)
+        depth = _transpose_and_gather_feat(outputs["depth"], inds)
+        rot = _transpose_and_gather_feat(outputs["rot"], inds)
+
+        # 4. Convert to Sensor Coordinates
+        xs = xs.view(xs.size(0), K, 1) + reg[:, :, 0:1]
+        ys = ys.view(ys.size(0), K, 1) + reg[:, :, 1:2]
+
+        # Sensor Frame Coordinates
+        x_sensor = xs * Config.BEV_RESOLUTION + Config.X_RANGE[0]
+        y_sensor = ys * Config.BEV_RESOLUTION + Config.Y_RANGE[0]
+        z_sensor = depth
+
+        # 5. Transform to Global Coordinates
+        # Cite solution_lesson_node_00017
+        batch_size = scores.size(0)
+        results = []
+
+        for i in range(batch_size):
+            sample_dets = []
+            
+            # Get transform for this sample
+            T = sensor_to_global[i] # (4, 4)
+            y_b = yaw_bias[i].item()
+
+            for j in range(K):
+                score = scores[i, j].item()
+                if score < score_thresh:
+                    continue
+
+                # Point in Sensor Frame
+                p_s = torch.tensor([x_sensor[i, j].item(), y_sensor[i, j].item(), z_sensor[i, j].item(), 1.0], device=self.device)
+                
+                # Transform to Global
+                p_g = torch.matmul(T, p_s)
+                
+                # Yaw in Sensor Frame
+                yaw_s = torch.atan2(rot[i, j, 0], rot[i, j, 1]).item()
+                # Yaw Global
+                yaw_g = yaw_s + y_b
+
+                cls_id = clses[i, j].item()
+                cls_name = Config.ID_TO_CLASS[cls_id]
+
+                det = {
+                    "score": score,
+                    "center_x": p_g[0].item(),
+                    "center_y": p_g[1].item(),
+                    "center_z": p_g[2].item(),
+                    "width": wh[i, j, 0].item(),
+                    "length": wh[i, j, 1].item(),
+                    "height": wh[i, j, 2].item(),
+                    "yaw": yaw_g,
+                    "class_name": cls_name,
+                }
+                sample_dets.append(det)
+            results.append(sample_dets)
+
+        return results
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+                outputs = self.model(inputs)
+
+                # Decode
+                batch_detections = self.decode_predictions(
+                    outputs,
+                    K=Config.MAX_DETECTIONS,
+                    score_thresh=Config.SCORE_THRESHOLD,
+                )
+
+                # Format
+                for token, dets in zip(sample_tokens, batch_detections):
+=======
+                outputs = self.model(inputs)
+                
+                sensor_to_global = batch["sensor_to_global"].to(self.device)
+                yaw_bias = batch["yaw_bias"].to(self.device)
+
+                # Decode
+                batch_detections = self.decode_predictions(
+                    outputs,
+                    sensor_to_global,
+                    yaw_bias,
+                    K=Config.MAX_DETECTIONS,
+                    score_thresh=Config.SCORE_THRESHOLD,
+                )
+
+                # Format
+                for token, dets in zip(sample_tokens, batch_detections):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+            # Decode
+            batch_detections = predictor.decode_predictions(
+                outputs, K=Config.MAX_DETECTIONS, score_thresh=Config.SCORE_THRESHOLD
+            )
+
+            # Process each sample in batch
+=======
+            # Decode
+            sensor_to_global = batch["sensor_to_global"].to(device)
+            yaw_bias = batch["yaw_bias"].to(device)
+            
+            batch_detections = predictor.decode_predictions(
+                outputs, 
+                sensor_to_global,
+                yaw_bias,
+                K=Config.MAX_DETECTIONS, 
+                score_thresh=Config.SCORE_THRESHOLD
+            )
+
+            # Process each sample in batch
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 1. Configuration
+    # Set cache dir to current working dir to generate new cache with correct dimensions (256, 256)
+    Config.CACHE_DIR = "./working/idea_2"
+    # Ensure working dir is correct for saving model
+    Config.WORKING_DIR = "./working/idea_2"
+    Config.MODEL_SAVE_PATH = os.path.join(Config.WORKING_DIR, "dla34_best_model.pth")
+=======
+    # 1. Configuration
+    # Set cache dir to current working dir to generate new cache with correct dimensions
+    Config.CACHE_DIR = "./working/idea_3"
+    # Ensure working dir is correct for saving model
+    Config.WORKING_DIR = "./working/idea_3"
+    Config.MODEL_SAVE_PATH = os.path.join(Config.WORKING_DIR, "dla34_best_model.pth")
+>>>>>>> REPLACE
+```

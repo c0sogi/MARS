@@ -1,0 +1,183 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+# 1. Monkey Patch Configuration for Fast Baseline
+# We modify the Config class before other modules use it to control the run parameters.
+from library.configuration import Config
+
+# Increase debug sample size to 200k to get a representative model within time limits
+Config.DEBUG_SAMPLE_SIZE = 200000
+# Limit epochs to 10 for speed (sufficient for convergence on 200k samples)
+Config.EPOCHS = 10
+# Optimize batch sizes for A100 GPU
+Config.BATCH_SIZE_EXTRACT = 512
+Config.BATCH_SIZE_TRAIN = 4096
+
+# Import library modules after configuration patch
+from library.utilities import seed_everything, calculate_accuracy
+from library.preprocessing import extract_features
+from library.dataset import FeatureMemoryDataset, get_training_dataloader
+from library.engine import Trainer, generate_submission
+from library.architecture import ConditionalCascadeMLP
+
+
+def main():
+    # Ensure reproducibility
+    seed_everything(Config.SEED)
+    print("Initializing Fast Baseline Run (Idea 14)...")
+
+    # ==========================================
+    # 1. Feature Extraction
+    # ==========================================
+    print("\n=== Phase 1: Feature Extraction ===")
+
+    # Train & Val: Use Debug subset (200k) to save time while maintaining signal
+    print(f"Extracting Train Features (Subset: {Config.DEBUG_SAMPLE_SIZE})...")
+    extract_features(split="train", load_cached_data=True, debug=True)
+
+    print(f"Extracting Val Features (Subset: {Config.DEBUG_SAMPLE_SIZE})...")
+    extract_features(split="val", load_cached_data=True, debug=True)
+
+    # Test: Must use Full set to generate valid submission for all IDs
+    print("Extracting Test Features (Full Dataset)...")
+    # debug=False ensures we process the entire metadata/test.csv
+    extract_features(split="test", load_cached_data=True, debug=False)
+
+    # ==========================================
+    # 2. Model Training (Ensemble)
+    # ==========================================
+    print("\n=== Phase 2: Model Training ===")
+    model_paths = []
+
+    # Get Dataloaders (using the features we just extracted)
+    # Note: These loaders pull from the cached .npy files generated above
+    train_loader = get_training_dataloader(split="train", debug=True)
+    val_loader = get_training_dataloader(split="val", debug=True)
+
+    # Train Ensemble of 3 models
+    for i in range(Config.NUM_MODELS):
+        print(f"\nTraining Model {i+1}/{Config.NUM_MODELS}...")
+        model_name = f"ensemble_model_{i}.pth"
+        save_path = os.path.join(Config.WORKING_DIR, model_name)
+
+        trainer = Trainer(model_save_path=save_path)
+        best_acc = trainer.fit(train_loader, val_loader, epochs=Config.EPOCHS)
+
+        model_paths.append(save_path)
+        print(f"Model {i+1} finished with Best Val Acc: {best_acc:.6f}")
+
+    # ==========================================
+    # 3. Validation & Failure Analysis
+    # ==========================================
+    print("\n=== Phase 3: Validation & Analysis ===")
+
+    # Load Validation Data Manually for detailed inference
+    val_ds = FeatureMemoryDataset(split="val", debug=True)
+    val_loader_full = DataLoader(
+        val_ds,
+        batch_size=Config.BATCH_SIZE_TRAIN,
+        shuffle=False,
+        num_workers=Config.NUM_WORKERS,
+    )
+
+    device = torch.device(Config.DEVICE)
+
+    # Load Ensemble Models
+    models = []
+    for path in model_paths:
+        m = ConditionalCascadeMLP()
+        m.load_state_dict(torch.load(path, map_location=device))
+        m.to(device)
+        m.eval()
+        models.append(m)
+
+    # Run Inference on Validation Set
+    all_preds = []
+    all_targets = []
+
+    print("Running ensemble inference on validation set...")
+    with torch.no_grad():
+        for batch in val_loader_full:
+            feats, l1, l2, l3 = batch
+            feats = feats.to(device)
+
+            # Ensemble Averaging
+            avg_probs = None
+            for model in models:
+                _, _, logits = model(feats)
+                probs = torch.softmax(logits, dim=1)
+                if avg_probs is None:
+                    avg_probs = probs
+                else:
+                    avg_probs += probs
+
+            avg_probs /= len(models)
+            preds = torch.argmax(avg_probs, dim=1).cpu()
+            all_preds.append(preds)
+            all_targets.append(l3)
+
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
+
+    # Compute and Print Final Metric
+    final_acc = calculate_accuracy(all_preds, all_targets)
+    print(f"Final Validation Metric: {final_acc}")
+
+    # Failure Analysis: Correlation between Class Frequency and Accuracy
+    print("Performing Failure Analysis...")
+
+    # Get class counts from training set (to see support per class)
+    train_ds = FeatureMemoryDataset(split="train", debug=True)
+    train_labels = train_ds.labels_l3
+    class_counts = pd.Series(train_labels).value_counts().sort_index()
+
+    # Get accuracy per class in validation
+    results_df = pd.DataFrame(
+        {"target": all_targets.numpy(), "pred": all_preds.numpy()}
+    )
+    results_df["correct"] = results_df["target"] == results_df["pred"]
+
+    class_acc = results_df.groupby("target")["correct"].mean()
+
+    # Intersect indices to handle classes that might be missing in the subset
+    common_classes = class_counts.index.intersection(class_acc.index)
+
+    if len(common_classes) > 1:
+        corr = class_counts.loc[common_classes].corr(class_acc.loc[common_classes])
+        print(f"Correlation (Class Frequency vs Accuracy): {corr:.4f}")
+    else:
+        print("Insufficient class overlap for correlation analysis.")
+
+    # ==========================================
+    # 4. Submission
+    # ==========================================
+    THRESHOLD = 0.6239621493939094
+
+    if final_acc > THRESHOLD:
+        print(
+            f"\nValidation Metric ({final_acc:.6f}) > Threshold ({THRESHOLD}). Generating Submission..."
+        )
+
+        # Load Test Data (Full)
+        # We use debug=False here because we extracted the full test set earlier
+        test_ds = FeatureMemoryDataset(split="test", debug=False)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=Config.BATCH_SIZE_TRAIN,
+            shuffle=False,
+            num_workers=Config.NUM_WORKERS,
+        )
+
+        generate_submission(model_paths, test_loader)
+    else:
+        print(
+            f"\nValidation Metric ({final_acc:.6f}) <= Threshold ({THRESHOLD}). Skipping Submission."
+        )
+
+
+if __name__ == "__main__":
+    main()

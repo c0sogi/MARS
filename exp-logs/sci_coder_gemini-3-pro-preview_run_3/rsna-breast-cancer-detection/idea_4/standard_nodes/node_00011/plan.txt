@@ -1,0 +1,238 @@
+To resolve the `torch.OutOfMemoryError` caused by the large memory footprint of the EfficientNetV2 backbone with high-resolution images, I will implement a multi-faceted memory optimization strategy. First, I will reduce the physical `BATCH_SIZE` from 16 to 8 to fit within the GPU's VRAM (Cite debug_lesson_3). To preserve the convergence properties of the larger batch size, I will introduce `GRADIENT_ACCUMULATION_STEPS = 2`. Second, I will implement Automatic Mixed Precision (AMP) using `torch.cuda.amp.autocast` and `GradScaler` to reduce activation memory usage and accelerate training (Cite debug_lesson_2). Finally, I will optimize the `BreastMILModel.forward` method to pre-allocate the batch tensor on the GPU and copy data directly from the CPU, eliminating the creation of intermediate duplicate tensors during the concatenation of image bags.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Batch size represents number of 'bags' (breasts) per step
+    # A100 40GB can handle larger batches, but MIL adds overhead per sample.
+    BATCH_SIZE = 16
+
+    LEARNING_RATE = 1e-4
+=======
+    # Batch size represents number of 'bags' (breasts) per step
+    # Reduced from 16 to 8 to avoid OOM on 16GB GPU (Cite debug_lesson_3)
+    BATCH_SIZE = 8
+
+    # Accumulate gradients to maintain effective batch size of 16
+    GRADIENT_ACCUMULATION_STEPS = 2
+
+    LEARNING_RATE = 1e-4
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def forward(self, images):
+        """
+        Forward pass for a batch of bags.
+
+        Args:
+            images (List[torch.Tensor]): A list of length B, where each element is a
+                                         tensor of shape (N_i, 3, H, W) representing
+                                         the bag of views for a specific breast.
+
+        Returns:
+            torch.Tensor: Logits of shape (B, 1).
+        """
+        # Optimization: Concatenate all images into a single tensor to maximize GPU utilization
+        # for the backbone pass, rather than looping through the backbone B times.
+
+        # Track the split sizes to reconstruct bags later
+        split_sizes = [bag.shape[0] for bag in images]
+
+        # Flatten list of bags into one big batch of images
+        # Shape: (Sum(N_i), 3, H, W)
+        flat_images = torch.cat(images, dim=0)
+
+        # Extract features for all images at once
+        # Shape: (Sum(N_i), Feature_Dim)
+        flat_features = self.forward_features(flat_images)
+=======
+    def forward(self, images):
+        """
+        Forward pass for a batch of bags.
+
+        Args:
+            images (List[torch.Tensor]): A list of length B, where each element is a
+                                         tensor of shape (N_i, 3, H, W).
+                                         Can be on CPU or GPU.
+
+        Returns:
+            torch.Tensor: Logits of shape (B, 1).
+        """
+        # Optimization: Concatenate all images into a single tensor to maximize GPU utilization
+        # for the backbone pass, rather than looping through the backbone B times.
+
+        # Determine device from model parameters
+        device = next(self.parameters()).device
+
+        # Track the split sizes to reconstruct bags later
+        split_sizes = [bag.shape[0] for bag in images]
+
+        # Memory Optimization:
+        # If images are on CPU, allocate the large tensor on GPU once and copy directly
+        # to avoid holding a list of GPU tensors AND the concatenated tensor simultaneously.
+        total_images = sum(split_sizes)
+        if total_images == 0:
+            return torch.zeros((len(images), 1), device=device)
+
+        H, W = images[0].shape[-2:]
+
+        # Pre-allocate the full batch tensor on the target device
+        flat_images = torch.empty((total_images, 3, H, W), device=device)
+
+        # Fill it
+        start_idx = 0
+        for bag in images:
+            end_idx = start_idx + bag.shape[0]
+            # Copy data to the allocated slot (handles CPU->GPU transfer if needed)
+            flat_images[start_idx:end_idx] = bag.to(device)
+            start_idx = end_idx
+
+        # Extract features for all images at once
+        # Shape: (Sum(N_i), Feature_Dim)
+        flat_features = self.forward_features(flat_images)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from library.config import Config
+=======
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from torch.cuda.amp import autocast, GradScaler
+from library.config import Config
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch.
+    """
+    model.train()
+    running_loss = 0.0
+
+    # We don't strictly need to calculate pF1 for training since it's on a balanced set
+    # and not indicative of final performance, but we track loss.
+
+    for batch_idx, (images, labels, _) in enumerate(loader):
+        # images is a list of tensors, need to move each to device
+        # The model handles the list input, but the tensors inside must be on device
+        images = [img.to(device) for img in images]
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(images)
+
+        # Calculate loss
+        loss = criterion(logits, labels)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    return running_loss / len(loader)
+=======
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    """
+    Trains the model for one epoch using AMP and Gradient Accumulation.
+    """
+    model.train()
+    running_loss = 0.0
+
+    # Initialize Scaler for AMP (Cite debug_lesson_2)
+    scaler = GradScaler()
+
+    optimizer.zero_grad()
+
+    for batch_idx, (images, labels, _) in enumerate(loader):
+        # Note: 'images' is a list of tensors. We pass them to the model directly.
+        # The model handles moving them to GPU efficiently to save memory.
+
+        labels = labels.to(device).unsqueeze(1)  # (B, 1)
+
+        # Forward pass with AMP
+        with autocast():
+            logits = model(images)
+            loss = criterion(logits, labels)
+            # Normalize loss for gradient accumulation
+            loss = loss / Config.GRADIENT_ACCUMULATION_STEPS
+
+        # Backward pass with scaler
+        scaler.scale(loss).backward()
+
+        # Step optimizer every N steps
+        if (batch_idx + 1) % Config.GRADIENT_ACCUMULATION_STEPS == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        # Track full loss for reporting (undo division)
+        running_loss += loss.item() * Config.GRADIENT_ACCUMULATION_STEPS
+
+    # Handle remaining gradients if last batch didn't trigger step
+    if len(loader) % Config.GRADIENT_ACCUMULATION_STEPS != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return running_loss / len(loader)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, labels, _ in loader:
+            images = [img.to(device) for img in images]
+            labels = labels.to(device).unsqueeze(1)
+
+            logits = model(images)
+            loss = criterion(logits, labels)
+            running_loss += loss.item()
+=======
+    with torch.no_grad():
+        for images, labels, _ in loader:
+            # Pass list of images (CPU or GPU) to model
+            labels = labels.to(device).unsqueeze(1)
+
+            # Use autocast for evaluation to save memory
+            with autocast():
+                logits = model(images)
+                loss = criterion(logits, labels)
+
+            running_loss += loss.item()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train_eval.py
+<<<<<<< SEARCH
+    with torch.no_grad():
+        for images, _, ids in loader:
+            images = [img.to(device) for img in images]
+
+            logits = model(images)
+=======
+    with torch.no_grad():
+        for images, _, ids in loader:
+            # Use autocast for inference
+            with autocast():
+                logits = model(images)
+>>>>>>> REPLACE
+```

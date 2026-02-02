@@ -1,0 +1,410 @@
+Implementation Strategy:
+1.  **Refactor Model Architecture**: Replace the `MultiHeadInteractionBlock` with a monolithic `ReceiverAwareInteractionBlock` in `library/model.py`. This aligns with **Lesson 00084**, which indicates that monolithic message passing outperforms multi-head splitting on this dataset size by utilizing the full feature capacity more effectively. The new block will retain the **Receiver-Aware** property (**Lesson 00072**) and **Gated Convolution** mechanism (**Lesson 00080**).
+2.  **Optimize Residual Connections**: Ensure the residual connection uses a scalar learnable parameter initialized to zero, preserving the identity mapping initially and allowing the model to learn the optimal scaling (**Lesson 00060**, **Lesson 00065**). The activation will be placed after the residual addition (**Lesson 00041**).
+3.  **Update Configuration**: Remove the unused `NUM_HEADS` parameter from `library/config.py`.
+4.  **Tune Training Hyperparameters**: In `runfile.py`, increase `NUM_EPOCHS` from 50 to 120. Since the monolithic architecture is computationally more efficient (~4x faster per epoch according to Lesson 00084), we can afford to train longer to ensure convergence without exceeding the time limit.
+5.  **Data Loading Optimization**: Enable `num_workers=2` in the DataLoaders within `runfile.py` to reduce data bottlenecking.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+HIDDEN_DIM = 128  # Dimension of node embeddings and hidden layers
+NUM_HEADS = 4  # Number of heads for multi-head gating
+NUM_BLOCKS = 4  # Number of interaction blocks
+DROPOUT_RATE = 0.1  # Dropout probability
+=======
+HIDDEN_DIM = 128  # Dimension of node embeddings and hidden layers
+NUM_BLOCKS = 4  # Number of interaction blocks
+DROPOUT_RATE = 0.1  # Dropout probability
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+from library.config import (
+    HIDDEN_DIM,
+    NUM_HEADS,
+    NUM_BLOCKS,
+    DROPOUT_RATE,
+    ATOM_EMBEDDING_DIM,
+    EDGE_EMBEDDING_DIM,
+    NUM_RBF_BINS,
+    CUTOFF_RADIUS,
+    RBF_GAMMA,
+)
+
+
+class GaussianRBF(nn.Module):
+    """
+    Expands scalar distances into a vector of Gaussian radial basis functions.
+    """
+
+    def __init__(
+        self, start=0.0, stop=CUTOFF_RADIUS, num_bins=NUM_RBF_BINS, gamma=RBF_GAMMA
+    ):
+        super().__init__()
+        self.centers = nn.Parameter(
+            torch.linspace(start, stop, num_bins), requires_grad=False
+        )
+        self.gamma = gamma
+
+    def forward(self, x):
+        # x: (E, 1) distances
+        # centers: (num_bins, )
+        # output: (E, num_bins)
+        return torch.exp(-self.gamma * (x - self.centers) ** 2)
+
+
+class MultiHeadInteractionBlock(MessagePassing):
+    """
+    Interaction block with Multi-Head Gating and Receiver-Awareness.
+    Splits features into heads, computes independent gated messages, and aggregates them.
+    """
+
+    def __init__(self, hidden_dim, num_heads, dropout):
+        super().__init__(aggr="add")
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.dropout = dropout
+
+        assert hidden_dim % num_heads == 0, "Hidden dim must be divisible by num_heads"
+
+        # Head-specific layers
+        # Input to each head is concatenation of source (head_dim), target (head_dim), and edge (head_dim)
+        # Total input dim per head = 3 * head_dim
+        self.head_filters = nn.ModuleList(
+            [nn.Linear(3 * self.head_dim, self.head_dim) for _ in range(num_heads)]
+        )
+        self.head_gates = nn.ModuleList(
+            [nn.Linear(3 * self.head_dim, self.head_dim) for _ in range(num_heads)]
+        )
+
+        # Mixing layer to combine information from heads
+        self.mix_linear = nn.Linear(hidden_dim, hidden_dim)
+
+        # Batch Normalization
+        self.bn = nn.BatchNorm1d(hidden_dim)
+
+        # Learnable residual scalar initialized to 0
+        self.epsilon = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x, edge_index, edge_attr):
+        # x: (N, hidden_dim)
+        # edge_index: (2, E)
+        # edge_attr: (E, hidden_dim) - projected edge features
+
+        # Save input for residual connection
+        x_in = x
+
+        # Propagate messages
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+        # Mix heads
+        out = self.mix_linear(out)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+
+        # Residual connection with learnable scalar
+        # h_{l+1} = Softplus(BN(Agg + (1 + eps) * h_l))
+        out = out + (1.0 + self.epsilon) * x_in
+        out = self.bn(out)
+        out = F.softplus(out)
+
+        return out
+
+    def message(self, x_i, x_j, edge_attr):
+        # x_i, x_j: (E, hidden_dim)
+        # edge_attr: (E, hidden_dim)
+
+        # Split features into heads
+        # Reshape to (E, num_heads, head_dim)
+        x_i_split = x_i.view(-1, self.num_heads, self.head_dim)
+        x_j_split = x_j.view(-1, self.num_heads, self.head_dim)
+        edge_split = edge_attr.view(-1, self.num_heads, self.head_dim)
+
+        head_messages = []
+
+        for k in range(self.num_heads):
+            # Receiver-Aware Concatenation for head k
+            # z_k = [h_i^{(k)} || h_j^{(k)} || e_{ij}^{(k)}]
+            # Shape: (E, 3 * head_dim)
+            z_k = torch.cat(
+                [x_i_split[:, k, :], x_j_split[:, k, :], edge_split[:, k, :]], dim=-1
+            )
+
+            # Filter: Softplus(W_f * z_k)
+            f_k = F.softplus(self.head_filters[k](z_k))
+
+            # Gate: Sigmoid(W_g * z_k)
+            g_k = torch.sigmoid(self.head_gates[k](z_k))
+
+            # Message: f_k * g_k
+            m_k = f_k * g_k
+            head_messages.append(m_k)
+
+        # Concatenate messages from all heads back to (E, hidden_dim)
+        return torch.cat(head_messages, dim=-1)
+
+
+class MH_RA_CGN(nn.Module):
+    """
+    Multi-Head Receiver-Aware Crystal Graph Network.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Node Embedding (Atomic numbers up to 118)
+        self.atom_embedding = nn.Embedding(119, HIDDEN_DIM)
+
+        # Edge Embedding and Projection
+        self.rbf = GaussianRBF()
+        self.edge_proj = nn.Linear(NUM_RBF_BINS, HIDDEN_DIM)
+
+        # Stack of Interaction Blocks
+        self.blocks = nn.ModuleList(
+            [
+                MultiHeadInteractionBlock(HIDDEN_DIM, NUM_HEADS, DROPOUT_RATE)
+                for _ in range(NUM_BLOCKS)
+            ]
+        )
+=======
+from library.config import (
+    HIDDEN_DIM,
+    NUM_BLOCKS,
+    DROPOUT_RATE,
+    ATOM_EMBEDDING_DIM,
+    EDGE_EMBEDDING_DIM,
+    NUM_RBF_BINS,
+    CUTOFF_RADIUS,
+    RBF_GAMMA,
+)
+
+
+class GaussianRBF(nn.Module):
+    """
+    Expands scalar distances into a vector of Gaussian radial basis functions.
+    """
+
+    def __init__(
+        self, start=0.0, stop=CUTOFF_RADIUS, num_bins=NUM_RBF_BINS, gamma=RBF_GAMMA
+    ):
+        super().__init__()
+        self.centers = nn.Parameter(
+            torch.linspace(start, stop, num_bins), requires_grad=False
+        )
+        self.gamma = gamma
+
+    def forward(self, x):
+        # x: (E, 1) distances
+        # centers: (num_bins, )
+        # output: (E, num_bins)
+        return torch.exp(-self.gamma * (x - self.centers) ** 2)
+
+
+class ReceiverAwareInteractionBlock(MessagePassing):
+    """
+    Monolithic Receiver-Aware Interaction Block with Gated Convolution.
+    Concatenates source, target, and edge features.
+    Cite solution_lesson_node_00084: Monolithic outperforms Multi-Head on small data.
+    Cite solution_lesson_node_00072: Receiver-Awareness improves performance.
+    """
+
+    def __init__(self, hidden_dim, dropout):
+        super().__init__(aggr="add")
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+
+        # Monolithic Linear layers for Filter and Gate
+        # Input: h_i || h_j || e_ij -> 3 * hidden_dim
+        self.lin_filter = nn.Linear(3 * hidden_dim, hidden_dim)
+        self.lin_gate = nn.Linear(3 * hidden_dim, hidden_dim)
+
+        # Update function
+        self.lin_update = nn.Linear(hidden_dim, hidden_dim)
+
+        # Batch Normalization
+        self.bn = nn.BatchNorm1d(hidden_dim)
+
+        # Learnable residual scalar initialized to 0
+        # Cite solution_lesson_node_00060, solution_lesson_node_00065
+        self.epsilon = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x, edge_index, edge_attr):
+        # x: (N, hidden_dim)
+        # edge_index: (2, E)
+        # edge_attr: (E, hidden_dim) - projected edge features
+
+        # Save input for residual connection
+        x_in = x
+
+        # Propagate messages
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+        # Update
+        out = self.lin_update(out)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+
+        # Residual connection with learnable scalar
+        # h_{l+1} = Softplus(BN(Agg + (1 + eps) * h_l))
+        out = out + (1.0 + self.epsilon) * x_in
+        out = self.bn(out)
+        out = F.softplus(out)  # Cite solution_lesson_node_00041
+
+        return out
+
+    def message(self, x_i, x_j, edge_attr):
+        # Concatenate source, target, edge
+        z = torch.cat([x_i, x_j, edge_attr], dim=-1)
+
+        # Gated Convolution
+        # Cite solution_lesson_node_00080: Gated Convolutions prefered.
+        f = F.softplus(self.lin_filter(z))
+        g = torch.sigmoid(self.lin_gate(z))
+        return f * g
+
+
+class CrystalGraphNetwork(nn.Module):
+    """
+    Monolithic Receiver-Aware Crystal Graph Network.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Node Embedding (Atomic numbers up to 118)
+        self.atom_embedding = nn.Embedding(119, HIDDEN_DIM)
+
+        # Edge Embedding and Projection
+        self.rbf = GaussianRBF()
+        self.edge_proj = nn.Linear(NUM_RBF_BINS, HIDDEN_DIM)
+
+        # Stack of Interaction Blocks
+        self.blocks = nn.ModuleList(
+            [
+                ReceiverAwareInteractionBlock(HIDDEN_DIM, DROPOUT_RATE)
+                for _ in range(NUM_BLOCKS)
+            ]
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import MH_RA_CGN
+
+
+def train_epoch(model, loader, optimizer, criterion, scaler, device):
+=======
+from library.model import CrystalGraphNetwork
+
+
+def train_epoch(model, loader, optimizer, criterion, scaler, device):
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 4. Initialize Model
+    model = MH_RA_CGN().to(device)
+
+    # 5. Optimizer & Loss
+=======
+    # 4. Initialize Model
+    model = CrystalGraphNetwork().to(device)
+
+    # 5. Optimizer & Loss
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import MH_RA_CGN
+from library.train import train_epoch, validate
+
+
+def main():
+    # 1. Setup and Configuration
+    set_seed(RANDOM_SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # Hyperparameters for fast baseline
+    BATCH_SIZE = 48
+    NUM_EPOCHS = 50  # Limited epochs for speed while ensuring convergence
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # 2. Data Loading
+    print("Loading datasets...")
+    # Load cached datasets if available to save time
+    train_dataset, val_dataset = get_train_val_datasets(load_cached=True)
+
+    # 3. Scaler Preparation
+    print("Preparing target scaler...")
+    # We fit the scaler on the training targets
+    all_train_targets = torch.cat([d.y for d in train_dataset], dim=0)
+    scaler_path = os.path.join(CACHE_DIR, "target_scaler.npz")
+    scaler = get_scaler(all_train_targets, scaler_path, load_cached_data=True)
+
+    # Move scaler statistics to device
+    if isinstance(scaler.mean, torch.Tensor):
+        scaler.mean = scaler.mean.to(device)
+        scaler.std = scaler.std.to(device)
+
+    # 4. Data Loaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # 5. Model Initialization
+    model = MH_RA_CGN().to(device)
+=======
+from library.model import CrystalGraphNetwork
+from library.train import train_epoch, validate
+
+
+def main():
+    # 1. Setup and Configuration
+    set_seed(RANDOM_SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # Hyperparameters for fast baseline
+    BATCH_SIZE = 48
+    NUM_EPOCHS = 120  # Increased epochs for monolithic model (Cite solution_lesson_node_00084)
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+
+    # 2. Data Loading
+    print("Loading datasets...")
+    # Load cached datasets if available to save time
+    train_dataset, val_dataset = get_train_val_datasets(load_cached=True)
+
+    # 3. Scaler Preparation
+    print("Preparing target scaler...")
+    # We fit the scaler on the training targets
+    all_train_targets = torch.cat([d.y for d in train_dataset], dim=0)
+    scaler_path = os.path.join(CACHE_DIR, "target_scaler.npz")
+    scaler = get_scaler(all_train_targets, scaler_path, load_cached_data=True)
+
+    # Move scaler statistics to device
+    if isinstance(scaler.mean, torch.Tensor):
+        scaler.mean = scaler.mean.to(device)
+        scaler.std = scaler.std.to(device)
+
+    # 4. Data Loaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2
+    )
+
+    # 5. Model Initialization
+    model = CrystalGraphNetwork().to(device)
+>>>>>>> REPLACE
+```

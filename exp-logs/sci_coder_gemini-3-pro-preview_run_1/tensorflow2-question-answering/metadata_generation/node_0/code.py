@@ -1,0 +1,216 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import GroupShuffleSplit
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+TRAIN_FILE = "simplified-nq-train.jsonl"
+TEST_FILE = "simplified-nq-test.jsonl"
+RANDOM_STATE = 42
+
+
+def extract_metadata(file_name, has_annotations=True):
+    """
+    Reads a JSONL file and extracts metadata.
+    Returns a list of dictionaries.
+    """
+    file_path = os.path.join(INPUT_DIR, file_name)
+    records = []
+
+    if not os.path.exists(file_path):
+        print(f"Warning: {file_name} not found in {INPUT_DIR}")
+        return records
+
+    print(f"Processing {file_name}...")
+    with open(file_path, "rb") as f:
+        while True:
+            offset = f.tell()
+            line = f.readline()
+            if not line:
+                break
+
+            try:
+                data = json.loads(line)
+
+                record = {
+                    "example_id": data["example_id"],
+                    "file_path": file_name,
+                    "byte_offset": offset,
+                }
+
+                if has_annotations:
+                    # document_url is used for grouping
+                    record["document_url"] = data.get("document_url", "")
+                    # Store annotations as a JSON string to handle complexity
+                    record["annotations"] = json.dumps(data.get("annotations", []))
+                else:
+                    record["document_url"] = None
+                    record["annotations"] = None
+
+                records.append(record)
+            except json.JSONDecodeError:
+                print(f"Error decoding JSON at offset {offset}")
+                continue
+
+    return records
+
+
+def generate_metadata_files():
+    """
+    Generates metadata files for train, val, and test.
+    """
+    if not os.path.exists(METADATA_DIR):
+        os.makedirs(METADATA_DIR)
+
+    # 1. Process Training Data
+    train_records = extract_metadata(TRAIN_FILE, has_annotations=True)
+    train_df = pd.DataFrame(train_records)
+
+    if not train_df.empty:
+        # Perform Group Stratified Split
+        # We group by document_url to ensure questions about the same article
+        # are not split across train and val.
+        print("Splitting training data into train/val sets...")
+        splitter = GroupShuffleSplit(
+            n_splits=1, train_size=0.8, random_state=RANDOM_STATE
+        )
+
+        # If document_url is missing, we treat each sample as its own group (fallback)
+        groups = (
+            train_df["document_url"].replace("", np.nan).fillna(train_df["example_id"])
+        )
+
+        train_idx, val_idx = next(splitter.split(train_df, groups=groups))
+
+        final_train_df = train_df.iloc[train_idx]
+        final_val_df = train_df.iloc[val_idx]
+
+        # Save to Parquet
+        final_train_df.to_parquet(
+            os.path.join(METADATA_DIR, "train.parquet"), index=False
+        )
+        final_val_df.to_parquet(os.path.join(METADATA_DIR, "val.parquet"), index=False)
+
+        print(f"Generated train.parquet with {len(final_train_df)} samples.")
+        print(f"Generated val.parquet with {len(final_val_df)} samples.")
+    else:
+        print("No training data found. Skipping train/val split.")
+        # Create empty placeholders to avoid downstream errors if file missing
+        pd.DataFrame(
+            columns=[
+                "example_id",
+                "file_path",
+                "byte_offset",
+                "document_url",
+                "annotations",
+            ]
+        ).to_parquet(os.path.join(METADATA_DIR, "train.parquet"))
+        pd.DataFrame(
+            columns=[
+                "example_id",
+                "file_path",
+                "byte_offset",
+                "document_url",
+                "annotations",
+            ]
+        ).to_parquet(os.path.join(METADATA_DIR, "val.parquet"))
+
+    # 2. Process Test Data
+    test_records = extract_metadata(TEST_FILE, has_annotations=False)
+    test_df = pd.DataFrame(test_records)
+
+    if not test_df.empty:
+        test_df.to_parquet(os.path.join(METADATA_DIR, "test.parquet"), index=False)
+        print(f"Generated test.parquet with {len(test_df)} samples.")
+    else:
+        print("No test data found.")
+        pd.DataFrame(
+            columns=[
+                "example_id",
+                "file_path",
+                "byte_offset",
+                "document_url",
+                "annotations",
+            ]
+        ).to_parquet(os.path.join(METADATA_DIR, "test.parquet"))
+
+
+def verify_metadata():
+    """
+    Verifies the generated metadata files.
+    """
+    print("\n--- Verifying Metadata ---")
+
+    try:
+        train_df = pd.read_parquet(os.path.join(METADATA_DIR, "train.parquet"))
+        val_df = pd.read_parquet(os.path.join(METADATA_DIR, "val.parquet"))
+        test_df = pd.read_parquet(os.path.join(METADATA_DIR, "test.parquet"))
+    except Exception as e:
+        raise AssertionError(f"Failed to load metadata files: {e}")
+
+    # 1. Print Summary Statistics
+    print(f"Train Shape: {train_df.shape}")
+    print(f"Val Shape: {val_df.shape}")
+    print(f"Test Shape: {test_df.shape}")
+
+    # 2. Check File Paths
+    for name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        if df.empty:
+            print(f"Skipping file path check for empty {name} dataset.")
+            continue
+
+        print(f"Checking file paths for {name} dataset...")
+        sample_df = df.sample(n=min(1000, len(df)), random_state=RANDOM_STATE)
+        missing_count = 0
+        missing_examples = []
+
+        for _, row in sample_df.iterrows():
+            rel_path = row["file_path"]
+            abs_path = os.path.join(INPUT_DIR, rel_path)
+            if not os.path.exists(abs_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(rel_path)
+
+        missing_ratio = missing_count / len(sample_df)
+        print(f"Missing file ratio: {missing_ratio:.4f}")
+
+        if missing_ratio > 0.5:
+            print(f"Sample missing paths: {missing_examples}")
+            raise FileNotFoundError(
+                f"Missing file ratio {missing_ratio} exceeds threshold of 0.5 for {name} dataset."
+            )
+
+    # 3. Verify Validation Split (Group Leakage)
+    if not train_df.empty and not val_df.empty:
+        print("Verifying group split integrity...")
+        train_urls = set(train_df["document_url"].dropna().unique())
+        val_urls = set(val_df["document_url"].dropna().unique())
+
+        # Remove empty strings if any, as they don't constitute a valid group ID
+        if "" in train_urls:
+            train_urls.remove("")
+        if "" in val_urls:
+            val_urls.remove("")
+
+        intersection = train_urls.intersection(val_urls)
+
+        if len(intersection) > 0:
+            raise AssertionError(
+                f"Data leakage detected! {len(intersection)} document_urls found in both train and validation sets."
+            )
+
+        print("Validation split verified: No group leakage detected.")
+
+
+if __name__ == "__main__":
+    try:
+        generate_metadata_files()
+        verify_metadata()
+        print("\nMetadata generation and verification completed successfully.")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        exit(1)

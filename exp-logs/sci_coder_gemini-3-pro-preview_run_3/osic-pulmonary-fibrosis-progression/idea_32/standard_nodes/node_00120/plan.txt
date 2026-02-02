@@ -1,0 +1,350 @@
+Implementation Strategy:
+1.  **Architecture Upgrade (DSPRNet)**: I will replace the existing `OSPRNet` (Output-Space Probabilistic Residual Network) with `DSPRNet` (Dual-Stream Point-Wise Residual Network). This architecture aligns with **Lesson 00052** and **Lesson 00060**, which demonstrated that fusing a strong linear autoregressive stream with a deep interaction stream in a shared latent space outperforms output-space summation or direct linear mapping.
+2.  **Latent Fusion**: The new model will feature two streams:
+    -   **Linear Stream**: Projects the dominant autoregressive features (Baseline FVC and Time) into a 64-dimensional latent space (**Cite Lesson 00060**).
+    -   **Deep Stream**: Extracts features from the image (EfficientNet-B2) and tabular data, projecting them into the same 64-dimensional latent space.
+    -   These streams will be summed in the latent space before passing through a shared head, allowing the model to learn complex non-linear corrections to the baseline trend without bottlenecking the strong linear signal.
+3.  **Initialization & Uncertainty**: I will remove the zero-initialization of the residual branch, as **Lesson 00118** indicates this harms performance in latent fusion architectures. Additionally, the shared head will predict both mean and uncertainty, ensuring the uncertainty estimate is informed by both the strong priors and the image features (**Cite Lesson 00055**).
+4.  **Monitoring**: I will add print statements to `runfile.py` to monitor training progress and convergence.
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalAnchor(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor (The Prior).
+    Learns the baseline disease trajectory from clinical metadata.
+    """
+
+    def __init__(self, input_dim=5):
+        super(ClinicalAnchor, self).__init__()
+        # Over-Parameterized MLP: Input -> 128 -> ReLU -> 64 -> ReLU -> 2
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),  # Outputs: mu_clin, sigma_clin_raw
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Tabular features of shape (B, 5).
+        Returns:
+            torch.Tensor: Shape (B, 2) containing raw mu and raw sigma logits.
+        """
+        return self.net(x)
+
+
+class VisualResidual(nn.Module):
+    """
+    Stream B: Visual Residual Stream (The Correction).
+    Uses EfficientNet-B2 to predict corrections to the clinical anchor.
+    """
+
+    def __init__(self, input_dim=5):
+        super(VisualResidual, self).__init__()
+
+        # 1. Image Backbone
+        # efficientnet_b2, num_classes=0 removes the classifier and returns pooled features
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # 2. Fine-Tuning Strategy: Unfreeze top two stages; keep bottom frozen.
+        # First, freeze all parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze the Head components (Conv + BN) if they exist
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+
+        # Unfreeze the last 2 blocks (stages)
+        # self.backbone.blocks is a nn.Sequential of blocks in timm
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            # Unfreeze last 2 blocks
+            for i in range(max(0, num_blocks - 2), num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        # 3. Fusion & Head
+        self.img_feature_dim = self.backbone.num_features
+        fusion_dim = self.img_feature_dim + input_dim
+
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(Config.DROP_RATE),
+            nn.Linear(128, 2),  # Outputs: delta_mu, delta_sigma
+        )
+
+        # 4. Structural Innovation: Zero Initialization
+        self.zero_init_head()
+
+    def zero_init_head(self):
+        """
+        Explicitly initializes the weights and biases of the final Linear layer to zero.
+        This forces the visual stream to output exactly 0 correction at epoch 0.
+        """
+        final_layer = self.head[-1]
+        nn.init.constant_(final_layer.weight, 0.0)
+        nn.init.constant_(final_layer.bias, 0.0)
+
+    def forward(self, img, tab):
+        """
+        Args:
+            img (torch.Tensor): Image tensor (B, C, H, W).
+            tab (torch.Tensor): Tabular tensor (B, 5).
+        Returns:
+            torch.Tensor: Residual corrections (B, 2).
+        """
+        # Extract image features
+        img_feats = self.backbone(img)  # (B, num_features)
+
+        # Early Fusion: Concatenate
+        fused = torch.cat([img_feats, tab], dim=1)
+
+        # Predict residuals
+        residuals = self.head(fused)
+
+        return residuals
+
+
+class OSPRNet(nn.Module):
+    """
+    Output-Space Probabilistic Residual Network.
+    Synthesizes Dual-Stream Output-Space Summation.
+    """
+
+    def __init__(self):
+        super(OSPRNet, self).__init__()
+        self.clinical_anchor = ClinicalAnchor(input_dim=5)
+        self.visual_residual = VisualResidual(input_dim=5)
+
+    def forward(self, img, tab):
+        """
+        Args:
+            img (torch.Tensor): Image tensor (B, 3, 260, 260).
+            tab (torch.Tensor): Tabular tensor (B, 5).
+        Returns:
+            mu (torch.Tensor): Predicted FVC mean (B,).
+            sigma (torch.Tensor): Predicted FVC uncertainty (B,).
+        """
+        # 1. Stream A: Clinical Anchor
+        # Returns (B, 2) -> [mu_clin, sigma_clin_raw]
+        clin_out = self.clinical_anchor(tab)
+
+        # 2. Stream B: Visual Residual
+        # Returns (B, 2) -> [delta_mu, delta_sigma]
+        res_out = self.visual_residual(img, tab)
+
+        # 3. Output-Space Summation
+
+        # Mean: mu_final = mu_clin + delta_mu
+        mu = clin_out[:, 0] + res_out[:, 0]
+
+        # Uncertainty: sigma_final = Softplus(sigma_clin_raw + delta_sigma) + epsilon
+        # We sum the logits to allow the residual to push uncertainty up or down in logit space
+        sigma_logit = clin_out[:, 1] + res_out[:, 1]
+        sigma = F.softplus(sigma_logit) + 1e-6
+
+        return mu, sigma
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPRNet).
+    Fuses a Linear Residual Stream (for strong autoregressive priors) with a 
+    Deep Interaction Stream (for image-based corrections) in a latent space.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # Stream A: Linear Residual Stream
+        # Projects dominant autoregressive features (BaseFVC, Time) to latent space.
+        # Cite Lesson 00052: Use linear residual stream for baseline dependency.
+        # Cite Lesson 00060: Over-parameterize linear baseline in latent space (64 dim).
+        self.linear_stream = nn.Linear(2, 64)
+
+        # Stream B: Deep Interaction Stream
+        # Extracts features from Image and Tabular data.
+        self.backbone = timm.create_model(
+            Config.BACKBONE,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Fine-Tuning Strategy
+        # Cite Lesson 00027: Differential Learning Rates
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        if hasattr(self.backbone, "conv_head"):
+            for param in self.backbone.conv_head.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "bn2"):
+            for param in self.backbone.bn2.parameters():
+                param.requires_grad = True
+        if hasattr(self.backbone, "blocks"):
+            num_blocks = len(self.backbone.blocks)
+            for i in range(max(0, num_blocks - 2), num_blocks):
+                for param in self.backbone.blocks[i].parameters():
+                    param.requires_grad = True
+
+        self.img_feature_dim = self.backbone.num_features
+
+        # Deep Stream Projection
+        # Concatenates Image + Tabular (5) -> MLP -> Latent (64)
+        self.deep_stream = nn.Sequential(
+            nn.Linear(self.img_feature_dim + 5, 256),
+            nn.ReLU(),
+            nn.Dropout(Config.DROP_RATE),
+            nn.Linear(256, 64),
+        )
+
+        # Shared Head
+        # Fused Latent (64) -> Output (2)
+        # Cite Lesson 00055: Shared path for uncertainty
+        self.head = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+        # Cite Lesson 00118: Standard initialization (no zero init) for latent fusion.
+
+    def forward(self, img, tab):
+        # Stream A: Linear (BaseFVC at idx 0, Time at idx 1)
+        # Cite Lesson 00052: Linear mapping of dominant autoregressive features
+        lin_feat = self.linear_stream(tab[:, :2])
+
+        # Stream B: Deep
+        img_feat = self.backbone(img)
+        deep_in = torch.cat([img_feat, tab], dim=1)
+        deep_feat = self.deep_stream(deep_in)
+
+        # Latent Fusion (Summation)
+        # Cite Lesson 00060: Summing in latent space
+        fused = lin_feat + deep_feat
+
+        # Prediction
+        out = self.head(fused)
+
+        mu = out[:, 0]
+        # Cite Lesson 00066: Metric-aligned loss expects sigma, use softplus
+        sigma = F.softplus(out[:, 1]) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import OSPRNet
+=======
+from library.model import DSPRNet
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    # 3. Model
+    model = OSPRNet().to(Config.DEVICE)
+
+    # 4. Optimizer with Differential Learning Rates
+    # Identify backbone parameters (those that are part of the timm model and require grad)
+    # We use the object identity to separate them.
+    backbone_params_ids = list(map(id, model.visual_residual.backbone.parameters()))
+=======
+    # 3. Model
+    model = DSPRNet().to(Config.DEVICE)
+
+    # 4. Optimizer with Differential Learning Rates
+    # Identify backbone parameters (those that are part of the timm model and require grad)
+    # We use the object identity to separate them.
+    backbone_params_ids = list(map(id, model.backbone.parameters()))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import OSPRNet
+from library.train import train_epoch, validate, generate_submission
+=======
+from library.model import DSPRNet
+from library.train import train_epoch, validate, generate_submission
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 3. Model Initialization
+    device = Config.DEVICE
+    model = OSPRNet().to(device)
+
+    # 4. Optimizer & Scheduler
+    # Separate backbone and head parameters for differential learning rates
+    backbone_params_ids = list(map(id, model.visual_residual.backbone.parameters()))
+
+    backbone_params = [
+        p
+        for p in model.parameters()
+        if id(p) in backbone_params_ids and p.requires_grad
+    ]
+=======
+    # 3. Model Initialization
+    device = Config.DEVICE
+    model = DSPRNet().to(device)
+
+    # 4. Optimizer & Scheduler
+    # Separate backbone and head parameters for differential learning rates
+    backbone_params_ids = list(map(id, model.backbone.parameters()))
+
+    backbone_params = [
+        p
+        for p in model.parameters()
+        if id(p) in backbone_params_ids and p.requires_grad
+    ]
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    for epoch in range(Config.EPOCHS):
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_score = validate(model, val_loader, device)
+
+        scheduler.step()
+
+        if val_score > best_score:
+            best_score = val_score
+            torch.save(model.state_dict(), best_model_path)
+=======
+    for epoch in range(Config.EPOCHS):
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_score = validate(model, val_loader, device)
+
+        scheduler.step()
+
+        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Val Score: {val_score:.4f}")
+
+        if val_score > best_score:
+            best_score = val_score
+            torch.save(model.state_dict(), best_model_path)
+>>>>>>> REPLACE
+```

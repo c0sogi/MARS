@@ -1,0 +1,397 @@
+The strategy focuses on correcting a critical caching bug and optimizing I/O throughput to improve both model performance and training speed within the time limit.
+
+1.  **Fix Partial Caching Bug (Cite Lesson 00081):** The previous implementation of `get_anchor_slice_ids` naively returned the loaded cache if it existed, without verifying if the current dataset's subjects were present in it. This caused the validation set (processed after training) to receive default anchor indices (0), leading to inputs of black/noise slices and near-random performance (AUC ~0.47). I will modify the function to identify missing subjects in the cache, compute their anchors, and update the cache file, ensuring valid inputs for all splits.
+2.  **Optimize I/O with Bounds Caching (Cite Lesson 00098):** The previous `construct_adaptive_volume` function performed an expensive `os.listdir` operation for every modality of every subject in every epoch to determine slice boundaries for clamping. I will refactor `BraTSDataset` to scan and cache these directory bounds (min/max slice IDs) once during initialization. This eliminates the repeated file system calls during the training loop, significantly reducing overhead.
+3.  **Refactor Volume Construction:** I will move the volume construction logic into the `BraTSDataset` class to leverage the new `bounds_cache` directly, streamlining the data loading pipeline.
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+def get_anchor_slice_ids(df, cache_path, load_cached_data=True):
+    """
+    Determines the anchor slice ID (max intensity in FLAIR) for each subject.
+    Implements caching to satisfy deterministic processing requirements.
+    """
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            # Convert to dictionary mapping BraTS21ID to anchor_id
+            return dict(zip(cache_df["BraTS21ID"], cache_df["anchor_id"]))
+        except Exception as e:
+            logger.warning(f"Failed to load anchor cache: {e}. Recomputing...")
+
+    logger.info("Computing anchor slices for dataset...")
+    anchors = {}
+
+    # Iterate over unique subjects in the dataframe
+    # We use a set of IDs to avoid redundant processing if df has duplicates (unlikely here)
+    subjects = df[["BraTS21ID", "path_FLAIR"]].drop_duplicates()
+
+    for _, row in subjects.iterrows():
+        subject_id = row["BraTS21ID"]
+        flair_dir = os.path.join(INPUT_DIR, row["path_FLAIR"])
+
+        if not os.path.exists(flair_dir):
+            anchors[subject_id] = 0
+            continue
+
+        files = [f for f in os.listdir(flair_dir) if f.endswith(".dcm")]
+        if not files:
+            anchors[subject_id] = 0
+            continue
+
+        # Sort files by ID
+        file_map = []  # (id, filename)
+        for f in files:
+            fid = get_file_id(f)
+            if fid != -1:
+                file_map.append((fid, f))
+
+        file_map.sort(key=lambda x: x[0])
+
+        if not file_map:
+            anchors[subject_id] = 0
+            continue
+
+        # Filter by depth (15% - 85%)
+        num_slices = len(file_map)
+        start_idx = int(num_slices * ROI_DEPTH_MIN)
+        end_idx = int(num_slices * ROI_DEPTH_MAX)
+
+        # Ensure at least one slice is checked
+        if start_idx == end_idx:
+            end_idx = start_idx + 1
+
+        roi_files = file_map[start_idx:end_idx]
+
+        max_intensity = -1.0
+        best_id = file_map[num_slices // 2][0]  # Default to middle
+
+        for fid, fname in roi_files:
+            path = os.path.join(flair_dir, fname)
+            img = load_dicom_robust(path)
+            intensity = np.sum(img)
+
+            if intensity > max_intensity:
+                max_intensity = intensity
+                best_id = fid
+
+        anchors[subject_id] = best_id
+
+    # Save to cache
+    ensure_dir(os.path.dirname(cache_path))
+    cache_df = pd.DataFrame(list(anchors.items()), columns=["BraTS21ID", "anchor_id"])
+    cache_df.to_parquet(cache_path)
+
+    return anchors
+
+
+def construct_adaptive_volume(row, anchor_id):
+    """
+    Constructs the 12-channel input tensor using biologically-adaptive strides.
+    """
+    channels = []
+
+    # Define the geometry of the volume
+    # Groups: FLAIR, T2w, T1w, T1wCE
+
+    for mod in MODALITY_ORDER:
+        base_path = os.path.join(INPUT_DIR, row[f"path_{mod}"])
+        stride = STRIDES[mod]
+
+        # Target IDs: [Anchor-Stride, Anchor, Anchor+Stride]
+        target_ids = [anchor_id - stride, anchor_id, anchor_id + stride]
+
+        # We need to know the min/max ID available for this modality to clamp correctly
+        # Listing files is expensive, but necessary for correct clamping if we don't cache metadata.
+        # Optimization: We assume IDs are somewhat contiguous or we just check existence.
+        # However, "Edge Clamping" requires knowing the boundary.
+        # Given the "on-the-fly" constraint, we'll implement a soft clamp:
+        # If file doesn't exist, we try to find the nearest existing file?
+        # Or simpler: We just check existence. If missing, we zero pad.
+        # Wait, the prompt explicitly asks for "Edge Clamping" for Z-axis bounds.
+        # To do this efficiently without listing dir every time, we can try to load.
+        # If load fails, we assume it's out of bounds? No, it could be a gap.
+        # Let's list files once per modality.
+
+        if os.path.exists(base_path):
+            files = os.listdir(base_path)
+            ids = sorted([get_file_id(f) for f in files if f.endswith(".dcm")])
+            if not ids:
+                # Modality empty
+                for _ in range(3):
+                    channels.append(np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32))
+                continue
+
+            min_id, max_id = ids[0], ids[-1]
+
+            for tid in target_ids:
+                # Spatial Clamping
+                clamped_id = tid
+                if clamped_id < min_id:
+                    clamped_id = min_id
+                elif clamped_id > max_id:
+                    clamped_id = max_id
+
+                # Construct path
+                # Note: Filenames might not be strictly Image-{ID}.dcm if there are prefix variations,
+                # but the dataset description shows "Image-1.dcm".
+                img_path = os.path.join(base_path, f"Image-{clamped_id}.dcm")
+
+                # Load
+                img = load_dicom_robust(img_path)
+
+                # Normalize Independent Per-Channel Min-Max
+                if np.max(img) > np.min(img):
+                    img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
+                else:
+                    img = np.zeros_like(img)  # Avoid division by zero
+
+                channels.append(img)
+        else:
+            # Missing Modality -> Zero Padding
+            for _ in range(3):
+                channels.append(np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32))
+
+    # Stack channels: (12, 224, 224)
+    volume = np.stack(channels, axis=0)
+    return volume
+
+
+class BraTSDataset(Dataset):
+    def __init__(self, df, anchor_map, transform=None):
+        self.df = df
+        self.anchor_map = anchor_map
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get Anchor
+        anchor_id = self.anchor_map.get(subject_id, 0)
+
+        # Construct Volume
+        # Shape: (C, H, W)
+        volume = construct_adaptive_volume(row, anchor_id)
+
+        # Apply Transforms
+        # Albumentations expects (H, W, C), so we transpose
+        if self.transform:
+            volume_hwc = np.transpose(volume, (1, 2, 0))
+            augmented = self.transform(image=volume_hwc)["image"]
+            # ToTensorV2 converts to (C, H, W) and returns Tensor
+            volume_tensor = augmented
+        else:
+            volume_tensor = torch.tensor(volume, dtype=torch.float32)
+
+        # Get Label if available
+        if "MGMT_value" in row:
+            label = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return volume_tensor, label
+        else:
+            return volume_tensor
+=======
+def get_anchor_slice_ids(df, cache_path, load_cached_data=True):
+    """
+    Determines the anchor slice ID (max intensity in FLAIR) for each subject.
+    Implements robust partial caching to handle sequential data splits.
+    Cite Lesson 00081: Avoid naive "check-and-return" caching logic.
+    """
+    anchors = {}
+    cache_dirty = False
+
+    # 1. Load existing cache
+    if load_cached_data and os.path.exists(cache_path):
+        try:
+            cache_df = pd.read_parquet(cache_path)
+            anchors = dict(zip(cache_df["BraTS21ID"], cache_df["anchor_id"]))
+            logger.info(f"Loaded {len(anchors)} anchors from cache.")
+        except Exception as e:
+            logger.warning(f"Failed to load anchor cache: {e}. Starting fresh.")
+
+    # 2. Identify missing subjects
+    # We need anchors for every subject in the provided dataframe
+    required_ids = df["BraTS21ID"].unique()
+    missing_ids = [uid for uid in required_ids if uid not in anchors]
+
+    if not missing_ids:
+        return anchors
+
+    logger.info(f"Computing anchors for {len(missing_ids)} missing subjects...")
+
+    # 3. Compute missing anchors
+    # Filter DF to only missing subjects to avoid redundant computation
+    df_missing = df[df["BraTS21ID"].isin(missing_ids)].drop_duplicates(subset=["BraTS21ID"])
+
+    for _, row in df_missing.iterrows():
+        subject_id = row["BraTS21ID"]
+        flair_dir = os.path.join(INPUT_DIR, row["path_FLAIR"])
+
+        best_id = 0  # Default
+
+        if os.path.exists(flair_dir):
+            files = [f for f in os.listdir(flair_dir) if f.endswith(".dcm")]
+            
+            # Map IDs
+            file_map = []
+            for f in files:
+                fid = get_file_id(f)
+                if fid != -1:
+                    file_map.append((fid, f))
+            
+            file_map.sort(key=lambda x: x[0])
+
+            if file_map:
+                # Filter by depth (15% - 85%)
+                num_slices = len(file_map)
+                start_idx = int(num_slices * ROI_DEPTH_MIN)
+                end_idx = int(num_slices * ROI_DEPTH_MAX)
+                if start_idx == end_idx:
+                    end_idx = start_idx + 1
+                
+                roi_files = file_map[start_idx:end_idx]
+                
+                # Find max intensity
+                max_intensity = -1.0
+                best_id = file_map[num_slices // 2][0] # Fallback to middle
+
+                for fid, fname in roi_files:
+                    path = os.path.join(flair_dir, fname)
+                    img = load_dicom_robust(path)
+                    intensity = np.sum(img)
+                    
+                    if intensity > max_intensity:
+                        max_intensity = intensity
+                        best_id = fid
+        
+        anchors[subject_id] = best_id
+        cache_dirty = True
+
+    # 4. Update Cache
+    if cache_dirty:
+        ensure_dir(os.path.dirname(cache_path))
+        cache_df = pd.DataFrame(list(anchors.items()), columns=["BraTS21ID", "anchor_id"])
+        cache_df.to_parquet(cache_path)
+        logger.info(f"Updated anchor cache saved to {cache_path}")
+
+    return anchors
+
+
+class BraTSDataset(Dataset):
+    def __init__(self, df, anchor_map, transform=None):
+        self.df = df
+        self.anchor_map = anchor_map
+        self.transform = transform
+        
+        # Pre-scan modality bounds to avoid os.listdir in __getitem__
+        # This optimizes I/O throughput significantly.
+        self.bounds_cache = {}
+        self._scan_bounds()
+
+    def _scan_bounds(self):
+        """
+        Scans the directory structure to find min/max file IDs for each subject/modality.
+        This allows for O(1) clamping during training.
+        """
+        for _, row in self.df.iterrows():
+            subject_id = row["BraTS21ID"]
+            self.bounds_cache[subject_id] = {}
+            
+            for mod in MODALITY_ORDER:
+                dir_path = os.path.join(INPUT_DIR, row[f"path_{mod}"])
+                min_id, max_id = 0, 0
+                
+                if os.path.exists(dir_path):
+                    # We assume standard naming Image-{ID}.dcm
+                    # To be fast, we list once. 
+                    # Note: This adds initialization time but saves training time.
+                    try:
+                        files = [f for f in os.listdir(dir_path) if f.endswith(".dcm")]
+                        ids = [get_file_id(f) for f in files]
+                        ids = [i for i in ids if i != -1]
+                        if ids:
+                            min_id, max_id = min(ids), max(ids)
+                    except OSError:
+                        pass
+                
+                self.bounds_cache[subject_id][mod] = (min_id, max_id)
+
+    def construct_adaptive_volume(self, row, anchor_id):
+        """
+        Constructs the 12-channel input tensor using biologically-adaptive strides.
+        Uses cached bounds for efficient clamping.
+        """
+        channels = []
+        subject_id = row["BraTS21ID"]
+
+        for mod in MODALITY_ORDER:
+            base_path = os.path.join(INPUT_DIR, row[f"path_{mod}"])
+            stride = STRIDES[mod]
+            
+            # Retrieve cached bounds
+            min_id, max_id = self.bounds_cache.get(subject_id, {}).get(mod, (0, 0))
+            
+            # If max_id is 0, likely empty or missing
+            if max_id == 0:
+                for _ in range(3):
+                    channels.append(np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32))
+                continue
+
+            # Target IDs: [Anchor-Stride, Anchor, Anchor+Stride]
+            target_ids = [anchor_id - stride, anchor_id, anchor_id + stride]
+
+            for tid in target_ids:
+                # Spatial Clamping
+                clamped_id = tid
+                if clamped_id < min_id:
+                    clamped_id = min_id
+                elif clamped_id > max_id:
+                    clamped_id = max_id
+
+                img_path = os.path.join(base_path, f"Image-{clamped_id}.dcm")
+                img = load_dicom_robust(img_path)
+
+                # Normalize
+                if np.max(img) > np.min(img):
+                    img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
+                else:
+                    img = np.zeros_like(img)
+
+                channels.append(img)
+
+        volume = np.stack(channels, axis=0)
+        return volume
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        subject_id = row["BraTS21ID"]
+
+        # Get Anchor
+        anchor_id = self.anchor_map.get(subject_id, 0)
+
+        # Construct Volume
+        volume = self.construct_adaptive_volume(row, anchor_id)
+
+        # Apply Transforms
+        if self.transform:
+            volume_hwc = np.transpose(volume, (1, 2, 0))
+            augmented = self.transform(image=volume_hwc)["image"]
+            volume_tensor = augmented
+        else:
+            volume_tensor = torch.tensor(volume, dtype=torch.float32)
+
+        # Get Label if available
+        if "MGMT_value" in row:
+            label = torch.tensor(row["MGMT_value"], dtype=torch.float32)
+            return volume_tensor, label
+        else:
+            return volume_tensor
+>>>>>>> REPLACE
+```

@@ -1,0 +1,329 @@
+To optimize the solution, I will switch the loss function from `BCEDiceLoss` to `BCELovaszLoss` to directly optimize the Jaccard index (Cite solution_lesson_node_00021). I will also incorporate Test-Time Augmentation (TTA) into the validation loop to align checkpoint selection with inference protocols (Cite solution_lesson_node_00003), and increase the training duration to 50 epochs to accommodate the slower convergence of the Lovasz-Hinge loss (Cite solution_lesson_node_00018).
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+class BCEDiceLoss(nn.Module):
+    """
+    Combined BCEWithLogitsLoss and Dice Loss.
+    """
+
+    def __init__(self, bce_weight=0.5, smooth=1.0):
+        super(BCEDiceLoss, self).__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = 1.0 - bce_weight
+        self.smooth = smooth
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, pred, target):
+        # BCE Loss
+        bce = self.bce_loss(pred, target)
+
+        # Dice Loss
+        pred_sigmoid = torch.sigmoid(pred)
+
+        # Flatten
+        pred_flat = pred_sigmoid.view(-1)
+        target_flat = target.view(-1)
+
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum()
+
+        dice = 1 - ((2.0 * intersection + self.smooth) / (union + self.smooth))
+
+        return self.bce_weight * bce + self.dice_weight * dice
+=======
+def lovasz_grad(gt_sorted):
+    """
+    Computes gradient of the Lovasz extension w.r.t sorted errors
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:  # cover 1-pixel case
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+def lovasz_hinge_flat(logits, labels):
+    """
+    Binary Lovasz hinge loss
+      logits: [P] Variable, logits at each pixel (between -\infty and +\infty)
+      labels: [P] Tensor, binary ground truth masks (0 or 1)
+    """
+    if len(labels) == 0:
+        # only void pixels, the gradients should be 0
+        return logits.sum() * 0.0
+    signs = 2.0 * labels.float() - 1.0
+    errors = 1.0 - logits * signs
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    perm = perm.data
+    gt_sorted = labels[perm]
+    grad = lovasz_grad(gt_sorted)
+    loss = torch.dot(F.relu(errors_sorted), grad)
+    return loss
+
+
+def lovasz_hinge(logits, labels, per_image=True, ignore=None):
+    """
+    Binary Lovasz hinge loss
+      logits: [B, H, W] Variable, logits at each pixel (between -\infty and +\infty)
+      labels: [B, H, W] Tensor, binary ground truth masks (0 or 1)
+      per_image: compute the loss per image instead of per batch
+      ignore: void class id
+    """
+    # Squeeze channel dimension if present
+    if logits.dim() == 4 and logits.size(1) == 1:
+        logits = logits.squeeze(1)
+    if labels.dim() == 4 and labels.size(1) == 1:
+        labels = labels.squeeze(1)
+
+    if per_image:
+        loss = torch.mean(
+            torch.stack(
+                [
+                    lovasz_hinge_flat(log.view(-1), lab.view(-1))
+                    for log, lab in zip(logits, labels)
+                ]
+            )
+        )
+    else:
+        loss = lovasz_hinge_flat(logits.view(-1), labels.view(-1))
+    return loss
+
+
+class BCELovaszLoss(nn.Module):
+    """
+    Combined BCEWithLogitsLoss and Lovasz-Hinge Loss.
+    """
+
+    def __init__(self, bce_weight=0.5):
+        super(BCELovaszLoss, self).__init__()
+        self.bce_weight = bce_weight
+        self.lovasz_weight = 1.0 - bce_weight
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, pred, target):
+        bce = self.bce_loss(pred, target)
+        lovasz = lovasz_hinge(pred, target)
+        return self.bce_weight * bce + self.lovasz_weight * lovasz
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def validate_segmenter_epoch(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            images, masks, depths, _ = batch
+
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+
+            outputs = model(images, depths)
+            loss = criterion(outputs, masks)
+
+            running_loss += loss.item() * images.size(0)
+
+            # Prepare for mAP calculation
+            # Sigmoid to get probabilities
+            probs = torch.sigmoid(outputs)
+
+            # Convert to numpy arrays
+            # Squeeze channel dim: (B, 1, H, W) -> (B, H, W)
+            probs_np = probs.squeeze(1).cpu().numpy()
+            masks_np = masks.squeeze(1).cpu().numpy()
+
+            for p, t in zip(probs_np, masks_np):
+                all_preds.append(p)
+                all_targets.append(t)
+=======
+def validate_segmenter_epoch(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            images, masks, depths, _ = batch
+
+            images = images.to(device)
+            masks = masks.to(device)
+            depths = depths.to(device)
+
+            # TTA: Original + Horizontal Flip for Validation
+            # 1. Forward Original
+            out_orig = model(images, depths)
+            prob_orig = torch.sigmoid(out_orig)
+
+            # 2. Forward Flip
+            images_flipped = torch.flip(images, dims=[3])
+            out_flipped = model(images_flipped, depths)
+            prob_flipped = torch.sigmoid(out_flipped)
+            prob_flipped = torch.flip(prob_flipped, dims=[3])
+
+            # Average probabilities
+            probs = (prob_orig + prob_flipped) / 2.0
+
+            # Calculate loss on original output (approximation, or could use averaged probs with BCE)
+            # For consistency with training, we often check loss on non-TTA or TTA.
+            # Here we use original output for loss tracking to avoid complexity with Lovasz on averaged probs
+            loss = criterion(out_orig, masks)
+            running_loss += loss.item() * images.size(0)
+
+            # Convert to numpy arrays
+            # Squeeze channel dim: (B, 1, H, W) -> (B, H, W)
+            probs_np = probs.squeeze(1).cpu().numpy()
+            masks_np = masks.squeeze(1).cpu().numpy()
+
+            for p, t in zip(probs_np, masks_np):
+                all_preds.append(p)
+                all_targets.append(t)
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def run_segmentation_training(
+    train_loader, val_loader, epochs=50, lr=1e-3, patience=10
+):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    set_seed(42)
+
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    criterion = BCEDiceLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+=======
+def run_segmentation_training(
+    train_loader, val_loader, epochs=50, lr=1e-3, patience=10
+):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    set_seed(42)
+
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    criterion = BCELovaszLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Train segmenter using ground truth depths
+    seg_model_path = run_segmentation_training(
+        train_loader, val_loader, epochs=30, lr=1e-3, patience=8
+    )
+=======
+    # Train segmenter using ground truth depths
+    seg_model_path = run_segmentation_training(
+        train_loader, val_loader, epochs=50, lr=1e-3, patience=12
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def get_val_predictions(model_path, loader):
+    """
+    Generates predictions and retrieves targets for the validation set.
+    Crops predictions and targets back to the original 101x101 size.
+    """
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    all_probs = []
+    all_targets = []
+    all_depths = []
+
+    with torch.no_grad():
+        for batch in loader:
+            images, masks, depths, _ = batch
+            images = images.to(DEVICE)
+            depths = depths.to(DEVICE)
+
+            # Forward pass
+            outputs = model(images, depths)
+            probs = torch.sigmoid(outputs)
+
+            # Convert to Numpy
+            probs_np = probs.squeeze(1).cpu().numpy()
+            masks_np = masks.squeeze(1).cpu().numpy()
+            depths_np = depths.cpu().numpy().flatten()
+
+            # Crop and store
+            for p, m, d in zip(probs_np, masks_np, depths_np):
+                p_crop = crop_center(p, (101, 101))
+                m_crop = crop_center(m, (101, 101))
+
+                all_probs.append(p_crop)
+                all_targets.append(m_crop)
+                all_depths.append(d)
+
+    return np.array(all_probs), np.array(all_targets), np.array(all_depths)
+=======
+def get_val_predictions(model_path, loader):
+    """
+    Generates predictions and retrieves targets for the validation set.
+    Crops predictions and targets back to the original 101x101 size.
+    Uses TTA (Horizontal Flip) to match inference and validation logic.
+    """
+    model = DepthAwareLinkNet34(num_classes=1).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    all_probs = []
+    all_targets = []
+    all_depths = []
+
+    with torch.no_grad():
+        for batch in loader:
+            images, masks, depths, _ = batch
+            images = images.to(DEVICE)
+            depths = depths.to(DEVICE)
+
+            # TTA: Original + Horizontal Flip
+            # 1. Forward Original
+            out_orig = model(images, depths)
+            prob_orig = torch.sigmoid(out_orig)
+
+            # 2. Forward Flip
+            images_flipped = torch.flip(images, dims=[3])
+            out_flipped = model(images_flipped, depths)
+            prob_flipped = torch.sigmoid(out_flipped)
+            prob_flipped = torch.flip(prob_flipped, dims=[3])
+
+            # Average
+            probs = (prob_orig + prob_flipped) / 2.0
+
+            # Convert to Numpy
+            probs_np = probs.squeeze(1).cpu().numpy()
+            masks_np = masks.squeeze(1).cpu().numpy()
+            depths_np = depths.cpu().numpy().flatten()
+
+            # Crop and store
+            for p, m, d in zip(probs_np, masks_np, depths_np):
+                p_crop = crop_center(p, (101, 101))
+                m_crop = crop_center(m, (101, 101))
+
+                all_probs.append(p_crop)
+                all_targets.append(m_crop)
+                all_depths.append(d)
+
+    return np.array(all_probs), np.array(all_targets), np.array(all_depths)
+>>>>>>> REPLACE
+```

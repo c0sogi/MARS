@@ -1,0 +1,289 @@
+The following modifications implement a "Causal-Aware" architecture using a DeBERTa-v3 backbone, as suggested by the lessons.
+
+### Strategy Outline
+1.  **Backbone Upgrade**: Switch from `distilroberta-base` to `microsoft/deberta-v3-base`. DeBERTa-v3 is a stronger model for semantic tasks (Cite `solution_lesson_node_00006`).
+2.  **Architecture Restructuring**: Implement a `CausalDeberta` class with decoupled prediction heads.
+    *   **Head 1 (Question)**: Predicts the 21 question-related targets using *only* the question embedding. This enforces the causal constraint that question properties are independent of the answer (Cite `solution_lesson_node_00014`).
+    *   **Head 2 (Answer)**: Predicts the 9 answer-related targets using the full interaction vector `[u, v, |u-v|, u*v]`.
+3.  **Full Fine-Tuning**: Remove the logic that freezes the backbone layers. The lessons indicate that full fine-tuning significantly outperforms fixed feature extraction on this task (Cite `solution_lesson_node_00008`).
+4.  **Training Schedule**: Increase `PATIENCE` from 3 to 5. Siamese networks with interaction heads require more updates to align the latent spaces and converge properly (Cite `solution_lesson_node_00015`).
+5.  **Cache Management**: Change `WORKING_DIR` to ensure the dataset is re-tokenized with the new DeBERTa tokenizer.
+
+### Code Changes
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    WORKING_DIR = "./working/idea_2"
+    SUBMISSION_DIR = "./submission"
+
+    # Input Files (using metadata splits)
+=======
+    WORKING_DIR = "./working/solution_opt"
+    SUBMISSION_DIR = "./submission"
+
+    # Input Files (using metadata splits)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    MODEL_NAME = "distilroberta-base"
+    MAX_LENGTH = 512
+    HIDDEN_SIZE = 768  # Standard for distilroberta-base
+    DROPOUT_RATE = 0.2
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    EPOCHS = 10
+    PATIENCE = 3  # Early stopping patience
+=======
+    # ==========================================
+    # Model Hyperparameters
+    # ==========================================
+    MODEL_NAME = "microsoft/deberta-v3-base"
+    MAX_LENGTH = 512
+    HIDDEN_SIZE = 768  # Standard for deberta-v3-base
+    DROPOUT_RATE = 0.2
+
+    # ==========================================
+    # Training Hyperparameters
+    # ==========================================
+    SEED = 42
+    EPOCHS = 10
+    PATIENCE = 5  # Early stopping patience (Cite solution_lesson_node_00015)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class SiameseRoBERTa(nn.Module):
+    """
+    Siamese DistilRoBERTa network with an explicit interaction head.
+
+    Architecture:
+    1. Shared DistilRoBERTa backbone for Question and Answer streams.
+    2. Mean Pooling to generate fixed-size sentence embeddings (u, v).
+    3. Interaction Fusion: [u, v, |u-v|, u*v].
+    4. MLP Classification Head mapping to 30 target probabilities.
+    """
+
+    def __init__(self):
+        super(SiameseRoBERTa, self).__init__()
+
+        # Load configuration and pre-trained backbone
+        config = AutoConfig.from_pretrained(Config.MODEL_NAME)
+        self.backbone = AutoModel.from_pretrained(Config.MODEL_NAME, config=config)
+
+        # Freeze Embeddings and First 6 Layers to prevent overfitting (Cite Lesson 00007)
+        # We want to leverage pre-trained features without destroying them on small data.
+        for name, param in self.backbone.named_parameters():
+            if "embeddings" in name:
+                param.requires_grad = False
+            elif "encoder.layer" in name:
+                try:
+                    # Extract layer index (e.g., encoder.layer.0.attention...)
+                    layer_idx = int(name.split("encoder.layer.")[1].split(".")[0])
+                    if layer_idx < 6:
+                        param.requires_grad = False
+                except (IndexError, ValueError):
+                    pass
+
+        # Dimension of the fused interaction vector
+        # Concatenation of u, v, |u-v|, u*v results in 4x the hidden size
+        self.fusion_dim = 4 * config.hidden_size
+
+        # Classification Head (MLP)
+        # Maps the fused vector to the 30 target labels
+        self.classifier = nn.Sequential(
+            nn.Linear(self.fusion_dim, config.hidden_size),
+            nn.BatchNorm1d(config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Linear(config.hidden_size, Config.NUM_LABELS),
+            nn.Sigmoid(),  # Output probabilities in range [0, 1]
+        )
+
+    def forward(self, q_input_ids, q_attention_mask, a_input_ids, a_attention_mask):
+        """
+        Forward pass of the Siamese network.
+
+        Args:
+            q_input_ids (Tensor): Input IDs for the question stream (Batch, SeqLen).
+            q_attention_mask (Tensor): Attention mask for the question stream (Batch, SeqLen).
+            a_input_ids (Tensor): Input IDs for the answer stream (Batch, SeqLen).
+            a_attention_mask (Tensor): Attention mask for the answer stream (Batch, SeqLen).
+
+        Returns:
+            Tensor: Probabilities for the 30 target labels (Batch, 30).
+        """
+        # --- Question Stream ---
+        # Pass through backbone
+        q_outputs = self.backbone(
+            input_ids=q_input_ids, attention_mask=q_attention_mask
+        )
+        # Apply Mean Pooling to get embedding 'u'
+        u = self._mean_pooling(q_outputs.last_hidden_state, q_attention_mask)
+
+        # --- Answer Stream ---
+        # Pass through backbone (shared weights)
+        a_outputs = self.backbone(
+            input_ids=a_input_ids, attention_mask=a_attention_mask
+        )
+        # Apply Mean Pooling to get embedding 'v'
+        v = self._mean_pooling(a_outputs.last_hidden_state, a_attention_mask)
+
+        # --- Interaction Fusion ---
+        # Construct features: [u, v, |u-v|, u*v]
+        diff = torch.abs(u - v)
+        prod = u * v
+        fused_features = torch.cat([u, v, diff, prod], dim=1)
+
+        # --- Classification ---
+        probs = self.classifier(fused_features)
+
+        return probs
+=======
+class CausalDeberta(nn.Module):
+    """
+    Causal-Aware Siamese DeBERTa network.
+    
+    Implements decoupled prediction heads (Cite solution_lesson_node_00014):
+    1. Question Head: Predicts 21 question-related targets using only Question embeddings.
+    2. Answer/Interaction Head: Predicts 9 answer-related targets using [u, v, |u-v|, u*v].
+    
+    Uses Full Fine-Tuning (Cite solution_lesson_node_00008).
+    """
+
+    def __init__(self):
+        super(CausalDeberta, self).__init__()
+
+        # Load configuration and pre-trained backbone
+        config = AutoConfig.from_pretrained(Config.MODEL_NAME)
+        self.backbone = AutoModel.from_pretrained(Config.MODEL_NAME, config=config)
+
+        # Identify target indices
+        # Config.TARGET_COLS is ordered: 21 question cols then 9 answer cols
+        self.q_indices = [i for i, c in enumerate(Config.TARGET_COLS) if c.startswith("question_")]
+        self.a_indices = [i for i, c in enumerate(Config.TARGET_COLS) if not c.startswith("question_")]
+
+        # Head 1: Question Only (Input: u)
+        self.q_classifier = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.BatchNorm1d(config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Linear(config.hidden_size, len(self.q_indices)),
+            nn.Sigmoid()
+        )
+
+        # Head 2: Interaction (Input: [u, v, |u-v|, u*v])
+        self.fusion_dim = 4 * config.hidden_size
+        self.a_classifier = nn.Sequential(
+            nn.Linear(self.fusion_dim, config.hidden_size),
+            nn.BatchNorm1d(config.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
+            nn.Linear(config.hidden_size, len(self.a_indices)),
+            nn.Sigmoid()
+        )
+
+    def forward(self, q_input_ids, q_attention_mask, a_input_ids, a_attention_mask):
+        # --- Question Stream ---
+        q_outputs = self.backbone(
+            input_ids=q_input_ids, attention_mask=q_attention_mask
+        )
+        u = self._mean_pooling(q_outputs.last_hidden_state, q_attention_mask)
+
+        # --- Answer Stream ---
+        a_outputs = self.backbone(
+            input_ids=a_input_ids, attention_mask=a_attention_mask
+        )
+        v = self._mean_pooling(a_outputs.last_hidden_state, a_attention_mask)
+
+        # --- Head 1: Question Targets ---
+        q_probs = self.q_classifier(u)
+
+        # --- Head 2: Answer Targets ---
+        diff = torch.abs(u - v)
+        prod = u * v
+        fused_features = torch.cat([u, v, diff, prod], dim=1)
+        a_probs = self.a_classifier(fused_features)
+
+        # --- Reassemble ---
+        # Concatenate in order (Question cols first, then Answer cols)
+        return torch.cat([q_probs, a_probs], dim=1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+        # Differential Learning Rates
+        optimizer_parameters = [
+            {"params": self.model.backbone.parameters(), "lr": Config.BACKBONE_LR},
+            {"params": self.model.classifier.parameters(), "lr": Config.HEAD_LR},
+        ]
+
+        self.optimizer = optim.AdamW(
+            optimizer_parameters, weight_decay=Config.WEIGHT_DECAY
+        )
+=======
+        # Differential Learning Rates
+        optimizer_parameters = [
+            {"params": self.model.backbone.parameters(), "lr": Config.BACKBONE_LR},
+            {"params": self.model.q_classifier.parameters(), "lr": Config.HEAD_LR},
+            {"params": self.model.a_classifier.parameters(), "lr": Config.HEAD_LR},
+        ]
+
+        self.optimizer = optim.AdamW(
+            optimizer_parameters, weight_decay=Config.WEIGHT_DECAY
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.dataset import get_dataloaders
+from library.model import SiameseRoBERTa
+from library.trainer import Trainer
+=======
+from library.dataset import get_dataloaders
+from library.model import CausalDeberta
+from library.trainer import Trainer
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # 3. Model & Trainer Initialization
+    # ==========================================
+    print("Initializing model and trainer...")
+    model = SiameseRoBERTa()
+    trainer = Trainer(model, train_loader, val_loader, test_loader)
+=======
+    # ==========================================
+    # 3. Model & Trainer Initialization
+    # ==========================================
+    print("Initializing model and trainer...")
+    model = CausalDeberta()
+    trainer = Trainer(model, train_loader, val_loader, test_loader)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ==========================================
+    # 7. Submission Generation
+    # ==========================================
+    THRESHOLD = 0.2078132531759014
+
+    if val_score > THRESHOLD:
+=======
+    # ==========================================
+    # 7. Submission Generation
+    # ==========================================
+    THRESHOLD = 0.39609456952678757
+
+    if val_score > THRESHOLD:
+>>>>>>> REPLACE
+```

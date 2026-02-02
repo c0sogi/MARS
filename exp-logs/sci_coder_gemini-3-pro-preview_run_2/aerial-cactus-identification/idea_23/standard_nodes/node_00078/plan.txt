@@ -1,0 +1,339 @@
+I will optimize the solution by simplifying the architecture to a standard "Wide ResNet" with a channel configuration of `[32, 64, 128]` and Multi-Scale Aggregation. This strategy removes the computational overhead of Squeeze-and-Excitation blocks (Cite `solution_lesson_node_00013`) and grouped convolutions, while maintaining sufficient network width (Cite `solution_lesson_node_00049`) and feature aggregation (Cite `solution_lesson_node_00016`) to saturate the performance metric efficiently.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Output directories
+    WORKING_DIR = "./working/idea_23"
+    SUBMISSION_DIR = "./submission"
+=======
+    # Output directories
+    WORKING_DIR = "./working/optimized"
+    SUBMISSION_DIR = "./submission"
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Architecture: Custom Wide Dual-Pooling SE-ResNeXt with Multi-Scale Aggregation
+    # "Super-Wide" Channel Configuration
+    MODEL_CHANNELS = [64, 128, 256]
+
+    # Grouped Convolutions Cardinality
+    MODEL_CARDINALITY = 32
+=======
+    # Architecture: Wide ResNet with Multi-Scale Aggregation
+    # Wide Channel Configuration (Cite solution_lesson_node_00049)
+    MODEL_CHANNELS = [32, 64, 128]
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class DualPoolingSE(nn.Module):
+    """
+    Dual-Pooling Squeeze-and-Excitation Block.
+    Combines Global Average Pooling and Global Max Pooling to capture
+    both global context and salient features (e.g., spines).
+    """
+
+    def __init__(self, channels, reduction=16):
+        super(DualPoolingSE, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        # Shared MLP
+        # Ensure hidden dimension is at least a reasonable size
+        mid_channels = max(channels // reduction, 4)
+
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_channels, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+
+        # Squeeze: Dual Pooling
+        y_avg = self.avg_pool(x).view(b, c)
+        y_max = self.max_pool(x).view(b, c)
+
+        # Aggregate: Summation
+        # This combines the signals before the MLP
+        y = y_avg + y_max
+
+        # Excitation: Shared MLP
+        y = self.fc(y).view(b, c, 1, 1)
+
+        # Scale
+        return x * y
+
+
+class ResNeXtBlock(nn.Module):
+    """
+    ResNeXt Basic Block with Grouped Convolutions and Dual-Pooling SE.
+    Uses 3x3 convolutions exclusively for spatial processing.
+    Uses 1x1 convolutions strictly for shortcuts.
+    """
+
+    def __init__(
+        self, in_channels, out_channels, stride=1, cardinality=32, reduction=16
+    ):
+        super(ResNeXtBlock, self).__init__()
+
+        # Groups for ResNeXt cardinality
+        # Ensure groups divide channels (guaranteed by config [64, 128, 256] and card=32)
+        groups = cardinality
+
+        # First 3x3 Grouped Conv
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=groups,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+
+        # Second 3x3 Grouped Conv
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=groups,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Dual-Pooling SE Attention
+        self.se = DualPoolingSE(out_channels, reduction)
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            # Strictly utilize 1x1 convolutions for projection shortcuts
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        # Apply Attention
+        out = self.se(out)
+
+        # Residual connection
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class WideResNeXt(nn.Module):
+    """
+    Custom Wide Dual-Pooling SE-ResNeXt with Multi-Scale Aggregation.
+
+    Architecture:
+    - Stem: 3x3 Conv
+    - Stage 1: 32x32 (Wide Channels)
+    - Stage 2: 16x16 (Wide Channels)
+    - Stage 3: 8x8 (Wide Channels)
+    - Head: Multi-Scale Aggregation (Stage 2 + Stage 3) -> Classifier
+    """
+
+    def __init__(self):
+        super(WideResNeXt, self).__init__()
+
+        channels = Config.MODEL_CHANNELS  # [64, 128, 256]
+        cardinality = Config.MODEL_CARDINALITY
+        num_classes = Config.NUM_CLASSES
+
+        # Stem: 3x3 convolution to preserve 32x32 input resolution initially
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, channels[0], kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 1: 32x32, 64 channels
+        self.stage1 = self._make_layer(
+            channels[0], channels[0], stride=1, cardinality=cardinality
+        )
+
+        # Stage 2: 16x16, 128 channels
+        self.stage2 = self._make_layer(
+            channels[0], channels[1], stride=2, cardinality=cardinality
+        )
+
+        # Stage 3: 8x8, 256 channels
+        self.stage3 = self._make_layer(
+            channels[1], channels[2], stride=2, cardinality=cardinality
+        )
+
+        # Multi-Scale Head Classifier
+        # Input dim = Stage 2 channels (128) + Stage 3 channels (256) = 384
+        head_dim = channels[1] + channels[2]
+        self.classifier = nn.Linear(head_dim, num_classes)
+
+        self._init_weights()
+
+    def _make_layer(self, in_ch, out_ch, stride, cardinality):
+        # Using 2 blocks per stage for efficient "Wide" capacity on 32x32 images
+        layers = []
+        # First block handles potential downsampling/channel expansion
+        layers.append(ResNeXtBlock(in_ch, out_ch, stride, cardinality))
+        # Second block refines features
+        layers.append(ResNeXtBlock(out_ch, out_ch, 1, cardinality))
+        return nn.Sequential(*layers)
+=======
+class ResNetBlock(nn.Module):
+    """
+    Standard ResNet Basic Block.
+    Removes SE blocks (Cite solution_lesson_node_00013) and Grouped Convolutions
+    to reduce overhead while maintaining representational power.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            # 1x1 projection for shortcut
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class WideResNet(nn.Module):
+    """
+    Wide ResNet with Multi-Scale Aggregation.
+    Uses [32, 64, 128] channels (Cite solution_lesson_node_00049).
+    """
+
+    def __init__(self):
+        super(WideResNet, self).__init__()
+
+        channels = Config.MODEL_CHANNELS  # [32, 64, 128]
+        num_classes = Config.NUM_CLASSES
+
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, channels[0], kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # Stage 1: 32x32
+        self.stage1 = self._make_layer(channels[0], channels[0], stride=1)
+
+        # Stage 2: 16x16
+        self.stage2 = self._make_layer(channels[0], channels[1], stride=2)
+
+        # Stage 3: 8x8
+        self.stage3 = self._make_layer(channels[1], channels[2], stride=2)
+
+        # Multi-Scale Head Classifier (Cite solution_lesson_node_00016)
+        # Input dim = Stage 2 channels + Stage 3 channels
+        head_dim = channels[1] + channels[2]
+        self.classifier = nn.Linear(head_dim, num_classes)
+
+        self._init_weights()
+
+    def _make_layer(self, in_ch, out_ch, stride):
+        layers = []
+        layers.append(ResNetBlock(in_ch, out_ch, stride))
+        layers.append(ResNetBlock(out_ch, out_ch, 1))
+        return nn.Sequential(*layers)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+from library.model import WideResNeXt
+=======
+from library.model import WideResNet
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Initialize Model
+    model = WideResNeXt()
+    model.to(device)
+=======
+    # Initialize Model
+    model = WideResNet()
+    model.to(device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        print(f"Loading model for seed {seed}...")
+        model = WideResNeXt()
+        model.load_state_dict(torch.load(model_path, map_location=device))
+=======
+        print(f"Loading model for seed {seed}...")
+        model = WideResNet()
+        model.load_state_dict(torch.load(model_path, map_location=device))
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+from library.model import WideResNeXt
+from library.train import train_model, generate_submission
+=======
+from library.model import WideResNet
+from library.train import train_model, generate_submission
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    print("==================================================")
+    print("   Custom Wide Dual-Pooling SE-ResNeXt Pipeline   ")
+    print("==================================================")
+=======
+    print("==================================================")
+    print("   Optimized Wide ResNet Pipeline                 ")
+    print("==================================================")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Initialize architecture
+        model = WideResNeXt()
+=======
+        # Initialize architecture
+        model = WideResNet()
+>>>>>>> REPLACE
+```

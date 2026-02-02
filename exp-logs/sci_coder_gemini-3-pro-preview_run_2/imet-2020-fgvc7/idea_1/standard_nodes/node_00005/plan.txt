@@ -1,0 +1,404 @@
+To optimize the model's performance, I will implement a **dynamic thresholding strategy** based on predicting the label count, as recommended in the failure analysis (Cite `solution_lesson_node_00001`). The previous analysis showed a strong correlation between error and label density, suggesting that a fixed threshold of 0.5 is suboptimal for images with varying numbers of attributes.
+
+My implementation strategy is as follows:
+1.  **Dataset Modification**: Update `ArtworkDataset` to return the count of labels (cardinality) as an auxiliary target during training.
+2.  **Model Architecture**: Modify `ArtworkClassifier` to include a secondary regression head that predicts the number of attributes ($k$) for a given image.
+3.  **Loss Function**: Update the training loop to minimize a joint loss: `BCEWithLogitsLoss` for the labels and `MSELoss` (scaled) for the count prediction.
+4.  **Inference Logic**: Replace the static 0.5 threshold with a **Top-K strategy**. For each test image, the model will predict $k$, and we will select the top $\text{round}(k)$ attributes with the highest probabilities.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+        # Return data based on mode
+        if self.mode == "test":
+            # For test, we need the ID to map predictions later
+            return image, row["id"]
+        else:
+            # For train/val, we return the multi-hot encoded target
+            label_indices = self.labels[idx]
+            target = torch.zeros(self.num_classes, dtype=torch.float32)
+            if label_indices:
+                target[label_indices] = 1.0
+
+            return image, target
+=======
+        # Return data based on mode
+        if self.mode == "test":
+            # For test, we need the ID to map predictions later
+            return image, row["id"]
+        else:
+            # For train/val, we return the multi-hot encoded target
+            label_indices = self.labels[idx]
+            target = torch.zeros(self.num_classes, dtype=torch.float32)
+            count = 0.0
+            if label_indices:
+                target[label_indices] = 1.0
+                count = float(len(label_indices))
+
+            return image, target, torch.tensor(count, dtype=torch.float32)
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def __init__(self, model_name, num_classes, pretrained=True):
+        """
+        Args:
+            model_name (str): Name of the model architecture (e.g., 'tf_efficientnetv2_s').
+            num_classes (int): Number of output classes (attributes).
+            pretrained (bool): Whether to load pre-trained ImageNet weights.
+        """
+        super(ArtworkClassifier, self).__init__()
+
+        # Load the pre-trained model
+        self.model = timm.create_model(model_name, pretrained=pretrained)
+
+        # Replace the original classification head with a new Linear layer
+        # reset_classifier automatically handles finding the correct input features
+        # and replacing the head (e.g., 'classifier' or 'fc') with a new Linear layer.
+        self.model.reset_classifier(num_classes=num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input image tensor of shape (B, C, H, W).
+
+        Returns:
+            torch.Tensor: Logits of shape (B, num_classes).
+        """
+        return self.model(x)
+=======
+    def __init__(self, model_name, num_classes, pretrained=True):
+        """
+        Args:
+            model_name (str): Name of the model architecture (e.g., 'tf_efficientnetv2_s').
+            num_classes (int): Number of output classes (attributes).
+            pretrained (bool): Whether to load pre-trained ImageNet weights.
+        """
+        super(ArtworkClassifier, self).__init__()
+
+        # Load the pre-trained model with num_classes=0 to get feature extractor
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        
+        # Get the number of features from the backbone
+        self.num_features = self.backbone.num_features
+
+        # Classification head
+        self.cls_head = nn.Linear(self.num_features, num_classes)
+        
+        # Regression head for predicting label count
+        self.count_head = nn.Linear(self.num_features, 1)
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input image tensor of shape (B, C, H, W).
+
+        Returns:
+            tuple: (logits, count_pred)
+        """
+        features = self.backbone(x)
+        logits = self.cls_head(features)
+        count_pred = self.count_head(features)
+        return logits, count_pred.squeeze(-1)
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+    model.train()
+    losses = AverageMeter()
+
+    for batch_idx, (images, targets) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward pass
+        with autocast():
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+        # Scales loss and calls backward() to create scaled gradients
+        scaler.scale(loss).backward()
+=======
+    model.train()
+    losses = AverageMeter()
+    
+    # MSE Loss for count regression
+    mse_criterion = nn.MSELoss()
+
+    for batch_idx, (images, targets, counts) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        counts = counts.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward pass
+        with autocast():
+            logits, count_preds = model(images)
+            
+            # Classification loss
+            loss_cls = criterion(logits, targets)
+            
+            # Regression loss (scaled to be comparable to BCE)
+            # BCE is approx 0.003, MSE for count (diff ~1-5) is ~1-25. 
+            # We scale MSE by 0.002 to balance the gradients.
+            loss_count = mse_criterion(count_preds, counts)
+            
+            loss = loss_cls + 0.002 * loss_count
+
+        # Scales loss and calls backward() to create scaled gradients
+        scaler.scale(loss).backward()
+>>>>>>> REPLACE
+```
+
+```diff
+library/train.py
+<<<<<<< SEARCH
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set.
+
+    Args:
+        model (nn.Module): The neural network model.
+        loader (DataLoader): The validation data loader.
+        criterion (nn.Module): The loss function.
+        device (torch.device): The device to evaluate on.
+
+    Returns:
+        tuple: (average_loss, micro_f1_score)
+    """
+    model.eval()
+    losses = AverageMeter()
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # Standard forward pass (autocast optional for inference, but good for speed)
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+
+            losses.update(loss.item(), images.size(0))
+
+            # Store logits and targets for F1 calculation
+            all_preds.append(outputs.cpu())
+            all_targets.append(targets.cpu())
+
+    # Concatenate all batches
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    # Calculate metric
+    micro_f1 = calculate_micro_f1(
+        all_preds, all_targets, threshold=0.5, from_logits=True
+    )
+
+    return losses.avg, micro_f1
+=======
+def validate(model, loader, criterion, device):
+    """
+    Evaluates the model on the validation set using Top-K prediction.
+    """
+    model.eval()
+    losses = AverageMeter()
+
+    all_binary_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, targets, counts in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            # counts are not used for loss here, but needed for unpacking
+
+            with autocast():
+                logits, count_preds = model(images)
+                loss = criterion(logits, targets)
+
+            losses.update(loss.item(), images.size(0))
+
+            # Top-K Logic
+            # 1. Get predicted count k
+            k_preds = torch.round(count_preds).clamp(min=1).long()
+            
+            # 2. Convert logits to binary predictions using top-k
+            batch_binary_preds = torch.zeros_like(logits, dtype=torch.int)
+            
+            for i in range(logits.size(0)):
+                k = k_preds[i].item()
+                # Get indices of top k logits
+                _, top_indices = torch.topk(logits[i], k)
+                batch_binary_preds[i, top_indices] = 1
+
+            all_binary_preds.append(batch_binary_preds.cpu())
+            all_targets.append(targets.cpu())
+
+    all_binary_preds = torch.cat(all_binary_preds, dim=0).numpy()
+    all_targets = torch.cat(all_targets, dim=0).numpy().astype(int)
+
+    # Calculate Micro F1 directly from binary predictions
+    # We set from_logits=False and threshold=0.5 (dummy) because we already binarized
+    micro_f1 = calculate_micro_f1(
+        all_binary_preds, all_targets, threshold=0.5, from_logits=False
+    )
+
+    return losses.avg, micro_f1
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # 4. Inference Loop
+    results = []
+    print("Starting inference...")
+
+    with torch.no_grad():
+        for images, image_ids in test_loader:
+            images = images.to(device, non_blocking=True)
+
+            # Mixed precision inference
+            with autocast():
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+
+            # Move to CPU for processing
+            probs = probs.cpu()
+
+            # Apply threshold to get binary predictions
+            binary_preds = probs > threshold
+
+            # Process batch
+            for i in range(len(image_ids)):
+                img_id = image_ids[i]
+
+                # Get indices of predicted classes
+                # torch.nonzero returns indices where condition is True
+                pred_indices = torch.nonzero(binary_preds[i]).flatten().numpy()
+
+                # Convert to space-separated string
+                if len(pred_indices) > 0:
+                    pred_str = " ".join(map(str, pred_indices))
+                else:
+                    pred_str = ""  # No attributes predicted
+
+                results.append({"id": img_id, "attribute_ids": pred_str})
+=======
+    # 4. Inference Loop
+    results = []
+    print("Starting inference...")
+
+    with torch.no_grad():
+        for images, image_ids in test_loader:
+            images = images.to(device, non_blocking=True)
+
+            # Mixed precision inference
+            with autocast():
+                logits, count_preds = model(images)
+            
+            # Move to CPU
+            logits = logits.cpu()
+            count_preds = count_preds.cpu()
+            
+            # Determine K for each image
+            k_preds = torch.round(count_preds).clamp(min=1).long()
+
+            # Process batch
+            for i in range(len(image_ids)):
+                img_id = image_ids[i]
+                k = k_preds[i].item()
+                
+                # Get Top-K indices
+                _, top_indices = torch.topk(logits[i], k)
+                pred_indices = top_indices.numpy()
+                
+                # Sort indices for consistency (optional but good practice)
+                pred_indices.sort()
+
+                # Convert to space-separated string
+                if len(pred_indices) > 0:
+                    pred_str = " ".join(map(str, pred_indices))
+                else:
+                    pred_str = ""
+
+                results.append({"id": img_id, "attribute_ids": pred_str})
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Inference on Validation Set
+    all_preds = []
+    all_targets = []
+
+    print("Running inference on validation set...")
+    with torch.no_grad():
+        for images, targets in val_loader:
+            images = images.to(device, non_blocking=True)
+
+            # Use mixed precision for inference speed
+            with autocast():
+                logits = model(images)
+                probs = torch.sigmoid(logits)
+
+            # Move to CPU and convert to float32 for metric calculation
+            all_preds.append(probs.float().cpu().numpy())
+            all_targets.append(targets.numpy())
+
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate Metric
+    # Binarize predictions with threshold 0.5
+    binary_preds = (all_preds > 0.5).astype(int)
+    val_micro_f1 = f1_score(all_targets, binary_preds, average="micro")
+=======
+    # Inference on Validation Set
+    all_binary_preds = []
+    all_targets = []
+
+    print("Running inference on validation set...")
+    with torch.no_grad():
+        for images, targets, counts in val_loader:
+            images = images.to(device, non_blocking=True)
+
+            # Use mixed precision for inference speed
+            with autocast():
+                logits, count_preds = model(images)
+            
+            # Top-K Logic
+            k_preds = torch.round(count_preds).clamp(min=1).long().cpu()
+            logits = logits.cpu()
+            
+            batch_binary_preds = np.zeros(logits.shape, dtype=int)
+            for i in range(logits.size(0)):
+                k = k_preds[i].item()
+                _, top_indices = torch.topk(logits[i], k)
+                batch_binary_preds[i, top_indices] = 1
+                
+            all_binary_preds.append(batch_binary_preds)
+            all_targets.append(targets.numpy())
+
+    binary_preds = np.concatenate(all_binary_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Calculate Metric
+    val_micro_f1 = f1_score(all_targets, binary_preds, average="micro")
+>>>>>>> REPLACE
+```

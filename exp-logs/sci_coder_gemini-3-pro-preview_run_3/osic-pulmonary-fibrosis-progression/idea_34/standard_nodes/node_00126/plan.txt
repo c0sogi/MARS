@@ -1,0 +1,355 @@
+Based on the analysis of the previous solution and the provided lessons, I will optimize the solution by implementing the **Dual-Stream Point-Wise Residual Network (DSPRNet)** architecture. This addresses the limitations of the previous `MACOSR` model by properly separating the strong linear autoregressive signal (Baseline FVC + Time) from the complex non-linear visual interaction, and fusing them in a shared latent space rather than the output space.
+
+Key changes:
+1.  **Architecture Upgrade (`library/model.py`)**: Replace `MACOSR` with `DSPRNet`.
+    *   **Stream A (Linear)**: A direct linear projection of `[Baseline FVC, Relative Time]` to a 64-dim latent space. This follows Lesson `solution_lesson_node_00060` (Over-Parameterization of Linear Baselines) and Lesson `solution_lesson_node_00052` (Dual-Stream Residuals).
+    *   **Stream B (Deep)**: Concatenates EfficientNet-B2 image embeddings with *all* raw tabular features (Lesson `solution_lesson_node_00035`) and projects to the same 64-dim latent space.
+    *   **Fusion**: Sums the latent vectors from both streams.
+    *   **Output**: A shared head predicts both FVC and Uncertainty from the fused latent vector, ensuring the linear stream contributes directly to uncertainty estimation (Lesson `solution_lesson_node_00055`).
+    *   **Initialization**: Removed zero-initialization for the residual branch to avoid optimization bias (Lesson `solution_lesson_node_00118`).
+
+2.  **Training Configuration (`runfile.py`)**:
+    *   Initialize `DSPRNet` instead of `MACOSR`.
+    *   Update optimizer parameter groups to match the new architecture (separating the backbone from the new heads).
+    *   Increase `EPOCHS` to 25 to ensure the scheduler completes a full decay cycle appropriate for convergence (Lesson `solution_lesson_node_00100`).
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+class ClinicalAnchor(nn.Module):
+    """
+    Stream A: Over-Parameterized Clinical Anchor.
+    Acts as the base learner using tabular data.
+    """
+
+    def __init__(self, input_dim=5, hidden_dim=128, latent_dim=64):
+        super(ClinicalAnchor, self).__init__()
+
+        # MLP Backbone
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            # Note: No ReLU here on the latent output to allow full vector space usage
+            # before fusion or projection.
+        )
+
+        # Base Prediction Head (Mu, Raw Sigma)
+        self.head = nn.Linear(latent_dim, 2)
+
+    def forward(self, x):
+        # x shape: (Batch, 5)
+        latent = self.net(x)  # (Batch, 64)
+        base_preds = self.head(latent)  # (Batch, 2) -> [mu_base, sigma_logit_base]
+        return latent, base_preds
+
+
+class VisualResidual(nn.Module):
+    """
+    Stream B: Cascaded Visual Residual.
+    Extracts visual features and learns a residual correction conditioned on the clinical state.
+    """
+
+    def __init__(self, clinical_latent_dim=64, dropout_rate=0.2):
+        super(VisualResidual, self).__init__()
+
+        # 1. Backbone: EfficientNet-B2
+        # num_classes=0 removes the classifier, returning pooled features if global_pool is set
+        # However, timm returns features before pooling if global_pool='' or num_classes=0 usually.
+        # We use forward_features + manual pooling or let timm handle it.
+        # EfficientNet B2 feature dim is 1408.
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Feature dimension for EfficientNet-B2
+        self.img_feature_dim = self.backbone.num_features  # 1408
+
+        # 2. Freezing Strategy (Unfreeze top 2 stages)
+        # EfficientNet blocks are named 'blocks.0' through 'blocks.6'.
+        # We unfreeze blocks 5, 6 and the conv_head.
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        for name, param in self.backbone.named_parameters():
+            # Unfreeze top stages (blocks.5, blocks.6) and head components
+            if any(x in name for x in ["blocks.5", "blocks.6", "conv_head", "bn2"]):
+                param.requires_grad = True
+
+        # 3. Fusion & Residual Head
+        # Concatenate Image Features + Clinical Latent
+        fusion_dim = self.img_feature_dim + clinical_latent_dim
+
+        self.residual_head = nn.Sequential(
+            nn.Linear(fusion_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, 2),  # [delta_mu, delta_sigma_logit]
+        )
+
+        # 4. Zero Initialization
+        # Explicitly initialize the final linear layer to zero
+        self._zero_init_final_layer()
+
+    def _zero_init_final_layer(self):
+        final_layer = self.residual_head[-1]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.zeros_(final_layer.bias)
+
+    def forward(self, img, clinical_latent):
+        # img: (Batch, 3, 260, 260)
+        # clinical_latent: (Batch, 64)
+
+        # Extract visual features
+        # timm with num_classes=0 and global_pool='avg' returns (Batch, num_features)
+        img_feats = self.backbone(img)
+
+        # Fusion
+        fused = torch.cat([img_feats, clinical_latent], dim=1)
+
+        # Predict Residuals
+        residuals = self.residual_head(fused)  # (Batch, 2)
+
+        return residuals
+
+
+class MACOSR(nn.Module):
+    """
+    Metric-Aligned Cascaded Output-Space Residual Network.
+    Combines Clinical Anchor and Visual Residual streams.
+    """
+
+    def __init__(self):
+        super(MACOSR, self).__init__()
+
+        # Input dim is 5 based on library.data processing:
+        # [Base_FVC, Rel_Time, Age, Sex, Smoke]
+        self.clinical_input_dim = 5
+
+        self.clinical_anchor = ClinicalAnchor(
+            input_dim=self.clinical_input_dim,
+            hidden_dim=Config.CLINICAL_HIDDEN_DIM,
+            latent_dim=Config.CLINICAL_LATENT_DIM,
+        )
+
+        self.visual_residual = VisualResidual(
+            clinical_latent_dim=Config.CLINICAL_LATENT_DIM,
+            dropout_rate=Config.DROPOUT_RATE,
+        )
+
+    def forward(self, tabular, image):
+        """
+        Args:
+            tabular: (Batch, 5) tensor of clinical features.
+            image: (Batch, 3, H, W) tensor of slice volumes.
+        Returns:
+            mu: Predicted FVC (normalized scale).
+            sigma: Predicted Confidence (normalized scale).
+        """
+        # Stream A: Clinical Anchor
+        clinical_latent, base_preds = self.clinical_anchor(tabular)
+        # base_preds: [mu_base, sigma_logit_base]
+
+        # Stream B: Visual Residual
+        # Pass latent to visual stream for conditioned correction
+        residuals = self.visual_residual(image, clinical_latent)
+        # residuals: [delta_mu, delta_sigma_logit]
+
+        # Output Space Summation
+        mu_final = base_preds[:, 0] + residuals[:, 0]
+        sigma_logit_final = base_preds[:, 1] + residuals[:, 1]
+
+        # Uncertainty Activation
+        # Softplus ensures positivity. Epsilon prevents division by zero in loss.
+        # We do not clip to 70 here (that is for metric/submission), allowing gradient flow.
+        sigma_final = F.softplus(sigma_logit_final) + 1e-6
+
+        return mu_final, sigma_final
+=======
+class DSPRNet(nn.Module):
+    """
+    Dual-Stream Point-Wise Residual Network (DSPRNet).
+    Cite solution_lesson_node_00052: Dual-Stream Residuals for Strong Autoregressive Signals.
+    Cite solution_lesson_node_00060: Over-Parameterization of Linear Baselines.
+    """
+
+    def __init__(self):
+        super(DSPRNet, self).__init__()
+
+        # Dimensions
+        self.latent_dim = 64
+        self.dropout_rate = Config.DROPOUT_RATE
+        self.img_feature_dim = 1408  # EfficientNet-B2
+        self.tabular_dim = 5  # [Base_FVC, Rel_Time, Age, Sex, Smoke]
+
+        # Stream A: Linear Residual (Baseline + Time)
+        # Projects dominant autoregressive features to latent space
+        # Cite solution_lesson_node_00060: Over-parameterize linear stream in latent space
+        self.linear_stream = nn.Linear(2, self.latent_dim)
+
+        # Stream B: Deep Interaction (Image + Tabular)
+        # Cite solution_lesson_node_00035: Direct concatenation of strong scalar predictors
+        self.backbone = timm.create_model(
+            Config.BACKBONE_NAME,
+            pretrained=Config.PRETRAINED,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        # Freeze/Unfreeze strategy
+        # Cite solution_lesson_node_00027: Differential Learning Rates / Fine-tuning
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        for name, param in self.backbone.named_parameters():
+            if any(x in name for x in ["blocks.5", "blocks.6", "conv_head", "bn2"]):
+                param.requires_grad = True
+
+        self.deep_head = nn.Sequential(
+            nn.Linear(self.img_feature_dim + self.tabular_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(512, self.latent_dim),
+        )
+
+        # Shared Head
+        # Cite solution_lesson_node_00055: Preserve Low-Complexity Pathways for Uncertainty
+        self.final_head = nn.Linear(self.latent_dim, 2)
+
+    def forward(self, tabular, image):
+        # Stream A: Linear (Baseline FVC, Relative Time)
+        # tabular is [Base, Time, Age, Sex, Smoke]. We take first 2.
+        linear_latent = self.linear_stream(tabular[:, :2])
+
+        # Stream B: Deep
+        img_feats = self.backbone(image)
+        # Concatenate all tabular features with image features
+        combined = torch.cat([img_feats, tabular], dim=1)
+        deep_latent = self.deep_head(combined)
+
+        # Latent Summation
+        # Cite solution_lesson_node_00052: Sum in latent space
+        fused_latent = linear_latent + deep_latent
+
+        # Prediction
+        preds = self.final_head(fused_latent)
+        mu = preds[:, 0]
+        sigma = F.softplus(preds[:, 1]) + 1e-6
+
+        return mu, sigma
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def main():
+    # 1. Setup
+    utils.seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # Modify Config for Fast Baseline
+    Config.EPOCHS = 20  # Reduced from 50 for speed
+
+    # 2. Data Loading
+    print("Loading Data...")
+    train_loader, val_loader, scaler_stats = data.get_dataloaders(
+        debug=Config.DEBUG, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    print("Initializing Model...")
+    net = model.MACOSR().to(device)
+
+    # Differential Learning Rates
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": net.clinical_anchor.parameters(), "lr": Config.LR_HEADS},
+            {
+                "params": net.visual_residual.backbone.parameters(),
+                "lr": Config.LR_BACKBONE,
+            },
+            {
+                "params": net.visual_residual.residual_head.parameters(),
+                "lr": Config.LR_HEADS,
+            },
+        ],
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.EPOCHS, eta_min=Config.ETA_MIN
+    )
+
+    # 4. Training
+    print("Starting Training...")
+    best_score = engine.run_training(
+        net,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        scaler_stats,
+        epochs=Config.EPOCHS,
+        patience=10,
+    )
+=======
+def main():
+    # 1. Setup
+    utils.seed_everything(Config.SEED)
+    device = torch.device(Config.DEVICE)
+    print(f"Using device: {device}")
+
+    # Modify Config for Fast Baseline
+    # Cite solution_lesson_node_00100: Scheduler horizon coupled to training duration
+    Config.EPOCHS = 25  # Increased slightly to ensure convergence (Lesson 52: converged ~14)
+
+    # 2. Data Loading
+    print("Loading Data...")
+    train_loader, val_loader, scaler_stats = data.get_dataloaders(
+        debug=Config.DEBUG, load_cached_data=True
+    )
+
+    # 3. Model Initialization
+    print("Initializing Model...")
+    net = model.DSPRNet().to(device)
+
+    # Differential Learning Rates
+    optimizer = torch.optim.AdamW(
+        [
+            # Stream A (Linear) and Heads get higher LR
+            {"params": net.linear_stream.parameters(), "lr": Config.LR_HEADS},
+            {"params": net.deep_head.parameters(), "lr": Config.LR_HEADS},
+            {"params": net.final_head.parameters(), "lr": Config.LR_HEADS},
+            # Stream B (Backbone) gets lower LR
+            {
+                "params": net.backbone.parameters(),
+                "lr": Config.LR_BACKBONE,
+            },
+        ],
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=Config.EPOCHS, eta_min=Config.ETA_MIN
+    )
+
+    # 4. Training
+    print("Starting Training...")
+    best_score = engine.run_training(
+        net,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        scaler_stats,
+        epochs=Config.EPOCHS,
+        patience=10,
+    )
+>>>>>>> REPLACE
+```

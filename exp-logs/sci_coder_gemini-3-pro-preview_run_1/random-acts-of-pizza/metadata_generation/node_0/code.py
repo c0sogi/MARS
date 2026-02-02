@@ -1,0 +1,181 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Configuration
+INPUT_DIR = "./input"
+METADATA_DIR = "./metadata"
+RANDOM_STATE = 42
+VAL_SIZE = 0.2
+
+
+def run():
+    # Ensure metadata directory exists
+    os.makedirs(METADATA_DIR, exist_ok=True)
+
+    print("Initializing metadata generation...")
+
+    # Locate input files
+    # The dataset description lists files in root input/ and subdirectories.
+    # We prioritize root files if they exist, otherwise check subdirectories.
+    possible_train_paths = [
+        os.path.join(INPUT_DIR, "train.json"),
+        os.path.join(INPUT_DIR, "train", "train.json"),
+    ]
+    possible_test_paths = [
+        os.path.join(INPUT_DIR, "test.json"),
+        os.path.join(INPUT_DIR, "test", "test.json"),
+    ]
+
+    train_path = next((p for p in possible_train_paths if os.path.exists(p)), None)
+    test_path = next((p for p in possible_test_paths if os.path.exists(p)), None)
+
+    if not train_path:
+        raise FileNotFoundError("Could not find train.json in input directory.")
+    if not test_path:
+        raise FileNotFoundError("Could not find test.json in input directory.")
+
+    print(f"Found train data at: {train_path}")
+    print(f"Found test data at: {test_path}")
+
+    # Load data
+    print("Loading JSON data...")
+    with open(train_path, "r") as f:
+        train_data = json.load(f)
+    with open(test_path, "r") as f:
+        test_data = json.load(f)
+
+    df_train_full = pd.DataFrame(train_data)
+    df_test = pd.DataFrame(test_data)
+
+    # Add source_file column (relative to INPUT_DIR)
+    # This satisfies the requirement to have file paths relative to ./input
+    df_train_full["source_file"] = os.path.relpath(train_path, INPUT_DIR)
+    df_test["source_file"] = os.path.relpath(test_path, INPUT_DIR)
+
+    # Split training data into train and validation
+    # Requirement: 80:20 split, random state 42, stratified
+    print("Splitting training data...")
+    target_col = "requester_received_pizza"
+
+    if target_col not in df_train_full.columns:
+        raise ValueError(f"Target column '{target_col}' not found in training data.")
+
+    df_train, df_val = train_test_split(
+        df_train_full,
+        test_size=VAL_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=df_train_full[target_col],
+    )
+
+    # Save metadata
+    print("Saving metadata CSVs...")
+    train_csv_path = os.path.join(METADATA_DIR, "train.csv")
+    val_csv_path = os.path.join(METADATA_DIR, "val.csv")
+    test_csv_path = os.path.join(METADATA_DIR, "test.csv")
+
+    df_train.to_csv(train_csv_path, index=False)
+    df_val.to_csv(val_csv_path, index=False)
+    df_test.to_csv(test_csv_path, index=False)
+
+    print("Metadata generation complete. Starting verification...")
+
+    # --- Verification Step ---
+
+    # Reload data
+    df_train_loaded = pd.read_csv(train_csv_path)
+    df_val_loaded = pd.read_csv(val_csv_path)
+    df_test_loaded = pd.read_csv(test_csv_path)
+
+    # 1. Summary Statistics
+    print("\n=== Summary Statistics ===")
+    print(f"Train samples: {len(df_train_loaded)}")
+    print(f"Val samples:   {len(df_val_loaded)}")
+    print(f"Test samples:  {len(df_test_loaded)}")
+
+    print("\nTrain Target Distribution:")
+    print(df_train_loaded[target_col].value_counts(normalize=True))
+
+    print("\nVal Target Distribution:")
+    print(df_val_loaded[target_col].value_counts(normalize=True))
+
+    # 2. Check File Paths
+    print("\nChecking file paths...")
+
+    def check_file_paths(df, dataset_name):
+        if "source_file" not in df.columns:
+            return
+
+        # Select 1000 random paths (or all if less than 1000)
+        n_samples = min(1000, len(df))
+        sample_paths = df["source_file"].sample(n=n_samples, random_state=RANDOM_STATE)
+
+        missing_count = 0
+        missing_examples = []
+
+        for rel_path in sample_paths:
+            full_path = os.path.join(INPUT_DIR, rel_path)
+            if not os.path.exists(full_path):
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(rel_path)
+
+        missing_ratio = missing_count / n_samples
+        print(f"[{dataset_name}] Missing file ratio: {missing_ratio:.4f}")
+
+        if missing_ratio > 0.5:
+            print(f"Example missing paths: {missing_examples}")
+            raise FileNotFoundError(
+                f"Missing file ratio > 0.5 for {dataset_name} dataset."
+            )
+
+    check_file_paths(df_train_loaded, "Train")
+    check_file_paths(df_val_loaded, "Val")
+    check_file_paths(df_test_loaded, "Test")
+
+    # 3. Verify Validation Split Requirements
+    print("\nVerifying split requirements...")
+
+    # Check Split Ratio
+    total_train = len(df_train_loaded)
+    total_val = len(df_val_loaded)
+    total_combined = total_train + total_val
+    val_ratio = total_val / total_combined
+
+    print(f"Observed Validation Ratio: {val_ratio:.4f}")
+    if not (0.19 < val_ratio < 0.21):  # Allow small float/rounding deviation
+        raise AssertionError(
+            f"Validation split ratio {val_ratio:.4f} is not close to 0.2"
+        )
+
+    # Check Stratification
+    train_pos_rate = df_train_loaded[target_col].mean()
+    val_pos_rate = df_val_loaded[target_col].mean()
+
+    print(f"Train Positive Rate: {train_pos_rate:.4f}")
+    print(f"Val Positive Rate:   {val_pos_rate:.4f}")
+
+    # Tolerance for stratification (e.g. 1%)
+    if abs(train_pos_rate - val_pos_rate) > 0.01:
+        raise AssertionError(
+            "Stratification check failed: Positive rates differ significantly."
+        )
+
+    # Check Data Leakage (Overlap)
+    # Using request_id as unique identifier
+    train_ids = set(df_train_loaded["request_id"])
+    val_ids = set(df_val_loaded["request_id"])
+    overlap = train_ids.intersection(val_ids)
+
+    if overlap:
+        raise AssertionError(
+            f"Data leakage detected: {len(overlap)} IDs present in both train and val sets."
+        )
+
+    print("\nAll verifications passed successfully!")
+
+
+if __name__ == "__main__":
+    run()

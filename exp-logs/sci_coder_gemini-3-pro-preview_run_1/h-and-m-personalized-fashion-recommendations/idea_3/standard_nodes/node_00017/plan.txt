@@ -1,0 +1,312 @@
+The strategy is to transition from a **Weighted Linear Ensemble** back to a **Strict Cascade** architecture, as previous lessons (`solution_lesson_node_00016`, `solution_lesson_node_00003`) demonstrated that enforcing a strict hierarchy of signals (Repurchase > Collaborative Filtering > Popularity) outperforms linear blending in this domain.
+
+To implement this efficiently without rewriting the vectorized inference engine:
+1.  **Config Update**: I will set the ensemble weights to orders of magnitude apart (e.g., Repurchase=`1e9`, Behavioral=`1e6`, Trend=`1.0`). This "soft cascade" leverages the floating-point dynamic range to ensure that any signal from a higher tier strictly dominates any signal from a lower tier, effectively mimicking a hard cascade while retaining the speed of matrix operations.
+2.  **Disable Visual Component**: I will set the Visual weight to `0.0` and conditionally skip its computation. Lesson `solution_lesson_node_00016` indicated that visual features added noise and computational overhead without improving the cascade baseline.
+3.  **Remove Tuning Overhead**: I will remove the `run_validation_and_tuning` function and replace it with a direct `run_validation`. Since we are adopting a deterministic cascade strategy, online hyperparameter tuning of linear weights is unnecessary and potentially counterproductive.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+    # Default Ensemble Weights (Linear Combination)
+    # Score = alpha*Repurchase + beta*Behavioral + gamma*Visual + delta*Trend
+    # These serve as initial values or fallbacks if tuning is skipped
+    WEIGHT_ALPHA = 1.0  # Repurchase (Habit)
+    WEIGHT_BETA = 0.6  # Behavioral (Co-occurrence)
+    WEIGHT_GAMMA = 0.4  # Visual (Content-based)
+    WEIGHT_DELTA = 0.2  # Global Trend (Popularity)
+=======
+    # Default Ensemble Weights (Linear Combination)
+    # Score = alpha*Repurchase + beta*Behavioral + gamma*Visual + delta*Trend
+    # These serve as initial values or fallbacks if tuning is skipped
+    # Modified to enforce Cascade Strategy (Cite solution_lesson_node_00016)
+    # Tiers: Repurchase (1e9) > Behavioral (1e6) > Trend (1.0)
+    WEIGHT_ALPHA = 1e9  # Repurchase (Habit)
+    WEIGHT_BETA = 1e6  # Behavioral (Co-occurrence)
+    WEIGHT_GAMMA = 0.0  # Visual (Disabled)
+    WEIGHT_DELTA = 1.0  # Global Trend (Popularity)
+>>>>>>> REPLACE
+```
+
+```diff
+library/hybrid_recommender.py
+<<<<<<< SEARCH
+        # View 3: Visual Similarity (Content)
+        # Sparse Matrix: (N_Items, N_Items)
+        self.S_visual = compute_visual_similarity_matrix(
+            self.mapper, load_cached_data=load_cached_data
+        )
+
+        # View 4: Global Trend (Popularity)
+=======
+        # View 3: Visual Similarity (Content)
+        # Sparse Matrix: (N_Items, N_Items)
+        # Only compute if weight > 0 to save resources (Cite solution_lesson_node_00016)
+        if Config.WEIGHT_GAMMA > 0:
+            self.S_visual = compute_visual_similarity_matrix(
+                self.mapper, load_cached_data=load_cached_data
+            )
+        else:
+            self.S_visual = None
+
+        # View 4: Global Trend (Popularity)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+def run_validation_and_tuning(recommender):
+    print("Loading validation data...")
+    val_df = pd.read_csv(
+        Config.PATH_VAL,
+        dtype={"article_id": "int32", "price": "float32", "sales_channel_id": "int8"},
+    )
+    val_df["t_dat"] = pd.to_datetime(val_df["t_dat"])
+
+    # Time split for validation: Last 7 days is target, previous 5 weeks is input
+    max_date = val_df["t_dat"].max()
+    split_date = max_date - pd.Timedelta(days=7)
+    start_date = split_date - pd.Timedelta(weeks=Config.TRAIN_WEEKS)
+
+    print(
+        f"Splitting validation data. Input: {start_date} to {split_date}. Target: > {split_date}"
+    )
+
+    val_target = val_df[val_df["t_dat"] > split_date].copy()
+    val_input = val_df[
+        (val_df["t_dat"] <= split_date) & (val_df["t_dat"] > start_date)
+    ].copy()
+
+    target_users = val_target["customer_id"].unique()
+    print(f"Total validation target users: {len(target_users)}")
+
+    # Sample users for fast weight tuning
+    rng = np.random.RandomState(Config.SEED)
+    tune_users = rng.choice(
+        target_users, size=min(10000, len(target_users)), replace=False
+    )
+
+    # Build Ground Truth for Tuning
+    gt_df = val_target[val_target["customer_id"].isin(tune_users)]
+    gt_dict = gt_df.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    # Build Input History for Tuning
+    val_input_tune = val_input[val_input["customer_id"].isin(tune_users)]
+    U_hist_tune = build_user_history_vectors(
+        val_input_tune, recommender.mapper, load_cached_data=False
+    )
+    tune_indices = recommender.mapper.map_users(pd.Series(tune_users))
+
+    # Grid Search for Weights
+    # (Repurchase, Behavioral, Visual, Trend)
+    param_grid = [
+        (1.0, 0.6, 0.4, 0.2),  # Default
+        (1.5, 0.6, 0.4, 0.2),  # High Habit
+        (1.0, 1.0, 0.4, 0.2),  # High Co-occurrence
+        (1.0, 0.6, 1.0, 0.2),  # High Visual
+        (0.8, 0.8, 0.8, 0.2),  # Balanced
+    ]
+
+    best_score = -1
+    best_params = param_grid[0]
+
+    print("Tuning weights...")
+    # Temporarily swap U_hist
+    original_U_hist = recommender.U_hist
+    recommender.U_hist = U_hist_tune
+
+    for params in param_grid:
+        recommender.w_rep, recommender.w_beh, recommender.w_vis, recommender.w_trend = (
+            params
+        )
+
+        # Predict
+        scores = recommender.predict_scores(tune_indices)
+
+        # Extract Top 12
+        top_k = 12
+        top_indices = np.argpartition(scores, -top_k, axis=1)[:, -top_k:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        # Convert to IDs
+        pred_articles = []
+        for i in range(len(final_indices)):
+            ids = recommender.mapper.get_items_from_indices(final_indices[i])
+            pred_articles.append(list(ids))
+
+        actuals = [gt_dict.get(u, set()) for u in tune_users]
+        score = map_at_k(actuals, pred_articles, k=12)
+
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+    print(f"Best Params: {best_params} (MAP@12: {best_score:.6f})")
+
+    # Apply Best Params
+    recommender.w_rep, recommender.w_beh, recommender.w_vis, recommender.w_trend = (
+        best_params
+    )
+
+    # --- Final Validation on ALL Target Users ---
+    print("Running final validation...")
+
+    # Build history for ALL target users
+    val_input_all = val_input[val_input["customer_id"].isin(target_users)]
+    U_hist_all = build_user_history_vectors(
+        val_input_all, recommender.mapper, load_cached_data=False
+    )
+    recommender.U_hist = U_hist_all
+
+    all_indices = recommender.mapper.map_users(pd.Series(target_users)).values
+    gt_dict_all = val_target.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    batch_size = 2000
+    user_aps = []
+    user_hist_lens = []
+
+    for start in range(0, len(target_users), batch_size):
+        end = min(start + batch_size, len(target_users))
+        batch_indices = all_indices[start:end]
+        batch_users = target_users[start:end]
+
+        scores = recommender.predict_scores(batch_indices)
+
+        top_indices = np.argpartition(scores, -12, axis=1)[:, -12:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        for i, u in enumerate(batch_users):
+            truth = gt_dict_all.get(u, set())
+            if not truth:
+                continue
+
+            pred_ids = recommender.mapper.get_items_from_indices(final_indices[i])
+
+            # Compute AP
+            ap = 0.0
+            hits = 0.0
+            for k, p in enumerate(pred_ids):
+                if p in truth:
+                    hits += 1.0
+                    ap += hits / (k + 1.0)
+            ap /= min(len(truth), 12)
+            user_aps.append(ap)
+
+            # History Length
+            hist_len = U_hist_all[batch_indices[i]].getnnz()
+            user_hist_lens.append(hist_len)
+
+    # Restore original U_hist
+    recommender.U_hist = original_U_hist
+
+    final_map = np.mean(user_aps)
+    print(f"Final Validation Metric: {final_map:.10f}")
+
+    return final_map, user_aps, user_hist_lens
+=======
+def run_validation(recommender):
+    print("Loading validation data...")
+    val_df = pd.read_csv(
+        Config.PATH_VAL,
+        dtype={"article_id": "int32", "price": "float32", "sales_channel_id": "int8"},
+    )
+    val_df["t_dat"] = pd.to_datetime(val_df["t_dat"])
+
+    # Time split for validation: Last 7 days is target, previous 5 weeks is input
+    max_date = val_df["t_dat"].max()
+    split_date = max_date - pd.Timedelta(days=7)
+    start_date = split_date - pd.Timedelta(weeks=Config.TRAIN_WEEKS)
+
+    print(
+        f"Splitting validation data. Input: {start_date} to {split_date}. Target: > {split_date}"
+    )
+
+    val_target = val_df[val_df["t_dat"] > split_date].copy()
+    val_input = val_df[
+        (val_df["t_dat"] <= split_date) & (val_df["t_dat"] > start_date)
+    ].copy()
+
+    target_users = val_target["customer_id"].unique()
+    print(f"Total validation target users: {len(target_users)}")
+
+    # --- Final Validation on ALL Target Users ---
+    print("Running validation with Cascade weights...")
+
+    # Build history for ALL target users
+    val_input_all = val_input[val_input["customer_id"].isin(target_users)]
+    # We must rebuild U_hist for the validation users based on validation input window
+    original_U_hist = recommender.U_hist
+    U_hist_all = build_user_history_vectors(
+        val_input_all, recommender.mapper, load_cached_data=False
+    )
+    recommender.U_hist = U_hist_all
+
+    all_indices = recommender.mapper.map_users(pd.Series(target_users)).values
+    gt_dict_all = val_target.groupby("customer_id")["article_id"].apply(set).to_dict()
+
+    batch_size = 2000
+    user_aps = []
+    user_hist_lens = []
+
+    for start in range(0, len(target_users), batch_size):
+        end = min(start + batch_size, len(target_users))
+        batch_indices = all_indices[start:end]
+        batch_users = target_users[start:end]
+
+        scores = recommender.predict_scores(batch_indices)
+
+        # Efficient Top-K Retrieval (Cite solution_lesson_node_00013)
+        top_indices = np.argpartition(scores, -12, axis=1)[:, -12:]
+        rows = np.arange(len(scores))[:, None]
+        top_vals = scores[rows, top_indices]
+        sort_inds = np.argsort(-top_vals, axis=1)
+        final_indices = top_indices[rows, sort_inds]
+
+        for i, u in enumerate(batch_users):
+            truth = gt_dict_all.get(u, set())
+            if not truth:
+                continue
+
+            pred_ids = recommender.mapper.get_items_from_indices(final_indices[i])
+
+            # Compute AP
+            ap = 0.0
+            hits = 0.0
+            for k, p in enumerate(pred_ids):
+                if p in truth:
+                    hits += 1.0
+                    ap += hits / (k + 1.0)
+            ap /= min(len(truth), 12)
+            user_aps.append(ap)
+
+            # History Length
+            hist_len = U_hist_all[batch_indices[i]].getnnz()
+            user_hist_lens.append(hist_len)
+
+    # Restore original U_hist
+    recommender.U_hist = original_U_hist
+
+    final_map = np.mean(user_aps)
+    print(f"Final Validation Metric: {final_map:.10f}")
+
+    return final_map, user_aps, user_hist_lens
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 2. Validation & Tuning
+    val_metric, user_aps, user_hist_lens = run_validation_and_tuning(rec)
+=======
+    # 2. Validation (Cascade Strategy)
+    val_metric, user_aps, user_hist_lens = run_validation(rec)
+>>>>>>> REPLACE
+```

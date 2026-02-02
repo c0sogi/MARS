@@ -1,0 +1,421 @@
+To improve the model's performance, I will implement a strategy focused on enhancing the geometric representation of the molecules and optimizing the training configuration.
+
+**Strategy Outline:**
+
+1.  **Feature Engineering (Geometric Encodings):** The previous model used a simple inverse-squared distance ($1/d^2$) as a scalar edge weight. This limits the model's ability to distinguish subtle spatial variations. I will replace this with **Radial Basis Function (RBF) expansion** (Gaussian Smearing) of the inter-atomic distances. This projects the scalar distance into a high-dimensional vector, allowing the neural network to learn complex, non-linear distance-dependent interaction filters (similar to SchNet).
+2.  **Model Architecture (Continuous Filter Convolution):** I will replace the basic `DWConvLayer` with a **Continuous Filter Convolution (CFConv)** layer. This layer generates edge-specific filters using the RBF-expanded distances, which are then applied to neighbor features. This significantly increases the expressivity of the message-passing phase. I will also increase the hidden dimension to 256 and the batch size to 1024 to better utilize the A100 GPU.
+3.  **Data Processing:** I will modify the `StructureProcessor` to store raw distances in the edge attributes instead of pre-computed weights, enabling the RBF expansion to happen dynamically within the model. I will also update the working directory to `idea_2` to ensure the cache is regenerated with these new features.
+4.  **Submission Logic:** I will update the `runfile.py` to strictly adhere to the requirement of generating a submission *if and only if* the validation metric improves upon the previous best (-0.2036).
+
+I will continue to use the `TargetScaler` for per-group target standardization as established in the previous solution (Cite solution_lesson_node_00003), as it is critical for handling the heterogeneous coupling types.
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+WORKING_DIR = "./working/idea_1"
+SUBMISSION_DIR = "./submission"
+=======
+WORKING_DIR = "./working/idea_2"
+SUBMISSION_DIR = "./submission"
+>>>>>>> REPLACE
+```
+
+```diff
+library/config.py
+<<<<<<< SEARCH
+EMBED_DIM = 128  # Dimension for atom embeddings
+HIDDEN_DIM = 128  # Dimension for hidden layers in MLP
+NUM_GCN_LAYERS = 3  # Number of Distance-Weighted GCN layers
+NUM_MLP_LAYERS = 3  # Number of layers in the prediction head
+DROPOUT = 0.1  # Dropout rate
+
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+SEED = 42
+BATCH_SIZE = 512  # Batch size (adjust based on GPU memory)
+=======
+EMBED_DIM = 128  # Dimension for atom embeddings
+HIDDEN_DIM = 256  # Dimension for hidden layers in MLP
+NUM_RBF = 50  # Number of Radial Basis Functions
+NUM_GCN_LAYERS = 3  # Number of Interaction layers
+NUM_MLP_LAYERS = 3  # Number of layers in the prediction head
+DROPOUT = 0.1  # Dropout rate
+
+# ==========================================
+# Training Hyperparameters
+# ==========================================
+SEED = 42
+BATCH_SIZE = 1024  # Batch size (adjust based on GPU memory)
+>>>>>>> REPLACE
+```
+
+```diff
+library/data_factory.py
+<<<<<<< SEARCH
+            # Compute Edge Weights (1/d^2)
+            edge_dists = dists[src, dst]
+            weights = 1.0 / (edge_dists**2)
+
+            # Append to lists
+            all_node_feats.append(atoms)
+            all_coords.append(xyz)
+
+            # Edge indices must be relative to the molecule start (0 to N-1)
+            # We stack them as (2, NumEdges)
+            edges = np.stack([src, dst], axis=0).astype(np.int32)
+            all_edge_indices.append(edges)
+            all_edge_attrs.append(weights.astype(np.float32))
+=======
+            # Compute Edge Distances
+            edge_dists = dists[src, dst]
+            # We store raw distances now to allow RBF expansion in the model
+
+            # Append to lists
+            all_node_feats.append(atoms)
+            all_coords.append(xyz)
+
+            # Edge indices must be relative to the molecule start (0 to N-1)
+            # We stack them as (2, NumEdges)
+            edges = np.stack([src, dst], axis=0).astype(np.int32)
+            all_edge_indices.append(edges)
+            all_edge_attrs.append(edge_dists.astype(np.float32))
+>>>>>>> REPLACE
+```
+
+```diff
+library/model_arch.py
+<<<<<<< SEARCH
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import MessagePassing
+from library.config import (
+    NUM_ATOM_TYPES,
+    NUM_COUPLING_TYPES,
+    EMBED_DIM,
+    HIDDEN_DIM,
+    NUM_GCN_LAYERS,
+    NUM_MLP_LAYERS,
+    DROPOUT,
+)
+
+
+class DWConvLayer(MessagePassing):
+    """
+    Distance-Weighted Graph Convolutional Layer.
+    Update Rule: h_i = ReLU( W_self * h_i + W_neigh * sum( (1/d_ij^2) * h_j ) )
+    """
+
+    def __init__(self, in_channels, out_channels):
+        # aggr='add' sums the messages from neighbors
+        super(DWConvLayer, self).__init__(aggr="add")
+        self.lin_self = nn.Linear(in_channels, out_channels)
+        self.lin_neigh = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x, edge_index, edge_weight):
+        """
+        Args:
+            x (Tensor): Node features of shape (N, in_channels)
+            edge_index (LongTensor): Graph connectivity of shape (2, E)
+            edge_weight (Tensor): Edge weights (1/d^2) of shape (E,)
+        """
+        # Propagate messages along edges
+        # This calls message(), aggregate(), and update() internally
+        aggr_out = self.propagate(edge_index, x=x, edge_weight=edge_weight)
+
+        # Apply linear transformations and combine
+        # Self-loop contribution + Neighbor contribution
+        out = self.lin_self(x) + self.lin_neigh(aggr_out)
+
+        return F.relu(out)
+
+    def message(self, x_j, edge_weight):
+        """
+        Constructs the message from neighbor j to node i.
+        Weighted by the edge attribute (inverse squared distance).
+        """
+        # x_j: features of neighbors, shape (E, in_channels)
+        # edge_weight: shape (E,)
+        return x_j * edge_weight.view(-1, 1)
+
+
+class CouplingPredictor(nn.Module):
+    """
+    Main architecture for Scalar Coupling Prediction.
+    Combines DW-GCN for structure encoding and an MLP for pair-wise regression.
+    """
+
+    def __init__(self):
+        super(CouplingPredictor, self).__init__()
+
+        # 1. Embeddings
+        self.atom_embedding = nn.Embedding(NUM_ATOM_TYPES, EMBED_DIM)
+        self.type_embedding = nn.Embedding(NUM_COUPLING_TYPES, EMBED_DIM)
+
+        # 2. Graph Convolutional Layers
+        self.gcn_layers = nn.ModuleList()
+
+        # First layer maps from Embedding Dim to Hidden Dim
+        self.gcn_layers.append(DWConvLayer(EMBED_DIM, HIDDEN_DIM))
+
+        # Subsequent layers stay in Hidden Dim
+        for _ in range(NUM_GCN_LAYERS - 1):
+            self.gcn_layers.append(DWConvLayer(HIDDEN_DIM, HIDDEN_DIM))
+
+        # 3. Prediction Head (MLP)
+        # Input features:
+        #   - Node 0 Feature (HIDDEN_DIM)
+        #   - Node 1 Feature (HIDDEN_DIM)
+        #   - Coupling Type Embedding (EMBED_DIM)
+        #   - Distance (1)
+        #   - Dot Product of Node Features (1)
+        mlp_input_dim = (HIDDEN_DIM * 2) + EMBED_DIM + 1 + 1
+
+        self.mlp = nn.Sequential()
+        current_dim = mlp_input_dim
+
+        for i in range(NUM_MLP_LAYERS - 1):
+            self.mlp.add_module(f"lin_{i}", nn.Linear(current_dim, HIDDEN_DIM))
+            self.mlp.add_module(f"bn_{i}", nn.BatchNorm1d(HIDDEN_DIM))
+            self.mlp.add_module(f"relu_{i}", nn.ReLU())
+            self.mlp.add_module(f"drop_{i}", nn.Dropout(DROPOUT))
+            current_dim = HIDDEN_DIM
+
+        # Final regression layer
+        self.mlp.add_module("lin_out", nn.Linear(current_dim, 1))
+
+    def forward(self, data):
+        """
+        Args:
+            data (Batch): PyG Batch object containing graph and task data.
+        """
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        target_pair = data.target_pair  # Shape (B, 2), local indices
+        type_idx = data.type_idx  # Shape (B,) or (B, 1)
+        dist = data.dist  # Shape (B,) or (B, 1)
+
+        # --- 1. Graph Encoding ---
+        # Embed atoms
+        h = self.atom_embedding(x)  # (TotalNodes, EMBED_DIM)
+
+        # Apply GCN layers
+        for layer in self.gcn_layers:
+            h = layer(h, edge_index, edge_attr)
+
+        # --- 2. Pair-Centric Readout ---
+        # We need to extract the features for the specific atom pairs.
+        # target_pair contains indices local to each molecule (0..NumAtoms-1).
+        # We need to convert these to global indices in the batched 'h' tensor.
+
+        if hasattr(data, "ptr"):
+            # data.ptr is a tensor of offsets [0, N1, N1+N2, ...]
+            # We take the start index for each graph in the batch
+            batch_offsets = data.ptr[:-1].to(target_pair.device)
+        else:
+            # Fallback: compute offsets from batch vector
+            # This handles cases where ptr is missing (though rare in PyG DataLoaders)
+            unique, counts = torch.unique(data.batch, sorted=True, return_counts=True)
+            batch_offsets = torch.cat(
+                [
+                    torch.tensor([0], device=target_pair.device),
+                    torch.cumsum(counts, dim=0)[:-1],
+                ]
+            )
+
+        # Broadcast offsets to match target_pair shape (B, 2)
+        # global_idx = local_idx + graph_start_idx
+        global_pair_indices = target_pair + batch_offsets.view(-1, 1)
+
+        # Gather node features
+        idx_0 = global_pair_indices[:, 0]
+        idx_1 = global_pair_indices[:, 1]
+
+        h0 = h[idx_0]  # (B, HIDDEN_DIM)
+        h1 = h[idx_1]  # (B, HIDDEN_DIM)
+
+        # --- 3. Feature Fusion ---
+        # Ensure shapes are correct for concatenation
+
+        # Coupling Type Embedding
+        t_emb = self.type_embedding(type_idx)
+        if t_emb.dim() == 3:  # Handle (B, 1, D)
+            t_emb = t_emb.squeeze(1)
+
+        # Distance
+        if dist.dim() == 1:
+            dist = dist.unsqueeze(1)  # (B, 1)
+
+        # Dot Product (Interaction alignment)
+        # (B, D) * (B, D) -> (B, D) -> sum -> (B, 1)
+        dot_prod = (h0 * h1).sum(dim=1, keepdim=True)
+
+        # Concatenate all features
+        mlp_in = torch.cat([h0, h1, t_emb, dist, dot_prod], dim=1)
+
+        # --- 4. Prediction ---
+        out = self.mlp(mlp_in)
+
+        return out
+=======
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import MessagePassing
+from library.config import (
+    NUM_ATOM_TYPES,
+    NUM_COUPLING_TYPES,
+    EMBED_DIM,
+    HIDDEN_DIM,
+    NUM_GCN_LAYERS,
+    NUM_MLP_LAYERS,
+    DROPOUT,
+    NUM_RBF,
+    RADIUS_CUTOFF,
+)
+
+
+class GaussianSmearing(nn.Module):
+    """
+    Expands a distance scalar into a vector of RBF values.
+    """
+    def __init__(self, start=0.0, stop=RADIUS_CUTOFF, num_gaussians=NUM_RBF):
+        super().__init__()
+        offset = torch.linspace(start, stop, num_gaussians)
+        self.coeff = -0.5 / ((stop - start) / (num_gaussians - 1)) ** 2
+        self.register_buffer("offset", offset)
+
+    def forward(self, dist):
+        dist = dist.view(-1, 1) - self.offset.view(1, -1)
+        return torch.exp(self.coeff * torch.pow(dist, 2))
+
+
+class CFConvLayer(MessagePassing):
+    """
+    Continuous Filter Convolution Layer (SchNet-like).
+    Uses RBF-expanded distances to generate edge-specific filters.
+    """
+
+    def __init__(self, in_channels, out_channels, num_filters):
+        super(CFConvLayer, self).__init__(aggr="add")
+        self.lin1 = nn.Linear(num_filters, num_filters)
+        self.lin2 = nn.Linear(num_filters, num_filters)
+        self.nn = nn.Sequential(self.lin1, nn.Softplus(), self.lin2)
+        self.lin_root = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x, edge_index, edge_attr):
+        # edge_attr is the RBF expanded distance
+        W = self.nn(edge_attr)
+        return self.propagate(edge_index, x=x, W=W) + self.lin_root(x)
+
+    def message(self, x_j, W):
+        return x_j * W
+
+
+class CouplingPredictor(nn.Module):
+    """
+    Improved architecture using Continuous Filter Convolutions and RBF expansion.
+    """
+
+    def __init__(self):
+        super(CouplingPredictor, self).__init__()
+
+        # 1. Embeddings & RBF
+        self.atom_embedding = nn.Embedding(NUM_ATOM_TYPES, HIDDEN_DIM)
+        self.distance_expansion = GaussianSmearing(0.0, RADIUS_CUTOFF, NUM_RBF)
+        self.type_embedding = nn.Embedding(NUM_COUPLING_TYPES, HIDDEN_DIM)
+
+        # 2. Interaction Layers
+        self.interactions = nn.ModuleList()
+        for _ in range(NUM_GCN_LAYERS):
+            self.interactions.append(
+                CFConvLayer(HIDDEN_DIM, HIDDEN_DIM, NUM_RBF)
+            )
+
+        # 3. Prediction Head (MLP)
+        # Input: Node0(D) + Node1(D) + Type(D) + Dist(1) + DotProd(1)
+        mlp_input_dim = (HIDDEN_DIM * 3) + 1 + 1
+
+        self.mlp = nn.Sequential()
+        current_dim = mlp_input_dim
+
+        for i in range(NUM_MLP_LAYERS - 1):
+            self.mlp.add_module(f"lin_{i}", nn.Linear(current_dim, HIDDEN_DIM))
+            self.mlp.add_module(f"bn_{i}", nn.BatchNorm1d(HIDDEN_DIM))
+            self.mlp.add_module(f"act_{i}", nn.SiLU()) # SiLU (Swish) often works better
+            self.mlp.add_module(f"drop_{i}", nn.Dropout(DROPOUT))
+            current_dim = HIDDEN_DIM
+
+        self.mlp.add_module("lin_out", nn.Linear(current_dim, 1))
+
+    def forward(self, data):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        target_pair = data.target_pair
+        type_idx = data.type_idx
+        dist = data.dist
+
+        # --- 1. Graph Encoding ---
+        # Expand distances
+        edge_rbf = self.distance_expansion(edge_attr)
+        
+        # Embed atoms
+        h = self.atom_embedding(x)
+
+        # Apply Interaction layers
+        for layer in self.interactions:
+            h = F.silu(layer(h, edge_index, edge_rbf))
+
+        # --- 2. Pair-Centric Readout ---
+        if hasattr(data, "ptr"):
+            batch_offsets = data.ptr[:-1].to(target_pair.device)
+        else:
+            unique, counts = torch.unique(data.batch, sorted=True, return_counts=True)
+            batch_offsets = torch.cat(
+                [torch.tensor([0], device=target_pair.device), torch.cumsum(counts, dim=0)[:-1]]
+            )
+
+        global_pair_indices = target_pair + batch_offsets.view(-1, 1)
+        
+        h0 = h[global_pair_indices[:, 0]]
+        h1 = h[global_pair_indices[:, 1]]
+
+        # --- 3. Feature Fusion ---
+        t_emb = self.type_embedding(type_idx)
+        if t_emb.dim() == 3: t_emb = t_emb.squeeze(1)
+
+        if dist.dim() == 1: dist = dist.unsqueeze(1)
+        
+        dot_prod = (h0 * h1).sum(dim=1, keepdim=True)
+
+        # Concatenate
+        mlp_in = torch.cat([h0, h1, t_emb, dist, dot_prod], dim=1)
+
+        # --- 4. Prediction ---
+        return self.mlp(mlp_in)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Submission Generation
+    print("\n==== Generating Submission ====")
+    # Generates predictions on the test set and saves to ./submission/submission.csv
+    trainer.predict()
+    print("Run complete.")
+=======
+    # 7. Submission Generation
+    print("\n==== Generating Submission ====")
+    
+    # Threshold from previous best run
+    THRESHOLD = -0.20359964668750763
+    
+    if val_metric < THRESHOLD:
+        print(f"Validation metric {val_metric} improved over threshold {THRESHOLD}. Generating submission...")
+        trainer.predict()
+    else:
+        print(f"Validation metric {val_metric} did not improve over threshold {THRESHOLD}. Skipping submission.")
+        
+    print("Run complete.")
+>>>>>>> REPLACE
+```

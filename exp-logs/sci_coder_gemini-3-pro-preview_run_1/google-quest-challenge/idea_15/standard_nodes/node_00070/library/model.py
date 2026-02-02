@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+
+
+class DistilRobertaDualEncoder(nn.Module):
+    """
+    DistilRoBERTa Dual-Encoder (Full Fine-Tuning).
+    Cite solution_lesson_node_00068: Full FT of small models > LoRA of large models.
+    Cite solution_lesson_node_00027: Contextual Dual-Encoder with Interaction Fusion.
+    """
+
+    def __init__(
+        self,
+        model_name="distilroberta-base",
+        num_labels=30,
+    ):
+        super().__init__()
+
+        # 1. Load Backbone
+        self.config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.hidden_size = self.config.hidden_size
+
+        # 2. Fusion & Head
+        # Input dim: 4 original pools (u_avg, u_max, v_avg, v_max) + 2 interactions (prod, diff)
+        # Total = 6 * hidden_size
+        fusion_dim = self.hidden_size * 6
+
+        # Cite solution_lesson_node_00054: Simple Head (Linear -> ReLU -> Dropout -> Linear)
+        self.head = nn.Sequential(
+            nn.Linear(fusion_dim, self.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size, num_labels),
+        )
+
+        # Initialize head weights
+        self._init_weights(self.head)
+
+    def _init_weights(self, module):
+        """Initialize weights for the custom head."""
+        if isinstance(module, nn.Linear):
+            # Cite solution_lesson_node_00051: Match backbone init (Normal)
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
+        elif isinstance(module, nn.Sequential):
+            for sub_module in module:
+                self._init_weights(sub_module)
+
+    def _pool(self, last_hidden_state, attention_mask):
+        """
+        Applies Masked Global Average Pooling and Masked Max Pooling.
+        """
+        # Expand mask: (batch, seq_len) -> (batch, seq_len, hidden_size)
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        )
+
+        # Average Pooling
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        avg_pool = sum_embeddings / sum_mask
+
+        # Max Pooling
+        # Mask out padding tokens with a very large negative value
+        hidden_masked = last_hidden_state.clone()
+        hidden_masked = hidden_masked.masked_fill(input_mask_expanded == 0, -1e9)
+        max_pool = torch.max(hidden_masked, 1)[0]
+
+        return avg_pool, max_pool
+
+    def forward(
+        self,
+        q_input_ids,
+        q_attention_mask,
+        a_input_ids,
+        a_attention_mask,
+        labels=None,
+        **kwargs
+    ):
+        # 1. Process Question Branch
+        q_outputs = self.backbone(
+            input_ids=q_input_ids, attention_mask=q_attention_mask
+        )
+        q_hidden = q_outputs.last_hidden_state
+        u_avg, u_max = self._pool(q_hidden, q_attention_mask)
+
+        # 2. Process Answer Branch
+        a_outputs = self.backbone(
+            input_ids=a_input_ids, attention_mask=a_attention_mask
+        )
+        a_hidden = a_outputs.last_hidden_state
+        v_avg, v_max = self._pool(a_hidden, a_attention_mask)
+
+        # 3. Interaction Features (on Average Pooled vectors)
+        prod = u_avg * v_avg
+        diff = torch.abs(u_avg - v_avg)
+
+        # 4. Concatenation
+        fused_vector = torch.cat([u_avg, u_max, v_avg, v_max, prod, diff], dim=1)
+
+        # 5. Prediction Head
+        logits = self.head(fused_vector)
+
+        return logits

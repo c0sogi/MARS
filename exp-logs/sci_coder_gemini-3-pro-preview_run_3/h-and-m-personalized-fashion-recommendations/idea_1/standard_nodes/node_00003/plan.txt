@@ -1,0 +1,376 @@
+To improve the model's performance, I will implement a **Hybrid Strategy** that combines the Time-Aware Markov Chain with a **Repeat Purchase Heuristic**, as suggested in the lesson (Cite solution_lesson_node_00002). The previous solution relied solely on the transition graph from the *last* purchased item, which suffers from sparsity. By incorporating the user's most frequent and recent purchases from the training window as high-priority candidates, we can capture the strong tendency of users to repurchase preferred items or styles.
+
+**Implementation Strategy:**
+1.  **Modify `library/data_loader.py`**: Add a `get_user_top_items` function. This function will aggregate the time-weighted transaction history (already filtered to the last 10 weeks) to identify the top-weighted items per user. This serves as our "Repurchase" candidate set.
+2.  **Modify `library/model.py`**: Update `generate_predictions` to accept this additional history. The prediction logic will be updated to prioritize candidates in this order:
+    *   **Markov Candidates**: Contextual next-items based on the immediate last purchase.
+    *   **Repurchase Candidates**: High-weight items from the user's recent history.
+    *   **Global Popularity**: Fallback for filling the remaining slots.
+3.  **Update Pipelines**: Adjust `library/inference.py` and `runfile.py` to generate these history features and pass them to the model during both validation and final inference.
+
+This ablation targets the "sparsity" weakness of the Order-1 Markov Chain by filling gaps with personalized history rather than generic popularity.
+
+```diff
+library/data_loader.py
+<<<<<<< SEARCH
+    print(f"Saving user history to cache: {cache_path}")
+    last_purchases.to_parquet(cache_path, index=False)
+
+    return last_purchases
+=======
+    print(f"Saving user history to cache: {cache_path}")
+    last_purchases.to_parquet(cache_path, index=False)
+
+    return last_purchases
+
+
+def get_user_top_items(transactions_df, load_cached_data=True):
+    """
+    Aggregates transactions by user and item, summing the time weights,
+    and retrieves the top K items per user.
+
+    Args:
+        transactions_df (pd.DataFrame): Weighted transactions.
+        load_cached_data (bool): Whether to use cache.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'customer_id' and 'history_items' (list of article_ids).
+    """
+    cache_path = config.WORKING_DIR / "user_top_items.parquet"
+
+    if load_cached_data and cache_path.exists():
+        print(f"Loading user top items from cache: {cache_path}")
+        return pd.read_parquet(cache_path)
+
+    print("Extracting user top items from scratch...")
+
+    # Group by customer and article, sum the time-decay weights
+    # This ranks items by a combination of frequency and recency
+    grouped = (
+        transactions_df.groupby(["customer_id", "article_id"])["weight"]
+        .sum()
+        .reset_index()
+    )
+
+    # Sort by customer and weight (descending)
+    grouped = grouped.sort_values(["customer_id", "weight"], ascending=[True, False])
+
+    # Take top K items per customer
+    top_k = grouped.groupby("customer_id").head(config.TOP_K)
+
+    # Aggregate into lists
+    result = (
+        top_k.groupby("customer_id")["article_id"]
+        .apply(list)
+        .reset_index()
+        .rename(columns={"article_id": "history_items"})
+    )
+
+    print(f"Saving user top items to cache: {cache_path}")
+    result.to_parquet(cache_path, index=False)
+
+    return result
+>>>>>>> REPLACE
+```
+
+```diff
+library/model.py
+<<<<<<< SEARCH
+    def generate_predictions(self, user_history_df):
+        """
+        Generates predictions for users based on their last purchased item.
+
+        Args:
+            user_history_df (pd.DataFrame): DataFrame with 'customer_id' and 'article_id'
+                                            representing the last purchase.
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print("Generating predictions...")
+
+        # Pre-compute global top K for fallback
+        global_top_k = self.global_popularity[: config.TOP_K]
+
+        # Prepare inputs
+        customer_ids = user_history_df["customer_id"].values
+        last_article_ids = user_history_df["article_id"].values
+
+        # Map last articles to indices
+        # pd.Index.get_indexer is very fast for bulk lookups
+        # Returns -1 for items not found in the index
+        idx_map = pd.Index(self.idx_to_article)
+        source_indices = idx_map.get_indexer(last_article_ids)
+
+        predictions = []
+
+        # Iterate over each query
+        # While a loop in python is generally slow, iterating 1.3M times with efficient
+        # sparse row slicing is feasible within the time limit compared to full matrix ops.
+
+        # Optimization: Access CSR internals directly to avoid overhead
+        indptr = self.transition_matrix.indptr
+        indices = self.transition_matrix.indices
+        data = self.transition_matrix.data
+
+        for src_idx in source_indices:
+            preds = []
+
+            # If the source item exists in our graph
+            if src_idx != -1:
+                # Get the row corresponding to this article
+                start = indptr[src_idx]
+                end = indptr[src_idx + 1]
+
+                if end > start:
+                    row_indices = indices[start:end]
+                    row_data = data[start:end]
+
+                    # Get top K neighbors
+                    if len(row_data) > config.TOP_K:
+                        # argpartition puts the top K elements at the end (unsorted)
+                        top_k_arg = np.argpartition(row_data, -config.TOP_K)[
+                            -config.TOP_K :
+                        ]
+                        # Sort these top K by weight descending
+                        sorted_top_k_arg = top_k_arg[
+                            np.argsort(row_data[top_k_arg])[::-1]
+                        ]
+                        best_indices = row_indices[sorted_top_k_arg]
+                    else:
+                        # If fewer than K, just sort all of them
+                        sorted_arg = np.argsort(row_data)[::-1]
+                        best_indices = row_indices[sorted_arg]
+
+                    # Map back to article IDs
+                    preds = self.idx_to_article[best_indices].tolist()
+
+            # Fallback / Padding
+            # Fill with global popularity if we don't have 12 predictions
+            if len(preds) < config.TOP_K:
+                for p in global_top_k:
+                    if p not in preds:
+                        preds.append(p)
+                        if len(preds) == config.TOP_K:
+                            break
+
+            # Format as space-separated string
+            predictions.append(" ".join(map(str, preds)))
+
+        return pd.DataFrame({"customer_id": customer_ids, "prediction": predictions})
+=======
+    def generate_predictions(self, user_history_df):
+        """
+        Generates predictions using a hybrid approach:
+        1. Markov Chain candidates (based on last item)
+        2. User History candidates (based on frequent/recent purchases)
+        3. Global Popularity (fallback)
+
+        Args:
+            user_history_df (pd.DataFrame): DataFrame with columns:
+                - 'customer_id'
+                - 'article_id' (last purchased item)
+                - 'history_items' (list of top items from history, optional)
+
+        Returns:
+            pd.DataFrame: DataFrame with 'customer_id' and 'prediction' columns.
+        """
+        print("Generating predictions...")
+
+        # Pre-compute global top K for fallback
+        global_top_k = self.global_popularity[: config.TOP_K]
+
+        # Prepare inputs
+        customer_ids = user_history_df["customer_id"].values
+        last_article_ids = user_history_df["article_id"].values
+        
+        # Handle history_items if present, otherwise use empty lists
+        if "history_items" in user_history_df.columns:
+            history_items_array = user_history_df["history_items"].values
+        else:
+            history_items_array = np.empty(len(user_history_df), dtype=object)
+
+        # Map last articles to indices
+        idx_map = pd.Index(self.idx_to_article)
+        source_indices = idx_map.get_indexer(last_article_ids)
+
+        predictions = []
+
+        # Optimization: Access CSR internals directly
+        indptr = self.transition_matrix.indptr
+        indices = self.transition_matrix.indices
+        data = self.transition_matrix.data
+
+        for i, src_idx in enumerate(source_indices):
+            preds = []
+            seen = set()
+
+            # 1. Markov Chain Candidates
+            if src_idx != -1:
+                start = indptr[src_idx]
+                end = indptr[src_idx + 1]
+
+                if end > start:
+                    row_indices = indices[start:end]
+                    row_data = data[start:end]
+
+                    # Get top K neighbors
+                    if len(row_data) > config.TOP_K:
+                        top_k_arg = np.argpartition(row_data, -config.TOP_K)[
+                            -config.TOP_K :
+                        ]
+                        sorted_top_k_arg = top_k_arg[
+                            np.argsort(row_data[top_k_arg])[::-1]
+                        ]
+                        best_indices = row_indices[sorted_top_k_arg]
+                    else:
+                        sorted_arg = np.argsort(row_data)[::-1]
+                        best_indices = row_indices[sorted_arg]
+
+                    markov_candidates = self.idx_to_article[best_indices]
+                    
+                    for cand in markov_candidates:
+                        if cand not in seen:
+                            preds.append(cand)
+                            seen.add(cand)
+
+            # 2. User History Candidates (Repurchase)
+            # Cite solution_lesson_node_00002: Hybridizing with Repeat Purchase heuristic
+            hist_list = history_items_array[i]
+            if isinstance(hist_list, (list, np.ndarray)):
+                for cand in hist_list:
+                    if cand not in seen:
+                        preds.append(cand)
+                        seen.add(cand)
+                        if len(preds) >= config.TOP_K:
+                            break
+            
+            # 3. Global Popularity Fallback
+            if len(preds) < config.TOP_K:
+                for cand in global_top_k:
+                    if cand not in seen:
+                        preds.append(cand)
+                        seen.add(cand)
+                        if len(preds) >= config.TOP_K:
+                            break
+
+            # Truncate and format
+            final_preds = preds[: config.TOP_K]
+            predictions.append(" ".join(map(str, final_preds)))
+
+        return pd.DataFrame({"customer_id": customer_ids, "prediction": predictions})
+>>>>>>> REPLACE
+```
+
+```diff
+library/inference.py
+<<<<<<< SEARCH
+    # Get the last purchase history for all users
+    user_history_df = data_loader.get_last_purchases(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # Merge test customers with their history.
+    # Left join ensures we have a row for every customer in the test set.
+    # Customers with no history will have NaN in 'article_id'.
+    input_df = test_customers_df[["customer_id"]].merge(
+        user_history_df, on="customer_id", how="left"
+    )
+
+    # Fill NaN article_ids with a placeholder (e.g., -1) to ensure type consistency
+    # The model handles unknown/missing IDs by falling back to global popularity.
+    # We assume article_id is generally numeric (int64 in raw data), but merge might make it float.
+    input_df["article_id"] = input_df["article_id"].fillna(-1).astype(np.int64)
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(input_df)} customers...")
+    predictions_df = graph_model.generate_predictions(input_df)
+=======
+    # Get the last purchase history for all users (for Markov source)
+    user_last_purchase_df = data_loader.get_last_purchases(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # Get top items from history (for Repurchase candidates)
+    user_top_items_df = data_loader.get_user_top_items(
+        transactions_df, load_cached_data=load_cached_data
+    )
+
+    # Merge test customers with their history.
+    input_df = test_customers_df[["customer_id"]].merge(
+        user_last_purchase_df, on="customer_id", how="left"
+    )
+    
+    # Merge with top items history
+    input_df = input_df.merge(
+        user_top_items_df, on="customer_id", how="left"
+    )
+
+    # Fill NaN article_ids with a placeholder (e.g., -1)
+    input_df["article_id"] = input_df["article_id"].fillna(-1).astype(np.int64)
+    
+    # Note: 'history_items' will be NaN for users with no history. 
+    # The model handles this check.
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(input_df)} customers...")
+    predictions_df = graph_model.generate_predictions(input_df)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Prepare Inputs for Validation Users
+    print("Preparing Validation Inputs...")
+    # Extract last purchase from the history part of validation
+    # We use the helper but must be careful about caching.
+    # We pass load_cached_data=False to avoid reading/writing the main cache file with partial data
+    val_input_history = data_loader.get_last_purchases(
+        history_df, load_cached_data=False
+    )
+
+    # Identify users to predict for (those who actually bought something in the test window)
+    target_users = ground_truth_df["customer_id"].unique()
+
+    # Create input dataframe for the model
+    pred_input = pd.DataFrame({"customer_id": target_users})
+    pred_input = pred_input.merge(val_input_history, on="customer_id", how="left")
+
+    # Fill missing history with -1 (Cold Start in Validation Period)
+    pred_input["article_id"] = pred_input["article_id"].fillna(-1).astype(np.int64)
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(pred_input)} validation users...")
+    preds_df = graph_model.generate_predictions(pred_input)
+=======
+    # 4. Prepare Inputs for Validation Users
+    print("Preparing Validation Inputs...")
+    # Extract last purchase from the history part of validation
+    # We use the helper but must be careful about caching.
+    # We pass load_cached_data=False to avoid reading/writing the main cache file with partial data
+    val_last_purchase = data_loader.get_last_purchases(
+        history_df, load_cached_data=False
+    )
+    
+    # Extract top history items for Repurchase heuristic
+    val_top_items = data_loader.get_user_top_items(
+        history_df, load_cached_data=False
+    )
+
+    # Identify users to predict for (those who actually bought something in the test window)
+    target_users = ground_truth_df["customer_id"].unique()
+
+    # Create input dataframe for the model
+    pred_input = pd.DataFrame({"customer_id": target_users})
+    pred_input = pred_input.merge(val_last_purchase, on="customer_id", how="left")
+    pred_input = pred_input.merge(val_top_items, on="customer_id", how="left")
+
+    # Fill missing history with -1 (Cold Start in Validation Period)
+    pred_input["article_id"] = pred_input["article_id"].fillna(-1).astype(np.int64)
+
+    # 5. Generate Predictions
+    print(f"Generating predictions for {len(pred_input)} validation users...")
+    preds_df = graph_model.generate_predictions(pred_input)
+>>>>>>> REPLACE
+```

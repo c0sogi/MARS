@@ -1,0 +1,436 @@
+The `CUDA error: device-side assert triggered` is caused by the `FocalLoss` function receiving target labels that are out of the valid index range `[0, num_classes - 1]`. The dataset uses raw `category_id`s (e.g., taxonomy IDs like 15672) which are not contiguous integers starting from 0. When `FocalLoss` attempts to gather log probabilities using these raw IDs as indices, it triggers an assertion failure on the GPU.
+
+To fix this, I will:
+1.  **Create a Label Map**: In `library/dataset.py`, calculate a mapping from raw `category_id` to contiguous indices `[0, num_classes-1]` using the training metadata.
+2.  **Update Dataset**: Modify `HerbariumDataset` to accept this map and transform labels in `__getitem__`.
+3.  **Update Data Loading**: Modify `get_dataloaders` to generate the map, pass it to the datasets, and return the inverse map (index -> raw ID).
+4.  **Update Trainer**: Modify `Trainer` to accept the inverse map and use it in `predict` to convert model predictions (indices) back to raw `category_id`s for the submission file.
+5.  **Update Runfile**: Propagate the map from `get_dataloaders` to `Trainer`.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+class HerbariumDataset(Dataset):
+    """
+    Custom Dataset for loading Plant Species images.
+    """
+
+    def __init__(self, df, input_dir, transform=None, mode="train"):
+        """
+        Args:
+            df (pd.DataFrame): DataFrame containing image paths and labels (for train/val).
+            input_dir (str): Root directory for input data.
+            transform (albumentations.Compose): Transformations to apply to the images.
+            mode (str): 'train', 'val', or 'test'. Determines what __getitem__ returns.
+        """
+        self.df = df
+        self.input_dir = input_dir
+        self.transform = transform
+        self.mode = mode
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full image path
+        # file_path in CSV is relative to input_dir (e.g., nybg2020/train/...)
+        image_path = os.path.join(self.input_dir, row["file_path"])
+
+        # Load image using OpenCV
+        image = cv2.imread(image_path)
+        if image is None:
+            # Fallback for missing images (though verification script showed 0 missing)
+            # Create a black image to prevent crashing
+            image = torch.zeros((224, 224, 3), dtype=torch.uint8).numpy()
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Apply transformations
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            # Minimal transform if none provided: Normalize and ToTensor
+            base_transform = A.Compose(
+                [
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
+            augmented = base_transform(image=image)
+            image = augmented["image"]
+
+        if self.mode in ["train", "val"]:
+            label = row["category_id"]
+            return image, torch.tensor(label, dtype=torch.long)
+        else:
+            # For test mode, return image and image_id for submission mapping
+            image_id = row["image_id"]
+            return image, torch.tensor(image_id, dtype=torch.long)
+=======
+class HerbariumDataset(Dataset):
+    """
+    Custom Dataset for loading Plant Species images.
+    """
+
+    def __init__(self, df, input_dir, transform=None, mode="train", label_map=None):
+        """
+        Args:
+            df (pd.DataFrame): DataFrame containing image paths and labels (for train/val).
+            input_dir (str): Root directory for input data.
+            transform (albumentations.Compose): Transformations to apply to the images.
+            mode (str): 'train', 'val', or 'test'. Determines what __getitem__ returns.
+            label_map (dict, optional): Mapping from raw category_id to index.
+        """
+        self.df = df
+        self.input_dir = input_dir
+        self.transform = transform
+        self.mode = mode
+        self.label_map = label_map
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full image path
+        # file_path in CSV is relative to input_dir (e.g., nybg2020/train/...)
+        image_path = os.path.join(self.input_dir, row["file_path"])
+
+        # Load image using OpenCV
+        image = cv2.imread(image_path)
+        if image is None:
+            # Fallback for missing images (though verification script showed 0 missing)
+            # Create a black image to prevent crashing
+            image = torch.zeros((224, 224, 3), dtype=torch.uint8).numpy()
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Apply transformations
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            # Minimal transform if none provided: Normalize and ToTensor
+            base_transform = A.Compose(
+                [
+                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                    ToTensorV2(),
+                ]
+            )
+            augmented = base_transform(image=image)
+            image = augmented["image"]
+
+        if self.mode in ["train", "val"]:
+            label = row["category_id"]
+            if self.label_map is not None:
+                label = self.label_map[label]
+            return image, torch.tensor(label, dtype=torch.long)
+        else:
+            # For test mode, return image and image_id for submission mapping
+            image_id = row["image_id"]
+            return image, torch.tensor(image_id, dtype=torch.long)
+>>>>>>> REPLACE
+```
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+def get_dataloaders(cfg):
+    """
+    Creates DataLoaders for train, validation, and test sets.
+
+    Args:
+        cfg (Config): Configuration object containing paths and params.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader)
+    """
+    # Load Metadata
+    train_df = pd.read_csv(cfg.train_csv_path)
+    val_df = pd.read_csv(cfg.val_csv_path)
+    test_df = pd.read_csv(cfg.test_csv_path)
+
+    # Debug Mode: Subset data
+    if cfg.debug:
+        print(f"Debug mode active. Subsetting data to {cfg.debug_sample_size} samples.")
+        train_df = train_df.head(cfg.debug_sample_size)
+        val_df = val_df.head(cfg.debug_sample_size)
+        test_df = test_df.head(cfg.debug_sample_size)
+
+    # Define Transforms
+    train_transform = get_transforms(cfg, data="train")
+    val_transform = get_transforms(cfg, data="val")
+    test_transform = get_transforms(cfg, data="test")
+
+    # Create Datasets
+    train_dataset = HerbariumDataset(
+        df=train_df, input_dir=cfg.input_dir, transform=train_transform, mode="train"
+    )
+    val_dataset = HerbariumDataset(
+        df=val_df, input_dir=cfg.input_dir, transform=val_transform, mode="val"
+    )
+    test_dataset = HerbariumDataset(
+        df=test_df, input_dir=cfg.input_dir, transform=test_transform, mode="test"
+    )
+
+    # Create DataLoaders
+    # Pin memory helps with faster data transfer to GPU
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,  # Drop last incomplete batch for training stability
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader, test_loader
+=======
+def get_dataloaders(cfg):
+    """
+    Creates DataLoaders for train, validation, and test sets.
+
+    Args:
+        cfg (Config): Configuration object containing paths and params.
+
+    Returns:
+        tuple: (train_loader, val_loader, test_loader, inv_label_map)
+    """
+    # Load Metadata
+    train_df = pd.read_csv(cfg.train_csv_path)
+    val_df = pd.read_csv(cfg.val_csv_path)
+    test_df = pd.read_csv(cfg.test_csv_path)
+
+    # Create Label Map
+    # Map raw category_id to contiguous index [0, num_classes-1]
+    unique_ids = sorted(train_df["category_id"].unique())
+    label_map = {k: v for v, k in enumerate(unique_ids)}
+    inv_label_map = {v: k for k, v in label_map.items()}
+
+    # Debug Mode: Subset data
+    if cfg.debug:
+        print(f"Debug mode active. Subsetting data to {cfg.debug_sample_size} samples.")
+        train_df = train_df.head(cfg.debug_sample_size)
+        val_df = val_df.head(cfg.debug_sample_size)
+        test_df = test_df.head(cfg.debug_sample_size)
+
+    # Define Transforms
+    train_transform = get_transforms(cfg, data="train")
+    val_transform = get_transforms(cfg, data="val")
+    test_transform = get_transforms(cfg, data="test")
+
+    # Create Datasets
+    train_dataset = HerbariumDataset(
+        df=train_df,
+        input_dir=cfg.input_dir,
+        transform=train_transform,
+        mode="train",
+        label_map=label_map,
+    )
+    val_dataset = HerbariumDataset(
+        df=val_df,
+        input_dir=cfg.input_dir,
+        transform=val_transform,
+        mode="val",
+        label_map=label_map,
+    )
+    test_dataset = HerbariumDataset(
+        df=test_df, input_dir=cfg.input_dir, transform=test_transform, mode="test"
+    )
+
+    # Create DataLoaders
+    # Pin memory helps with faster data transfer to GPU
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,  # Drop last incomplete batch for training stability
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return train_loader, val_loader, test_loader, inv_label_map
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+    def __init__(
+        self,
+        cfg,
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        optimizer,
+        scheduler=None,
+    ):
+        """
+        Args:
+            cfg: Configuration object.
+            model: PyTorch model.
+            train_loader: DataLoader for training.
+            val_loader: DataLoader for validation.
+            test_loader: DataLoader for testing.
+            optimizer: PyTorch optimizer.
+            scheduler: Learning rate scheduler (optional).
+        """
+        self.cfg = cfg
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = cfg.device
+        self.logger = get_logger(cfg.log_path)
+=======
+    def __init__(
+        self,
+        cfg,
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        optimizer,
+        scheduler=None,
+        label_map=None,
+    ):
+        """
+        Args:
+            cfg: Configuration object.
+            model: PyTorch model.
+            train_loader: DataLoader for training.
+            val_loader: DataLoader for validation.
+            test_loader: DataLoader for testing.
+            optimizer: PyTorch optimizer.
+            scheduler: Learning rate scheduler (optional).
+            label_map: Dictionary mapping index to raw category_id (inverse map).
+        """
+        self.cfg = cfg
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.label_map = label_map
+        self.device = cfg.device
+        self.logger = get_logger(cfg.log_path)
+>>>>>>> REPLACE
+```
+
+```diff
+library/trainer.py
+<<<<<<< SEARCH
+                _, predicted = torch.max(outputs, 1)
+
+                ids.extend(image_ids.cpu().numpy())
+                predictions.extend(predicted.cpu().numpy())
+
+        # Create submission DataFrame
+        submission_df = pd.DataFrame({"Id": ids, "Predicted": predictions})
+=======
+                _, predicted = torch.max(outputs, 1)
+
+                ids.extend(image_ids.cpu().numpy())
+                
+                preds_cpu = predicted.cpu().numpy()
+                if self.label_map:
+                    preds_mapped = [self.label_map[p] for p in preds_cpu]
+                    predictions.extend(preds_mapped)
+                else:
+                    predictions.extend(preds_cpu)
+
+        # Create submission DataFrame
+        submission_df = pd.DataFrame({"Id": ids, "Predicted": predictions})
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 4. Data Loading
+    logger.info("Loading data...")
+    train_loader, val_loader, test_loader = get_dataloaders(cfg)
+
+    # 5. Model Setup
+    logger.info(f"Initializing model: {cfg.model_name}")
+=======
+    # 4. Data Loading
+    logger.info("Loading data...")
+    train_loader, val_loader, test_loader, label_map = get_dataloaders(cfg)
+
+    # 5. Model Setup
+    logger.info(f"Initializing model: {cfg.model_name}")
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # 7. Training
+    trainer = Trainer(
+        cfg=cfg,
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+=======
+    # 7. Training
+    trainer = Trainer(
+        cfg=cfg,
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        label_map=label_map,
+    )
+>>>>>>> REPLACE
+```

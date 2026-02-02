@@ -1,0 +1,82 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import StandardScaler
+
+from library.config import SUBMISSION_FILE, PROB_CLIP_EPS
+from library.data_manager import load_combined_train_val, load_dataset
+from library.models import get_linear_branch, get_generative_branch
+
+
+def train_and_predict_ensemble(load_cached_data=True):
+    """
+    Orchestrates the training of the ensemble and generates predictions.
+    Uses Soft Voting between Logistic Regression and LDA.
+    """
+    # 1. Load Data
+    print("Loading combined training and validation data...")
+    X_train, y_train, ids_train = load_combined_train_val(
+        load_cached_data=load_cached_data
+    )
+
+    print("Loading test data...")
+    X_test, _, ids_test = load_dataset("test", load_cached_data=load_cached_data)
+
+    print(f"Training set size: {X_train.shape}")
+    print(f"Test set size: {X_test.shape}")
+
+    # 2. Preprocessing
+    print("Preprocessing: Applying global scaling...")
+    scaler = StandardScaler()
+
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # 3. Model Training
+
+    # --- Branch 1: Discriminative Linear (Logistic Regression) ---
+    print("Training Linear Branch (LogisticRegressionCV)...")
+    clf_linear = get_linear_branch()
+    clf_linear.fit(X_train_scaled, y_train)
+    print("Linear Branch training complete.")
+
+    # --- Branch 2: Generative Linear (LDA) ---
+    print("Training Generative Branch (LDA)...")
+    clf_gen = get_generative_branch()
+    clf_gen.fit(X_train_scaled, y_train)
+    print("Generative Branch training complete.")
+
+    # 4. Inference
+    print("Generating predictions on test set...")
+
+    # Verify class alignment
+    classes = clf_linear.classes_
+    if not np.array_equal(clf_gen.classes_, classes):
+        raise RuntimeError("Class mismatch between Linear and Generative models.")
+
+    print(f"Number of classes: {len(classes)}")
+
+    # Get probabilities from each branch
+    probs_linear = clf_linear.predict_proba(X_test_scaled)
+    probs_gen = clf_gen.predict_proba(X_test_scaled)
+
+    # 5. Ensemble (Soft Voting)
+    print("Ensembling predictions via Soft Voting (LR + LDA)...")
+    # Cite solution_lesson_node_00006: Combine discriminative and generative models
+    final_probs = (probs_linear + probs_gen) / 2.0
+
+    # 6. Post-processing
+    # Clip probabilities to prevent infinite log loss
+    # max(min(p, 1-eps), eps)
+    final_probs = np.clip(final_probs, PROB_CLIP_EPS, 1.0 - PROB_CLIP_EPS)
+
+    # 7. Save Submission
+    print("Formatting and saving submission...")
+    submission_df = pd.DataFrame(final_probs, columns=classes)
+    submission_df.insert(0, "id", ids_test)
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(SUBMISSION_FILE), exist_ok=True)
+
+    submission_df.to_csv(SUBMISSION_FILE, index=False)
+    print(f"Submission successfully saved to {SUBMISSION_FILE}")
