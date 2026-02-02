@@ -47,7 +47,7 @@ This repository contains the official release of MARS generated code and traject
 If you find this work useful, please consider citing:
 
 ```bibtex
-@article{,
+@article{mars2026,
   title={MARS: Modular Agent with Reflective Search for Automated AI Research},
   author={Chen, Jiefeng and Mishra, Bhavana Dalvi and Nam, Jaehyun and Meng, Rui and Pfister, Tomas and Yoon, Jinsung},
   journal={arXiv preprint arXiv},
