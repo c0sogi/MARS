@@ -15,7 +15,7 @@ MARS achieves state-of-the-art performance among open-source frameworks on **MLE
 
 MARS reformulates the research process as a search for an optimal software repository. The framework explicitly balances performance maximization with execution expense and manages architectural complexity through a modular pipeline.
 
-![MARS Overview](./figures/MARS_teaser.pdf)
+![MARS Overview](./figures/MARS_teaser.png)
 
 ### Core Components
 
@@ -29,7 +29,7 @@ MARS reformulates the research process as a search for an optimal software repos
 
 MARS is capable of experiencing "Aha!" moments during long-horizon exploration, successfully navigating complex optimization landscapes where baselines fail.
 
-![Aha Moment](./figures/mars-aha-moment.pdf)
+![Aha Moment](./figures/mars-aha-moment.png)
 
 *Figure: The "Aha!" moment of MARS on the challenging iMet-2020-FGVC7 task. The visualization tracks validation performance gains triggered by specific strategic lessons. While existing methods fail to reach medal-level performance, MARS progressively refines its strategy -- evolving from a lightweight residual network to model ensemble techniques -- to ultimately achieve a silver medal.*
 
