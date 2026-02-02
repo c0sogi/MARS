@@ -1,6 +1,6 @@
 # MARS: Modular Agent with Reflective Search
 
-**Automating AI research** differs from general software engineering due to computationally expensive evaluation (e.g., model training) and opaque performance attribution. Current LLM-based agents struggle here, often generating monolithic scripts that ignore execution costs and causal factors.
+Automating AI research differs from general software engineering due to computationally expensive evaluation (e.g., model training) and opaque performance attribution. Current LLM-based agents struggle here, often generating monolithic scripts that ignore execution costs and causal factors.
 
 We introduce **MARS** (**M**odular **A**gent with **R**eflective **S**earch), a framework optimized for autonomous AI research. MARS relies on three pillars:
 1. **Budget-Aware Planning** via cost-constrained Monte Carlo Tree Search (MCTS) to explicitly balance performance with execution expense.
@@ -47,7 +47,12 @@ This repository contains the official release of MARS generated code and traject
 If you find this work useful, please consider citing:
 
 ```bibtex
-TODO
+@article{,
+  title={MARS: Modular Agent with Reflective Search for Automated AI Research},
+  author={Chen, Jiefeng and Mishra, Bhavana Dalvi and Nam, Jaehyun and Meng, Rui and Pfister, Tomas and Yoon, Jinsung},
+  journal={arXiv preprint arXiv},
+  year={2026}
+}
 ```
 
 ## License
