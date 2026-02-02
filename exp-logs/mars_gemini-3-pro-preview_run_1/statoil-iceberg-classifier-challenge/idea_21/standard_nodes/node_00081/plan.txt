@@ -1,0 +1,706 @@
+My strategy to optimize the solution involves two key changes derived from the provided lessons:
+
+1.  **Remove ImageNet Normalization**: As detailed in **Lesson 00042**, applying ImageNet normalization (mean subtraction and variance scaling) to intensity-based Synthetic Aperture Radar (SAR) data can suppress critical signal information by centering the background at zero. I will modify `library/dataset.py` to use simple Min-Max scaling (effectively passing the [0, 1] data through) by setting the normalization parameters to mean=0 and std=1.
+
+2.  **Revert to Supervised SWA Ensemble with Global Epoch Selection**: Following **Lesson 00053**, I will discard the semi-supervised (Teacher-Student) pipeline which proved detrimental. Instead, I will implement the robust supervised strategy from **Lesson 00049**:
+    *   **Phase 1 (Calibration):** Perform 5-Fold Cross-Validation on the training set to determine the global `optimal_epoch` that minimizes the average validation loss. This decouples stopping criteria from a single noisy validation split.
+    *   **Phase 2 (Production Training):** Train an ensemble of 5 independent models on the **full** training set. Each model will train for the calibrated `optimal_epoch` count using the standard schedule, followed immediately by `SWA_EPOCHS` (12) of Stochastic Weight Averaging to find a flatter, more generalizable minimum (**Lesson 00055**).
+
+This approach leverages the full dataset for training (maximizing effective data size per **Lesson 00020**) while ensuring rigorous convergence calibration.
+
+```diff
+library/dataset.py
+<<<<<<< SEARCH
+    # ImageNet normalization constants
+    mean = (0.485, 0.456, 0.406)
+    std = (0.229, 0.224, 0.225)
+
+    if phase == "train":
+        return A.Compose(
+            [
+                # Bicubic Upsampling to 224x224
+                A.Resize(
+                    height=IMG_SIZE, width=IMG_SIZE, interpolation=cv2.INTER_CUBIC
+                ),
+                # Geometric Augmentations
+                A.RandomRotate90(p=0.5),
+                # ShiftScaleRotate with limit 20 degrees as per plan
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625,
+                    scale_limit=0.1,
+                    rotate_limit=20,
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=0.5,
+                ),
+                # Normalization (Max pixel value 1.0 because we manually normalize bands to [0,1])
+                A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose(
+            [
+                # Deterministic Resize
+                A.Resize(
+                    height=IMG_SIZE, width=IMG_SIZE, interpolation=cv2.INTER_CUBIC
+                ),
+                # Normalization
+                A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+=======
+    # Cite solution_lesson_node_00042: Prefer Min-Max Scaling over Distribution Standardization for SAR.
+    # We remove ImageNet normalization statistics and use mean=0, std=1 to preserve the [0, 1] intensity range.
+    mean = (0.0, 0.0, 0.0)
+    std = (1.0, 1.0, 1.0)
+
+    if phase == "train":
+        return A.Compose(
+            [
+                # Bicubic Upsampling to 224x224
+                A.Resize(
+                    height=IMG_SIZE, width=IMG_SIZE, interpolation=cv2.INTER_CUBIC
+                ),
+                # Geometric Augmentations
+                A.RandomRotate90(p=0.5),
+                # ShiftScaleRotate with limit 20 degrees as per plan
+                A.ShiftScaleRotate(
+                    shift_limit=0.0625,
+                    scale_limit=0.1,
+                    rotate_limit=20,
+                    interpolation=cv2.INTER_CUBIC,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=0.5,
+                ),
+                # Normalization (Max pixel value 1.0 because we manually normalize bands to [0,1])
+                A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        return A.Compose(
+            [
+                # Deterministic Resize
+                A.Resize(
+                    height=IMG_SIZE, width=IMG_SIZE, interpolation=cv2.INTER_CUBIC
+                ),
+                # Normalization
+                A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+                ToTensorV2(),
+            ]
+        )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+import os
+import sys
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, ConcatDataset
+from sklearn.metrics import log_loss
+import logging
+
+# Import provided library modules
+from library import config
+from library import utils
+from library import dataset
+from library import network
+from library import engine
+from library import inference
+from library import pseudo_labeling
+
+# =============================================================================
+# SETUP & CONSTANTS
+# =============================================================================
+logger = utils.setup_logger("idea_21", os.path.join(config.WORK_DIR, "execution.log"))
+DEVICE = utils.get_device()
+THRESHOLD_METRIC = 0.16918645240183008
+
+
+def main():
+    utils.set_seed(config.SEED)
+    logger.info(f"Using device: {DEVICE}")
+
+    # =========================================================================
+    # 1. DATA LOADING
+    # =========================================================================
+    logger.info("Loading data splits...")
+    train_data_dict, val_data_dict, test_data_dict = dataset.load_data_splits(
+        load_cached_data=True
+    )
+
+    # Create Datasets
+    # Training set (from train_metadata)
+    train_dataset = dataset.IcebergDataset(
+        images=train_data_dict["images"],
+        angles=train_data_dict["angles"],
+        labels=train_data_dict["labels"],
+        ids=train_data_dict["ids"],
+        transform=dataset.get_transforms(phase="train"),
+    )
+
+    # Validation set (from val_metadata - HOLD OUT)
+    val_dataset = dataset.IcebergDataset(
+        images=val_data_dict["images"],
+        angles=val_data_dict["angles"],
+        labels=val_data_dict["labels"],
+        ids=val_data_dict["ids"],
+        transform=dataset.get_transforms(phase="val"),
+    )
+
+    # Test set (for pseudo-labeling and submission)
+    test_dataset = dataset.IcebergDataset(
+        images=test_data_dict["images"],
+        angles=test_data_dict["angles"],
+        labels=None,
+        ids=test_data_dict["ids"],
+        transform=dataset.get_transforms(phase="test"),
+    )
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+    )
+
+    # =========================================================================
+    # 2. STAGE 1: TEACHER ENSEMBLE TRAINING
+    # =========================================================================
+    logger.info("--- Starting Stage 1: Teacher Ensemble Training ---")
+
+    teacher_model_paths = []
+    num_teachers = 5  # As per idea description
+
+    # Directory for checkpoints
+    ckpt_dir = os.path.join(config.WORK_DIR, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    for i in range(num_teachers):
+        logger.info(f"Training Teacher Model {i+1}/{num_teachers}")
+
+        # Seed variation for ensemble diversity
+        utils.set_seed(config.SEED + i)
+
+        model = network.IcebergResNet().to(DEVICE)
+        optimizer, scheduler = engine.get_optimizer_scheduler(model)
+
+        # SWA Setup
+        swa_model = engine.get_swa_model(model)
+        swa_start_epoch = config.MAX_EPOCHS - config.SWA_EPOCHS
+
+        best_loss = float("inf")
+        patience_counter = 0
+
+        for epoch in range(1, config.MAX_EPOCHS + 1):
+            # Train
+            train_loss = engine.train_one_epoch(
+                model, train_loader, optimizer, DEVICE, epoch
+            )
+
+            # SWA Update
+            if epoch > swa_start_epoch:
+                swa_model.update_parameters(model)
+
+            # Validation (for scheduler and early stopping monitoring)
+            val_loss, _, _ = engine.evaluate(model, val_loader, DEVICE)
+
+            # Scheduler Step
+            scheduler.step(val_loss)
+
+            # Early Stopping Check (on standard model)
+            if val_loss < best_loss:
+                best_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if (
+                patience_counter >= config.EARLY_STOPPING_PATIENCE
+                and epoch < swa_start_epoch
+            ):
+                logger.info(f"Early stopping triggered at epoch {epoch}")
+                # If we stop early, we might not have reached SWA phase.
+                # In this fast baseline, we ensure we run at least until SWA starts or handle it.
+                # For robustness, we'll continue to SWA phase if close, or just break.
+                # Given strict SWA requirement, we force running SWA at the end.
+                # To keep it simple: we rely on fixed epochs for SWA part.
+                pass
+
+        # Finalize SWA
+        engine.update_swa_bn(train_loader, swa_model, DEVICE)
+
+        # Save Teacher
+        save_path = os.path.join(ckpt_dir, f"teacher_{i}.pth")
+        utils.save_checkpoint(
+            {"model_state_dict": swa_model.module.state_dict()},
+            is_best=False,
+            checkpoint_dir=ckpt_dir,
+            filename=f"teacher_{i}.pth",
+        )
+        teacher_model_paths.append(save_path)
+
+    # =========================================================================
+    # 3. STAGE 2: PSEUDO-LABELING
+    # =========================================================================
+    logger.info("--- Starting Stage 2: Pseudo-Labeling ---")
+
+    # Generate stats
+    stats_df = pseudo_labeling.generate_ensemble_stats(
+        teacher_model_paths, test_loader, DEVICE, load_cached_data=False
+    )
+
+    # Filter
+    pseudo_labels_df = pseudo_labeling.filter_pseudo_labels(stats_df)
+
+    # Extract Data
+    p_imgs, p_angs, p_lbls, p_ids = pseudo_labeling.extract_pseudo_dataset(
+        test_data_dict, pseudo_labels_df
+    )
+
+    if len(p_imgs) > 0:
+        # Create Combined Dataset
+        logger.info(
+            f"Augmenting training set with {len(p_imgs)} pseudo-labeled samples."
+        )
+
+        # Combine arrays
+        combined_imgs = np.concatenate([train_data_dict["images"], p_imgs], axis=0)
+        combined_angs = np.concatenate([train_data_dict["angles"], p_angs], axis=0)
+        combined_lbls = np.concatenate([train_data_dict["labels"], p_lbls], axis=0)
+        combined_ids = np.concatenate([train_data_dict["ids"], p_ids], axis=0)
+
+        combined_dataset = dataset.IcebergDataset(
+            images=combined_imgs,
+            angles=combined_angs,
+            labels=combined_lbls,
+            ids=combined_ids,
+            transform=dataset.get_transforms(phase="train"),
+        )
+
+        combined_loader = DataLoader(
+            combined_dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=True,
+        )
+    else:
+        logger.warning(
+            "No pseudo-labels generated. Proceeding with original training set."
+        )
+        combined_loader = train_loader
+
+    # =========================================================================
+    # 4. STAGE 3: STUDENT ENSEMBLE TRAINING
+    # =========================================================================
+    logger.info("--- Starting Stage 3: Student Ensemble Training ---")
+
+    student_model_paths = []
+    num_students = 5
+
+    # Scale epochs based on data size increase?
+    # For simplicity/safety in this baseline, we keep config epochs but rely on scheduler.
+
+    for i in range(num_students):
+        logger.info(f"Training Student Model {i+1}/{num_students}")
+        utils.set_seed(config.SEED + 100 + i)  # Different seeds
+
+        model = network.IcebergResNet().to(DEVICE)
+        optimizer, scheduler = engine.get_optimizer_scheduler(model)
+
+        swa_model = engine.get_swa_model(model)
+        swa_start_epoch = config.MAX_EPOCHS - config.SWA_EPOCHS
+
+        for epoch in range(1, config.MAX_EPOCHS + 1):
+            engine.train_one_epoch(model, combined_loader, optimizer, DEVICE, epoch)
+
+            if epoch > swa_start_epoch:
+                swa_model.update_parameters(model)
+
+            # Validate on original validation set
+            val_loss, _, _ = engine.evaluate(model, val_loader, DEVICE)
+            scheduler.step(val_loss)
+
+        engine.update_swa_bn(combined_loader, swa_model, DEVICE)
+
+        save_path = os.path.join(ckpt_dir, f"student_{i}.pth")
+        utils.save_checkpoint(
+            {"model_state_dict": swa_model.module.state_dict()},
+            is_best=False,
+            checkpoint_dir=ckpt_dir,
+            filename=f"student_{i}.pth",
+        )
+        student_model_paths.append(save_path)
+
+    # =========================================================================
+    # 5. FINAL EVALUATION & FAILURE ANALYSIS
+    # =========================================================================
+    logger.info("--- Final Evaluation ---")
+
+    # Predict on Validation Set using Student Ensemble
+    df_val_preds = inference.ensemble_predict(
+        student_model_paths, val_loader, DEVICE, output_path=None
+    )
+
+    # Merge with ground truth
+    # val_data_dict['ids'] and val_data_dict['labels'] are aligned with val_loader order
+    # But ensemble_predict returns a DF aligned with loader iteration.
+    # We can trust the ID matching.
+
+    gt_df = pd.DataFrame(
+        {
+            "id": val_data_dict["ids"],
+            "label": val_data_dict["labels"],
+            "inc_angle": val_data_dict["angles"],
+        }
+    )
+
+    # Merge
+    eval_df = pd.merge(gt_df, df_val_preds, on="id")
+
+    # Calculate Metric
+    y_true = eval_df["label"].values
+    y_pred = eval_df["is_iceberg"].values
+
+    final_metric = log_loss(y_true, y_pred, labels=[0, 1])
+
+    # REQUIRED PRINT FORMAT
+    print(f"Final Validation Metric: {final_metric}")
+
+    # Failure Analysis
+    logger.info("Performing Failure Analysis...")
+    # Calculate per-sample error (log loss contribution or absolute error)
+    # Using absolute error for correlation analysis as it's more intuitive for "magnitude"
+    eval_df["abs_error"] = np.abs(eval_df["label"] - eval_df["is_iceberg"])
+
+    # Calculate simple image stats for correlation
+    # We'll do this on the fly for the validation set
+    val_imgs = val_data_dict["images"]
+    b1_means = []
+    b2_means = []
+    for i in range(len(val_imgs)):
+        # Raw images are (75,75,2)
+        img = val_imgs[i]
+        b1_means.append(np.mean(img[:, :, 0]))
+        b2_means.append(np.mean(img[:, :, 1]))
+
+    eval_df["b1_mean"] = b1_means
+    eval_df["b2_mean"] = b2_means
+
+    # Correlations
+    corr_angle = eval_df["abs_error"].corr(eval_df["inc_angle"])
+    corr_b1 = eval_df["abs_error"].corr(eval_df["b1_mean"])
+    corr_b2 = eval_df["abs_error"].corr(eval_df["b2_mean"])
+
+    print("Failure Analysis Correlations (Error Magnitude vs Feature):")
+    print(f"  Incidence Angle: {corr_angle:.4f}")
+    print(f"  Band 1 Mean: {corr_b1:.4f}")
+    print(f"  Band 2 Mean: {corr_b2:.4f}")
+
+    # =========================================================================
+    # 6. SUBMISSION
+    # =========================================================================
+    if final_metric < THRESHOLD_METRIC:
+        logger.info(
+            f"Validation metric {final_metric:.6f} < {THRESHOLD_METRIC}. Generating submission..."
+        )
+        inference.ensemble_predict(
+            student_model_paths, test_loader, DEVICE, output_path=config.SUBMISSION_PATH
+        )
+    else:
+        logger.warning(
+            f"Validation metric {final_metric:.6f} >= {THRESHOLD_METRIC}. Submission skipped."
+        )
+=======
+import os
+import sys
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import KFold
+from sklearn.metrics import log_loss
+import logging
+
+# Import provided library modules
+from library import config
+from library import utils
+from library import dataset
+from library import network
+from library import engine
+from library import inference
+
+# =============================================================================
+# SETUP & CONSTANTS
+# =============================================================================
+logger = utils.setup_logger("idea_22", os.path.join(config.WORK_DIR, "execution.log"))
+DEVICE = utils.get_device()
+THRESHOLD_METRIC = 0.16918645240183008
+
+
+def run_calibration_cv(train_data_dict, device, n_splits=5):
+    """
+    Performs 5-Fold Cross-Validation on the training set to determine the
+    Global Optimal Epoch.
+    Cite solution_lesson_node_00049: Global Epoch Selection.
+    """
+    logger.info(f"--- Starting Phase 1: Global Epoch Calibration ({n_splits}-Fold CV) ---")
+    
+    # Prepare data for KFold
+    indices = np.arange(len(train_data_dict["images"]))
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=config.SEED)
+    
+    # Store validation loss history: shape (n_splits, max_epochs)
+    val_loss_history = []
+    
+    for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
+        logger.info(f"Calibrating Fold {fold+1}/{n_splits}")
+        utils.set_seed(config.SEED + fold)
+        
+        # Create subsets
+        train_sub = dataset.IcebergDataset(
+            images=train_data_dict["images"][train_idx],
+            angles=train_data_dict["angles"][train_idx],
+            labels=train_data_dict["labels"][train_idx],
+            ids=train_data_dict["ids"][train_idx],
+            transform=dataset.get_transforms(phase="train")
+        )
+        val_sub = dataset.IcebergDataset(
+            images=train_data_dict["images"][val_idx],
+            angles=train_data_dict["angles"][val_idx],
+            labels=train_data_dict["labels"][val_idx],
+            ids=train_data_dict["ids"][val_idx],
+            transform=dataset.get_transforms(phase="val")
+        )
+        
+        train_loader = DataLoader(train_sub, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
+        val_loader = DataLoader(val_sub, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
+        
+        # Initialize Model
+        model = network.IcebergResNet().to(device)
+        optimizer, scheduler = engine.get_optimizer_scheduler(model)
+        
+        fold_losses = []
+        
+        # Train
+        # We use a reasonably high epoch count to ensure we see the minimum
+        # But respect config.MAX_EPOCHS
+        for epoch in range(1, config.MAX_EPOCHS + 1):
+            engine.train_one_epoch(model, train_loader, optimizer, device, epoch)
+            val_loss, _, _ = engine.evaluate(model, val_loader, device)
+            scheduler.step(val_loss)
+            fold_losses.append(val_loss)
+            
+        val_loss_history.append(fold_losses)
+        
+    # Calculate Average Loss Curve
+    avg_losses = np.mean(val_loss_history, axis=0)
+    
+    # Apply smoothing to find robust minimum (Cite solution_lesson_node_00063)
+    # Simple moving average window 3
+    smoothed_losses = np.convolve(avg_losses, np.ones(3)/3, mode='valid')
+    
+    # Find optimal epoch (add 1 because 0-indexed and convolution shift)
+    # Convolution reduces size by 2. Index i corresponds to original index i+1
+    best_idx = np.argmin(smoothed_losses)
+    optimal_epoch = best_idx + 1 + 1 # +1 for 0-index, +1 for window shift center approx
+    
+    logger.info(f"Calibration Complete. Optimal Epoch: {optimal_epoch} (Min Smoothed Loss: {smoothed_losses[best_idx]:.4f})")
+    
+    return optimal_epoch
+
+
+def train_final_ensemble(train_data_dict, optimal_epoch, device, n_models=5):
+    """
+    Trains an ensemble of models on the FULL training set for optimal_epoch + SWA.
+    Cite solution_lesson_node_00049: Ensemble Training on full set.
+    """
+    logger.info(f"--- Starting Phase 2: Final Ensemble Training (N={n_models}) ---")
+    
+    model_paths = []
+    ckpt_dir = os.path.join(config.WORK_DIR, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    
+    # Full Training Dataset
+    full_train_dataset = dataset.IcebergDataset(
+        images=train_data_dict["images"],
+        angles=train_data_dict["angles"],
+        labels=train_data_dict["labels"],
+        ids=train_data_dict["ids"],
+        transform=dataset.get_transforms(phase="train")
+    )
+    
+    full_loader = DataLoader(
+        full_train_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True
+    )
+    
+    # Total epochs = Calibrated Convergence + SWA Phase (Cite solution_lesson_node_00055)
+    total_epochs = optimal_epoch + config.SWA_EPOCHS
+    swa_start = optimal_epoch
+    
+    logger.info(f"Training Schedule: {optimal_epoch} Standard Epochs + {config.SWA_EPOCHS} SWA Epochs = {total_epochs} Total")
+    
+    for i in range(n_models):
+        logger.info(f"Training Ensemble Model {i+1}/{n_models}")
+        utils.set_seed(config.SEED + 100 + i) # Distinct seeds
+        
+        model = network.IcebergResNet().to(device)
+        optimizer, scheduler = engine.get_optimizer_scheduler(model)
+        swa_model = engine.get_swa_model(model)
+        
+        for epoch in range(1, total_epochs + 1):
+            loss = engine.train_one_epoch(model, full_loader, optimizer, device, epoch)
+            
+            # We don't have a validation set here (trained on full data), 
+            # so we step scheduler based on training loss or just let it decay naturally?
+            # Ideally, we want the same dynamics as calibration.
+            # In calibration, scheduler stepped on val_loss.
+            # Here we can step on train_loss or just rely on the fact that we calibrated the duration.
+            # However, ReduceLROnPlateau needs a metric. 
+            # Using train_loss is a reasonable proxy for convergence speed in this phase.
+            scheduler.step(loss)
+            
+            if epoch > swa_start:
+                swa_model.update_parameters(model)
+                
+        # Finalize SWA
+        engine.update_swa_bn(full_loader, swa_model, device)
+        
+        # Save
+        save_path = os.path.join(ckpt_dir, f"ensemble_{i}.pth")
+        utils.save_checkpoint(
+            {"model_state_dict": swa_model.module.state_dict()},
+            is_best=False,
+            checkpoint_dir=ckpt_dir,
+            filename=f"ensemble_{i}.pth"
+        )
+        model_paths.append(save_path)
+        
+    return model_paths
+
+
+def main():
+    utils.set_seed(config.SEED)
+    logger.info(f"Using device: {DEVICE}")
+
+    # =========================================================================
+    # 1. DATA LOADING
+    # =========================================================================
+    logger.info("Loading data splits...")
+    train_data_dict, val_data_dict, test_data_dict = dataset.load_data_splits(
+        load_cached_data=True
+    )
+    
+    # =========================================================================
+    # 2. PHASE 1: CALIBRATION (Global Epoch Selection)
+    # =========================================================================
+    # Cite solution_lesson_node_00053: Prioritize Baseline Calibration.
+    optimal_epoch = run_calibration_cv(train_data_dict, DEVICE)
+    
+    # =========================================================================
+    # 3. PHASE 2: ENSEMBLE TRAINING
+    # =========================================================================
+    # Train final models on the full training set using the calibrated epoch
+    model_paths = train_final_ensemble(train_data_dict, optimal_epoch, DEVICE)
+
+    # =========================================================================
+    # 4. FINAL EVALUATION
+    # =========================================================================
+    logger.info("--- Final Evaluation on Hold-Out Validation Set ---")
+    
+    val_dataset = dataset.IcebergDataset(
+        images=val_data_dict["images"],
+        angles=val_data_dict["angles"],
+        labels=val_data_dict["labels"],
+        ids=val_data_dict["ids"],
+        transform=dataset.get_transforms(phase="val"),
+    )
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
+
+    # Predict
+    df_val_preds = inference.ensemble_predict(
+        model_paths, val_loader, DEVICE, output_path=None
+    )
+
+    # Calculate Metric
+    gt_df = pd.DataFrame({
+        "id": val_data_dict["ids"],
+        "label": val_data_dict["labels"],
+        "inc_angle": val_data_dict["angles"]
+    })
+    
+    eval_df = pd.merge(gt_df, df_val_preds, on="id")
+    final_metric = log_loss(eval_df["label"].values, eval_df["is_iceberg"].values, labels=[0, 1])
+
+    print(f"Final Validation Metric: {final_metric}")
+
+    # Failure Analysis
+    logger.info("Performing Failure Analysis...")
+    eval_df["abs_error"] = np.abs(eval_df["label"] - eval_df["is_iceberg"])
+    
+    # Calculate image stats on the fly
+    val_imgs = val_data_dict["images"]
+    b1_means = [np.mean(img[:, :, 0]) for img in val_imgs]
+    b2_means = [np.mean(img[:, :, 1]) for img in val_imgs]
+    eval_df["b1_mean"] = b1_means
+    eval_df["b2_mean"] = b2_means
+
+    corr_angle = eval_df["abs_error"].corr(eval_df["inc_angle"])
+    corr_b1 = eval_df["abs_error"].corr(eval_df["b1_mean"])
+    corr_b2 = eval_df["abs_error"].corr(eval_df["b2_mean"])
+
+    print("Failure Analysis Correlations (Error Magnitude vs Feature):")
+    print(f"  Incidence Angle: {corr_angle:.4f}")
+    print(f"  Band 1 Mean: {corr_b1:.4f}")
+    print(f"  Band 2 Mean: {corr_b2:.4f}")
+
+    # =========================================================================
+    # 5. SUBMISSION
+    # =========================================================================
+    if final_metric < THRESHOLD_METRIC:
+        logger.info(f"Validation metric {final_metric:.6f} < {THRESHOLD_METRIC}. Generating submission...")
+        test_dataset = dataset.IcebergDataset(
+            images=test_data_dict["images"],
+            angles=test_data_dict["angles"],
+            labels=None,
+            ids=test_data_dict["ids"],
+            transform=dataset.get_transforms(phase="test"),
+        )
+        test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
+        
+        inference.ensemble_predict(
+            model_paths, test_loader, DEVICE, output_path=config.SUBMISSION_PATH
+        )
+    else:
+        logger.warning(f"Validation metric {final_metric:.6f} >= {THRESHOLD_METRIC}. Submission skipped.")
+>>>>>>> REPLACE
+```

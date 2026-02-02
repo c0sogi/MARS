@@ -1,0 +1,479 @@
+To resolve the `torch.OutOfMemoryError` caused by the large batch size relative to the available VRAM, I will implement **Gradient Accumulation** (Cite debug_lesson_5). This technique decouples the physical micro-batch size (which must fit in VRAM) from the effective training batch size (which determines convergence behavior).
+
+The changes involve:
+1.  **`library/engine.py`**: Modifying `train_mlm` and `train_fn` to accept a `gradient_accumulation_steps` parameter. The loss will be scaled by this factor, and the optimizer/scheduler steps (including AWP) will only execute once every `gradient_accumulation_steps` batches.
+2.  **`runfile.py`**: Configuring a safe `MICRO_BATCH_SIZE` of 8 and calculating the necessary `ACCUM_STEPS` to maintain the target batch size of 32. The `Config.train_batch_size` will be updated to the micro-batch size, and the `total_steps` for the schedulers will be adjusted to account for the reduced number of updates.
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_mlm(model, train_loader, optimizer, scheduler, device, epoch, logger=None):
+    """
+    Trains the model for Masked Language Modeling (DAPT).
+    """
+    model.train()
+    losses = AverageMeter()
+    start = time.time()
+
+    for step, data in enumerate(train_loader):
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        labels = data["labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward pass (HuggingFace models compute MLM loss automatically if labels are provided)
+        outputs = model(
+            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+        )
+        loss = outputs.loss
+
+        losses.update(loss.item(), batch_size)
+
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+=======
+def train_mlm(
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    epoch,
+    logger=None,
+    gradient_accumulation_steps=1,
+):
+    """
+    Trains the model for Masked Language Modeling (DAPT).
+    """
+    model.train()
+    losses = AverageMeter()
+    start = time.time()
+
+    optimizer.zero_grad()
+
+    for step, data in enumerate(train_loader):
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        labels = data["labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # Forward pass (HuggingFace models compute MLM loss automatically if labels are provided)
+        outputs = model(
+            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+        )
+        loss = outputs.loss
+
+        # Scale loss for gradient accumulation
+        loss = loss / gradient_accumulation_steps
+        losses.update(loss.item() * gradient_accumulation_steps, batch_size)
+
+        loss.backward()
+
+        if (step + 1) % gradient_accumulation_steps == 0 or (
+            step + 1
+        ) == len(train_loader):
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+>>>>>>> REPLACE
+```
+
+```diff
+library/engine.py
+<<<<<<< SEARCH
+def train_fn(
+    fold,
+    train_loader,
+    model,
+    criterion,
+    optimizer,
+    epoch,
+    scheduler,
+    device,
+    awp=None,
+    logger=None,
+):
+    """
+    Trains the model for one epoch using Deep Supervision and optionally AWP.
+    Used for both Supervised Teacher training and Student Distillation.
+    """
+    model.train()
+    losses = AverageMeter()
+    start = time.time()
+
+    for step, data in enumerate(train_loader):
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        labels = data["labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # --- Forward Pass ---
+        outputs = model(input_ids, attention_mask)
+        main_logits = outputs["main_logits"]
+        aux_logits = outputs["aux_logits"]
+
+        # --- Loss Calculation ---
+        loss_main = criterion(main_logits, labels)
+
+        # Deep Supervision Logic
+        if Config.use_deep_supervision:
+            loss_aux = criterion(aux_logits, labels)
+            loss = loss_main + Config.aux_loss_weight * loss_aux
+        else:
+            loss = loss_main
+
+        losses.update(loss.item(), batch_size)
+
+        # --- Backward Pass ---
+        loss.backward()
+
+        # --- AWP Attack ---
+        # AWP is applied after the first backward pass to perturb weights based on gradients
+        if awp is not None and (epoch + 1) >= Config.awp_start_epoch:
+            awp._save()
+            awp._attack_step()
+
+            # Re-forward with perturbed weights
+            outputs_adv = model(input_ids, attention_mask)
+            main_logits_adv = outputs_adv["main_logits"]
+            aux_logits_adv = outputs_adv["aux_logits"]
+
+            loss_main_adv = criterion(main_logits_adv, labels)
+
+            if Config.use_deep_supervision:
+                loss_aux_adv = criterion(aux_logits_adv, labels)
+                loss_adv = loss_main_adv + Config.aux_loss_weight * loss_aux_adv
+            else:
+                loss_adv = loss_main_adv
+
+            # Accumulate gradients from adversarial pass
+            loss_adv.backward()
+
+            # Restore original weights
+            awp.restore()
+
+        # --- Optimizer Step ---
+        torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+=======
+def train_fn(
+    fold,
+    train_loader,
+    model,
+    criterion,
+    optimizer,
+    epoch,
+    scheduler,
+    device,
+    awp=None,
+    logger=None,
+    gradient_accumulation_steps=1,
+):
+    """
+    Trains the model for one epoch using Deep Supervision and optionally AWP.
+    Used for both Supervised Teacher training and Student Distillation.
+    """
+    model.train()
+    losses = AverageMeter()
+    start = time.time()
+
+    optimizer.zero_grad()
+
+    for step, data in enumerate(train_loader):
+        input_ids = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        labels = data["labels"].to(device)
+
+        batch_size = input_ids.size(0)
+
+        # --- Forward Pass ---
+        outputs = model(input_ids, attention_mask)
+        main_logits = outputs["main_logits"]
+        aux_logits = outputs["aux_logits"]
+
+        # --- Loss Calculation ---
+        loss_main = criterion(main_logits, labels)
+
+        # Deep Supervision Logic
+        if Config.use_deep_supervision:
+            loss_aux = criterion(aux_logits, labels)
+            loss = loss_main + Config.aux_loss_weight * loss_aux
+        else:
+            loss = loss_main
+
+        # Scale loss for gradient accumulation
+        loss = loss / gradient_accumulation_steps
+        losses.update(loss.item() * gradient_accumulation_steps, batch_size)
+
+        # --- Backward Pass ---
+        loss.backward()
+
+        if (step + 1) % gradient_accumulation_steps == 0 or (
+            step + 1
+        ) == len(train_loader):
+            # --- AWP Attack ---
+            # AWP is applied after the first backward pass to perturb weights based on gradients
+            if awp is not None and (epoch + 1) >= Config.awp_start_epoch:
+                awp._save()
+                awp._attack_step()
+
+                # Re-forward with perturbed weights
+                outputs_adv = model(input_ids, attention_mask)
+                main_logits_adv = outputs_adv["main_logits"]
+                aux_logits_adv = outputs_adv["aux_logits"]
+
+                loss_main_adv = criterion(main_logits_adv, labels)
+
+                if Config.use_deep_supervision:
+                    loss_aux_adv = criterion(aux_logits_adv, labels)
+                    loss_adv = loss_main_adv + Config.aux_loss_weight * loss_aux_adv
+                else:
+                    loss_adv = loss_main_adv
+
+                # Accumulate gradients from adversarial pass
+                loss_adv.backward()
+
+                # Restore original weights
+                awp.restore()
+
+            # --- Optimizer Step ---
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        if step % Config.print_freq == 0 or step == (len(train_loader) - 1):
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    # Override Config for Fast Baseline (2-hour limit)
+    Config.epochs = 2
+    Config.train_batch_size = 32
+    Config.valid_batch_size = 64
+    Config.awp_start_epoch = 1  # Start AWP earlier since we have fewer epochs
+
+    # Subsampling limits
+=======
+    # Override Config for Fast Baseline (2-hour limit)
+    Config.epochs = 2
+    
+    # Cite debug_lesson_5: Decouple VRAM Constraints from Batch Size using Gradient Accumulation
+    TARGET_BATCH_SIZE = 32
+    MICRO_BATCH_SIZE = 8
+    ACCUM_STEPS = TARGET_BATCH_SIZE // MICRO_BATCH_SIZE
+    
+    Config.train_batch_size = MICRO_BATCH_SIZE
+    Config.valid_batch_size = 64
+    Config.awp_start_epoch = 1  # Start AWP earlier since we have fewer epochs
+
+    # Subsampling limits
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    optimizer = AdamW(
+        dapt_model.parameters(), lr=5e-5, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer, max_lr=5e-5, total_steps=len(dapt_loader), pct_start=0.1
+    )
+
+    # Train DAPT (1 Epoch is sufficient for adaptation)
+    train_mlm(dapt_model, dapt_loader, optimizer, scheduler, Config.device, 0, logger)
+=======
+    optimizer = AdamW(
+        dapt_model.parameters(), lr=5e-5, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=5e-5,
+        total_steps=len(dapt_loader) // ACCUM_STEPS,
+        pct_start=0.1,
+    )
+
+    # Train DAPT (1 Epoch is sufficient for adaptation)
+    train_mlm(
+        dapt_model,
+        dapt_loader,
+        optimizer,
+        scheduler,
+        Config.device,
+        0,
+        logger,
+        gradient_accumulation_steps=ACCUM_STEPS,
+    )
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    optimizer = AdamW(
+        teacher_model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=Config.lr,
+        total_steps=len(train_loader) * Config.epochs,
+        pct_start=Config.pct_start,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+    awp = (
+        AWP(teacher_model, optimizer, adv_lr=Config.awp_lr, adv_eps=Config.awp_eps)
+        if Config.use_awp
+        else None
+    )
+
+    # Train Teacher
+    for epoch in range(Config.epochs):
+        train_fn(
+            0,
+            train_loader,
+            teacher_model,
+            criterion,
+            optimizer,
+            epoch,
+            scheduler,
+            Config.device,
+            awp,
+            logger,
+        )
+        valid_fn(val_loader, teacher_model, criterion, Config.device, logger)
+=======
+    optimizer = AdamW(
+        teacher_model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=Config.lr,
+        total_steps=(len(train_loader) // ACCUM_STEPS) * Config.epochs,
+        pct_start=Config.pct_start,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+    awp = (
+        AWP(teacher_model, optimizer, adv_lr=Config.awp_lr, adv_eps=Config.awp_eps)
+        if Config.use_awp
+        else None
+    )
+
+    # Train Teacher
+    for epoch in range(Config.epochs):
+        train_fn(
+            0,
+            train_loader,
+            teacher_model,
+            criterion,
+            optimizer,
+            epoch,
+            scheduler,
+            Config.device,
+            awp,
+            logger,
+            gradient_accumulation_steps=ACCUM_STEPS,
+        )
+        valid_fn(val_loader, teacher_model, criterion, Config.device, logger)
+>>>>>>> REPLACE
+```
+
+```diff
+runfile.py
+<<<<<<< SEARCH
+    optimizer = AdamW(
+        student_model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=Config.lr,
+        total_steps=len(student_loader) * Config.epochs,
+        pct_start=Config.pct_start,
+    )
+    awp = (
+        AWP(student_model, optimizer, adv_lr=Config.awp_lr, adv_eps=Config.awp_eps)
+        if Config.use_awp
+        else None
+    )
+
+    # Train Student
+    final_preds = None
+    final_targets = None
+
+    for epoch in range(Config.epochs):
+        train_fn(
+            0,
+            student_loader,
+            student_model,
+            criterion,
+            optimizer,
+            epoch,
+            scheduler,
+            Config.device,
+            awp,
+            logger,
+        )
+        val_loss, final_preds, final_targets = valid_fn(
+            val_loader, student_model, criterion, Config.device, logger
+        )
+=======
+    optimizer = AdamW(
+        student_model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=Config.lr,
+        total_steps=(len(student_loader) // ACCUM_STEPS) * Config.epochs,
+        pct_start=Config.pct_start,
+    )
+    awp = (
+        AWP(student_model, optimizer, adv_lr=Config.awp_lr, adv_eps=Config.awp_eps)
+        if Config.use_awp
+        else None
+    )
+
+    # Train Student
+    final_preds = None
+    final_targets = None
+
+    for epoch in range(Config.epochs):
+        train_fn(
+            0,
+            student_loader,
+            student_model,
+            criterion,
+            optimizer,
+            epoch,
+            scheduler,
+            Config.device,
+            awp,
+            logger,
+            gradient_accumulation_steps=ACCUM_STEPS,
+        )
+        val_loss, final_preds, final_targets = valid_fn(
+            val_loader, student_model, criterion, Config.device, logger
+        )
+>>>>>>> REPLACE
+```
