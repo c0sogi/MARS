@@ -1,4 +1,5 @@
 # MARS: Modular Agent with Reflective Search
+[[Paper]](https://arxiv.org/pdf/2602.02660)
 
 Automating AI research differs from general software engineering due to computationally expensive evaluation (e.g., model training) and opaque performance attribution. Current LLM-based agents struggle here, often generating monolithic scripts that ignore execution costs and causal factors.
 
