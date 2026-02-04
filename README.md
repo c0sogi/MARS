@@ -50,7 +50,7 @@ If you find this work useful, please consider citing:
 @article{mars2026,
   title={MARS: Modular Agent with Reflective Search for Automated AI Research},
   author={Chen, Jiefeng and Mishra, Bhavana Dalvi and Nam, Jaehyun and Meng, Rui and Pfister, Tomas and Yoon, Jinsung},
-  journal={arXiv preprint arXiv},
+  journal={arXiv preprint arXiv:2602.02660},
   year={2026}
 }
 ```
