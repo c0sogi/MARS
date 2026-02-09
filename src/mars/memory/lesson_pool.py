@@ -48,7 +48,7 @@ class LessonPool:
     def save(self, path: str) -> None:
         """Save lessons to a JSON file."""
         data = [{"id": lesson.id, "description": lesson.description} for lesson in self.lessons]
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
     def load(self, path: str) -> None:

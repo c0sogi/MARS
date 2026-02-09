@@ -43,18 +43,18 @@ class SolutionRepo:
 
         for fname, code in node.modules.items():
             fpath = os.path.join(lib_dir, fname)
-            with open(fpath, "w") as f:
+            with open(fpath, "w", encoding="utf-8") as f:
                 f.write(code)
 
         # Write main script as runfile.py
         main_path = os.path.join(path, "runfile.py")
-        with open(main_path, "w") as f:
+        with open(main_path, "w", encoding="utf-8") as f:
             f.write(node.main_script)
 
         # Write __init__.py for library module
         init_path = os.path.join(lib_dir, "__init__.py")
         if not os.path.exists(init_path):
-            with open(init_path, "w") as f:
+            with open(init_path, "w", encoding="utf-8") as f:
                 f.write("")
 
     def save_best(self, node: MCTSNode) -> str:

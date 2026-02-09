@@ -21,7 +21,7 @@ def run_eda(llm: LLMClient, task_description: str, metadata_context: str, config
     eda_dir = os.path.join(config.work_dir, "eda")
     os.makedirs(eda_dir, exist_ok=True)
     script_path = os.path.join(eda_dir, "eda.py")
-    with open(script_path, "w") as f:
+    with open(script_path, "w", encoding="utf-8") as f:
         f.write(script)
 
     runner = ScriptRunner(config)

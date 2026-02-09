@@ -124,7 +124,7 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             # Save idea
             idea_dir = os.path.join(config.work_dir, f"idea_{idea_counter}")
             os.makedirs(idea_dir, exist_ok=True)
-            with open(os.path.join(idea_dir, "idea.txt"), "w") as f:
+            with open(os.path.join(idea_dir, "idea.txt"), "w", encoding="utf-8") as f:
                 f.write(idea)
 
             # Line 17: Decompose into modules
@@ -277,7 +277,7 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
 
         # Save tree visualisation
         tree_path = os.path.join(config.work_dir, "tree.txt")
-        with open(tree_path, "w") as f:
+        with open(tree_path, "w", encoding="utf-8") as f:
             f.write(tree.render_tree())
 
         # Save lessons

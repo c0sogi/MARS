@@ -69,8 +69,20 @@ class LLMClient:
                 response = self.model.invoke(messages)
                 self.total_calls += 1
                 content = response.content
-                assert isinstance(content, str)
-                return content
+                if isinstance(content, str):
+                    return content
+                # Handle models that return list of content blocks (e.g. thinking + text)
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, str):
+                            text_parts.append(block)
+                        elif isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif isinstance(block, dict) and block.get("type") == "thinking":
+                            continue  # Skip thinking blocks
+                    return "\n".join(text_parts)
+                return str(content)
             except Exception:
                 if attempt == max_retries - 1:
                     raise

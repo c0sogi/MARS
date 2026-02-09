@@ -25,7 +25,7 @@ def generate_metadata(llm: LLMClient, task_description: str, config: MARSConfig)
     metadata_dir = os.path.join(config.work_dir, "metadata_generation")
     os.makedirs(metadata_dir, exist_ok=True)
     script_path = os.path.join(metadata_dir, "generate_metadata.py")
-    with open(script_path, "w") as f:
+    with open(script_path, "w", encoding="utf-8") as f:
         f.write(script)
 
     runner = ScriptRunner(config)
@@ -44,7 +44,7 @@ def generate_metadata(llm: LLMClient, task_description: str, config: MARSConfig)
 
     # Save documentation
     doc_path = os.path.join(metadata_dir, "metadata_info.txt")
-    with open(doc_path, "w") as f:
+    with open(doc_path, "w", encoding="utf-8") as f:
         f.write(documentation)
 
     logger.info("Metadata generation complete")
