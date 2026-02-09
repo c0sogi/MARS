@@ -3,21 +3,110 @@
 ## Quick Start
 
 ```bash
-# 1. Install a provider
+# 1. Install MARS with a provider
 uv sync --extra google  # or: openai, anthropic, all
 
 # 2. Set up API key
 echo "GOOGLE_API_KEY=your-key-here" > .env
 
-# 3. Run MARS on a task
-uv run python -m mars.run --task ./tasks/my-task --budget 1800
+# 3. Create and run a task
+mars init my-task --template classification
+# edit tasks/my-task/description.md, copy data to input/
+mars run my-task --budget 1800
+```
+
+---
+
+## CLI Commands
+
+MARS provides three subcommands: `init`, `run`, and `list`.
+
+### `mars init` — Create a new task
+
+```bash
+mars init <name> [--template TYPE] [--dir PATH]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `name` | *(required)* | Task name (creates `tasks/<name>/`) |
+| `--template` | `generic` | Template: `generic`, `classification`, `regression`, `nlp`, `vision` |
+| `--dir` | `tasks` | Parent directory for tasks |
+
+Creates the task directory with `description.md` and `input/`:
+
+```bash
+$ mars init titanic --template classification
+Created tasks/titanic/
+  tasks/titanic/description.md   <- edit this
+  tasks/titanic/input/           <- put data here
+
+Next: edit description.md, copy data to input/, then run:
+  mars run titanic --budget 1800
+```
+
+### `mars run` — Run MARS on a task
+
+```bash
+mars run <task> [--budget N] [--model M] [--temperature T] ...
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `task` | *(required)* | Task name (resolved to `tasks/<name>/`) or full path |
+| `--budget` | `86400` | Time budget in seconds (86400 = 24h) |
+| `--model` | `google_genai:gemini-2.5-pro` | LLM model (`provider:model` format) |
+| `--temperature` | `1.0` | LLM sampling temperature |
+| `--script-timeout` | `14400` | Per-script timeout in seconds (14400 = 4h) |
+| `--max-lessons` | `30` | Max lessons stored per category |
+| `--max-debug` | `10` | Max debug attempts per solution |
+| `--verbose` / `-v` | off | Enable debug logging |
+| `--dir` | `tasks` | Tasks directory |
+
+Examples:
+
+```bash
+# Quick test (30 minutes)
+mars run my-task --budget 1800
+
+# Full run (24 hours, default)
+mars run my-task
+
+# Different providers
+mars run my-task --model google_genai:gemini-2.5-pro
+mars run my-task --model openai:gpt-4o
+mars run my-task --model anthropic:claude-sonnet-4-20250514
+
+# OpenRouter
+mars run my-task --model openrouter:google/gemini-2.5-pro
+
+# Run by full path instead of name
+mars run ./my-custom-path/task --budget 3600
+
+# Verbose logging with lower temperature
+mars run my-task --budget 1800 -v --temperature 0.7
+```
+
+### `mars list` — List available tasks
+
+```bash
+mars list [--dir PATH]
+```
+
+Shows all tasks with their status:
+
+```bash
+$ mars list
+TASK                 DESCRIPTION   INPUT    WORKSPACE   BEST METRIC
+titanic              yes           yes      no          -
+house-prices         yes           yes      yes         0.142
 ```
 
 ---
 
 ## Step 1: Prepare Your Task
 
-Create a task directory with this structure:
+You can create a task automatically with `mars init`, or manually:
 
 ```
 tasks/my-task/
@@ -92,51 +181,12 @@ Get your keys from:
 
 ## Step 3: Run MARS
 
-### Basic Run (30-minute test)
+See the [`mars run` command](#mars-run--run-mars-on-a-task) above.
+
+The legacy invocation still works:
 
 ```bash
 uv run python -m mars.run --task ./tasks/my-task --budget 1800
-```
-
-### Full Run (24 hours)
-
-```bash
-uv run python -m mars.run --task ./tasks/my-task
-```
-
-### All Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--task` | *(required)* | Path to task directory |
-| `--budget` | `86400` | Time budget in seconds (86400 = 24h) |
-| `--model` | `google_genai:gemini-2.5-pro` | LLM model (`provider:model` format) |
-| `--temperature` | `1.0` | LLM sampling temperature |
-| `--script-timeout` | `14400` | Per-script timeout in seconds (14400 = 4h) |
-| `--max-lessons` | `30` | Max lessons stored per category |
-| `--max-debug` | `10` | Max debug attempts per solution |
-| `--verbose` / `-v` | off | Enable debug logging |
-
-### Examples
-
-```bash
-# Quick test with verbose logging
-uv run python -m mars.run --task ./tasks/titanic --budget 1800 -v
-
-# Different providers
-uv run python -m mars.run --task ./tasks/titanic --model google_genai:gemini-2.5-pro
-uv run python -m mars.run --task ./tasks/titanic --model openai:gpt-4o
-uv run python -m mars.run --task ./tasks/titanic --model anthropic:claude-sonnet-4-20250514
-
-# OpenRouter (auto-remaps to OpenAI backend with OpenRouter base URL)
-uv run python -m mars.run --task ./tasks/titanic --model openrouter:google/gemini-2.5-pro
-uv run python -m mars.run --task ./tasks/titanic --model openrouter:meta-llama/llama-3-70b
-
-# Lower temperature for more deterministic output
-uv run python -m mars.run --task ./tasks/titanic --temperature 0.7
-
-# Short script timeout for quick iterations
-uv run python -m mars.run --task ./tasks/titanic --budget 3600 --script-timeout 600
 ```
 
 ---

@@ -1,5 +1,5 @@
 """Allow running MARS as `python -m mars`."""
 
-from mars.run import main
+from mars.cli import main
 
 main()

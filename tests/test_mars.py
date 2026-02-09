@@ -1,8 +1,5 @@
 """Comprehensive test suite for MARS framework core modules."""
 
-from __future__ import annotations
-
-import json
 import tempfile
 from pathlib import Path
 
@@ -15,7 +12,6 @@ from mars.mcts.tree import MCTSNode, MCTSTree
 from mars.memory.lesson_pool import Lesson, LessonPool
 from mars.prompts import initial_idea, lesson_dedup, metric_parsing
 from mars.solution.diff import apply_diffs, parse_diffs
-
 
 # ============================================================================
 # 1. Test config.py - MARSConfig
@@ -438,9 +434,7 @@ class TestLesson:
 
     def test_lesson_with_source(self) -> None:
         """Test lesson with source node."""
-        lesson = Lesson(
-            id="L002", category="debug", description="Check tensor shapes", source_node="node_00042"
-        )
+        lesson = Lesson(id="L002", category="debug", description="Check tensor shapes", source_node="node_00042")
         assert lesson.source_node == "node_00042"
 
 
@@ -743,9 +737,7 @@ class TestPromptTemplates:
 
     def test_initial_idea_sections(self) -> None:
         """Test that initial_idea prompt includes all required sections."""
-        prompt = initial_idea.format_prompt(
-            model_arch_desc="Architectures", previous_ideas="Ideas", context="Context"
-        )
+        prompt = initial_idea.format_prompt(model_arch_desc="Architectures", previous_ideas="Ideas", context="Context")
 
         # Should mention required response sections
         assert "Model:" in prompt or "Model" in prompt
