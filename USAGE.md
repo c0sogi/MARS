@@ -3,10 +3,13 @@
 ## Quick Start
 
 ```bash
-# 1. Set up API key
+# 1. Install a provider
+uv sync --extra google  # or: openai, anthropic, all
+
+# 2. Set up API key
 echo "GOOGLE_API_KEY=your-key-here" > .env
 
-# 2. Run MARS on a task
+# 3. Run MARS on a task
 uv run python -m mars.run --task ./tasks/my-task --budget 1800
 ```
 
@@ -52,15 +55,38 @@ Print the final validation score as: Final Validation Metric: <value>
 
 ---
 
-## Step 2: Set Up API Key
+## Step 2: Install Provider & Set Up API Key
 
-Create a `.env` file in the project root:
+MARS supports multiple LLM providers. Install only the one you need:
 
+```bash
+uv sync --extra google     # Google Gemini
+uv sync --extra openai     # OpenAI
+uv sync --extra anthropic  # Anthropic Claude
+uv sync --extra all        # All providers
 ```
+
+Create a `.env` file with the API key for your chosen provider:
+
+```bash
+# Google Gemini (default)
 GOOGLE_API_KEY=your-gemini-api-key
+
+# OpenAI
+OPENAI_API_KEY=sk-...
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# OpenRouter (access 100+ models via single key)
+OPENROUTER_API_KEY=sk-or-...
 ```
 
-Get your key from [Google AI Studio](https://aistudio.google.com/apikey).
+Get your keys from:
+- Gemini: [Google AI Studio](https://aistudio.google.com/apikey)
+- OpenAI: [OpenAI Platform](https://platform.openai.com/api-keys)
+- Anthropic: [Anthropic Console](https://console.anthropic.com/)
+- OpenRouter: [OpenRouter](https://openrouter.ai/keys)
 
 ---
 
@@ -84,7 +110,7 @@ uv run python -m mars.run --task ./tasks/my-task
 |------|---------|-------------|
 | `--task` | *(required)* | Path to task directory |
 | `--budget` | `86400` | Time budget in seconds (86400 = 24h) |
-| `--model` | `gemini-2.5-pro` | LLM model name |
+| `--model` | `google_genai:gemini-2.5-pro` | LLM model (`provider:model` format) |
 | `--temperature` | `1.0` | LLM sampling temperature |
 | `--script-timeout` | `14400` | Per-script timeout in seconds (14400 = 4h) |
 | `--max-lessons` | `30` | Max lessons stored per category |
@@ -97,8 +123,14 @@ uv run python -m mars.run --task ./tasks/my-task
 # Quick test with verbose logging
 uv run python -m mars.run --task ./tasks/titanic --budget 1800 -v
 
-# Use a faster/cheaper model
-uv run python -m mars.run --task ./tasks/titanic --model gemini-2.5-flash
+# Different providers
+uv run python -m mars.run --task ./tasks/titanic --model google_genai:gemini-2.5-pro
+uv run python -m mars.run --task ./tasks/titanic --model openai:gpt-4o
+uv run python -m mars.run --task ./tasks/titanic --model anthropic:claude-sonnet-4-20250514
+
+# OpenRouter (auto-remaps to OpenAI backend with OpenRouter base URL)
+uv run python -m mars.run --task ./tasks/titanic --model openrouter:google/gemini-2.5-pro
+uv run python -m mars.run --task ./tasks/titanic --model openrouter:meta-llama/llama-3-70b
 
 # Lower temperature for more deterministic output
 uv run python -m mars.run --task ./tasks/titanic --temperature 0.7
@@ -194,7 +226,8 @@ Increase `--script-timeout` or reduce data size. Default is 4 hours per script.
 
 ### API rate limits
 MARS makes many LLM calls. If you hit rate limits, try:
-- Use `--model gemini-2.5-flash` (higher rate limits)
+- Use a faster model: `--model google_genai:gemini-2.5-flash`
+- Switch providers: `--model openrouter:google/gemini-2.5-flash`
 - Reduce `--max-debug` to fewer debugging attempts
 
 ### No metric extracted
