@@ -1,5 +1,25 @@
 # MARS Command Reference
 
+All commands are run from the **workspace directory** (where `pyproject.toml` lives).
+
+## Installation
+
+**If the workspace IS the MARS repo** (developing MARS itself):
+```bash
+uv sync --extra google   # or: openai, anthropic, all
+```
+
+**If the workspace is a separate project** (MARS as dependency):
+```bash
+# From GitHub (standard use)
+uv add "mars[google] @ git+https://github.com/c0sogi/MARS.git"
+
+# From local clone (editable, for development)
+uv add --editable "<PATH-TO-MARS>[google]"
+```
+
+Replace `[google]` with the desired provider extra: `[google]`, `[openai]`, `[anthropic]`, or `[all]`.
+
 ## mars init
 
 ```bash
@@ -40,29 +60,18 @@ Shows all tasks with status, description, input, workspace, and best metric.
 
 ## Model Options
 
-```bash
-# Google
---model google_genai:gemini-3-pro-preview
---model google_genai:gemini-3-flash-preview
+| Extra | Provider | Model String |
+|-------|----------|-------------|
+| `[google]` | Google Gemini | `google_genai:gemini-3-pro-preview`, `google_genai:gemini-3-flash-preview` |
+| `[openai]` | OpenAI | `openai:gpt-4o`, `openai:o3-mini` |
+| `[anthropic]` | Anthropic | `anthropic:claude-sonnet-4-20250514` |
+| *(any)* | OpenRouter | `openrouter:google/gemini-3-pro-preview` (any model via single key) |
 
-# OpenAI
---model openai:gpt-4o
---model openai:o3-mini
+## Provider API Keys
 
-# Anthropic
---model anthropic:claude-sonnet-4-20250514
-
-# OpenRouter (any model via single key)
---model openrouter:google/gemini-3-pro-preview
-```
-
-## Provider Setup
+Set in `.env` at the workspace root:
 
 ```bash
-# Install provider
-uv sync --extra google     # or: openai, anthropic, all
-
-# .env file
 GOOGLE_API_KEY=your-key
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
