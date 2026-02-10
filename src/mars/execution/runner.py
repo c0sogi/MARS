@@ -75,12 +75,19 @@ class ScriptRunner:
         start = time.time()
 
         try:
+            # Add library/ subdirectory to PYTHONPATH so modules can be imported directly
+            env = os.environ.copy()
+            lib_dir = os.path.join(os.path.abspath(work_dir), "library")
+            if os.path.isdir(lib_dir):
+                existing = env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = lib_dir + (os.pathsep + existing if existing else "")
             result = subprocess.run(
                 [sys.executable, script],
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
             duration = time.time() - start
             output = result.stdout
