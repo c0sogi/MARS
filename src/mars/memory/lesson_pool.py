@@ -53,7 +53,7 @@ class LessonPool:
 
     def load(self, path: str) -> None:
         """Load lessons from a JSON file."""
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         self.lessons = [
             Lesson(id=d["id"], category=self.category, description=d["description"])  # type: ignore[arg-type]

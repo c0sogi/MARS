@@ -101,7 +101,7 @@ def main() -> None:
             print(f"Error: No description file found in {task_dir}", file=sys.stderr)
             sys.exit(1)
 
-    with open(desc_path) as f:
+    with open(desc_path, encoding="utf-8") as f:
         task_description = f.read()
 
     # Set up workspace

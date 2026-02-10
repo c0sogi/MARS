@@ -188,6 +188,7 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             syntax_errors = _validate_syntax(new_node)
             if syntax_errors:
                 from mars.execution.runner import ExecutionResult
+
                 exec_result = ExecutionResult(
                     success=False,
                     output=f"Syntax validation failed:\n{syntax_errors}",
@@ -216,7 +217,9 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             if len(recent) == MAX_REPEATED_ERRORS and len(set(recent)) == 1:
                 logger.warning(
                     "Same error repeated %d times for %s: %s — aborting debug",
-                    MAX_REPEATED_ERRORS, new_node.id, sig,
+                    MAX_REPEATED_ERRORS,
+                    new_node.id,
+                    sig,
                 )
                 break
 
@@ -225,7 +228,8 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             if remaining < 300:  # Less than 5 minutes left
                 logger.warning(
                     "Insufficient budget remaining (%.0fs), skipping debug for %s",
-                    remaining, new_node.id,
+                    remaining,
+                    new_node.id,
                 )
                 break
 
@@ -243,16 +247,18 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             )
             new_node.error_analysis = error_analysis
 
-            fixed_files = debugging_agent.fix(
+            diff_response = debugging_agent.fix(
                 files=_format_files(new_node),
                 exec_result=exec_result.output,
                 error_analysis=error_analysis,
                 debug_lessons=debug_lessons.format_lessons(),
             )
 
-            # Apply fixes
-            if fixed_files:
-                _apply_debug_fixes(new_node, fixed_files)
+            # Apply fixes using the same diff mechanism as the improve path
+            if diff_response:
+                new_modules, new_main = apply_diffs(diff_response, new_node.modules, new_node.main_script)
+                new_node.modules = new_modules
+                new_node.main_script = new_main
 
             # Extract debug lesson
             debug_lesson = distill_debug_lesson(
@@ -402,6 +408,7 @@ def _format_files(node: MCTSNode | None) -> str:
 def _validate_syntax(node: MCTSNode) -> str | None:
     """Validate Python syntax of all node files. Returns error message or None."""
     import ast
+
     files = {"runfile.py": node.main_script}
     files.update(node.modules)
     errors = []
@@ -418,6 +425,7 @@ def _validate_syntax(node: MCTSNode) -> str | None:
 def _extract_error_signature(output: str) -> str:
     """Extract a short error signature from execution output for dedup."""
     import re
+
     # Look for common Python error patterns
     match = re.search(r"(\w+Error): (.+?)$", output, re.MULTILINE)
     if match:
@@ -428,12 +436,3 @@ def _extract_error_signature(output: str) -> str:
     # Fallback: last non-empty line
     lines = [ln.strip() for ln in output.strip().splitlines() if ln.strip()]
     return lines[-1][:100] if lines else "unknown"
-
-
-def _apply_debug_fixes(node: MCTSNode, fixed_files: dict[str, str]) -> None:
-    """Apply debug fixes to node's files."""
-    for fname, code in fixed_files.items():
-        if fname == "runfile.py":
-            node.main_script = code
-        else:
-            node.modules[fname] = code

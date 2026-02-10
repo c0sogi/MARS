@@ -50,7 +50,7 @@ markdown code block (wrapped in ```):
     "summary": "The code trains a model to solve the task... The final \
 validation metric is ...",
     "metric": 0.99,
-    "valid_metric": true,
+    "valid_metric": true
 }}
 ```
 """

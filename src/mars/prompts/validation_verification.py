@@ -47,7 +47,7 @@ markdown code block (wrapped in ```):
     "analysis": "The validation dataset was not created successfully. The \
 script split the training data but did not use stratified sampling, \
 failing to create a representative sample.",
-    "success": false,
+    "success": false
 }}
 ```
 """

@@ -48,9 +48,23 @@ class LLMClient:
         return self._invoke_with_retry(messages)
 
     def call_json(self, prompt: str, *, system: str | None = None) -> dict:
-        """Generate JSON-structured response from LLM."""
+        """Generate JSON-structured response from LLM with retry on parse failure."""
         raw = self.call(prompt, system=system)
-        return _extract_json(raw)
+        try:
+            return _extract_json(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("JSON parse failed, retrying with correction prompt: %s", exc)
+            retry_prompt = (
+                "Your previous response was not valid JSON. Here is what you returned:\n\n"
+                f"```\n{raw[:500]}\n```\n\n"
+                f"Original request (respond ONLY with valid JSON in a ```json code block):\n\n{prompt}"
+            )
+            raw = self.call(retry_prompt, system=system)
+            try:
+                return _extract_json(raw)
+            except (json.JSONDecodeError, ValueError):
+                logger.error("JSON parse failed on retry. Raw response:\n%.500s", raw)
+                raise
 
     def call_code(self, prompt: str, *, system: str | None = None) -> str:
         """Generate code response, extracting from markdown code blocks."""
@@ -128,7 +142,12 @@ def _extract_json(text: str) -> dict:
     if text.startswith("{{") and text.endswith("}}"):
         text = text[1:-1]
 
-    return json.loads(text)  # type: ignore[no-any-return]
+    # Fix trailing commas before } or ] (common LLM mistake)
+    # Only match outside of quoted strings by targeting commas not preceded by
+    # a closing quote — acceptable heuristic for simple LLM JSON.
+    text = re.sub(r'(?<!")\s*,\s*([}\]])', r"\1", text)
+
+    return json.loads(text)
 
 
 def _extract_code(text: str) -> str:

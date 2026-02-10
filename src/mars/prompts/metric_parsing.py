@@ -24,7 +24,7 @@ code block (wrapped in ```):
 ```json
 {{
     "metric_name": "accuracy",
-    "lower_is_better": false,
+    "lower_is_better": false
 }}
 ```
 

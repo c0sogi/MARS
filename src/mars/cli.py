@@ -201,21 +201,31 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def _read_best_metric(workspace_dir: str) -> str:
-    """Try to read the best metric from a workspace's tree.txt or best_solution."""
+    """Try to read the best metric from a workspace's tree.txt."""
     tree_path = os.path.join(workspace_dir, "tree.txt")
     if not os.path.exists(tree_path):
         return "-"
     try:
         with open(tree_path, encoding="utf-8") as f:
             content = f.read()
-        # Look for the best node marker (★)
+        # Look for the best node marker: "● <metric> (best) (ID: ...)"
         for line in content.splitlines():
-            if "\u2605" in line:  # ★ best marker
-                # Extract metric value: metric=0.85
-                for part in line.split("|"):
-                    part = part.strip()
-                    if part.startswith("metric="):
-                        return part.removeprefix("metric=").strip()
+            if "(best)" in line:
+                stripped = line.strip()
+                # Remove the leading bullet character
+                if stripped.startswith("\u25cf"):
+                    stripped = stripped[1:].strip()
+                # Extract the metric value (first token before "(best)")
+                best_idx = stripped.find("(best)")
+                if best_idx == -1:
+                    continue
+                metric_str = stripped[:best_idx].strip()
+                if metric_str:
+                    try:
+                        float(metric_str)
+                        return metric_str
+                    except ValueError:
+                        pass
     except OSError:
         pass
     return "-"

@@ -56,8 +56,8 @@ class DebuggingAgent(BaseAgent):
         exec_result: str,
         error_analysis: str,
         debug_lessons: str,
-    ) -> dict[str, str]:
-        """Generate and apply fixes for identified bugs.
+    ) -> str:
+        """Generate fixes for identified bugs as a raw diff response.
 
         Args:
             files: Concatenated source files.
@@ -66,7 +66,7 @@ class DebuggingAgent(BaseAgent):
             debug_lessons: Lessons from previous debugging attempts.
 
         Returns:
-            Dict of {filename: fixed_code}. Empty dict if parsing fails.
+            Raw LLM response containing diffs. Empty string if no response.
         """
         prompt = debugging.format_prompt(
             lessons=debug_lessons,
@@ -77,17 +77,10 @@ class DebuggingAgent(BaseAgent):
         logger.info("Generating bug fixes")
         response = self.call(prompt)
 
-        try:
-            diffs = parse_diffs(response)
+        diffs = parse_diffs(response)
+        if diffs:
             logger.info("Parsed %d diffs from debugging response", len(diffs))
-            # Convert list of diffs to {filename: fixed_code} by collecting replacements
-            result: dict[str, str] = {}
-            for diff in diffs:
-                fname = diff.get("file", "")
-                replace = diff.get("replace", "")
-                if fname and replace:
-                    result[fname] = replace
-            return result
-        except Exception:
-            logger.warning("Failed to parse diffs from debugging response")
-            return {}
+            return response
+        else:
+            logger.warning("No valid diffs found in debugging response")
+            return ""

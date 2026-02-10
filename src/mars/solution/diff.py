@@ -73,7 +73,9 @@ def apply_diffs(
                 except SyntaxError as e:
                     logger.warning(
                         "Diff to %s produces syntax error (%s:%s), reverting",
-                        target, e.lineno, e.msg,
+                        target,
+                        e.lineno,
+                        e.msg,
                     )
             else:
                 logger.warning("Search block not found in %s, skipping", target)
@@ -81,7 +83,7 @@ def apply_diffs(
             # Try matching with and without library/ prefix
             fname = target
             if fname.startswith("library/"):
-                fname = fname[len("library/"):]
+                fname = fname[len("library/") :]
 
             if fname in new_modules:
                 if search in new_modules[fname]:
@@ -94,7 +96,9 @@ def apply_diffs(
                     except SyntaxError as e:
                         logger.warning(
                             "Diff to %s produces syntax error (%s:%s), reverting",
-                            fname, e.lineno, e.msg,
+                            fname,
+                            e.lineno,
+                            e.msg,
                         )
                 else:
                     logger.warning("Search block not found in %s, skipping", fname)
@@ -107,7 +111,9 @@ def apply_diffs(
                 except SyntaxError as e:
                     logger.warning(
                         "New file %s has syntax error (%s:%s), skipping",
-                        fname, e.lineno, e.msg,
+                        fname,
+                        e.lineno,
+                        e.msg,
                     )
 
     return new_modules, new_main

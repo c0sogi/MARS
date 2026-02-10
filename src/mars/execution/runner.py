@@ -49,7 +49,8 @@ class ScriptRunner:
             # Windows directory junction (works without admin)
             subprocess.run(
                 ["cmd", "/c", "mklink", "/J", dst, src],
-                capture_output=True, timeout=10,
+                capture_output=True,
+                timeout=10,
             )
             if os.path.exists(dst):
                 return
