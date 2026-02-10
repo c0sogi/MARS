@@ -49,7 +49,10 @@ def apply_diffs(
     """Apply diff edits from LLM response to modules and main script.
 
     Returns updated (modules, main_script).
+    Reverts individual files if diff application produces invalid syntax.
     """
+    import ast
+
     diffs = parse_diffs(llm_response)
     new_modules = dict(modules)
     new_main = main_script
@@ -61,25 +64,50 @@ def apply_diffs(
 
         if target in ("runfile.py", "main.py"):
             if search in new_main:
-                new_main = new_main.replace(search, replace, 1)
-                logger.info("Applied diff to %s", target)
+                candidate = new_main.replace(search, replace, 1)
+                # Validate syntax after diff application
+                try:
+                    ast.parse(candidate, filename=target)
+                    new_main = candidate
+                    logger.info("Applied diff to %s", target)
+                except SyntaxError as e:
+                    logger.warning(
+                        "Diff to %s produces syntax error (%s:%s), reverting",
+                        target, e.lineno, e.msg,
+                    )
             else:
                 logger.warning("Search block not found in %s, skipping", target)
         else:
             # Try matching with and without library/ prefix
             fname = target
             if fname.startswith("library/"):
-                fname = fname[len("library/") :]
+                fname = fname[len("library/"):]
 
             if fname in new_modules:
                 if search in new_modules[fname]:
-                    new_modules[fname] = new_modules[fname].replace(search, replace, 1)
-                    logger.info("Applied diff to %s", fname)
+                    candidate = new_modules[fname].replace(search, replace, 1)
+                    # Validate syntax after diff application
+                    try:
+                        ast.parse(candidate, filename=fname)
+                        new_modules[fname] = candidate
+                        logger.info("Applied diff to %s", fname)
+                    except SyntaxError as e:
+                        logger.warning(
+                            "Diff to %s produces syntax error (%s:%s), reverting",
+                            fname, e.lineno, e.msg,
+                        )
                 else:
                     logger.warning("Search block not found in %s, skipping", fname)
             else:
-                # New file
-                new_modules[fname] = replace
-                logger.info("Created new file %s from diff", fname)
+                # New file - validate before adding
+                try:
+                    ast.parse(replace, filename=fname)
+                    new_modules[fname] = replace
+                    logger.info("Created new file %s from diff", fname)
+                except SyntaxError as e:
+                    logger.warning(
+                        "New file %s has syntax error (%s:%s), skipping",
+                        fname, e.lineno, e.msg,
+                    )
 
     return new_modules, new_main

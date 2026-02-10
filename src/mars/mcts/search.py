@@ -176,12 +176,27 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             new_node = _improve_node(selected, improvement_agent, solution_lessons, config, tree)
 
         # === Debug loop (lines 26-30) ===
+        error_signatures: list[str] = []
+        MAX_REPEATED_ERRORS = 3
         k = 0
         while True:
             # Execute and review (line 31)
             node_dir = repo.create_node_dir(new_node.id, new_node.idea_id)
             repo.write_solution(new_node, node_dir)
-            exec_result = runner.execute(node_dir)
+
+            # Pre-execution syntax validation
+            syntax_errors = _validate_syntax(new_node)
+            if syntax_errors:
+                from mars.execution.runner import ExecutionResult
+                exec_result = ExecutionResult(
+                    success=False,
+                    output=f"Syntax validation failed:\n{syntax_errors}",
+                    duration=0.0,
+                    return_code=-1,
+                )
+                logger.warning("Syntax errors detected, skipping execution for %s", new_node.id)
+            else:
+                exec_result = runner.execute(node_dir)
 
             review = review_execution(review_agent, new_node, exec_result, context)
             new_node.execution_log = exec_result.output
@@ -192,6 +207,26 @@ def run_mars(task_description: str, config: MARSConfig) -> str:
             new_node.is_buggy = not exec_result.success or not new_node.valid_metric
 
             if not new_node.is_buggy or k >= config.max_debug_attempts:
+                break
+
+            # Track error signatures and abort on repeated errors
+            sig = _extract_error_signature(exec_result.output)
+            error_signatures.append(sig)
+            recent = error_signatures[-MAX_REPEATED_ERRORS:]
+            if len(recent) == MAX_REPEATED_ERRORS and len(set(recent)) == 1:
+                logger.warning(
+                    "Same error repeated %d times for %s: %s — aborting debug",
+                    MAX_REPEATED_ERRORS, new_node.id, sig,
+                )
+                break
+
+            # Budget check: skip debug if insufficient time remaining
+            remaining = config.exec_timeout - (time.time() - start_time)
+            if remaining < 300:  # Less than 5 minutes left
+                logger.warning(
+                    "Insufficient budget remaining (%.0fs), skipping debug for %s",
+                    remaining, new_node.id,
+                )
                 break
 
             # Line 28: Debug
@@ -362,6 +397,37 @@ def _format_files(node: MCTSNode | None) -> str:
     if node.main_script:
         parts.append(f"==== runfile.py ====\n{node.main_script}")
     return "\n\n".join(parts)
+
+
+def _validate_syntax(node: MCTSNode) -> str | None:
+    """Validate Python syntax of all node files. Returns error message or None."""
+    import ast
+    files = {"runfile.py": node.main_script}
+    files.update(node.modules)
+    errors = []
+    for fname, code in files.items():
+        if not code:
+            continue
+        try:
+            ast.parse(code, filename=fname)
+        except SyntaxError as e:
+            errors.append(f"{fname}:{e.lineno}: {e.msg}")
+    return "\n".join(errors) if errors else None
+
+
+def _extract_error_signature(output: str) -> str:
+    """Extract a short error signature from execution output for dedup."""
+    import re
+    # Look for common Python error patterns
+    match = re.search(r"(\w+Error): (.+?)$", output, re.MULTILINE)
+    if match:
+        return f"{match.group(1)}: {match.group(2)[:80]}"
+    match = re.search(r"(\w+Exception): (.+?)$", output, re.MULTILINE)
+    if match:
+        return f"{match.group(1)}: {match.group(2)[:80]}"
+    # Fallback: last non-empty line
+    lines = [ln.strip() for ln in output.strip().splitlines() if ln.strip()]
+    return lines[-1][:100] if lines else "unknown"
 
 
 def _apply_debug_fixes(node: MCTSNode, fixed_files: dict[str, str]) -> None:
